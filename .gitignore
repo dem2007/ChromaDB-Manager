@@ -1,0 +1,36 @@
+# Xcode / Swift
+build/
+.build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Build products of Scripts/build-app.sh
+dist/
+*.app/
+
+# Local user data — must never be committed.
+# Real databases, backups, logs and configs live in
+# ~/Library/Application Support/ChromaDBManager/
+config.json
+*.local.json
+chroma_data/
+backups/
+logs/
+*.log
+Resources/AppIcon.iconset/

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Язык, на котором написано приложение. Он же — язык ключей в каталоге
+	     текстов: строка в коде и есть ключ, по которому ищется перевод.
+	     Стояло `en`, хотя ни одной английской строки в приложении нет, и
+	     из-за этого macOS считала русский переводом, которого нет. -->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>ru</string>
+	<!-- `CFBundleLocalizations` здесь НЕТ, и это осознанно.
+	     Языки macOS видит по папкам `Resources/*.lproj`. Ключ, поставленный
+	     рядом с ними, список не дополняет, а **задваивает**: бандл начинал
+	     сообщать `["ru","en","en","ru"]` вместо `["en","ru"]`. Выбор языка
+	     от этого не ломался — проверено на запущенном приложении, — но
+	     список, где каждый язык назван дважды, неверен сам по себе. -->
+	<key>CFBundleExecutable</key>
+	<string>ChromaDBManager</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<!-- Shown by macOS when the app first asks Pages or Keynote to export a
+	     document. Required alongside the apple-events entitlement. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Чтобы прочитать документы Pages и Keynote, приложение просит их экспортировать содержимое в PDF. Без этого разрешения такие файлы не индексируются — всё остальное продолжает работать.</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.chromadbmanager</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ChromaDB Manager</string>
+	<key>CFBundleDisplayName</key>
+	<string>ChromaDB Manager</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.5</string>
+	<key>CFBundleVersion</key>
+	<string>6</string>
+	<!-- Ровно то же, что `platforms: [.macOS(.v14)]` в Package.swift.
+	     Стояло 13.0, хотя приложение под 13 не собирается вовсе: система
+	     пускала его запускаться там, где он заведомо неработоспособен, —
+	     а отказ при запуске куда понятнее, чем падение потом. Меняя
+	     минимум, менять оба места сразу. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Mozilla Public License 2.0</string>
+	<!-- H3. Пункты меню «Службы»: для выделенного текста и для файлов
+	     в Finder. Работают без расширений и без песочницы. Система
+	     регистрирует их только у приложения в стандартном расположении —
+	     об этом сказано в README. -->
+	<!-- H3. Что приложению можно бросить на значок в Dock. Без этого
+	     LaunchServices отфильтровывает всё, чего приложение не объявило,
+	     и файл до него просто не доходит — проверено в окне на `.zip`.
+	     `LSHandlerRank None` означает «умеем открыть, но никогда не по
+	     умолчанию»: приложение не претендует стать открывающим для
+	     чужих типов файлов. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Папка или файл</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>None</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+				<string>public.item</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Добавить текст в ChromaDB Manager</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>addTextFromService</string>
+			<key>NSPortName</key>
+			<string>ChromaDB Manager</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSStringPboardType</string>
+				<string>public.utf8-plain-text</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Добавить файлы в ChromaDB Manager</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>addFilesFromService</string>
+			<key>NSPortName</key>
+			<string>ChromaDB Manager</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSFilenamesPboardType</string>
+				<string>public.file-url</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

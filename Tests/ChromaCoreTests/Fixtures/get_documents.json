@@ -1,0 +1,1 @@
+{"ids":["a1","a2"],"embeddings":null,"documents":["кошка сидит на окне","собака бежит по улице"],"uris":null,"metadatas":[{"source_file":"a.md","chunk_index":0},{"source_file":"b.md","chunk_index":0}],"include":["documents","metadatas"]}
