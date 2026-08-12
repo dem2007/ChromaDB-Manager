@@ -9,7 +9,6 @@ A native macOS application (Swift + SwiftUI) for working with
 connecting to a local database or a server, browsing and editing its contents, and computing
 embeddings through a local [LM Studio](https://lmstudio.ai/).
 
-> **Status: stages 1, 2 (2A–2E), 3 (3A–3D), 4 (text extraction) and 5 (table sources) are closed.**
 > What follows describes only what is implemented and working; what is deliberately left
 > undone is in [Known limitations](#known-limitations).
 
