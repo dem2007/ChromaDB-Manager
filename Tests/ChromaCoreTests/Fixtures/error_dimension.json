@@ -1,0 +1,1 @@
+{"error":"InvalidArgumentError","message":"Collection expecting embedding with dimension of 4, got 2"}

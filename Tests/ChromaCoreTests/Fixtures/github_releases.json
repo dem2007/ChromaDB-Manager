@@ -1,0 +1,4 @@
+[{"tag_name":"latest","assets":[]},
+ {"tag_name":"1.5.9","assets":[]},
+ {"tag_name":"cli-1.4.4","assets":[{"name":"chroma-macos-arm64","browser_download_url":"https://github.com/chroma-core/chroma/releases/download/cli-1.4.4/chroma-macos-arm64","size":18874368},{"name":"chroma-linux","browser_download_url":"https://github.com/chroma-core/chroma/releases/download/cli-1.4.4/chroma-linux","size":19000000}]},
+ {"tag_name":"cli-1.4.3","assets":[{"name":"chroma-macos-arm64","browser_download_url":"https://github.com/chroma-core/chroma/releases/download/cli-1.4.3/chroma-macos-arm64","size":18800000}]}]

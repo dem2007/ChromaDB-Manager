@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The app launches external executables (chroma, python3, pip), which is
+	     incompatible with the App Sandbox. Distribution is Developer ID, not
+	     the Mac App Store. See README → «Подпись и песочница». -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- Outgoing: ChromaDB, LM Studio, GitHub/PyPI version checks. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Incoming: the local server the app runs, and the stage 3 proxy. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Pages and Keynote export their own documents for us. Under the
+	     Hardened Runtime this entitlement is required, and without it the system
+	     refuses automation with error -1743 — which reads like a bug in our code
+	     rather than a missing permission. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

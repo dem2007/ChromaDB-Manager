@@ -1,0 +1,64 @@
+# Build and test on every push and pull request.
+#
+# The suite runs on recorded fixtures: it needs neither ChromaDB nor LM Studio
+# nor a network. The live tests are gated behind CHROMA_IT, which is not set
+# here — a CI runner has no ChromaDB and no local model to talk to.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes a run that is still going: the older result is about
+  # code nobody will look at any more.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcode-select -p
+          swift --version
+          sw_vers
+
+      # The build directory is the expensive part; the key follows the manifest
+      # and the sources, so a cache is never reused for code it was not built
+      # from.
+      - name: Cache the build directory
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: build-${{ runner.os }}-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**/*.swift') }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ hashFiles('Package.swift') }}-
+            build-${{ runner.os }}-
+
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test
+
+      # The app bundle is what people actually run, and it is assembled by a
+      # script rather than by SwiftPM: Info.plist, the icon, the entitlements,
+      # the string catalogues and the signature. A build that passes the tests
+      # but does not assemble is a broken build.
+      - name: Assemble the app bundle
+        run: ./Scripts/build-app.sh release
+
+      - name: Check the bundle
+        run: |
+          test -d "dist/ChromaDB Manager.app" || { echo "the bundle was not assembled"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
+            "dist/ChromaDB Manager.app/Contents/Info.plist"
+          codesign --verify --strict "dist/ChromaDB Manager.app"
