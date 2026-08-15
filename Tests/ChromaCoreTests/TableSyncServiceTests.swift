@@ -73,13 +73,17 @@ final class TableSyncServiceTests: XCTestCase {
     private let sourceID = UUID(uuidString: "00000000-0000-0000-0000-0000000000CC")!
     private let columns = ["Артикул", "Название", "Цена"]
 
-    private func profile(mode: SheetMode = .dataTable) -> TableProfile {
-        TableProfile(
+    private func profile(
+        mode: SheetMode = .dataTable, keyColumn: String? = "Артикул", columns: [String]? = nil
+    ) -> TableProfile {
+        let used = columns ?? self.columns
+        var roles: [String: ColumnRole] = ["Артикул": .metadata, "Название": .text, "Цена": .metadata]
+        for column in used where roles[column] == nil { roles[column] = .metadata }
+        return TableProfile(
             name: "Каталог",
             mapping: TableMapping(
-                sheetName: "Каталог", mode: mode, headerRow: 1, columns: columns,
-                roles: ["Артикул": .metadata, "Название": .text, "Цена": .metadata],
-                keyColumn: "Артикул"
+                sheetName: "Каталог", mode: mode, headerRow: 1, columns: used,
+                roles: roles, keyColumn: keyColumn
             )
         )
     }
@@ -92,10 +96,19 @@ final class TableSyncServiceTests: XCTestCase {
         )
     }
 
-    private func workbook(_ items: [(String, String, Double)], sheet: String = "Каталог", extraSheet: XLSXFixtureBuilder.Sheet? = nil) throws -> URL {
+    private func workbook(
+        _ items: [(String, String, Double)], sheet: String = "Каталог",
+        extraSheet: XLSXFixtureBuilder.Sheet? = nil, note: String? = nil
+    ) throws -> URL {
         var builder = XLSXFixtureBuilder()
-        var rows: [[XLSXFixtureBuilder.Cell]] = [[.shared("Артикул"), .shared("Название"), .shared("Цена")]]
-        for item in items { rows.append([.shared(item.0), .shared(item.1), .number(item.2)]) }
+        var header: [XLSXFixtureBuilder.Cell] = [.shared("Артикул"), .shared("Название"), .shared("Цена")]
+        if note != nil { header.append(.shared("Примечание")) }
+        var rows: [[XLSXFixtureBuilder.Cell]] = [header]
+        for item in items {
+            var row: [XLSXFixtureBuilder.Cell] = [.shared(item.0), .shared(item.1), .number(item.2)]
+            if let note { row.append(.inline(note)) }
+            rows.append(row)
+        }
         builder.sheets = [.init(name: sheet, rows: rows)]
         if let extraSheet { builder.sheets.append(extraSheet) }
 
@@ -135,7 +148,9 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(embeddings.counter.texts, 2)
 
         let bolt = try XCTUnwrap(database.documents.values.first { $0.document.contains("Болт") })
-        XCTAssertEqual(bolt.document, "Название: Болт")
+        // Ключ строки — впереди текста: по артикулу её и ищут,
+        // а раньше он был только в метаданных.
+        XCTAssertEqual(bolt.document, "Артикул: A-1\nНазвание: Болт")
         XCTAssertEqual(bolt.metadata["артикул"], .string("A-1"))
         XCTAssertEqual(bolt.metadata["цена"], .int(12))
         XCTAssertEqual(bolt.metadata["sheet_name"], .string("Каталог"))
@@ -208,7 +223,7 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(report.rowsReembedded, 1)
         XCTAssertEqual(report.rowsUnchanged, 1)
         XCTAssertEqual(embeddings.counter.texts - before, 1)
-        XCTAssertTrue(database.documents.values.contains { $0.document == "Название: Болт М8" })
+        XCTAssertTrue(database.documents.values.contains { $0.document == "Артикул: A-1\nНазвание: Болт М8" })
     }
 
     /// a changed price costs a write, not a vector — and the vector that
@@ -236,6 +251,56 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(database.documents[id]?.metadata["цена"], .int(15))
     }
 
+    ///, до конца конвейера: вставка строки в файл без ключевой колонки
+    /// не должна уносить из базы ничего.
+    ///
+    /// Раньше уносила: сдвинувшиеся строки считались правками соседей, их
+    /// прежние документы удалялись после записи — а манифест продолжал считать
+    /// их записанными, так что ни один следующий прогон их не возвращал.
+    func testInsertingARowKeepsEveryDocumentInTheCollection() async throws {
+        let profile = profile(keyColumn: nil)
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8), ("A-3", "Шайба", 3)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        try await run(url, manifest: &manifest, profiles: [profile], database: database, embeddings: embeddings)
+        XCTAssertEqual(database.documents.count, 3)
+        let before = Set(database.documents.keys)
+
+        let wider = try workbook([
+            ("A-1", "Болт", 12), ("A-9", "Новый", 5), ("A-2", "Гайка", 8), ("A-3", "Шайба", 3),
+        ])
+        let report = try await run(wider, manifest: &manifest, profiles: [profile], database: database, embeddings: embeddings)
+
+        XCTAssertEqual(database.documents.count, 4, "было три строки, стало четыре")
+        XCTAssertTrue(before.isSubset(of: Set(database.documents.keys)), "ни один прежний документ не пропал")
+        XCTAssertTrue(database.deleted.isEmpty, "удалять было нечего")
+        XCTAssertEqual(report.rowsAdded, 1)
+        XCTAssertEqual(report.rowsReembedded, 0, "сдвиг — не правка, вектор считается только новой строке")
+    }
+
+    /// обрезка по длине не молчит — она называет колонку и счёт.
+    func testALongValueIsCutAndTheRunSaysWhichColumn() async throws {
+        let long = String(repeating: "я", count: RowMapper.metadataValueLimit + 100)
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)], note: long)
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let report = try await run(
+            url, manifest: &manifest,
+            profiles: [profile(columns: columns + ["Примечание"])],
+            database: database, embeddings: FakeEmbeddings()
+        )
+
+        let warning = try XCTUnwrap(report.warnings.first { $0.contains("обрезано") })
+        XCTAssertTrue(warning.contains("Примечание"), warning)
+        XCTAssertTrue(warning.contains("2"), "строк с обрезкой две — \(warning)")
+        let stored = try XCTUnwrap(database.documents.values.first)
+        guard case .string(let value)? = stored.metadata["примечание"] else {
+            return XCTFail("примечание должно быть строкой")
+        }
+        XCTAssertEqual(value.count, RowMapper.metadataValueLimit + 1)
+    }
+
     // MARK: - Rows that went away
 
     /// Rule 1 of Приложение 5: nothing is deleted automatically, not even a row.
@@ -252,6 +317,27 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(report.disappeared.map(\.rowKey), ["A-2"])
         XCTAssertEqual(database.documents.count, 2, "документ исчезнувшей строки остаётся до решения")
         XCTAssertTrue(database.deleted.isEmpty)
+        // И записывается туда, где решение будут принимать — в манифест
+        //. Отчёт живёт до конца прогона, а человек решает потом.
+        XCTAssertEqual(manifest.pendingRemovals["Каталог"]?.rows.map(\.rowKey), ["A-2"])
+    }
+
+    /// Строка вернулась в файл — решать больше нечего, и список чистится сам,
+    /// как у файлов.
+    func testAReturnedRowClearsTheDecisionList() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+
+        let shorter = try workbook([("A-1", "Болт", 12)])
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+        XCTAssertNotNil(manifest.pendingRemovals["Каталог"])
+
+        let restored = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        try await run(restored, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+        XCTAssertNil(manifest.pendingRemovals["Каталог"], "строка на месте — решать нечего")
     }
 
     // MARK: - Sheets nobody mapped

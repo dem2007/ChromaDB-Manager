@@ -7,6 +7,12 @@ import Foundation
 /// читает и сообщает.
 public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identifiable {
     case emptyDocuments
+    /// Ни одной буквы и ни одной цифры — скобка, точка, `]`.
+    ///
+    /// Отдельно от «слишком коротких», и это не педантизм: короткий документ
+    /// со словом внутри ведёт себя честно, а бессловесный всплывает по любому
+    /// запросу. Мерить эти две беды одной линейкой значит не увидеть ни одной.
+    case wordlessChunks
     case withoutMetadata
     case schemaViolations
     case orphanChunks
@@ -24,6 +30,7 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
     public var title: String {
         switch self {
         case .emptyDocuments: return String(localized: "Пустые и слишком короткие документы")
+        case .wordlessChunks: return String(localized: "Чанки без единого слова")
         case .withoutMetadata: return String(localized: "Документы без метаданных")
         case .schemaViolations: return String(localized: "Несоответствие схеме")
         case .orphanChunks: return String(localized: "Чанки-сироты")
@@ -49,6 +56,8 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
         switch self {
         case .emptyDocuments:
             return String(localized: "Текст короче порога. Такой чанк ничего не найдёт и только занимает место в выдаче.")
+        case .wordlessChunks:
+            return String(localized: "В тексте нет ни буквы, ни цифры — одни знаки препинания. Такой чанк не «ничего не находит», а находится сам: у текста без слов нет направления в пространстве смыслов, и он оказывается близко к любому запросу. Замеренный пример: до запроса «услуги связи» расстояние от чанка «)» — 0.33, а от предложения ровно про услуги связи — 0.42. Скобка выигрывает у ответа.")
         case .withoutMetadata:
             return String(localized: "Метаданных нет вовсе — по такому документу нельзя ни отфильтровать, ни понять, откуда он.")
         case .schemaViolations:
@@ -80,6 +89,8 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
         switch self {
         case .emptyDocuments, .duplicates, .nearDuplicates:
             return String(localized: "Просмотреть и удалить лишние — по одному или списком.")
+        case .wordlessChunks:
+            return String(localized: "Удалить: текст из одних знаков препинания не нужен ни человеку, ни агенту. Новые такие чанки приложение больше не создаёт — нарезка приклеивает их к соседу; эти остались от прежних прогонов.")
         case .withoutMetadata, .schemaViolations:
             return String(localized: "Дописать метаданные или переиндексировать источник.")
         case .orphanChunks:

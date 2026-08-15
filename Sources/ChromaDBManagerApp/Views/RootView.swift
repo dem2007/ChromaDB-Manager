@@ -415,11 +415,24 @@ struct RootView: View {
     }
 
     /// Startup does not touch the network: versions are only checked when the
-    /// user asks (or turns the option on).
+    /// user asks — or when they turned the option on themselves.
     private func startUp() async {
         settings.saveNow()
         app.refreshOrphans()
         await environmentModel.refresh(app)
+
+        // Единственное обращение к сети при старте — и только когда галочка
+        // включена руками. Молчаливая: недоступный GitHub не повод
+        // встречать человека сообщением об ошибке.
+        //
+        // **Рядом с запуском, а не внутри него.** С `await` в этой строке
+        // сеть без выхода в интернет задерживала бы всё последующее —
+        // подключение к базе и автоматическую синхронизацию — на таймаут
+        // запроса, то есть до двадцати секунд. Проверка версии столько
+        // внимания не стоит.
+        if settings.configuration.checkAppUpdatesOnLaunch {
+            Task { await environmentModel.checkAppUpdates(app, automatic: true) }
+        }
 
         // Starting on launch is a setting; when it is off the app
         // opens disconnected and waits for the button on the «Сервер» screen.
@@ -542,7 +555,7 @@ struct RootView: View {
         case .security:
             SecurityView(model: securityModel, serverModel: serverModel, tab: openTab)
         case .environment:
-            EnvironmentStatusView(model: environmentModel, serverModel: serverModel, tab: openTab)
+            EnvironmentStatusView(model: environmentModel, tab: openTab)
         case .tasks:
             TasksView(sources: sourcesModel)
         case .logs:

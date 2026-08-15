@@ -175,6 +175,68 @@ final class RowMetadataTests: XCTestCase {
         )
     }
 
+    /// в текст идёт «15 %», в метаданные — 15.
+    ///
+    /// Разные числа не по недосмотру: в тексте человек ищет то, что видит
+    /// в книге, а фильтр пишет по тому же числу — `= 15`, а не `= 0.15`.
+    func testAPercentReadsAsPercentInBothPlaces() throws {
+        let row = SheetRow(number: 5, cells: [
+            0: .text("A-1"),
+            1: .measured(0.15, .percent),
+            4: .text("скидка"),
+        ])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["цена"], .int(15))
+        XCTAssertEqual(row.value(at: 1).displayText, "15 %")
+    }
+
+    func testACurrencyKeepsItsNumberInMetadata() throws {
+        let row = SheetRow(number: 5, cells: [
+            0: .text("A-1"),
+            1: .measured(1234.5, NumberUnit(suffix: "₽")),
+            4: .text("цена"),
+        ])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["цена"], .double(1234.5))
+    }
+
+    /// у метаданных появился предел длины.
+    ///
+    /// Для текста документа предел есть — контекст модели; для метаданных
+    /// не было никакого, и примечание на сорок тысяч знаков уезжало в базу
+    /// целиком, а потом возвращалось в каждом результате поиска.
+    func testALongValueIsCutToTheLimitAndSaysSo() throws {
+        let long = String(repeating: "я", count: RowMapper.metadataValueLimit + 500)
+        let row = SheetRow(number: 5, cells: [0: .text(long), 4: .text("есть")])
+        let document = try XCTUnwrap(document(row))
+
+        guard case .string(let stored)? = document.metadata["артикул"] else {
+            return XCTFail("значение должно остаться строкой")
+        }
+        XCTAssertEqual(stored.count, RowMapper.metadataValueLimit + 1, "предел плюс многоточие")
+        XCTAssertTrue(stored.hasSuffix("…"), "обрезка видна в самом значении, а не только в отчёте")
+        XCTAssertEqual(document.truncatedColumns, ["Артикул"])
+    }
+
+    func testAValueAtTheLimitIsLeftAlone() throws {
+        let exact = String(repeating: "я", count: RowMapper.metadataValueLimit)
+        let row = SheetRow(number: 5, cells: [0: .text(exact), 4: .text("есть")])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["артикул"], .string(exact))
+        XCTAssertTrue(document.truncatedColumns.isEmpty)
+    }
+
+    /// Предел — про строки. Число и дата короткие по природе, и трогать их
+    /// значило бы превращать их в строки.
+    func testNumbersAndDatesAreNotTouched() throws {
+        let row = SheetRow(number: 5, cells: [
+            1: .number(12), 2: .date(Date(timeIntervalSince1970: 1_700_000_000)), 4: .text("есть"),
+        ])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["цена"], .int(12))
+        XCTAssertTrue(document.truncatedColumns.isEmpty)
+    }
+
     /// only string, int, float and bool exist in ChromaDB metadata.
     func testValuesAreCoercedToWhatChromaDBAccepts() throws {
         let date = Date(timeIntervalSince1970: 1_700_000_000)

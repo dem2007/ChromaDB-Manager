@@ -242,7 +242,11 @@ public struct IWorkExtractor: DocumentTextExtractor {
             structureSource: .legacyXML,
             containerFormat: kind.containerFormat,
             extractorID: id,
-            extractorVersion: version
+            extractorVersion: version,
+            // Про таблицы в старом XML-формате Pages сказать нечего: разметка
+            // ячеек в нём не размечена как таблица, и выдавать «их нет»
+            // за проверку нельзя. `nil` — это «не проверяли», и так честнее.
+            hasTables: nil
         )
     }
 }

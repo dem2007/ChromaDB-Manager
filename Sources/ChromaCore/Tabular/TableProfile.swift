@@ -28,6 +28,41 @@ public enum SheetSelection: Codable, Hashable, Sendable {
     }
 }
 
+/// Где живёт профиль сопоставления.
+///
+/// Профили начинались как принадлежность источника, и для папки, которую
+/// индексируют по расписанию, это правильно: разметка — часть её настройки.
+/// Но одинаковые книги приходят в разные папки, и разметив «отчёт ФЭО» в одном
+/// источнике, человек не находит его в другом — список там пуст, и разметку
+/// приходится повторять слово в слово.
+///
+/// Поэтому выбор делается при сохранении, а не решается за человека: у
+/// источника — как было, у приложения — видно всем источникам.
+public enum TableProfileScope: String, Codable, Sendable, CaseIterable, Identifiable {
+    /// Профиль виден только файлам этого источника.
+    case source
+    /// Профиль виден всем источникам приложения.
+    case application
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .source: return String(localized: "у этого источника")
+        case .application: return String(localized: "у всего приложения")
+        }
+    }
+
+    public var explanation: String {
+        switch self {
+        case .source:
+            return String(localized: "Профиль виден только файлам этого источника — как было раньше.")
+        case .application:
+            return String(localized: "Профиль виден всем источникам: та же книга в другой папке разметится сама. Свой профиль источника с таким же именем всё равно главнее.")
+        }
+    }
+}
+
 /// A saved mapping, attached to a source.
 ///
 /// A folder that indexes itself on a timer cannot stop to ask which column is
@@ -56,6 +91,65 @@ public struct TableProfile: Codable, Hashable, Sendable, Identifiable {
 
         /// The set of headers this variant was built for — its identity.
         public var headerSignature: Set<String> { TableProfile.signature(of: mapping.columns) }
+
+        /// Колонки, без которых разбор не имеет смысла: текст документа
+        /// и ключ строки.
+        ///
+        /// Всё остальное — метаданные, и их отсутствие меняет не смысл записи,
+        /// а состав фильтров по ней.
+        public var requiredColumns: [String] {
+            var required = mapping.textColumns
+            if let key = mapping.keyColumn, !required.contains(key) { required.append(key) }
+            return required
+        }
+
+        /// Берётся ли этот вариант за лист с такими колонками.
+        ///
+        /// **Не точное совпадение набора, и это исправление, а не послабление.**
+        /// Точное равенство означало, что файл, где колонка называется годом
+        /// («2025», «2026»), не совпадёт ни с одним профилем: у отчёта за
+        /// 2026–2027 годы другие, хотя таблица та же самая. Такие файлы уходили
+        /// в «требуют решения» целиком — при том что от недостающей колонки
+        /// с суммой за 2030 год теряется один фильтр, а не смысл строки.
+        ///
+        /// Поэтому обязательны только текст и ключ: без них запись не о чем.
+        /// Недостающие метаданные называются в отчёте, лишние колонки файла
+        /// не мешают — они просто не размечены.
+        /// - Parameter strict: требовать полного совпадения набора колонок.
+        ///   **Подбор строг, назначение — нет**, и это не мелочь: подбор
+        ///   угадывает, чем читать лист, и ошибка в догадке пишет в базу
+        ///   документы с чужой разметкой. Назначение — ответ человека, и
+        ///   спорить с ним из-за колонки со сроком «2030» незачем.
+        public func accepts(columns: [String], strict: Bool = true) -> Acceptance {
+            // Режимы «документ» и «не индексировать» колонок не разбирают:
+            // первому нужен лист целиком, второму — ничего.
+            guard mapping.mode == .dataTable else {
+                return Acceptance(matches: true, missing: [], extra: [], exact: true)
+            }
+            let present = TableProfile.signature(of: columns)
+            let missingRequired = requiredColumns.filter { !present.contains(TableProfile.normalised($0)) }
+            let missing = mapping.columns.filter { !present.contains(TableProfile.normalised($0)) }
+            let extra = columns.filter { !headerSignature.contains(TableProfile.normalised($0)) }
+            let exact = missing.isEmpty && extra.isEmpty
+            return Acceptance(
+                matches: strict ? exact : (missingRequired.isEmpty && !columns.isEmpty),
+                missing: missing,
+                extra: extra,
+                exact: exact
+            )
+        }
+
+        /// Чем кончилась примерка варианта к листу.
+        public struct Acceptance: Hashable, Sendable {
+            public var matches: Bool
+            /// Колонки профиля, которых в файле нет. При `matches` — только
+            /// метаданные: без текста и ключа вариант не берётся вовсе.
+            public var missing: [String]
+            /// Колонки файла, которых нет в профиле: они останутся неразмеченными.
+            public var extra: [String]
+            /// Набор совпал полностью — такой вариант предпочитается неточному.
+            public var exact: Bool
+        }
 
         /// Чем этот вариант назвать в списке: именем листа, если он назван,
         /// иначе — по выбору листов.
@@ -95,19 +189,25 @@ public struct TableProfile: Codable, Hashable, Sendable, Identifiable {
     /// Совпадение по набору колонок **и** по выбору листов: вариант «листы:
     /// ФЭО» не должен разбирать «Товары и услуги», даже если колонки сошлись.
     public func variant(forSheet sheetName: String, index: Int, columns: [String]) -> Variant? {
-        let signature = TableProfile.signature(of: columns)
-        return variants.first {
-            $0.sheets.admits(sheetName: sheetName, index: index) && $0.headerSignature == signature
-        }
+        variants(claiming: sheetName, index: index, columns: columns).first
     }
 
     /// Все варианты, готовые взять этот лист. Больше одного — профиль собран
     /// так, что сам себе противоречит, и выбирать за человека нельзя.
-    public func variants(claiming sheetName: String, index: Int, columns: [String]) -> [Variant] {
-        let signature = TableProfile.signature(of: columns)
-        return variants.filter {
-            $0.sheets.admits(sheetName: sheetName, index: index) && $0.headerSignature == signature
+    ///
+    /// Точное совпадение набора колонок идёт первым: когда в книге есть и
+    /// точный вариант, и подходящий с оговорками, брать надо точный.
+    public func variants(claiming sheetName: String, index: Int, columns: [String], strict: Bool = true) -> [Variant] {
+        let admitting = variants.filter { $0.sheets.admits(sheetName: sheetName, index: index) }
+        let accepted = admitting.compactMap { variant -> (Variant, Variant.Acceptance)? in
+            let acceptance = variant.accepts(columns: columns, strict: strict)
+            return acceptance.matches ? (variant, acceptance) : nil
         }
+        // Точные вперёд неточных — но **все** точные: два одинаково точных
+        // варианта на один лист это спор профиля с самим собой, и решать его
+        // за человека нельзя.
+        let exact = accepted.filter(\.1.exact)
+        return (exact.isEmpty ? accepted : exact).map(\.0)
     }
 
     /// Строка для списка: сколько вариантов и про какие листы.
@@ -125,7 +225,27 @@ public struct TableProfile: Codable, Hashable, Sendable, Identifiable {
     /// Case and spacing are not a different table; order is not either, because
     /// columns are resolved by title rather than by position.
     public static func signature(of columns: [String]) -> Set<String> {
-        Set(columns.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        Set(columns.map(normalised))
+    }
+
+    static func normalised(_ column: String) -> String {
+        column.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Профили, которыми читается источник: его собственные плюс общие.
+    ///
+    /// **Свой профиль главнее общего.** Одноимённый общий отбрасывается, а не
+    /// добавляется вторым: два профиля на один лист — это `.ambiguous`, то есть
+    /// лист не индексируется вовсе. Правка общего профиля не должна ломать
+    /// источник, у которого есть своя версия той же разметки.
+    ///
+    /// По имени **и** по `id`: общий профиль мог быть сделан из профиля
+    /// источника (при смене области хранения `id` сохраняется, чтобы уцелели
+    /// назначения файлов), и тогда одинаковы оба.
+    public static func resolved(own: [TableProfile], shared: [TableProfile]) -> [TableProfile] {
+        let takenIDs = Set(own.map(\.id))
+        let takenNames = Set(own.map { normalised($0.name) })
+        return own + shared.filter { !takenIDs.contains($0.id) && !takenNames.contains(normalised($0.name)) }
     }
 }
 

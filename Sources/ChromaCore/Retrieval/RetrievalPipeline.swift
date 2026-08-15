@@ -170,6 +170,12 @@ public struct RetrievalHit: Identifiable, Hashable, Sendable {
     /// The candidate's vector, carried only while MMR needs it. Never
     /// shown and never stored — a page of embeddings is megabytes.
     public var embedding: [Double]?
+    /// Коллекция, из которой пришёл результат.
+    ///
+    /// `nil` у обычного поиска: там коллекция одна и известна спрашивающему.
+    /// Заполняется поиском по нескольким коллекциям — без этого выдача
+    /// становится списком без ответа на вопрос «а это откуда».
+    public var collectionName: String?
 
     public init(
         id: String,
@@ -183,7 +189,8 @@ public struct RetrievalHit: Identifiable, Hashable, Sendable {
         contextKind: ContextKind? = nil,
         matchedChunkID: String? = nil,
         context: [RetrievalHit] = [],
-        embedding: [Double]? = nil
+        embedding: [Double]? = nil,
+        collectionName: String? = nil
     ) {
         self.id = id
         self.document = document
@@ -197,6 +204,7 @@ public struct RetrievalHit: Identifiable, Hashable, Sendable {
         self.matchedChunkID = matchedChunkID
         self.context = context
         self.embedding = embedding
+        self.collectionName = collectionName
     }
 
     public init(_ hit: QueryHit, source: CandidateSource = .vector, position: Int? = nil) {
@@ -685,7 +693,29 @@ public actor RetrievalPipeline {
             ))
         }
 
-        // MARK: Stage 8 — truncate
+        // MARK: Stage 8 — ручные пометки человека
+        //
+        // Последними, но до обрезки: закреплённое человеком обязано попасть
+        // в выдачу, а не быть срезанным вместе с хвостом. Внутри своей группы
+        // порядок сохраняется — пометка говорит «выше» и «ниже», а не «вместо».
+        if stages.contains(.marks) {
+            let marksStarted = Date()
+            let before = hits.count
+            let marked = Self.applyingMarks(hits)
+            hits = marked.hits
+            diagnostics.stages.append(.init(
+                stage: .marks, ran: true, inputCount: before, outputCount: hits.count,
+                duration: Date().timeIntervalSince(marksStarted),
+                note: marked.note
+            ))
+        } else {
+            diagnostics.stages.append(.init(
+                stage: .marks, ran: false, inputCount: hits.count, outputCount: hits.count,
+                duration: 0, note: String(localized: "в профиле не включено")
+            ))
+        }
+
+        // MARK: Stage 9 — truncate
         let truncateStarted = Date()
         let before = hits.count
         if hits.count > nResults { hits = Array(hits.prefix(nResults)) }
@@ -708,6 +738,34 @@ public actor RetrievalPipeline {
             log(.debug, "Поиск", "  \(report.line)")
         }
         return RetrievalOutcome(hits: hits, diagnostics: diagnostics)
+    }
+
+    // MARK: - Stage 8: ручные пометки
+
+    /// Двигает список по пометкам человека, **сохраняя порядок внутри групп**.
+    ///
+    /// Устойчивая сортировка, а не пересчёт очков: очко пометки пришлось бы
+    /// выражать в тех же единицах, что и релевантность, а они не сравнимы —
+    /// «насколько закреплённое важнее похожего» не имеет ответа. Порядок
+    /// групп: закреплённые, обычные, понижённые, устаревшие; внутри группы
+    /// всё остаётся так, как оставил конвейер.
+    static func applyingMarks(_ hits: [RetrievalHit]) -> (hits: [RetrievalHit], note: String) {
+        var groups: [Int: [RetrievalHit]] = [:]
+        var counts: [DocumentMark: Int] = [:]
+        for hit in hits {
+            let mark = DocumentMarks(metadata: hit.metadata).mark
+            if let mark { counts[mark, default: 0] += 1 }
+            groups[mark?.rankGroup ?? 1, default: []].append(hit)
+        }
+        guard !counts.isEmpty else {
+            return (hits, String(localized: "помеченных документов в выдаче нет"))
+        }
+        let ordered = groups.keys.sorted().flatMap { groups[$0] ?? [] }
+        var parts: [String] = []
+        if let pinned = counts[.pinned] { parts.append(String(localized: "закреплённых \(pinned.plainDigits)")) }
+        if let demoted = counts[.demoted] { parts.append(String(localized: "понижённых \(demoted.plainDigits)")) }
+        if let stale = counts[.stale] { parts.append(String(localized: "устаревших \(stale.plainDigits)")) }
+        return (ordered, parts.joined(separator: ", "))
     }
 
     // MARK: - Stage 1: which level to search

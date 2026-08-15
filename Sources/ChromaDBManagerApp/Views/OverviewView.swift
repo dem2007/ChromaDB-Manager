@@ -36,6 +36,11 @@ struct OverviewView: View {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 tiles
                 nowCard
+                // Процесс от прошлой сессии — рядом с фактами о сервере,
+                // и до списка решений: он держит порт и базу, и это
+                // не «стоит закрыть», а «вот прямо сейчас лишний сервер».
+                // Карточки нет, когда таких процессов нет.
+                ChromaProcessesCard(serverModel: server)
                 decisionsCard
                 languageCard
             }
@@ -293,13 +298,54 @@ struct OverviewView: View {
     private var decisions: [Decision] {
         var found: [Decision] = []
 
-        if !app.connection.isConnected {
+        // Первый запуск — цепочкой, по звену за раз.
+        //
+        // Отдельного мастера для этого нет и не будет: мастер — это второй
+        // сквозной путь через приложение, свои экраны, которые начнут
+        // расходиться с основными. Да и показывается он один раз, а «нечем
+        // работать» случается и на второй машине, и после переустановки
+        // движка, и когда база отвалилась через полгода.
+        //
+        // Звенья показываются **по одному**: пока не установлен движок,
+        // «нет подключения» — не решение, а следствие, и предлагать его
+        // значит отправлять человека туда, где ему нечего нажать.
+        if app.environmentStatus.checkedAt != nil, !app.environmentStatus.isEngineInstalled {
+            found.append(Decision(
+                id: "engine",
+                text: String(localized: "Движок ChromaDB не установлен — без него нет ни базы, ни поиска"),
+                isUrgent: true,
+                action: String(localized: "Установка"),
+                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Установка"))) }
+            ))
+        } else if !app.connection.isConnected {
             found.append(Decision(
                 id: "connection",
                 text: String(localized: "Нет подключения к базе — коллекции и поиск недоступны"),
                 isUrgent: true,
                 action: String(localized: "Подключение"),
                 go: { go(.overview, SidebarSection.overview.tabIndex(String(localized: "Подключение"))) }
+            ))
+        } else if collectionsModel.collections.isEmpty, !collectionsModel.isLoadingCollections {
+            // Подключились, а в базе пусто: следующий шаг — не «настроить
+            // поиск», а завести источник. Коллекцию создаст он сам, и звать
+            // человека делать её руками значит звать на лишнюю работу.
+            found.append(Decision(
+                id: "empty-database",
+                text: String(localized: "В базе нет ни одной коллекции — добавьте источник, он её и создаст"),
+                isUrgent: false,
+                action: String(localized: "Источники"),
+                go: { go(.sources, nil) }
+            ))
+        } else if settings.configuration.dataSources.isEmpty {
+            // Коллекции есть, а источников нет: база наполнена не отсюда —
+            // руками, импортом, чужим клиентом. Это не дефект, но и не то
+            // состояние, в котором приложение делает свою работу.
+            found.append(Decision(
+                id: "no-sources",
+                text: String(localized: "Источников нет — коллекции наполнены не приложением, обновлять их некому"),
+                isUrgent: false,
+                action: String(localized: "Источники"),
+                go: { go(.sources, nil) }
             ))
         }
         if sources.problemCount > 0 {

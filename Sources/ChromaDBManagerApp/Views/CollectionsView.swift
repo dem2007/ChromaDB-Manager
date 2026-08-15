@@ -24,6 +24,15 @@ struct CollectionsView: View {
     @State private var expandedDocumentID: String?
     @State private var metadataEditorID: String?
     @State private var metadataDraft = MetadataDraft()
+    /// Документ, у которого правят теги и заметку, и сами поля.
+    @State private var marksEditorID: String?
+    /// Коллекция этого документа, когда он пришёл не из открытой.
+    @State private var marksEditorCollection: String?
+    /// Редактор позвали из выдачи, а не из списка документов: рисовать его
+    /// надо у результата, иначе он открывается там, куда человек не смотрит.
+    @State private var marksEditorFromHit = false
+    @State private var marksTags = ""
+    @State private var marksNote = ""
 
     var body: some View {
         // Экран из макета: слева карточка со списком коллекций — она общая
@@ -873,6 +882,124 @@ struct CollectionsView: View {
         }
     }
 
+    /// Метрика коллекции, из которой пришёл результат.
+    private func metric(of hit: RetrievalHit, current: ChromaCollection) -> DistanceMetric? {
+        guard let name = hit.collectionName, name != current.name else { return current.space }
+        return model.collections.first { $0.name == name }?.space ?? current.space
+    }
+
+    /// Что ответила каждая коллекция.
+    ///
+    /// Отдельной строкой на коллекцию, а не одной сводкой: коллекция, которая
+    /// не ответила из-за ошибки, выглядит в общей выдаче ровно как коллекция,
+    /// в которой ничего не нашлось, — и человек делает из этого неверный вывод
+    /// о своих данных.
+    private var collectionsReport: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let summary = model.searchSummary {
+                Text(summary).font(Theme.Font.caption)
+            }
+            ForEach(model.searchReports, id: \.self) { report in
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(report.failure == nil ? Theme.Palette.running : Theme.Palette.danger)
+                        .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+                    if let failure = report.failure {
+                        Text("\(report.name) — не ответила: \(failure)")
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("\(report.name) — найдено \(report.found.plainDigits), \(Int((report.seconds * 1000).rounded()).plainDigits) мс")
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    /// Выбор коллекций, которые ищутся вместе с открытой.
+    ///
+    /// Меню, а не список чекбоксов на экране: коллекций бывает два десятка, и
+    /// поиск по одной — по-прежнему самый частый случай. Выбранные названы
+    /// строкой под меню, чтобы «где я сейчас ищу» читалось без открывания.
+    @ViewBuilder
+    private func alsoSearchInRow(_ collection: ChromaCollection) -> some View {
+        let others = model.collections.filter { $0.name != collection.name }
+        if !others.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(others, id: \.id) { other in
+                            Toggle(isOn: Binding(
+                                get: { model.alsoSearchIn.contains(other.name) },
+                                set: { isOn in
+                                    if isOn {
+                                        model.alsoSearchIn.insert(other.name)
+                                    } else {
+                                        model.alsoSearchIn.remove(other.name)
+                                    }
+                                }
+                            )) {
+                                // Коллекция без модели искать не может, и это
+                                // сказано прямо в строке выбора, а не после
+                                // запроса.
+                                Text(other.isBound
+                                     ? other.name
+                                     : String(localized: "\(other.name) — нет модели"))
+                            }
+                            .disabled(!other.isBound)
+                        }
+                    } label: {
+                        Text(model.alsoSearchIn.isEmpty
+                             ? String(localized: "Искать ещё в…")
+                             : String(localized: "Искать ещё в: \(model.alsoSearchIn.count.plainDigits)"))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .frame(width: 190)
+
+                    if !model.alsoSearchIn.isEmpty {
+                        Button(String(localized: "Только эта коллекция")) { model.alsoSearchIn = [] }
+                            .buttonStyle(.link).font(Theme.Font.micro)
+                    }
+                    Spacer()
+                }
+
+                if !model.alsoSearchIn.isEmpty {
+                    let names = ([collection.name] + model.alsoSearchIn.sorted())
+                    Text("ищем в: \(names.joined(separator: ", "))")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    // Поведение при разных моделях — главный вопрос этого
+                    // режима, и ответ на него стоит до запуска, а не после.
+                    Text(multiModelNote(collection))
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Сколько моделей затронет запрос — столько раз и посчитается вектор.
+    private func multiModelNote(_ collection: ChromaCollection) -> String {
+        let names = Set([collection.name]).union(model.alsoSearchIn)
+        let models = Set(
+            model.collections
+                .filter { names.contains($0.name) }
+                .compactMap { $0.boundModel }
+        )
+        let metrics = Set(
+            model.collections
+                .filter { names.contains($0.name) }
+                .compactMap { $0.space }
+        )
+        var line = String(localized: "Вектор запроса считается по разу на модель: моделей \(models.count.plainDigits).")
+        if metrics.count > 1 {
+            line += String(localized: " Метрики у коллекций разные, поэтому порядок задаётся слиянием рангов, а не расстояниями.")
+        }
+        return line
+    }
+
     private func queryCard(_ collection: ChromaCollection) -> some View {
         SectionCard(
             title: String(localized: "Запрос"),
@@ -884,6 +1011,8 @@ struct CollectionsView: View {
                 TextField(String(localized: "Текст запроса"), text: $model.queryText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(2...5)
+
+                alsoSearchInRow(collection)
 
                 HStack {
                     Stepper("n_results: \(model.numberOfResults)", value: $model.numberOfResults, in: 1...50)
@@ -917,7 +1046,9 @@ struct CollectionsView: View {
                         .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
                 }
 
-                if !model.hits.isEmpty {
+                if !model.searchReports.isEmpty { collectionsReport }
+
+                if !model.hits.isEmpty && model.alsoSearchIn.isEmpty {
                     // The scale depends entirely on the metric, so the header
                     // says which one produced these numbers.
                     Text(collection.space.map { metric in
@@ -939,14 +1070,51 @@ struct CollectionsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("#\(index + 1)").font(Theme.Font.caption).bold()
+                            // Из какой коллекции результат — в многоколлекционном
+                            // поиске это первое, что нужно знать о находке
+                            //. При поиске по одной коллекции строка
+                            // не нужна: она и так в шапке экрана.
+                            if !model.alsoSearchIn.isEmpty, let name = hit.collectionName {
+                                Text(name)
+                                    .font(Theme.Font.micro)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .fill(Theme.Palette.subtleFill)
+                                    )
+                            }
                             Text(hit.id).font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
                             Spacer()
-                            Text(hit.queryHit.distanceText(metric: collection.space))
+                            // Метрика — той коллекции, из которой результат.
+                            // В многоколлекционном поиске у соседа она может
+                            // быть другой, и пересчитывать её расстояние в
+                            // проценты по чужой шкале значило бы показать
+                            // выдуманное число.
+                            Text(hit.queryHit.distanceText(metric: metric(of: hit, current: collection)))
                                 .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                             // замкнуть петлю «нашёл → понял → пошёл
                             // к первоисточнику». Кнопка стоит у каждого
                             // результата, а не в меню: ходить к исходнику
                             // нужно на каждом втором.
+                            // Пометить прямо из выдачи: увидел, что фрагмент
+                            // мешает, — понизил, не уходя в список документов
+                            //.
+                            Menu {
+                                marksMenu(
+                                    for: DocumentRecord(
+                                        id: hit.id, document: hit.document, metadata: hit.metadata
+                                    ),
+                                    // Результат из соседней коллекции метится
+                                    // в ней самой, а не в открытой.
+                                    collectionName: hit.collectionName,
+                                    fromHit: true
+                                )
+                            } label: {
+                                Image(systemName: "bookmark").font(Theme.Font.caption)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .frame(width: 28)
+                            .help(String(localized: "Закрепить, понизить или пометить устаревшим"))
                             Button(String(localized: "Показать в документе")) {
                                 viewer.open(
                                     chunk: hit.document ?? "",
@@ -959,6 +1127,19 @@ struct CollectionsView: View {
                             }
                             .controlSize(.small)
                             .disabled((hit.document ?? "").isEmpty)
+                        }
+                        marksLine(of: hit.metadata)
+                        // Редактор тегов открывается **здесь же**, у того
+                        // результата, с которого его позвали: строки этого
+                        // документа в списке слева может не быть вовсе —
+                        // он с другой страницы или вовсе из другой коллекции.
+                        if marksEditorID == hit.id, marksEditorFromHit {
+                            marksEditor(
+                                for: DocumentRecord(
+                                    id: hit.id, document: hit.document, metadata: hit.metadata
+                                ),
+                                collectionName: hit.collectionName
+                            )
                         }
                         // A result that swallowed three others is a result the
                         // user is entitled to know about.
@@ -1375,6 +1556,132 @@ struct CollectionsView: View {
         }
     }
 
+    // MARK: - Ручные пометки
+
+    /// Пункты меню для пометок одного документа.
+    ///
+    /// Пометка — переключатель: повторное нажатие снимает её. Отдельного
+    /// «Снять» в меню нет — оно означало бы, что три пометки и снятие каждой
+    /// это шесть пунктов там, где хватает трёх с галочкой.
+    ///
+    /// - Parameter collectionName: коллекция, откуда пришёл документ. При
+    ///   поиске по нескольким она не совпадает с открытой, а пометка обязана
+    /// лечь в ту же коллекцию, где человек её увидел.
+    /// - Parameter fromHit: меню открыто у результата поиска, а не у строки
+    ///   списка документов.
+    @ViewBuilder
+    private func marksMenu(
+        for document: DocumentRecord, collectionName: String? = nil, fromHit: Bool = false
+    ) -> some View {
+        let marks = DocumentMarks(metadata: document.metadata)
+        ForEach(DocumentMark.allCases) { mark in
+            Button {
+                Task {
+                    await model.setMark(
+                        mark, for: document, app: app, collectionName: collectionName
+                    )
+                }
+            } label: {
+                // Галочка у стоящей пометки: меню обязано показывать
+                // состояние, а не только предлагать действие.
+                Text(marks.mark == mark ? "✓ \(mark.actionTitle)" : mark.actionTitle)
+            }
+        }
+        Button(String(localized: "Теги и заметка…")) {
+            marksEditorID = document.id
+            marksEditorCollection = collectionName
+            marksEditorFromHit = fromHit
+            marksTags = marks.tagsLine
+            marksNote = marks.note ?? ""
+        }
+    }
+
+    /// Теги и заметка — прямо в строке документа, а не отдельным окном:
+    /// это две строки текста, и открывать ради них лист значило бы уводить
+    /// человека от того, что он размечает.
+    @ViewBuilder
+    private func marksEditor(
+        for document: DocumentRecord, collectionName: String? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField(String(localized: "Теги через запятую"), text: $marksTags)
+                .textFieldStyle(.roundedBorder)
+            TextField(String(localized: "Заметка"), text: $marksNote, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...4)
+            HStack(spacing: 8) {
+                Button(String(localized: "Сохранить")) {
+                    let tags = marksTags
+                    let note = marksNote
+                    marksEditorID = nil
+                    marksEditorCollection = nil
+                    marksEditorFromHit = false
+                    // Одной записью: два вызова подряд собирали бы пометки
+                    // из метаданных, которые были на экране до правки, и
+                    // второй стёр бы теги, записанные первым.
+                    Task {
+                        await model.setTagsAndNote(
+                            tags: tags, note: note, for: document, app: app,
+                            collectionName: collectionName
+                        )
+                    }
+                }
+                .buttonStyle(.chromaPrimary)
+                Button(String(localized: "Отмена")) {
+                    marksEditorID = nil
+                    marksEditorCollection = nil
+                    marksEditorFromHit = false
+                }
+                .buttonStyle(.chromaNormal)
+                Spacer()
+                Text("теги видны агенту и годятся для фильтра по метаданным")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Что стоит на документе — строкой под его идентификатором.
+    @ViewBuilder
+    private func marksLine(of metadata: ChromaMetadata?) -> some View {
+        let marks = DocumentMarks(metadata: metadata)
+        if !marks.isEmpty {
+            HStack(spacing: 6) {
+                if let mark = marks.mark {
+                    Text(mark.title)
+                        .font(Theme.Font.micro)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(markTint(mark).opacity(0.14))
+                        )
+                        .foregroundStyle(markTint(mark))
+                }
+                if !marks.tags.isEmpty {
+                    Text(marks.tagsLine)
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+                if let note = marks.note, !note.isEmpty {
+                    Text(note)
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    /// Цвет — только состояние (правило 7 «как устроен экран»): закреплённое
+    /// работает на выдачу, устаревшее требует решения, понижённое выключено.
+    private func markTint(_ mark: DocumentMark) -> Color {
+        switch mark {
+        case .pinned: return Theme.Palette.running
+        case .demoted: return Theme.Palette.captionText
+        case .stale: return Theme.Palette.attention
+        }
+    }
+
     private func documentRow(_ document: DocumentRecord) -> some View {
         let isExpanded = expandedDocumentID == document.id
         let isEditingMetadata = metadataEditorID == document.id
@@ -1402,6 +1709,8 @@ struct CollectionsView: View {
                         metadataEditorID = document.id
                     }
                     Divider()
+                    marksMenu(for: document)
+                    Divider()
                     Button(String(localized: "Удалить документ"), role: .destructive) {
                         Task { await model.deleteDocument(document, app: app) }
                     }
@@ -1412,6 +1721,8 @@ struct CollectionsView: View {
                 .frame(width: 34)
             }
 
+            marksLine(of: document.metadata)
+
             Text(isExpanded ? (document.document ?? "") : document.preview)
                 .font(Theme.Font.body)
                 .copyable(document.document ?? "")
@@ -1419,6 +1730,12 @@ struct CollectionsView: View {
 
             if isExpanded, let vector = model.vectorPreviews[document.id] {
                 vectorPreview(vector)
+            }
+
+            // Только если редактор позвали отсюда: тот же id мог прийти
+            // из выдачи, и там у него своя строка и своя коллекция.
+            if marksEditorID == document.id, !marksEditorFromHit {
+                marksEditor(for: document)
             }
 
             if isEditingMetadata {

@@ -10,7 +10,13 @@ import UniformTypeIdentifiers
 /// Document-based и Hierarchical чанкинг.
 public struct HTMLExtractor: DocumentTextExtractor {
     public let id = "html"
-    public let version = 1
+    /// 3 — пункты перечислений получают маркер, а адреса ссылок доходят
+    /// до метаданных чанка: до этого пункт `<li>` приходил
+    /// голым текстом, и правило «вводная фраза списка» его не узнавало.
+    ///
+    /// 2 — таблицы страницы приходят разметкой Markdown, а не ячейками через
+    /// пробел, и ставится `has_tables`.
+    public let version = 3
 
     public init() {}
 
@@ -48,12 +54,14 @@ public struct HTMLExtractor: DocumentTextExtractor {
         return ExtractedDocument(
             plainText: text,
             structure: page.headings,
+            links: page.placedLinks,
             // Заголовки размечены в самом документе — это не догадка по размеру
             // шрифта, а объявленная структура.
             structureSource: page.headings.isEmpty ? .none : .headings,
             containerFormat: "html",
             extractorID: "html",
-            extractorVersion: 1,
+            extractorVersion: 3,
+            hasTables: page.hasTables,
             documentMetadata: metadata
         )
     }

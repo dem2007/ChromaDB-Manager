@@ -100,14 +100,34 @@ public struct KeychainStore {
             let status = SecItemDelete(query as CFDictionary)
             if status == errSecSuccess { removed += 1 }
         }
+        // Ключи — записи другого класса, и по сервису они не ищутся.
+        // Пока стирались только пароли, приватный ключ сертификата пережил бы
+        // «удалить все данные»: обещание стереть за собой всё было бы неправдой.
+        for tag in Self.allKeyTags {
+            let status = SecItemDelete([
+                kSecClass as String: kSecClassKey,
+                kSecAttrApplicationTag as String: Data(tag.utf8),
+            ] as CFDictionary)
+            if status == errSecSuccess { removed += 1 }
+        }
         return removed
     }
 
-    /// Every Keychain service the app writes under — currently one, and the
-    /// list exists so that adding a second one cannot be forgotten here.
+    /// Every Keychain service the app writes under. The list exists so that
+    /// adding a second one cannot be forgotten here.
     /// Client keys are deliberately not in it: only their hashes are stored,
     /// in the configuration file.
-    public static let allServices = ["io.github.chromadbmanager.tokens"]
+    public static let allServices = [
+        "io.github.chromadbmanager.tokens",
+        // Пароли защищённых документов. Свой сервис у них не ради порядка:
+        // стирание токенов сервера не должно уносить их с собой. А вот
+        // «удалить всё» обязано — и не уносило, пока эта строка не появилась.
+        DocumentPasswordStore.service,
+    ]
+
+    /// Метки ключей, созданных приложением. Сейчас один — приватный ключ
+    /// сертификата прокси.
+    public static let allKeyTags = ["io.github.chromadbmanager.tls"]
 
     public func hasToken(for account: String) -> Bool {
         ((try? token(for: account)) ?? nil) != nil

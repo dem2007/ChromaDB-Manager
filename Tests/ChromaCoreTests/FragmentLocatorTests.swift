@@ -57,10 +57,28 @@ final class FragmentLocatorTests: XCTestCase {
     }
 
     /// А обычный дефис внутри строки — часть слова и обязан остаться.
+    ///
+    /// Со слитной формой совпадение теперь бывает, но только последним шагом
+    /// и под своим именем: `ignoringHyphens` — огрублённый поиск, и человеку
+    /// об этом говорят. Точным такое совпадение не считается.
     func testAnOrdinaryHyphenSurvives() {
         let document = "Обслуживание ИТ-инфраструктуры заказчика."
         XCTAssertEqual(located("Обслуживание ИТ-инфраструктуры заказчика.", in: document)?.1, .exact)
-        XCTAssertNil(FragmentLocator.locate(chunk: "ИТинфраструктуры", in: document))
+
+        let glued = FragmentLocator.locate(chunk: "ИТинфраструктуры", in: document)
+        XCTAssertEqual(glued?.strategy, .ignoringHyphens)
+        XCTAssertEqual(glued?.strategy.isExact, false)
+    }
+
+    /// То, ради чего слепой шаг заведён: извлечение сохранило дефис
+    /// составного слова, а на странице он разорван концом строки.
+    ///
+    /// Без этого шага подсветка пропадала бы на делопроизводственных
+    /// документах, где таких слов больше всего.
+    func testACompoundWordBrokenByALineEndStillMatches() {
+        let document = "Развитие информационно-\nтелекоммуникационной инфраструктуры органов власти."
+        let chunk = "Развитие информационно-телекоммуникационной инфраструктуры органов власти."
+        XCTAssertEqual(FragmentLocator.locate(chunk: chunk, in: document)?.strategy, .ignoringHyphens)
     }
 
     func testCaseAndDiacriticsDoNotMatter() {

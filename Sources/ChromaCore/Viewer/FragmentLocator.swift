@@ -24,12 +24,15 @@ public enum FragmentLocator {
         case edges
         /// Нашлось самое длинное предложение чанка.
         case longestSentence
+        /// Нашлось, если не считать дефисы.
+        case ignoringHyphens
 
         public var title: String {
             switch self {
             case .exact: return String(localized: "фрагмент найден целиком")
             case .edges: return String(localized: "совпали начало и конец фрагмента")
             case .longestSentence: return String(localized: "совпало самое длинное предложение фрагмента")
+            case .ignoringHyphens: return String(localized: "совпало без учёта дефисов и переносов")
             }
         }
 
@@ -64,8 +67,30 @@ public enum FragmentLocator {
     /// Ищет место чанка. `nil` — четвёртый исход H1.2: перейти к странице
     /// без подсветки и честно сказать, что точное место не определено.
     public static func locate(chunk: String, in document: String) -> Match? {
-        let haystack = NormalisedText(document)
-        let needle = NormalisedText.normalise(chunk)
+        if let match = locate(chunk: chunk, in: document, ignoringHyphens: false) {
+            return match
+        }
+        // Последняя попытка — не считая дефисы вовсе.
+        //
+        // Обычная нормализация решает за документ, что `-` в конце строки
+        // всегда перенос, и склеивает слово. Извлечение решает иначе и часто
+        // правее: `информационно-` / `телекоммуникационной` — составное слово,
+        // и дефис в чанке остаётся. Тогда чанк и страница нормализуются
+        // по-разному, и подсветка пропадает ровно на тех документах, где таких
+        // слов больше всего (замер: 380 случаев на корпусе пользователя).
+        //
+        // Отдельным шагом, а не заменой правила: слепота к дефисам огрубляет
+        // поиск, и человеку об этом говорят — `ignoringHyphens` не считается
+        // точным совпадением.
+        guard let match = locate(chunk: chunk, in: document, ignoringHyphens: true) else {
+            return nil
+        }
+        return Match(range: match.range, strategy: .ignoringHyphens)
+    }
+
+    private static func locate(chunk: String, in document: String, ignoringHyphens: Bool) -> Match? {
+        let haystack = NormalisedText(document, ignoringHyphens: ignoringHyphens)
+        let needle = NormalisedText.normalise(chunk, ignoringHyphens: ignoringHyphens)
         guard !needle.isEmpty, !haystack.value.isEmpty else { return nil }
 
         if let range = haystack.range(of: needle) {
@@ -131,7 +156,7 @@ struct NormalisedText {
     /// Конец исходного символа — нужен, чтобы подсветка включала его целиком.
     private let ends: [String.Index]
 
-    init(_ source: String) {
+    init(_ source: String, ignoringHyphens: Bool = false) {
         var value = ""
         var origins: [String.Index] = []
         var ends: [String.Index] = []
@@ -146,10 +171,14 @@ struct NormalisedText {
 
         func flushHyphen() {
             guard let held = heldHyphen else { return }
+            heldHyphen = nil
+            // В слепом режиме дефис не пишется никуда: обе стороны сравнения
+            // приведены одинаково, и `ИТ-инфраструктура` совпадает
+            // с `ИТинфраструктура`.
+            guard !ignoringHyphens else { return }
             value.append("-")
             origins.append(held.index)
             ends.append(held.end)
-            heldHyphen = nil
         }
 
         while index < source.endIndex {
@@ -223,7 +252,9 @@ struct NormalisedText {
     }
 
     /// Приведение строки, которую ищут: карта для неё не нужна.
-    static func normalise(_ text: String) -> String { NormalisedText(text).value }
+    static func normalise(_ text: String, ignoringHyphens: Bool = false) -> String {
+        NormalisedText(text, ignoringHyphens: ignoringHyphens).value
+    }
 
     /// Диапазон в **исходном** тексте для найденного в нормализованном.
     func range(of needle: String, after start: String.Index? = nil) -> Range<String.Index>? {

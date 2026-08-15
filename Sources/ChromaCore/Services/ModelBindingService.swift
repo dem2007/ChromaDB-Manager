@@ -52,9 +52,17 @@ public actor ModelBindingService {
     private var contextProbed: Set<String> = []
     private var loadedContextCache: [String: Int] = [:]
     private var loadedContextProbed: Set<String> = []
+    /// Измеренный предел чтения — не тот, что сообщает рантайм.
+    private var inputLimitCache: [String: Int] = [:]
+    private var inputLimitProbed: Set<String> = []
 
-    public init(log: @escaping LogHandler = noopLogHandler) {
+    /// Хранилище измеренных пределов. `nil` — меряем на сессию
+    /// и не запоминаем: так работают проверки, которым файл ни к чему.
+    private let limits: EmbeddingLimitStore?
+
+    public init(log: @escaping LogHandler = noopLogHandler, limits: EmbeddingLimitStore? = nil) {
         self.log = log
+        self.limits = limits
     }
 
     /// Vector size of a model, measured once by embedding a short probe string.
@@ -77,6 +85,12 @@ public actor ModelBindingService {
         // то есть ровно тогда, когда сбрасывается всё остальное.
         loadedContextCache.removeAll()
         loadedContextProbed.removeAll()
+        // Измеренный предел чтения сбрасывается только в памяти. В файле он
+        // остаётся, и это не забывчивость: свежесть проверяется по контексту,
+        // с которым модель загружена, — на этот метод полагаться
+        // нельзя, у него нет ни одного вызова во всём приложении.
+        inputLimitCache.removeAll()
+        inputLimitProbed.removeAll()
     }
 
     /// Context length of a model, as LM Studio reports it, or `nil` when it
@@ -101,6 +115,55 @@ public actor ModelBindingService {
         let value = await lmStudio.loadedContextLength(of: model)
         loadedContextProbed.insert(model)
         if let value { loadedContextCache[model] = value }
+        return value
+    }
+
+    /// Сколько знаков модель эмбеддинга читает на самом деле.
+    ///
+    /// Отдельно от `contextLength` и `loadedContextLength`, потому что это
+    /// третье число, и оно не совпадает ни с одним из двух: у qwen3-embedding
+    /// сообщается 32768 и 2048, а вектор перестаёт меняться после 21 400
+    /// знаков. Спросить это нельзя — только измерить, поэтому измеряется
+    /// **один раз на модель** и только когда понадобилось.
+    ///
+    /// `nil` — обрыва не нашлось до предела пробы; тогда сравнивать не с чем
+    /// и ничего не блокируется.
+    public func measuredInputLimit(
+        of model: String, embeddings: EmbeddingProvider
+    ) async -> Int? {
+        if inputLimitProbed.contains(model) { return inputLimitCache[model] }
+        // Контекст, с которым модель загружена сейчас: он и есть признак
+        // свежести измеренного. Перезагрузили модель с другим
+        // контекстом — вчерашнее число больше ничего не значит, а звать
+        // `forgetCachedDimensions()` в приложении некому: у него нет ни
+        // одного вызова.
+        let loaded = await embeddings.reportedLoadedContextLength(of: model)
+
+        // Измеренное в прошлые запуски — проба стоит семи вызовов, и платить
+        // за неё каждый раз незачем.
+        if let remembered = await limits?.limit(for: model), remembered.loadedContext == loaded {
+            inputLimitProbed.insert(model)
+            inputLimitCache[model] = remembered.characters
+            return remembered.characters
+        }
+        // Мимо кэша векторов: восемь текстов по 64 000 знаков в нём никому
+        // не нужны, а вытеснят они векторы настоящих чанков.
+        let outcome = await EmbeddingInputProbe.measureOutcome { text in
+            try await embeddings.embedIgnoringCache(texts: [text], model: model).first ?? []
+        }
+        // Сорвавшаяся проба не запоминается как «мерили»: иначе одна
+        // секунда без LM Studio выключала бы проверку длины чанка до самого
+        // перезапуска приложения — при том что модель уже снова отвечает.
+        guard outcome != .failed else { return nil }
+        inputLimitProbed.insert(model)
+        let value: Int? = { if case .measured(let measured) = outcome { return measured }; return nil }()
+        if let value {
+            inputLimitCache[model] = value
+            log(.info, "Модели", "Модель «\(model)» читает за раз не больше \(value.plainDigits) знаков — измерено пробой")
+            await limits?.remember(
+                MeasuredInputLimit(model: model, characters: value, loadedContext: loaded)
+            )
+        }
         return value
     }
 

@@ -8,9 +8,15 @@ struct ODSFixtureBuilder {
         /// Several `<text:p>` in one cell — how ODS spells a multi-line value.
         case paragraphs([String])
         case number(Double)
+        /// Процент: в файле лежит доля, показывается сотня.
+        case percentage(Double)
+        /// Деньги с кодом валюты, как их пишет ODS.
+        case currency(Double, String)
         case boolean(Bool)
         case date(String)
         case empty
+        /// Объединённая ячейка: `rows` строк вниз, `columns` колонок вбок.
+        case spanning(Cell, rows: Int, columns: Int)
         /// One cell standing for several identical ones.
         case repeated(Cell, times: Int)
         /// The non-anchor part of a merge.
@@ -75,6 +81,20 @@ struct ODSFixtureBuilder {
         case .number(let value):
             let plain = value == value.rounded() ? String(Int(value)) : String(value)
             return "<table:table-cell office:value-type=\"float\" office:value=\"\(plain)\"\(attribute)><text:p>\(plain)</text:p></table:table-cell>"
+        case .spanning(let inner, let rows, let columns):
+            let base = xml(for: inner, repeats: repeats)
+            var attributes = ""
+            if rows > 1 { attributes += " table:number-rows-spanned=\"\(rows)\"" }
+            if columns > 1 { attributes += " table:number-columns-spanned=\"\(columns)\"" }
+            return base.replacingOccurrences(
+                of: "<table:table-cell", with: "<table:table-cell" + attributes
+            )
+        case .percentage(let value):
+            let plain = value == value.rounded() ? String(Int(value)) : String(value)
+            return "<table:table-cell office:value-type=\"percentage\" office:value=\"\(plain)\"\(attribute)/>"
+        case .currency(let value, let code):
+            let plain = value == value.rounded() ? String(Int(value)) : String(value)
+            return "<table:table-cell office:value-type=\"currency\" office:value=\"\(plain)\" office:currency=\"\(code)\"\(attribute)/>"
         case .boolean(let value):
             return "<table:table-cell office:value-type=\"boolean\" office:boolean-value=\"\(value)\"\(attribute)/>"
         case .date(let iso):
@@ -243,6 +263,64 @@ final class ODSReaderTests: XCTestCase {
             return seen < 5
         }
         XCTAssertEqual(seen, 5)
+    }
+
+    /// объединение вниз относится к каждой строке диапазона.
+    ///
+    /// ODS объявляет его на верхней ячейке, а остальные пишет
+    /// `<covered-table-cell/>` — и раньше они читались пустыми.
+    func testAVerticalSpanReachesEveryRowOfItsRange() throws {
+        var builder = ODSFixtureBuilder()
+        builder.tables = [.init(name: "Лист", rows: [
+            [.string("Категория"), .string("Товар")],
+            [.spanning(.string("Крепёж"), rows: 3, columns: 1), .string("Болт")],
+            [.covered, .string("Гайка")],
+            [.covered, .string("Шайба")],
+            [.string("Профиль"), .string("Уголок")],
+        ])]
+        let rows = try rows(builder)
+        XCTAssertEqual(rows[1].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[2].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[3].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[4].value(at: 0), .text("Профиль"), "за диапазоном — своё значение")
+    }
+
+    /// Объединение вбок остаётся как есть — и об этом говорится.
+    func testASidewaysSpanIsReported() throws {
+        var builder = ODSFixtureBuilder()
+        builder.tables = [.init(name: "Лист", rows: [
+            [.spanning(.string("Итого за квартал"), rows: 1, columns: 2), .covered],
+            [.string("Северсталь"), .number(62)],
+        ])]
+        var result: [SheetRow] = []
+        let url = try write(builder)
+        let warnings = try ODSReader(url: url).forEachRow(of: ODSReader(url: url).sheets[0]) {
+            result.append($0); return true
+        }
+        XCTAssertEqual(result[0].value(at: 1), .empty)
+        XCTAssertEqual(warnings, [.mergedSideways(cells: 1)])
+    }
+
+    /// ODS сам говорит, что это проценты, — и раньше это знание выбрасывалось:
+    /// и `percentage`, и `currency` сводились к обычному числу.
+    func testPercentagesAndCurrenciesKeepTheirUnit() throws {
+        var builder = ODSFixtureBuilder()
+        builder.tables = [.init(name: "Лист", rows: [[
+            .percentage(0.15), .currency(1234.5, "RUB"), .number(0.15),
+        ]])]
+        let rows = try rows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "15 %")
+        XCTAssertEqual(rows[0].value(at: 1).displayText, "1234.5 RUB")
+        XCTAssertEqual(rows[0].value(at: 2), .number(0.15))
+    }
+
+    /// Валюта без кода — обычное число: подпись, взятая с потолка, хуже её
+    /// отсутствия.
+    func testACurrencyWithoutACodeStaysANumber() throws {
+        var builder = ODSFixtureBuilder()
+        builder.tables = [.init(name: "Лист", rows: [[.currency(90, "")]])]
+        let rows = try rows(builder)
+        XCTAssertEqual(rows[0].value(at: 0), .number(90))
     }
 
     func testAFileThatIsNotAnODSIsRefused() throws {

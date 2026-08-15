@@ -106,10 +106,10 @@ final class SettingsTransferViewModel: ObservableObject {
         app.savedFilters.replaceAll(filters)
 
         let plan = pending.plan
-        statusMessage = String(localized: "Импортировано из \(pending.fileName): профилей \(plan.profiles.total.plainDigits), источников \(plan.sources.total.plainDigits), схем \(plan.schemas.total.plainDigits), фильтров \(plan.filters.total.plainDigits), клиентов \(plan.clients.total.plainDigits).")
+        statusMessage = String(localized: "Импортировано из \(pending.fileName): профилей \(plan.profiles.total.plainDigits), источников \(plan.sources.total.plainDigits), схем \(plan.schemas.total.plainDigits), фильтров \(plan.filters.total.plainDigits), клиентов \(plan.clients.total.plainDigits), общих профилей таблиц \(plan.tableProfiles.total.plainDigits).")
         app.log.record(
             .success, "Настройки",
-            "Импорт настроек из «\(pending.fileName)»: добавлено и заменено — профилей \(plan.profiles.total.plainDigits), источников \(plan.sources.total.plainDigits), схем \(plan.schemas.total.plainDigits), фильтров \(plan.filters.total.plainDigits), клиентов \(plan.clients.total.plainDigits); общие настройки \(pending.includePreferences ? "применены" : "не тронуты")"
+            "Импорт настроек из «\(pending.fileName)»: добавлено и заменено — профилей \(plan.profiles.total.plainDigits), источников \(plan.sources.total.plainDigits), схем \(plan.schemas.total.plainDigits), фильтров \(plan.filters.total.plainDigits), клиентов \(plan.clients.total.plainDigits), общих профилей таблиц \(plan.tableProfiles.total.plainDigits); общие настройки \(pending.includePreferences ? "применены" : "не тронуты")"
         )
         if !plan.clientsNeedingKey.isEmpty {
             app.log.record(

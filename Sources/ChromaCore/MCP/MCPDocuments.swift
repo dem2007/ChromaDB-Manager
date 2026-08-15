@@ -19,23 +19,49 @@ public struct MCPOutputLimits: Sendable, Hashable {
     /// тысяч токенов на один вызов инструмента. Предел ниже произведения
     /// двух других намеренно: он и должен срабатывать раньше них.
     public static let defaultResponseCharacters = 24_000
+    /// Сколько коллекций можно обыскать одним вызовом.
+    ///
+    /// Пять: столько человек ещё держит в голове, а десять поисков на один
+    /// вызов — это уже не поиск, а обход базы.
+    public static let defaultCollections = 5
 
     public var ceiling: Int
     public var documentCharacters: Int
     public var responseCharacters: Int
+    public var collections: Int
 
     public init(
         ceiling: Int = defaultCeiling,
         documentCharacters: Int = defaultDocumentCharacters,
-        responseCharacters: Int = defaultResponseCharacters
+        responseCharacters: Int = defaultResponseCharacters,
+        collections: Int = defaultCollections
     ) {
         self.ceiling = max(1, ceiling)
         self.documentCharacters = max(1, documentCharacters)
         self.responseCharacters = max(1, responseCharacters)
+        self.collections = max(1, collections)
+    }
+
+    /// Сколько коллекций взять из запрошенных и что сказать, если урезали.
+    public func resolvedCollections(_ requested: [String]) -> (names: [String], note: String?) {
+        guard requested.count > collections else { return (requested, nil) }
+        return (
+            Array(requested.prefix(collections)),
+            String(localized: "Запрошено коллекций: \(requested.count.plainDigits), обыскано \(collections.plainDigits) — это потолок, заданный правами ключа. Остальные — следующим вызовом.")
+        )
     }
 
     public static func forClient(_ permissions: ClientPermissions) -> MCPOutputLimits {
-        MCPOutputLimits(ceiling: permissions.maxSearchResults ?? defaultCeiling)
+        MCPOutputLimits(
+            ceiling: permissions.maxSearchResults ?? defaultCeiling,
+            // Символьные потолки тоже принадлежат ключу. Раньше они
+            // были константами, и «отдай мне файл целиком» упиралось в них
+            // молча: счётчик результатов подняли, а ответ всё равно обрывался
+            // на двадцати четырёх тысячах символов.
+            documentCharacters: permissions.maxDocumentCharacters ?? defaultDocumentCharacters,
+            responseCharacters: permissions.maxResponseCharacters ?? defaultResponseCharacters,
+            collections: permissions.maxSearchCollections ?? defaultCollections
+        )
     }
 
     /// Сколько результатов просить у базы и что сказать агенту, если его
@@ -51,6 +77,84 @@ public struct MCPOutputLimits: Sendable, Hashable {
         return (ceiling, String(
             localized: "Запрошено результатов: \(asked.plainDigits), отдано \(ceiling.plainDigits) — это потолок, заданный правами ключа."
         ))
+    }
+}
+
+/// Чанки одного файла — по порядку и страницами.
+///
+/// Почему это отдельная забота, а не «фильтр по `source_file`»: `get`
+/// у ChromaDB **порядок не гарантирует**, а листание `offset`-ом по
+/// неупорядоченной выдаче может и пропустить документ, и показать дважды.
+/// Агенту, который собирает файл обратно, нужен порядок чанков — тот самый,
+/// в котором файл был нарезан.
+public enum MCPFileChunks {
+    /// Сколько чанков одного файла приложение готово упорядочить.
+    ///
+    /// Порядок требует **всех** чанков файла: отсортировать половину, взятую
+    /// в произвольном порядке, значит уверенно отдать не те. Предел выбран
+    /// с запасом — файл на двадцать тысяч чанков это книга страниц на пять
+    /// тысяч, — а что делать сверх него, сказано словами, а не молчанием.
+    public static let maximumOrdered = 20_000
+
+    /// Ключ метаданных, по которому чанки идут в порядке файла.
+    public static let orderKey = "chunk_index"
+
+    /// Сколько чанков спрашивается у базы за раз при перечислении файла.
+    public static let scanBatch = 1000
+
+    /// Перечисляет все чанки файла — страницами, пока они не кончатся.
+    ///
+    /// Отдельно от того, кто их достаёт: алгоритм один и тот же в приложении
+    /// и в живой проверке, а живая проверка тут и нужна — предположения
+    /// о поведении `get` (что `offset` листает, что метаданные приходят без
+    /// текстов) проверяются на настоящем сервере, а не додумываются.
+    ///
+    /// Возвращает `overflowed`, когда файл длиннее `maximumOrdered`: тогда
+    /// порядок не гарантируется, и об этом говорится вслух.
+    public static func collect(
+        batch: Int = scanBatch,
+        fetch: (_ limit: Int, _ offset: Int) async throws -> [MCPDocumentPayload]
+    ) async rethrows -> (documents: [MCPDocumentPayload], overflowed: Bool) {
+        var collected: [MCPDocumentPayload] = []
+        var offset = 0
+        while true {
+            let page = try await fetch(batch, offset)
+            collected += page
+            offset += page.count
+            if page.count < batch { return (collected, false) }
+            if collected.count >= maximumOrdered { return (collected, true) }
+        }
+    }
+
+    /// Чанки в порядке файла.
+    ///
+    /// Без `chunk_index` — в конец, по идентификатору: документ, записанный
+    /// не нашей синхронизацией (агентом через `add_documents`, импортом),
+    /// номера чанка не имеет, и притворяться, что имеет, нельзя.
+    public static func ordered(_ documents: [MCPDocumentPayload]) -> [MCPDocumentPayload] {
+        documents.sorted { left, right in
+            switch (index(of: left), index(of: right)) {
+            case let (l?, r?): return l == r ? left.id < right.id : l < r
+            case (nil, _?): return false
+            case (_?, nil): return true
+            case (nil, nil): return left.id < right.id
+            }
+        }
+    }
+
+    /// Страница упорядоченного списка и ответ на вопрос «есть ли ещё».
+    public static func page(
+        _ documents: [MCPDocumentPayload], offset: Int, limit: Int
+    ) -> (page: [MCPDocumentPayload], hasMore: Bool) {
+        let start = max(0, offset)
+        guard start < documents.count else { return ([], false) }
+        let end = min(documents.count, start + max(1, limit))
+        return (Array(documents[start..<end]), end < documents.count)
+    }
+
+    static func index(of document: MCPDocumentPayload) -> Int? {
+        guard case .int(let value)? = document.metadata?[orderKey] else { return nil }
+        return value
     }
 }
 
@@ -71,6 +175,13 @@ public struct MCPDocumentPayload: Sendable, Hashable {
     /// Одна строка о том, откуда взялся этот результат: «раздел, к которому
     /// относится совпадение», «ещё 3 совпадения в этом разделе».
     public let note: String?
+    /// Коллекция, из которой пришёл результат.
+    ///
+    /// `nil` при поиске по одной коллекции: агент назвал её сам и знает.
+    /// При поиске по нескольким — обязателен: без него агент не сможет ни
+    /// дочитать документ через `get_file`, ни объяснить человеку, откуда
+    /// он это взял.
+    public let collection: String?
 
     public init(
         id: String,
@@ -78,7 +189,8 @@ public struct MCPDocumentPayload: Sendable, Hashable {
         metadata: ChromaMetadata?,
         distance: Double? = nil,
         role: HitRole = .match,
-        note: String? = nil
+        note: String? = nil,
+        collection: String? = nil
     ) {
         self.id = id
         self.text = text
@@ -86,6 +198,7 @@ public struct MCPDocumentPayload: Sendable, Hashable {
         self.distance = distance
         self.role = role
         self.note = note
+        self.collection = collection
     }
 }
 
@@ -173,6 +286,10 @@ public enum MCPDocumentRendering {
             budget -= shownText.count + metadataLine.count
 
             var object: [String: JSONValue] = ["id": .string(payload.id)]
+            // Из какой коллекции результат. Без этого агент, искавший
+            // по трём, не сможет ни дочитать документ, ни сказать человеку,
+            // откуда он это взял.
+            if let collection = payload.collection { object["collection"] = .string(collection) }
             if payload.text != nil { object["text"] = .string(shownText) }
             if let metadata = payload.metadata, !metadata.isEmpty {
                 object["metadata"] = .object(metadata.mapValues(\.json))
@@ -197,6 +314,9 @@ public enum MCPDocumentRendering {
                 let value = String(format: "%.4f", distance)
                 header += metric.map { String(localized: ", расстояние \(value) (\($0))") }
                     ?? String(localized: ", расстояние \(value)")
+            }
+            if let collection = payload.collection {
+                header += String(localized: ", коллекция «\(collection)»")
             }
             if let note = payload.note { header += ", \(note)" }
             if !metadataLine.isEmpty { header += "\n   " + metadataLine }

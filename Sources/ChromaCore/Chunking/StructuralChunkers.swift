@@ -27,25 +27,43 @@ public struct DocumentBasedChunker: Chunking {
         self.structure = structure
     }
 
-    public func chunks(from text: String) -> [TextChunk] {
+    /// Разделы, на которые эта стратегия режет **этот** текст.
+    ///
+    /// Отдельно от `chunks(from:)`, потому что тот же вопрос задаёт
+    /// синхронизация — прежде чем подменить стратегию.
+    public func sections(of text: String) -> [String] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
         // Cut on the untrimmed text: the offsets in `structure` are counted from
         // the start of what the extractor produced, and trimming first would
         // shift every one of them.
-        var sections = DocumentStructureSections.sections(
+        let fromStructure = DocumentStructureSections.sections(
             in: text, structure: structure, splitLevel: configuration.splitHeaderLevel
         )
-        if sections.isEmpty {
-            let format = DocumentSourceFormat.resolved(configuration.sourceFormat, fileExtension: fileExtension)
-            switch format {
-            case .markdown, .auto: sections = markdownSections(trimmed)
-            case .html: sections = htmlSections(trimmed)
-            case .code: sections = codeSections(trimmed)
-            }
-        }
+        guard fromStructure.isEmpty else { return fromStructure }
 
+        let format = DocumentSourceFormat.resolved(configuration.sourceFormat, fileExtension: fileExtension)
+        switch format {
+        case .markdown, .auto: return markdownSections(trimmed)
+        case .html: return htmlSections(trimmed)
+        case .code: return codeSections(trimmed)
+        }
+    }
+
+    /// Нашлись ли в тексте границы, ради которых эту стратегию и выбирают.
+    ///
+    /// Один раздел на весь текст — это не «нашлись»: так выглядит текст,
+    /// в котором ни заголовков, ни тегов, ни объявлений функций нет вовсе.
+    public func findsSections(in text: String) -> Bool {
+        sections(of: text).count > 1
+    }
+
+    public func chunks(from text: String) -> [TextChunk] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let sections = sections(of: text)
         let limit = configuration.maxSectionSizeInCharacters
         var result: [String] = []
         for section in sections {
@@ -327,26 +345,111 @@ public struct AdaptiveChunker: Chunking {
     }
 
     public func chunks(from text: String) -> [TextChunk] {
+        Self.honouringMinimum(
+            blocks(from: text),
+            minimum: configuration.minSizeInCharacters,
+            maximum: max(configuration.minSizeInCharacters + 1, configuration.maxSizeInCharacters)
+        ).enumerated().map { TextChunk(index: $0.offset, text: $0.element) }
+    }
+
+    /// Куски по блокам — до того, как сработала нижняя граница.
+    ///
+    /// Отдельным шагом, чтобы замер мог сравнить «до» и «после»
+    /// на одном и том же коде. Иначе «до» пришлось бы изображать настройкой,
+    /// а настройкой это не изображается: `minChunkSize` не опускается ниже
+    /// тридцати двух знаков (`converted`), и ноль в форме означал бы
+    /// не «правило выключено», а «правило с полом в 32».
+    func blocks(from text: String) -> [[String]] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
         // Blocks are sized independently, so a folder mixing tables and prose
         // does not have to compromise on one size for the whole file.
         let blocks = trimmed.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        var result: [TextChunk] = []
 
-        for block in blocks.isEmpty ? [trimmed] : blocks {
+        return (blocks.isEmpty ? [trimmed] : blocks).map { block in
             let size = targetSize(for: block)
-            let pieces = RecursiveChunker(
+            return RecursiveChunker(
                 size: size,
                 overlap: configuration.overlapInCharacters(percent: configuration.overlapPercent, of: size),
                 separators: configuration.separators
-            ).chunks(from: block)
-            for piece in pieces {
-                result.append(TextChunk(index: result.count, text: piece.text))
-            }
+            ).chunks(from: block).map(\.text)
         }
-        return result
+    }
+
+    /// Соблюдает нижнюю границу размера — ту самую, что записана у стратегии
+    ///.
+    ///
+    /// До этого `minChunkSize` у адаптивной нарезки не действовал вовсе, хотя
+    /// стоял в форме и был описан как общий для неё и семантической. Разбор
+    /// живой коллекции: 2837 чанков из 9771 короче ста двадцати восьми знаков,
+    /// и 2122 из них — голые заголовки разделов вроде `== Боевой бык ==`.
+    /// Такой чанк отвечает на запрос «боевой бык» лучше, чем текст раздела
+    /// (0.3806 против 0.5036), и не содержит при этом ни одного факта:
+    /// он отбирает место у ответа.
+    ///
+    /// **Направление склейки зависит от того, что склеиваем, и это главное.**
+    ///
+    /// * Хвост блока, оставшийся от нарезки длинного абзаца, приклеивается
+    ///   **назад** — к своему же блоку, из которого он и вышел.
+    /// * Блок, который сам целиком короче минимума (заголовок, подпись,
+    ///   вводная строка), приклеивается **вперёд** — к следующему блоку:
+    ///   такой блок открывает то, что за ним, а не завершает предыдущее.
+    ///
+    /// Одно правило «всё вперёд» склеило бы конец одного раздела с началом
+    /// следующего — то есть смешало бы две темы в одном векторе ради починки
+    /// заголовков.
+    ///
+    /// Потолок размера — граница жёсткая: чанк, вылезший за `maxChunkSize`,
+    /// модель может отказаться считать. Если склейка не помещается,
+    /// короткий кусок остаётся как есть: нижняя граница — пожелание, верхняя —
+    /// запрет.
+    static func honouringMinimum(
+        _ blocks: [[String]], minimum: Int, maximum: Int
+    ) -> [String] {
+        guard minimum > 0 else { return blocks.flatMap { $0 } }
+
+        // Хвост блока — назад, к соседу по своему блоку.
+        var tightened: [[String]] = blocks.map { block in
+            var pieces = block
+            while pieces.count > 1, let tail = pieces.last, tail.count < minimum {
+                let previous = pieces[pieces.count - 2]
+                guard previous.count + tail.count + 1 <= maximum else { break }
+                pieces.removeLast()
+                pieces[pieces.count - 1] = ChunkHygiene.joined(previous, tail)
+            }
+            return pieces
+        }
+
+        // Блок целиком короче минимума — вперёд, к следующему. Блоки
+        // склеиваются пустой строкой: именно она их и разделяла в файле.
+        var index = 0
+        while index < tightened.count {
+            let block = tightened[index]
+            let length = block.reduce(0) { $0 + $1.count }
+            guard block.count == 1, length < minimum else {
+                index += 1
+                continue
+            }
+            if index + 1 < tightened.count,
+               let next = tightened[index + 1].first,
+               length + next.count + 2 <= maximum {
+                tightened[index + 1][0] = block[0] + "\n\n" + next
+                tightened.remove(at: index)
+                continue
+            }
+            // Следующего нет или склейка не влезает — пробуем назад: короткий
+            // блок в конце файла принадлежит тому, что было до него.
+            if index > 0, let previous = tightened[index - 1].last,
+               previous.count + length + 2 <= maximum {
+                tightened[index - 1][tightened[index - 1].count - 1] = previous + "\n\n" + block[0]
+                tightened.remove(at: index)
+                continue
+            }
+            index += 1
+        }
+
+        return tightened.flatMap { $0 }
     }
 
     /// Density in 0…1, then the size moves from base towards min (dense) or max

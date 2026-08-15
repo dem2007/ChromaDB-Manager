@@ -128,17 +128,19 @@ final class OfficeExtractionTests: XCTestCase {
 
     // MARK: - Tables
 
-    /// Cells by tab, rows by newline, `has_tables` set — and no pretence that
-    /// the grid survived.
+    /// Таблица оформляется разметкой Markdown — тем же видом, что у книги
+    /// Excel и у Word: у одной и той же таблицы обязан быть один текст,
+    /// в чём бы её ни сохранили.
     @MainActor
-    func testATableBecomesTabbedText() async throws {
+    func testATableBecomesAMarkdownTable() async throws {
         let url = try write("table.rtf", type: .rtf, withTable: true)
         let extracted = try await OfficeExtractor().extract(from: url, options: ExtractionOptions())
 
         XCTAssertEqual(extracted.hasTables, true)
         XCTAssertTrue(extracted.warnings.contains(.tablesFlattened))
-        XCTAssertTrue(extracted.plainText.contains("Ключ\tЗначение"), "ячейки строки должны идти через табуляцию")
-        XCTAssertTrue(extracted.plainText.contains("альфа\t1"))
+        XCTAssertTrue(extracted.plainText.contains("| Ключ | Значение |"), extracted.plainText)
+        XCTAssertTrue(extracted.plainText.contains("| --- | --- |"), "шапка обязана быть опознаваемой")
+        XCTAssertTrue(extracted.plainText.contains("| альфа | 1 |"), extracted.plainText)
     }
 
     /// A document with no table says so — this extractor did look.
@@ -149,13 +151,16 @@ final class OfficeExtractionTests: XCTestCase {
         XCTAssertEqual(extracted.hasTables, false)
     }
 
-    /// PDF and plain text never looked for tables, and «did not look» must not
-    /// be written into metadata as «there are none».
-    func testAnExtractorThatDoesNotLookLeavesTheFieldEmpty() async throws {
+    /// ~~PDF и обычный текст таблиц не искали~~ — теперь ищут все:
+    /// признак ставил один Word, и фильтр «документы с таблицами» молча
+    /// не видел ни PDF, ни книг, ни веб-страниц. «Не смотрели» по-прежнему
+    /// нельзя записывать в метаданные как «их нет»: там, где посмотреть
+    /// нечем, поле остаётся пустым.
+    func testEveryExtractorEitherLooksOrLeavesTheFieldEmpty() async throws {
         let url = root.appendingPathComponent("note.txt")
         try "просто текст".write(to: url, atomically: true, encoding: .utf8)
         let extracted = try await PlainTextExtractor().extract(from: url, options: ExtractionOptions())
-        XCTAssertNil(extracted.hasTables)
+        XCTAssertEqual(extracted.hasTables, false, "текст посмотрели — таблиц в нём нет")
     }
 
     // MARK: - Failures are named, never silent

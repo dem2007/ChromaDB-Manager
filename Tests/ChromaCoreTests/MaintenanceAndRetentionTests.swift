@@ -260,6 +260,36 @@ final class DataWipePlanTests: XCTestCase {
 
     func testKeychainServicesAreListedInOnePlace() {
         XCTAssertTrue(KeychainStore.allServices.contains(KeychainStore().service))
+        // Пароли документов лежат в своём сервисе — и «удалить всё» обязано
+        // забрать и их. Пока этой строки не было, они переживали стирание.
+        XCTAssertTrue(KeychainStore.allServices.contains(DocumentPasswordStore.service))
+    }
+
+    /// Ключ сертификата — запись класса «ключ», а не «пароль»: по сервису она
+    /// не ищется и пережила бы стирание, если бы её не удаляли отдельно.
+    func testTheProxyCertificateKeyIsWipedToo() throws {
+        let tag = "io.github.chromadbmanager.tls"
+        XCTAssertTrue(KeychainStore.allKeyTags.contains(tag))
+
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("wipe-tls-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let service = TLSCertificateService(file: directory.appendingPathComponent("certificate.der"))
+        defer { service.remove() }
+        do {
+            _ = try service.issue(hosts: ["localhost"])
+        } catch {
+            throw XCTSkip("Keychain недоступен: \(error.localizedDescription)")
+        }
+        XCTAssertNoThrow(try service.identity(), "ключ есть, идентичность собирается")
+
+        KeychainStore().removeAllAppItems()
+
+        // Файл сертификата остался (он лежит в каталоге приложения и стирается
+        // вместе с ним), но ключа больше нет — а значит и идентичности.
+        XCTAssertThrowsError(try service.identity(), "после стирания ключ не должен находиться")
     }
 
     // MARK: - The engine goes with the data

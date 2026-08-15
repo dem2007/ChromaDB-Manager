@@ -47,6 +47,40 @@ public struct TableMapping: Codable, Hashable, Sendable {
         self.titles = titles
     }
 
+    /// Та же разметка, но на колонках **этого** файла.
+    ///
+    /// Роли, свои названия и ключ переносятся по именам, которые уцелели;
+    /// колонка, которой в профиле не было, получает роль из первого
+    /// предположения. Профиль говорит, что колонки значат, файл — какие они
+    /// и где.
+    ///
+    /// Без этого пересчёта разметка, подставленная из профиля, показывала
+    /// колонки профиля: колонок, которые есть в файле и которых профиль
+    /// не знает, в редакторе не было вовсе, и добавить их было нечем.
+    public func rebased(on shape: SheetShape) -> TableMapping {
+        let suggested = TableMapping.suggested(sheetName: sheetName, shape: shape)
+        var result = self
+        result.headerRow = shape.headerRow
+        result.columns = shape.columns
+        result.roles = shape.columns.reduce(into: [:]) { roles, column in
+            roles[column] = self.roles[column] ?? suggested.role(of: column)
+        }
+        result.titles = titles.filter { shape.columns.contains($0.key) }
+        if let key = keyColumn, !shape.columns.contains(key) {
+            result.keyColumn = suggested.keyColumn
+        }
+        return result
+    }
+
+    /// Размечено ли по буквам колонок, а не по прочитанным заголовкам.
+    ///
+    /// Выводится из самих колонок, а не хранится отдельным полем: лишний
+    /// признак в формате профиля потребовал бы миграции всех сохранённых
+    /// и выгруженных файлов ради того, что и так видно.
+    public var usesColumnLetters: Bool {
+        !columns.isEmpty && columns.enumerated().allSatisfy { $1 == XLSXReader.columnName($0) }
+    }
+
     public func role(of column: String) -> ColumnRole { roles[column] ?? .ignore }
 
     /// Как называть колонку: своё имя, если задано, иначе заголовок из файла.
@@ -179,12 +213,18 @@ public struct TableRowDocument: Hashable, Sendable {
     public let metadata: ChromaMetadata
     /// The key value this row was identified by, when there is a key column.
     public let rowKey: String?
+    /// Колонки, чьё значение не поместилось в предел метаданных.
+    public let truncatedColumns: [String]
 
-    public init(id: String, text: String, metadata: ChromaMetadata, rowKey: String?) {
+    public init(
+        id: String, text: String, metadata: ChromaMetadata, rowKey: String?,
+        truncatedColumns: [String] = []
+    ) {
         self.id = id
         self.text = text
         self.metadata = metadata
         self.rowKey = rowKey
+        self.truncatedColumns = truncatedColumns
     }
 }
 
@@ -201,14 +241,35 @@ public enum RowMapper {
     /// computed from, so search quality depends on it directly — which is why
     /// 8 insists it be previewable before a run rather than tuned by
     /// re-indexing.
+    /// - Parameter includingKey: дописывать ли ключ строки впереди.
+    ///   Выключается там, где нужен **свой** текст строки: строка, у которой
+    ///   заполнен один артикул, документом не становится, и решать это
+    ///   по тексту с дописанным артикулом нельзя — он не пуст никогда.
     public static func text(
         for row: SheetRow,
         mapping: TableMapping,
-        layout: SheetLayout
+        layout: SheetLayout,
+        includingKey: Bool = true
     ) -> String {
         func value(_ column: String) -> String {
             guard let index = layout.index(of: column) else { return "" }
             return row.value(at: index).displayText
+        }
+
+        /// Ключ строки — впереди её текста.
+        ///
+        /// Артикул, шифр, инвентарный номер почти всегда получают роль
+        /// метаданного: они короткие и на текст не похожи. А ищут строку
+        /// **именно по ним** — и не находили ни вектором, ни текстовой
+        /// стадией, потому что в тексте документа ключа не было вовсе;
+        /// работал только фильтр по метаданным, о чём человек знать не обязан.
+        ///
+        /// Дописывается только тогда, когда значения ключа в тексте ещё нет:
+        /// шаблон, в котором человек уже вывел артикул, не должен получить
+        /// его дважды.
+        func withKey(_ body: String) -> String {
+            guard includingKey else { return body }
+            return keyed(body, for: row, mapping: mapping, layout: layout)
         }
 
         let template = mapping.textTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -217,11 +278,13 @@ public enum RowMapper {
             // the user marked as carrying meaning.
             // Подпись — выбранное человеком имя: она уходит в текст документа
             // и попадает в поиск, поэтому «Столбец 3» там ни к чему.
-            return mapping.textColumns
-                .map { (mapping.title(of: $0), value($0)) }
-                .filter { !$0.1.isEmpty }
-                .map { "\($0.0): \($0.1)" }
-                .joined(separator: "\n")
+            return withKey(
+                mapping.textColumns
+                    .map { (mapping.title(of: $0), value($0)) }
+                    .filter { !$0.1.isEmpty }
+                    .map { "\($0.0): \($0.1)" }
+                    .joined(separator: "\n")
+            )
         }
 
         var result = template
@@ -237,7 +300,44 @@ public enum RowMapper {
         for (placeholder, column) in names.sorted(by: { $0.0.count > $1.0.count }) {
             result = result.replacingOccurrences(of: "{\(placeholder)}", with: value(column))
         }
-        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return withKey(result.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Текст строки с её ключом впереди.
+    ///
+    /// Отдельно от `text(for:...)`, потому что тот же ключ дописывается
+    /// и там, где текст уже посчитан: считать его дважды ради одной строки
+    /// значит удвоить работу на каждой строке таблицы.
+    static func keyed(
+        _ body: String, for row: SheetRow, mapping: TableMapping, layout: SheetLayout
+    ) -> String {
+        guard let key = mapping.keyColumn, let index = layout.index(of: key) else { return body }
+        let value = row.value(at: index).displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, !mentions(value, in: body) else { return body }
+        let line = "\(mapping.title(of: key)): \(value)"
+        return body.isEmpty ? line : line + "\n" + body
+    }
+
+    /// Стоит ли значение в тексте **отдельным** словом.
+    ///
+    /// Простое вхождение подстроки отвечало неправдой: артикул «12» есть
+    /// внутри «уровень 12А» и внутри «2012», и строка оставалась без своего
+    /// ключа — то есть ненаходимой ровно тем запросом, ради которого ключ
+    /// и дописывается.
+    static func mentions(_ value: String, in text: String) -> Bool {
+        var search = text.startIndex..<text.endIndex
+        while let range = text.range(of: value, range: search) {
+            let before = range.lowerBound == text.startIndex
+                ? nil : text[text.index(before: range.lowerBound)]
+            let after = range.upperBound == text.endIndex ? nil : text[range.upperBound]
+            let touching = { (character: Character?) in
+                character.map { $0.isLetter || $0.isNumber } ?? false
+            }
+            if !touching(before), !touching(after) { return true }
+            guard range.upperBound < text.endIndex else { return false }
+            search = range.upperBound..<text.endIndex
+        }
+        return false
     }
 
     /// Плейсхолдеры шаблона, которым не соответствует ни одна колонка этого
@@ -273,6 +373,11 @@ public enum RowMapper {
 
     // MARK: - Metadata
 
+    private static func numeric(_ value: Double) -> MetadataValue {
+        if value == value.rounded(), abs(value) < 9e15 { return .int(Int(value)) }
+        return .double(value)
+    }
+
     /// ChromaDB metadata holds only string, int, float and bool. A date goes
     /// out as an ISO-8601 string, the form this project uses everywhere.
     public static func metadataValue(_ cell: CellValue) -> MetadataValue? {
@@ -286,13 +391,37 @@ public enum RowMapper {
         case .boolean(let value):
             return .bool(value)
         case .number(let value):
-            if value == value.rounded(), abs(value) < 9e15 { return .int(Int(value)) }
-            return .double(value)
+            return numeric(value)
+        case .measured(let value, let unit):
+            // В метаданные идёт **показанное** число: в книге стоит
+            // «15 %», и фильтр человек напишет `= 15`, а не `= 0.15`. Единица
+            // остаётся в тексте документа — метаданные хранят числа, с
+            // которыми считают.
+            return numeric(unit.displayed(value))
         case .date(let value):
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime]
             return .string(formatter.string(from: value))
         }
+    }
+
+    /// Предел длины одного значения в метаданных.
+    ///
+    /// Для текста документа предел есть — контекст модели; для метаданных
+    /// не было никакого, и колонка с примечанием на сорок тысяч знаков уезжала
+    /// в базу целиком, а потом возвращалась в каждом результате поиска.
+    /// Две тысячи — с запасом на любое осмысленное поле, по которому фильтруют,
+    /// и в двадцать раз меньше того случая.
+    public static let metadataValueLimit = 2000
+
+    /// Значение с обрезкой по пределу. `nil` во втором члене — обрезки не было.
+    static func fitting(_ value: MetadataValue) -> (value: MetadataValue, truncated: Bool) {
+        guard case .string(let text) = value, text.count > metadataValueLimit else {
+            return (value, false)
+        }
+        // Многоточие в конце — чтобы обрезка была видна в самом значении,
+        // а не только в отчёте прогона.
+        return (.string(String(text.prefix(metadataValueLimit)) + "…"), true)
     }
 
     public static func metadata(
@@ -302,6 +431,18 @@ public enum RowMapper {
         sourceFile: String,
         rowKey: String?
     ) -> ChromaMetadata {
+        metadataAndTruncations(
+            for: row, mapping: mapping, layout: layout, sourceFile: sourceFile, rowKey: rowKey
+        ).metadata
+    }
+
+    static func metadataAndTruncations(
+        for row: SheetRow,
+        mapping: TableMapping,
+        layout: SheetLayout,
+        sourceFile: String,
+        rowKey: String?
+    ) -> (metadata: ChromaMetadata, truncated: [String]) {
         var result: ChromaMetadata = [
             "source_file": .string(sourceFile),
             "sheet_name": .string(mapping.sheetName),
@@ -314,6 +455,7 @@ public enum RowMapper {
         // two files writing «Цена» and «цена » must end up filterable by one
         // key, and must each be read from their own column.
         let keys = mapping.keyMap
+        var truncated: [String] = []
         for column in mapping.metadataColumns {
             // Позиция — по заголовку **из файла**, ключ — по тому имени,
             // которое человек выбрал. Это разные строки, когда
@@ -322,9 +464,11 @@ public enum RowMapper {
                   let key = keys.key(for: mapping.title(of: column))
             else { continue }
             guard let value = metadataValue(row.value(at: index)) else { continue }
-            result[key] = value
+            let fitted = fitting(value)
+            if fitted.truncated { truncated.append(mapping.title(of: column)) }
+            result[key] = fitted.value
         }
-        return result
+        return (result, truncated)
     }
 
     // MARK: - Identity
@@ -369,10 +513,17 @@ public enum RowMapper {
         sourceID: UUID,
         sourceFile: String
     ) -> TableRowDocument? {
-        let text = text(for: row, mapping: mapping, layout: layout)
         // A row whose text columns are all empty has nothing to embed. It is
-        // not an error and not a silent drop — the caller counts it.
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        // not an error and not a silent drop — the caller counts it. Считается
+        // это по тексту **без** ключа: с дописанным артикулом пустых
+        // строк не бывает вовсе, и такая строка молча становилась документом
+        // из одного артикула.
+        //
+        // Текст считается **один раз**: ключ дописывается к готовому телу,
+        // а не вторым проходом по шаблону.
+        let body = text(for: row, mapping: mapping, layout: layout, includingKey: false)
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let text = keyed(body, for: row, mapping: mapping, layout: layout)
 
         let rowKey = mapping.keyColumn
             .flatMap { layout.index(of: $0) }
@@ -386,14 +537,16 @@ public enum RowMapper {
             key: rowKey,
             rowContent: contentSeed(for: row, width: width)
         )
+        let fields = metadataAndTruncations(
+            for: row, mapping: mapping, layout: layout,
+            sourceFile: sourceFile, rowKey: rowKey
+        )
         return TableRowDocument(
             id: id,
             text: text,
-            metadata: metadata(
-                for: row, mapping: mapping, layout: layout,
-                sourceFile: sourceFile, rowKey: rowKey
-            ),
-            rowKey: rowKey
+            metadata: fields.metadata,
+            rowKey: rowKey,
+            truncatedColumns: fields.truncated
         )
     }
 }

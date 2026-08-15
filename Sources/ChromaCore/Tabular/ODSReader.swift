@@ -107,6 +107,14 @@ final class ODSParser: NSObject, XMLParserDelegate {
 
     private var cellValue: CellValue = .empty
     private var cellRepeat = 1
+    private var rowSpan = 1
+    /// Объединения вниз, ещё действующие: колонка → (значение, последняя
+    /// строка диапазона)..
+    ///
+    /// ODS объявляет их на верхней ячейке — `table:number-rows-spanned`, —
+    /// а строки идут по порядку, так что запомнить и подставлять хватает.
+    private var spans: [Int: (value: CellValue, lastRow: Int)] = [:]
+    private var sidewaysMerges = 0
     private var capturingText = false
     private var paragraphs: [String] = []
     private var text = ""
@@ -138,6 +146,8 @@ final class ODSParser: NSObject, XMLParserDelegate {
             // its value lives in the anchor, and reading it as a value of its
             // own would duplicate the anchor's across the range.
             cellValue = name == "table:covered-table-cell" ? .empty : Self.value(of: attributes)
+            rowSpan = Self.repetition(attributes["table:number-rows-spanned"])
+            if Self.repetition(attributes["table:number-columns-spanned"]) > 1 { sidewaysMerges += 1 }
 
         case "text:p":
             guard insideTable else { return }
@@ -172,7 +182,15 @@ final class ODSParser: NSObject, XMLParserDelegate {
             }
             if !cellValue.isEmpty {
                 for offset in 0..<cellRepeat { cells[column + offset] = cellValue }
+                // Объединено вниз — значение относится ко всем строкам
+                // диапазона, а не к одной верхней.
+                if rowSpan > 1 {
+                    for offset in 0..<cellRepeat {
+                        spans[column + offset] = (cellValue, rowNumber + rowSpan)
+                    }
+                }
             }
+            rowSpan = 1
             column += cellRepeat
 
         case "table:table-row":
@@ -181,6 +199,12 @@ final class ODSParser: NSObject, XMLParserDelegate {
                 rowNumber += 1
                 guard !finished else { break }
                 rowsEmitted += 1
+                // Действующие объединения вниз подставляются в строку до её
+                // выдачи; истёкшие забываются.
+                spans = spans.filter { $0.value.lastRow >= rowNumber }
+                for (column, span) in spans where cells[column] == nil {
+                    cells[column] = span.value
+                }
                 if rowsEmitted > limit {
                     finished = true
                     warnings.append(.rowLimitReached(limit: limit))
@@ -196,6 +220,9 @@ final class ODSParser: NSObject, XMLParserDelegate {
             cells = [:]
 
         case "table:table":
+            if insideTable, sidewaysMerges > 0 {
+                warnings.append(.mergedSideways(cells: sidewaysMerges))
+            }
             // The requested table is over; nothing after it is of interest.
             if insideTable {
                 insideTable = false
@@ -217,8 +244,19 @@ final class ODSParser: NSObject, XMLParserDelegate {
     /// the one place it is simpler than XLSX.
     static func value(of attributes: [String: String]) -> CellValue {
         switch attributes["office:value-type"] {
-        case "float", "percentage", "currency":
+        case "float":
             return attributes["office:value"].flatMap(Double.init).map(CellValue.number) ?? .empty
+        case "percentage":
+            // ODS честно говорит, что это проценты, — и раньше это знание
+            // выбрасывалось: 0.15 уходило в текст числом.
+            return attributes["office:value"].flatMap(Double.init)
+                .map { CellValue.measured($0, .percent) } ?? .empty
+        case "currency":
+            // Код валюты стоит рядом: `office:currency="RUB"`. Его и пишем —
+            // символа в файле нет, а «1234 RUB» человек прочтёт.
+            let code = attributes["office:currency"] ?? ""
+            guard let value = attributes["office:value"].flatMap(Double.init) else { return .empty }
+            return code.isEmpty ? .number(value) : .measured(value, NumberUnit(suffix: code))
         case "boolean":
             let raw = attributes["office:boolean-value"]?.lowercased()
             return raw.map { CellValue.boolean($0 == "true" || $0 == "1") } ?? .empty

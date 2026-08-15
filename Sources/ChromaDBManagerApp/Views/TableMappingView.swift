@@ -92,14 +92,17 @@ struct TableMappingSheet: View {
                                 }
                             )) {
                                 Text("подбирать по колонкам").tag("")
-                                ForEach(model.profiles) { profile in
-                                    Text(profile.name).tag(profile.id.uuidString)
+                                ForEach(model.allProfiles) { profile in
+                                    Text(model.isShared(profile)
+                                         ? String(localized: "\(profile.name) · общий")
+                                         : profile.name)
+                                        .tag(profile.id.uuidString)
                                 }
                             }
                             .labelsHidden()
                             .frame(width: 200)
-                            .disabled(model.profiles.isEmpty)
-                            .help(model.profiles.isEmpty
+                            .disabled(model.allProfiles.isEmpty)
+                            .help(model.allProfiles.isEmpty
                                   ? String(localized: "Профилей ещё нет: откройте файл, разметьте колонки и сохраните профиль — он появится в этом списке")
                                   : String(localized: "Каким профилем читать этот файл. «Подбирать по колонкам» — как раньше, по совпадению набора заголовков"))
 
@@ -188,10 +191,36 @@ struct TableMappingSheet: View {
                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
 
+                // на листе бывают одни данные — без шапки или с шапкой,
+                // которую не прочитать. Тогда колонки называются буквами, как
+                // в самой таблице, а имена человек задаёт полем «Своё
+                // название»: буква — адрес колонки, а не её смысл.
+                HStack(spacing: 8) {
+                    Button(String(localized: "Заголовков нет — назвать колонки самому")) {
+                        model.useColumnLetters(startingAfter: 0, for: preview.sheet.name)
+                    }
+                    .buttonStyle(.chromaNormal)
+                    if let row = mapping.headerRow, row > 0 {
+                        Button(String(localized: "В строке \(row.plainDigits) заголовков нет")) {
+                            model.useColumnLetters(startingAfter: row, for: preview.sheet.name)
+                        }
+                        .buttonStyle(.chromaNormal)
+                        .help(String(localized: "Считать эту строку служебной: колонки назвать буквами, данные читать со следующей"))
+                    }
+                    Spacer()
+                }
+
                 // Horizontal only, and no height cap. A vertically capped ScrollView
                 // nested inside the sheet's own ScrollView laid out its twenty rows
                 // over the heading above it — the sheet already scrolls, so the card
                 // is simply allowed to be as tall as its rows.
+                // Роли и свои названия — по разу на колонку, а не по разу
+                // на ячейку. На листе в 210 колонок это 4 400 обращений
+                // к словарям при каждой перерисовке — то есть при каждом
+                // нажатии клавиши в поле «Своё название».
+                let titles = (0..<width).map { $0 < mapping.columns.count ? mapping.columns[$0] : "" }
+                let roles = titles.map { mapping.role(of: $0) }
+
                 ScrollView(.horizontal) {
                     VStack(alignment: .leading, spacing: 2) {
                         // Буквы колонок — как в самой таблице.
@@ -204,7 +233,13 @@ struct TableMappingSheet: View {
                         // рядом, и это единственное имя, которое не зависит
                         // ни от выбранной строки заголовков, ни от
                         // переименований.
-                        HStack(spacing: 0) {
+                        // `LazyHStack`, а не `HStack`: на листе в 210 колонок
+                        // обычный стек строит все 210 ячеек каждой из 21
+                        // строки сразу — 4 400 текстов с рамкой и фоном,
+                        // и экран отвечает с задержкой в секунды. Ленивый
+                        // строит те, что видны; ширина ячейки задана числом,
+                        // поэтому ему есть от чего считать.
+                        LazyHStack(spacing: 0) {
                             Color.clear.frame(width: numberGutterWidth, height: 1)
                             ForEach(0..<width, id: \.self) { column in
                                 Text(XLSXReader.columnName(column))
@@ -215,20 +250,19 @@ struct TableMappingSheet: View {
                             }
                         }
 
-                        ForEach(preview.rows.prefix(TableMappingViewModel.previewRowCount + 1), id: \.number) { row in
+                        ForEach(preview.previewRows, id: \.number) { row in
                             let isHeader = row.number == mapping.headerRow
                             let isAbove = mapping.headerRow.map { row.number < $0 } ?? false
-                            HStack(spacing: 0) {
+                            LazyHStack(spacing: 0) {
                                 numberCell(row.number, isHeader: isHeader, sheet: preview.sheet.name)
                                 ForEach(0..<width, id: \.self) { column in
-                                    let title = column < mapping.columns.count ? mapping.columns[column] : ""
                                     // В строке заголовков показывается выбранное
                                     // человеком имя: переименование должно быть
                                     // видно там же, где на него смотрят.
-                                    let text = isHeader && !title.isEmpty
-                                        ? mapping.title(of: title)
+                                    let text = isHeader && !titles[column].isEmpty
+                                        ? mapping.title(of: titles[column])
                                         : row.value(at: column).displayText
-                                    cell(text, role: mapping.role(of: title), isHeader: isHeader, isAbove: isAbove)
+                                    cell(text, role: roles[column], isHeader: isHeader, isAbove: isAbove)
                                 }
                             }
                         }
@@ -304,16 +338,32 @@ struct TableMappingSheet: View {
                 // повторяются («Итого» над каждым кварталом), а `id: \.self`
                 // на повторе склеивает строки в одну. Номер он же
                 // даёт букву колонки.
-                ForEach(Array(binding.wrappedValue.columns.enumerated()), id: \.offset) { index, column in
+                //
+                // `LazyVStack` — по той же причине, что и в предпросмотре, но
+                // тяжелее: в каждой строке поле ввода и два выпадающих списка,
+                // и на листе в 210 колонок обычный стек строит их все разом.
+                //
+                // Ключи метаданных считаются **один раз на список**, а не
+                // на строку: `keyMap` строится по всем колонкам сразу, и
+                // обращение к нему в каждой строке превращало 210 колонок
+                // в 44 000 нормализаций на каждую перерисовку.
+                let keyMap = binding.wrappedValue.keyMap
+                LazyVStack(alignment: .leading, spacing: 6) {
+                  ForEach(Array(binding.wrappedValue.columns.enumerated()), id: \.offset) { index, column in
                     HStack(spacing: 8) {
                         Circle().fill(colour(for: binding.wrappedValue.role(of: column))).frame(width: 8, height: 8)
                         // Буква колонки — рядом с её именем: размечают, глядя
                         // в таблицу выше и в свой файл в Excel, а там колонка
                         // называется буквой.
+                        // Ширины хватает на две буквы: у листа в 210 колонок
+                        // они начинаются с двадцать седьмой, и в 22 точки
+                        // «HB» переносилось на вторую строку, растягивая
+                        // строку списка вдвое.
                         Text(XLSXReader.columnName(index))
                             .font(Theme.Font.micro.monospaced())
                             .foregroundStyle(Theme.Palette.captionText)
-                            .frame(width: 22, alignment: .trailing)
+                            .lineLimit(1)
+                            .frame(width: 28, alignment: .trailing)
                         Text(column).font(Theme.Font.body).frame(width: 160, alignment: .leading)
                             .lineLimit(1).truncationMode(.middle)
                             .help(column)
@@ -341,12 +391,13 @@ struct TableMappingSheet: View {
                         .labelsHidden()
                         .frame(width: 140)
 
-                        if let key = binding.wrappedValue.keyMap.key(for: binding.wrappedValue.title(of: column)) {
+                        if let key = keyMap.key(for: binding.wrappedValue.title(of: column)) {
                             Text(key).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
                     }
+                  }
                 }
 
                 Divider()
@@ -370,6 +421,13 @@ struct TableMappingSheet: View {
                 if let warning = model.keyColumnWarning {
                     Label(warning, systemImage: "exclamationmark.triangle")
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // Повтор значения ключа — не стиль разметки, а строки, которые
+                // не попадут в базу. Говорится здесь же, где ключ выбирают.
+                if let duplicates = model.keyColumnDuplicates {
+                    Label(duplicates, systemImage: "doc.on.doc")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // a rename the user never sees is the same as losing the
@@ -460,7 +518,7 @@ struct TableMappingSheet: View {
     private var profileCard: some View {
         SectionCard(
             title: "Профиль сопоставления",
-            subtitle: "Сохраняется у источника и применяется к файлам с тем же набором колонок. Файл с другим набором не индексируется наполовину — он попадёт в «требуют решения»."
+            subtitle: "Применяется к файлам с тем же набором колонок. Файл с другим набором не индексируется наполовину — он попадёт в «требуют решения»."
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -469,10 +527,32 @@ struct TableMappingSheet: View {
                         .frame(width: 260)
                     Spacer()
                     Button("Экспорт профилей…") { model.exportProfiles(app, source: source) }
-                        .disabled(model.profiles.isEmpty)
+                        .disabled(model.allProfiles.isEmpty)
                     Button("Импорт профилей…") { model.importProfiles(app, source: source) }
+                    Button("Разметить заново") { model.startOver(app, source: source) }
+                        .help(String(localized: "Забыть подставленный профиль и собрать разметку этого файла с нуля"))
+                        .disabled(model.sheets.isEmpty)
                     Button("Сохранить профиль") { model.save(app, source: source) }
                         .keyboardShortcut(.defaultAction)
+                }
+
+                // Где хранить профиль. Выбор человека, а не умолчание
+                // приложения: одинаковые книги приходят в разные папки, и
+                // разметка «отчёт ФЭО» не должна повторяться в каждой из них
+                // слово в слово. Умолчание при этом прежнее — у источника.
+                HStack(spacing: 8) {
+                    Text("Хранить профиль").font(Theme.Font.caption)
+                    Picker("", selection: $model.scope) {
+                        ForEach(TableProfileScope.allCases) { scope in
+                            Text(scope.title).tag(scope)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 220)
+                    Text(model.scope.explanation)
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
                 }
 
                 // Что именно сохранится: по варианту на лист, и к каким листам
@@ -487,7 +567,10 @@ struct TableMappingSheet: View {
                             .frame(width: 180, alignment: .leading)
                             .lineLimit(1).truncationMode(.middle)
                         if mapping.mode == .skip {
-                            Text("пропускается — в профиль не войдёт")
+                            // «Не индексировать» тоже сохраняется, и это важно:
+                            // лист без варианта означал бы «про него ничего
+                            // не сказано» и подхватывал чужой разбор.
+                            Text("не индексировать — так и записано в профиле")
                                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                         } else {
                             Picker("", selection: Binding(
@@ -519,12 +602,23 @@ struct TableMappingSheet: View {
                     }
                 }
 
-                if !model.profiles.isEmpty {
+                let listed = model.listedProfiles
+                if !listed.isEmpty {
                     Divider()
-                    Text("Профили источника").font(Theme.Font.caption).bold()
-                    ForEach(model.profiles) { profile in
+                    Text("Профили").font(Theme.Font.caption).bold()
+                    ForEach(listed) { profile in
                         HStack(spacing: 8) {
                             Text(profile.name).font(Theme.Font.caption)
+                            // Общий — виден всем источникам; перекрытый —
+                            // виден, но в подборе не участвует, потому что
+                            // у источника есть свой с тем же именем.
+                            if model.isOverridden(profile) {
+                                Text("общий, перекрыт своим")
+                                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                            } else if model.isShared(profile) {
+                                Text("общий")
+                                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                            }
                             Text(profile.summary)
                                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                                 .lineLimit(1).truncationMode(.tail)
@@ -533,6 +627,9 @@ struct TableMappingSheet: View {
                                 model.removeProfile(named: profile.name, app: app, source: source)
                             }
                             .font(Theme.Font.micro).buttonStyle(.link)
+                            .help(model.isShared(profile)
+                                  ? String(localized: "Профиль общий: он исчезнет у всех источников, и их файлы вернутся к подбору по колонкам")
+                                  : String(localized: "Профиль исчезнет у этого источника; назначенные ему файлы вернутся к подбору по колонкам"))
                         }
                     }
                 }

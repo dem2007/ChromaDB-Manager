@@ -50,6 +50,25 @@ public struct DocumentPart: Codable, Hashable, Sendable {
     }
 }
 
+/// Адрес, на который документ ссылается, и место этой ссылки.
+///
+/// **Почему адрес — метаданное, а не текст чанка.** Замер на 400 PDF: 471
+/// разный адрес, и почти все — непрозрачные редиректы вида
+/// `internet.garant.ru/document/redirect/71886920/0`. В них нет ни одного
+/// слова, по которому их станут искать, а в векторе они дают набор цифр.
+/// В метаданных адрес доступен человеку, агенту и фильтру — и вектор
+/// не размывает.
+public struct DocumentLink: Codable, Hashable, Sendable {
+    public let url: String
+    /// Где в `plainText` стоит ссылка, в знаках.
+    public let start: Int
+
+    public init(url: String, start: Int) {
+        self.url = url
+        self.start = max(0, start)
+    }
+}
+
 /// Where the structure came from — the user is entitled to know how much to
 /// trust it.
 public enum StructureSource: String, Codable, Sendable {
@@ -83,9 +102,17 @@ public enum ExtractionWarning: Hashable, Sendable {
         case .noStructure:
             return String(localized: "структура не найдена — текст плоский")
         case .tablesFlattened:
-            return String(localized: "таблицы приведены к тексту, разметка потеряна")
+            // Не «разметка потеряна»: строки и колонки как раз
+            // сохраняются — разметкой Markdown. Теряется оформление: ширины,
+            // объединения, цвета. Говорить про приложение то, чего оно
+            // не делает, нельзя даже в оговорке.
+            return String(localized: "таблицы записаны текстом: строки и колонки сохранены, оформление — нет")
         case .commentsSkipped:
-            return String(localized: "комментарии, сноски и правки не извлекаются")
+            // Для `.docx` эта оговорка больше не ставится: там сноски
+            // и комментарии извлекаются, а правки принимаются, и говорить
+            // «не извлекаются» значило бы врать о самом приложении.
+            // Остаётся у `.odt` и там, где часть с комментариями не читается.
+            return String(localized: "комментарии, сноски и правки не извлечены")
         case .ocrUsed(let confidence):
             return String(localized: "текст распознан OCR (средняя уверенность \(String(format: "%.2f", confidence))) — ошибки распознавания возможны")
         case .speakerNotesUnavailable:
@@ -106,6 +133,8 @@ public struct ExtractedDocument: Sendable {
     public var pageStarts: [Int]
     /// Chapters or slides, in the document's own order.
     public var parts: [DocumentPart]
+    /// Адреса, на которые ссылается документ, с их местом в тексте.
+    public var links: [DocumentLink]
     /// Where the paged text ends, in characters. Text past this offset was added
     /// by the extractor from somewhere other than the pages — Keynote's
     /// presenter notes are the case this exists for — and is on no page at all.
@@ -141,6 +170,7 @@ public struct ExtractedDocument: Sendable {
         pageCount: Int? = nil,
         pageStarts: [Int] = [],
         parts: [DocumentPart] = [],
+        links: [DocumentLink] = [],
         pagedTextEnd: Int? = nil,
         warnings: [ExtractionWarning] = [],
         structureSource: StructureSource = .none,
@@ -157,6 +187,7 @@ public struct ExtractedDocument: Sendable {
         self.pageCount = pageCount
         self.pageStarts = pageStarts
         self.parts = parts
+        self.links = links
         self.pagedTextEnd = pagedTextEnd
         self.warnings = warnings
         self.structureSource = structureSource

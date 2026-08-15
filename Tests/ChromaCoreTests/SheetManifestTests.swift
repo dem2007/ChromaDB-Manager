@@ -52,7 +52,7 @@ final class SheetSyncPlanTests: XCTestCase {
     func testTheHeaderRowIsNotADocument() {
         let result = plan(sheet([("A-1", "Болт", 12)]), SheetManifest(sheetName: "Каталог"))
         XCTAssertEqual(result.added.count, 1)
-        XCTAssertEqual(result.added.first?.text, "Название: Болт")
+        XCTAssertEqual(result.added.first?.text, "Артикул: A-1\nНазвание: Болт")
         XCTAssertEqual(result.added.first?.metadata["row_number"], .int(2))
         XCTAssertFalse(result.added.contains { $0.metadata["row_number"] == .int(1) })
     }
@@ -76,7 +76,7 @@ final class SheetSyncPlanTests: XCTestCase {
         let result = plan(after, manifest)
         XCTAssertEqual(result.embeddings, 1)
         XCTAssertEqual(result.unchanged, 2)
-        XCTAssertEqual(result.reembedded.first?.document.text, "Название: Гайка М6")
+        XCTAssertEqual(result.reembedded.first?.document.text, "Артикул: A-2\nНазвание: Гайка М6")
     }
 
     /// A changed price is a changed filter value, not changed meaning. Paying
@@ -116,11 +116,13 @@ final class SheetSyncPlanTests: XCTestCase {
         XCTAssertEqual(moved?.previousID, manifest.rows["key\u{0}A-2"]?.documentID)
     }
 
-    /// Without a key the row number is the only thread connecting «the row that
-    /// was here» to «the row that is here now» — which is exactly why
-    /// requires the manifest to keep it. An insertion therefore does look like
-    /// edits, and the user was warned when they declined a key column.
-    func testWithoutAKeyAnInsertionRewritesTheRowsBelow() {
+    /// без ключевой колонки вставка тоже стоит один вектор.
+    ///
+    /// Строка узнаётся по номеру, и раньше вставка сдвигала все остальные:
+    /// каждая сравнивалась с записью соседа, текст не совпадал — и хвост
+    /// уходил на переэмбеддинг. Теперь сдвинувшаяся строка сперва ищется
+    /// по содержимому и находится там, где она есть.
+    func testWithoutAKeyAnInsertionStillCostsOneVector() {
         let mapping = mapping(keyColumn: nil)
         let before = sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
         let manifest = synced(before, mapping: mapping)
@@ -128,8 +130,67 @@ final class SheetSyncPlanTests: XCTestCase {
 
         let result = plan(after, manifest, mapping: mapping)
         XCTAssertEqual(result.unchanged, 1, "первая строка не двигалась")
-        XCTAssertEqual(result.reembedded.count, 1, "третья строка теперь на месте второй")
+        XCTAssertEqual(result.embeddings, 1, "вектор считается только новой строке")
         XCTAssertEqual(result.added.count, 1)
+        XCTAssertEqual(result.metadataOnly.count, 1, "сдвинувшейся строке обновляется только номер")
+        XCTAssertTrue(result.disappeared.isEmpty)
+    }
+
+    /// Самое дорогое следствие прежнего разбора: «прежним» документом
+    /// сдвинувшейся строки объявлялся документ **живого** соседа — и после
+    /// записи он удалялся из базы. Проверяется прямо: ни один документ,
+    /// который остаётся в манифесте, не может попасть в список на удаление.
+    func testNoLiveDocumentIsEverSupersededByAnother() {
+        let mapping = mapping(keyColumn: nil)
+        let before = sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8), ("A-3", "Шайба", 3)])
+        let manifest = synced(before, mapping: mapping)
+        let after = sheet([
+            ("A-1", "Болт", 12), ("A-9", "Новый", 5), ("A-2", "Гайка", 8), ("A-3", "Шайба", 3),
+        ])
+
+        let result = plan(after, manifest, mapping: mapping)
+        let updated = TableSyncPlanner.applying(result, to: manifest, mapping: mapping)
+        let alive = Set(updated.documentIDs)
+        let superseded = (result.reembedded + result.metadataOnly)
+            .filter { $0.previousID != $0.document.id }
+            .map(\.previousID)
+        XCTAssertTrue(
+            superseded.allSatisfy { !alive.contains($0) },
+            "документ живой строки не может считаться замещённым"
+        )
+        XCTAssertEqual(updated.rowCount, 4, "в манифесте ровно столько строк, сколько в файле")
+    }
+
+    /// Ключ прежнего номера убирается вместе с переносом: иначе одна
+    /// строка осталась бы в манифесте дважды, и следующий прогон объявил бы
+    /// её вторую половину исчезнувшей.
+    func testAShiftedRowLeavesNoSecondRecordBehind() {
+        let mapping = mapping(keyColumn: nil)
+        let manifest = synced(sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8)]), mapping: mapping)
+        let after = sheet([("A-1", "Болт", 12), ("A-9", "Новый", 5), ("A-2", "Гайка", 8)])
+
+        let updated = TableSyncPlanner.applying(
+            plan(after, manifest, mapping: mapping), to: manifest, mapping: mapping
+        )
+        XCTAssertEqual(updated.rowCount, 3)
+        // И следующий прогон того же файла не находит ни изменений, ни пропаж.
+        let again = plan(after, updated, mapping: mapping)
+        XCTAssertEqual(again.unchanged, 3)
+        XCTAssertTrue(again.disappeared.isEmpty)
+        XCTAssertEqual(again.writes, 0)
+    }
+
+    /// Правка строки без ключа остаётся правкой: новый документ, старый —
+    /// в «требуют решения», а не втихую удалён.
+    func testWithoutAKeyAnEditIsStillAnEdit() {
+        let mapping = mapping(keyColumn: nil)
+        let manifest = synced(sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8)]), mapping: mapping)
+        let after = sheet([("A-1", "Болт", 12), ("A-2", "Гайка М6", 8)])
+
+        let result = plan(after, manifest, mapping: mapping)
+        XCTAssertEqual(result.unchanged, 1)
+        XCTAssertEqual(result.reembedded.count, 1, "текст изменился — это правка")
+        XCTAssertTrue(result.added.isEmpty)
     }
 
     // MARK: - Rows that went away
@@ -166,6 +227,43 @@ final class SheetSyncPlanTests: XCTestCase {
 
         let updated = TableSyncPlanner.applying(result, to: manifest, mapping: mapping())
         XCTAssertNotNil(updated.rows["key\u{0}A-2"])
+    }
+
+    /// «Оставить в базе» должно помниться: строка исчезла, человек ответил —
+    /// и следующий прогон не спрашивает о ней снова.
+    func testARowLeftInTheDatabaseIsNotAskedAboutAgain() {
+        let before = sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = synced(before)
+        let after = sheet([("A-1", "Болт", 12)])
+        XCTAssertEqual(plan(after, manifest).disappeared.count, 1)
+
+        manifest.rows["key\u{0}A-2"]?.isOrphaned = true
+        XCTAssertTrue(plan(after, manifest).disappeared.isEmpty)
+        XCTAssertNotNil(manifest.rows["key\u{0}A-2"], "запись остаётся: иначе документ нечем адресовать")
+    }
+
+    /// Вернувшаяся строка снова обычная — отметка «оставлена в базе» слетает
+    /// вместе с перезаписью записи.
+    func testAReturnedRowLosesItsOrphanMark() {
+        let rows = sheet([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = synced(rows)
+        manifest.rows["key\u{0}A-2"]?.isOrphaned = true
+        // Строка вернулась и притом изменилась — значит будет переписана.
+        let changed = sheet([("A-1", "Болт", 12), ("A-2", "Гайка М6", 8)])
+        let result = plan(changed, manifest)
+        let updated = TableSyncPlanner.applying(result, to: manifest, mapping: mapping())
+        XCTAssertEqual(updated.rows["key\u{0}A-2"]?.isOrphaned, false)
+    }
+
+    /// Манифест, записанный до появления отметки, читается как есть.
+    func testAManifestWithoutTheOrphanFlagStillReads() throws {
+        let json = """
+        {"sheetName":"Каталог","mappingSignature":"","rows":{"key\\u0000A-1":\
+        {"documentID":"abc","rowNumber":2,"rowKey":"A-1","textHash":"x","metadataHash":"y"}}}
+        """
+        let decoded = try JSONDecoder().decode(SheetManifest.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.rows.count, 1)
+        XCTAssertEqual(decoded.rows.first?.value.isOrphaned, false)
     }
 
     // MARK: - A changed mapping is not a sync
@@ -205,6 +303,66 @@ final class SheetSyncPlanTests: XCTestCase {
         let result = plan(rows, SheetManifest(sheetName: "Каталог"))
         XCTAssertEqual(result.added.count, 1)
         XCTAssertEqual(result.empty, [9])
+    }
+
+    // MARK: - Повторы ключа
+
+    /// Две строки с одним артикулом дают один документ: id считается от ключа.
+    /// Пока повтор не ловился, обе уходили в `added` — и отчёт говорил
+    /// «добавлено 2» там, где в базе оказывалась одна запись.
+    func testARepeatedKeyIsReportedRatherThanCollapsed() {
+        let rows = sheet([("A-1", "Болт", 12), ("A-1", "Болт оцинкованный", 14), ("A-2", "Гайка", 8)])
+        let result = plan(rows, SheetManifest(sheetName: "Каталог"))
+
+        XCTAssertEqual(result.added.count, 2, "записывается по одной строке на документ")
+        XCTAssertEqual(result.duplicates.count, 1)
+        XCTAssertEqual(result.duplicates.first?.rowKey, "A-1")
+        XCTAssertEqual(result.duplicates.first?.rows, [2, 3])
+        XCTAssertEqual(result.duplicates.first?.skipped, [3], "записана первая строка группы")
+    }
+
+    /// Без ключевой колонки id считается от содержимого — и две одинаковые
+    /// строки сходятся к одному документу тем же порядком.
+    func testTwoIdenticalRowsWithoutAKeyAreOneDocument() {
+        let noKey = mapping(keyColumn: nil)
+        let rows = sheet([("A-1", "Болт", 12), ("A-1", "Болт", 12)])
+        let result = plan(rows, SheetManifest(sheetName: "Каталог"), mapping: noKey)
+
+        XCTAssertEqual(result.added.count, 1)
+        XCTAssertEqual(result.duplicates.first?.rowKey, nil)
+        XCTAssertEqual(result.duplicates.first?.rows, [2, 3])
+    }
+
+    /// Пропущенный повтор не должен превращаться в «исчезло»: у него тот же
+    /// документ, что у оставленной строки, и удаление по его id снесло бы
+    /// строку, которая никуда не девалась.
+    func testASkippedDuplicateIsNotOfferedForRemoval() {
+        let before = sheet([("A-1", "Болт", 12)])
+        let manifest = synced(before)
+        let after = sheet([("A-1", "Болт", 12), ("A-1", "Болт", 12)])
+
+        let result = plan(after, manifest)
+        XCTAssertTrue(result.disappeared.isEmpty)
+        XCTAssertEqual(result.duplicates.count, 1)
+    }
+
+    /// И то же самое, когда прошлый прогон успел записать обе строки под
+    /// разными отметками: запись повтора остаётся в манифесте, но удалять
+    /// по ней нечего — документ занят живой строкой.
+    func testAnOldRecordOfADuplicateIsNotOfferedForRemoval() {
+        let noKey = mapping(keyColumn: nil)
+        var manifest = SheetManifest(sheetName: "Каталог", mappingSignature: noKey.signature)
+        let rows = sheet([("A-1", "Болт", 12), ("A-1", "Болт", 12)])
+        // Так выглядел манифест до правки: две отметки, один документ.
+        let document = RowMapper.document(
+            for: rows[1], mapping: noKey, layout: SheetLayout(mapping: noKey),
+            sourceID: sourceID, sourceFile: "прайс.xlsx"
+        )!
+        manifest.rows["row\u{0}2"] = TableSyncPlanner.record(for: document, rowNumber: 2)
+        manifest.rows["row\u{0}3"] = TableSyncPlanner.record(for: document, rowNumber: 3)
+
+        let result = plan(rows, manifest, mapping: noKey)
+        XCTAssertTrue(result.disappeared.isEmpty, "документ занят строкой 2 — предлагать его удаление нельзя")
     }
 
     // MARK: - Storage

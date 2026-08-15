@@ -132,4 +132,172 @@ final class ColumnLettersTests: XCTestCase {
             "одинаковые заголовки колонок склеятся в одну строку"
         )
     }
+
+    /// умолчания нарезки настраиваются в окне источника.
+    ///
+    /// И подставляются при переключении стратегии: без этого «умолчание для
+    /// всех стратегий» осталось бы умолчанием для одной.
+    func testChunkingDefaultsAreSetFromTheSourceWindow() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/ChromaDBManagerApp/Views/SourcesView.swift")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw XCTSkip("исходники экрана не найдены рядом с тестами")
+        }
+        let source = try String(contentsOf: url, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("model.makeChunkingDefault(app)"), "кнопка «Сделать умолчанием»")
+        XCTAssertTrue(source.contains("model.takeChunkingDefault(app)"), "кнопка «Взять умолчание»")
+        XCTAssertTrue(
+            source.contains("model.chunkingStrategyChanged(to: strategy, app: app)"),
+            "переключение стратегии обязано подставлять её умолчания"
+        )
+        // Ответ кнопки уходил бы за лист — экран источников под ним.
+        XCTAssertFalse(
+            source.contains("model.infoMessage = model.makeChunkingDefault"),
+            "сообщение об умолчании должно оставаться в листе источника"
+        )
+    }
+
+    /// широкий лист не строится целиком.
+    ///
+    /// Проверять глазами тут нечего до тех пор, пока не откроется файл
+    /// на 210 колонок: обычные стеки строят 4 400 ячеек и 210 полей ввода
+    /// на каждую перерисовку, и экран отвечает с задержкой в секунды.
+    /// На пробе с той же вложенностью ленивый стек построил 126 ячеек
+    /// вместо 4 400.
+    func testWideSheetsAreLaidOutLazily() throws {
+        let source = try mappingView()
+        XCTAssertTrue(
+            source.contains("LazyHStack(spacing: 0)"),
+            "строки предпросмотра должны строиться лениво — колонок бывает две сотни"
+        )
+        XCTAssertTrue(
+            source.contains("LazyVStack(alignment: .leading, spacing: 6)"),
+            "список колонок с полями и выпадающими списками — тем более"
+        )
+        XCTAssertFalse(
+            source.contains("binding.wrappedValue.keyMap.key(for:"),
+            "ключи метаданных считаются один раз на список, а не на каждую строку"
+        )
+    }
+
+    /// область хранения профиля спрашивается, а не решается за
+    /// человека.
+    ///
+    /// Выбор, которого нет на экране, — это выбор, сделанный приложением:
+    /// профиль молча уходит к источнику, и та же книга в другой папке
+    /// размечается заново.
+    func testTheScreenAsksWhereToKeepTheProfile() throws {
+        let source = try mappingView()
+        XCTAssertTrue(
+            source.contains("selection: $model.scope"),
+            "на экране должен быть выбор области хранения профиля"
+        )
+        XCTAssertTrue(
+            source.contains("TableProfileScope.allCases"),
+            "обе области должны быть в списке — иначе выбор половинчатый"
+        )
+    }
+
+    /// Списки профилей на экране — общие вместе со своими.
+    ///
+    /// Экран, показывающий не то, чем файл будет прочитан, хуже отсутствия
+    /// экрана: назначить можно только то, что видно.
+    func testProfileListsIncludeTheSharedOnes() throws {
+        let source = try mappingView()
+        XCTAssertTrue(
+            source.contains("ForEach(model.allProfiles)"),
+            "в выборе профиля для файла должны быть и общие профили"
+        )
+        XCTAssertFalse(
+            source.contains("ForEach(model.profiles)"),
+            "список только своих профилей скрывает половину того, чем читается источник"
+        )
+    }
+}
+
+/// сертификат виден и переносим.
+///
+/// Сторож по исходникам, как соседние: отпечаток, показанный наполовину или
+/// не показанный вовсе, компилируется и проходит все прочие тесты, а человеку
+/// оставляет невыполнимое — сверить, тот ли сертификат он видит.
+final class CertificateOnScreenTests: XCTestCase {
+    private func securityView() throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/ChromaDBManagerApp/Views/SecurityView.swift")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw XCTSkip("исходники экрана не найдены рядом с тестами")
+        }
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    func testTheFingerprintIsShownWholeAndCanBeTaken() throws {
+        let source = try securityView()
+        XCTAssertTrue(source.contains("Text(certificate.fingerprint)"), "отпечаток должен показываться целиком")
+        XCTAssertFalse(
+            source.contains("certificate.fingerprint.prefix"),
+            "обрезанный отпечаток сверить нельзя — он для того и нужен, чтобы совпасть целиком"
+        )
+        XCTAssertTrue(source.contains("model.copy(certificate.fingerprint)"), "отпечаток должен копироваться кнопкой")
+        XCTAssertTrue(source.contains(".textSelection(.enabled)"), "и выделяться мышью")
+    }
+
+    func testExportAndReissueAreBothOnTheScreen() throws {
+        let source = try securityView()
+        XCTAssertTrue(source.contains("model.exportCertificate(app)"), "сертификат должно быть можно сохранить в файл")
+        XCTAssertTrue(source.contains("model.isConfirmingReissue = true"), "перевыпуск должен быть, и через подтверждение")
+        XCTAssertTrue(
+            source.contains("model.reissueCertificate(app)"),
+            "перевыпуск вызывается только из подтверждения — он рвёт связь со всеми клиентами"
+        )
+    }
+
+    func testTheRunningModeIsShownAsAFactNotAsASetting() throws {
+        let source = try securityView()
+        XCTAssertTrue(
+            source.contains("proxy.tls == .tls"),
+            "строка о шифровании должна читать режим работающего прокси, а не настройку"
+        )
+    }
+}
+
+/// приложение не ходит в сеть само.
+///
+/// Правило легко нарушить одной строкой: убрать `if` вокруг проверки, и
+/// каждый запуск начнёт обращаться к GitHub. Ни один другой тест этого
+/// не заметит — обращение молчаливое и успешное.
+final class LaunchNetworkGuardTests: XCTestCase {
+    private func rootView() throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/ChromaDBManagerApp/Views/RootView.swift")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw XCTSkip("исходники экрана не найдены рядом с тестами")
+        }
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    func testTheLaunchCheckIsGatedBySetting() throws {
+        let source = try rootView()
+        // Ищем именно вызов, а не имя настройки: `checkAppUpdatesOnLaunch`
+        // содержит его подстрокой, и поиск попадал в само условие.
+        guard let range = source.range(of: "environmentModel.checkAppUpdates(") else {
+            return XCTFail("проверка обновлений при запуске пропала из RootView")
+        }
+        let before = source[source.startIndex..<range.lowerBound].suffix(400)
+        XCTAssertTrue(
+            before.contains("if settings.configuration.checkAppUpdatesOnLaunch"),
+            "проверка при запуске обязана стоять под галочкой, а не выполняться всегда"
+        )
+        XCTAssertTrue(
+            source.contains("automatic: true"),
+            "молчаливая проверка не должна показывать ошибку поверх экрана"
+        )
+    }
 }

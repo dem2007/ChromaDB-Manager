@@ -12,11 +12,18 @@ public struct HTMLPage: Sendable, Hashable {
     public var headings: [DocumentNode]
     /// Ссылки со страницы, как они в ней записаны, — для обхода сайта.
     public var links: [String]
+    /// Те же ссылки, но с местом в тексте и уже абсолютные, — для метаданных
+    /// чанка. Повторы здесь **остаются**: одна и та же ссылка,
+    /// стоящая в двух местах, принадлежит двум разным чанкам.
+    public var placedLinks: [DocumentLink] = []
     /// Язык из `<html lang>`, если объявлен.
     public var language: String?
     /// Описание из `<meta name="description">` — им подписывают страницу
     /// в списке источника.
     public var summary: String?
+    /// На странице есть таблица. Без этого признака фильтр «документы
+    /// с таблицами» не видел ни одной веб-страницы.
+    public var hasTables: Bool = false
 
     public init(
         title: String? = nil,
@@ -161,11 +168,21 @@ public enum HTMLParser {
         collect(body ?? root, into: &builder)
         page.plainText = builder.finish()
         page.headings = builder.headings
+        page.hasTables = builder.sawTable
         // Повторы убираются **после** приведения к абсолютным: «/guide#part1»
         // и «/guide#part2» — разные строки и одна страница.
         var seen = Set<String>()
         page.links = builder.links.compactMap { absolute($0, base: baseURL) }
             .filter { seen.insert($0).inserted }
+        // А здесь повторы нужны: ссылка, стоящая в двух местах страницы,
+        // принадлежит двум разным чанкам. Ссылка внутрь той же
+        // страницы (`#часть`) источником не является.
+        page.placedLinks = builder.placed.compactMap { link in
+            guard !link.url.hasPrefix("#"), let url = absolute(link.url, base: baseURL) else {
+                return nil
+            }
+            return DocumentLink(url: url, start: link.start)
+        }
 
         // Верхний заголовок часто лежит в `<header>` — так устроена и Википедия,
         // и половина шаблонов CMS, — а `<header>` мы вырезаем вместе с меню.
@@ -185,6 +202,10 @@ public enum HTMLParser {
         private var text = ""
         private(set) var headings: [DocumentNode] = []
         private(set) var links: [String] = []
+        /// Те же ссылки, но с местом в тексте — для метаданных чанка.
+        private(set) var placed: [DocumentLink] = []
+        /// На странице была таблица — из этого получается `has_tables`.
+        var sawTable = false
         /// Нужен ли разрыв перед следующим куском текста. Не пишется сразу:
         /// иначе пустой блок оставит после себя лишнюю пустую строку.
         private var pendingBreak: String?
@@ -219,6 +240,35 @@ public enum HTMLParser {
 
         mutating func link(_ href: String) {
             links.append(href)
+            // Место ссылки в тексте — тем же счётом, что у заголовка: с учётом
+            // отложенного разрыва, иначе ссылка указывала бы на конец
+            // предыдущего абзаца.
+            placed.append(DocumentLink(
+                url: href, start: text.isEmpty ? 0 : text.count + (pendingBreak?.count ?? 0)
+            ))
+        }
+
+        /// Вложенные перечисления: `nil` — маркированное, число — счётчик
+        /// нумерованного. Стопкой, потому что списки вкладываются друг в друга.
+        private var lists: [Int?] = []
+
+        mutating func openList(ordered: Bool) { lists.append(ordered ? 0 : nil) }
+        mutating func closeList() { if !lists.isEmpty { lists.removeLast() } }
+
+        /// Маркер очередного пункта — тем же видом, каким его пишет Word
+        ///: «—» у маркированного, «1.» у нумерованного.
+        ///
+        /// До этого пункты HTML приходили голым текстом, без всякого признака
+        /// перечисления, и правило «вводная фраза списка» их не узнавало
+        /// вовсе — то есть работало на Markdown и Word, но не на вебе.
+        mutating func item() {
+            guard !lists.isEmpty else { return }
+            if let number = lists[lists.count - 1] {
+                lists[lists.count - 1] = number + 1
+                append("\(number + 1).")
+            } else {
+                append("—")
+            }
         }
 
         mutating func finish() -> String {
@@ -241,10 +291,40 @@ public enum HTMLParser {
                 return
             }
 
-            if blockElements.contains(name) { builder.breakLine("\n\n") }
+            // Таблица целиком — разметкой Markdown, тем же видом, что у книги
+            // Excel, Word и PDF (11.13). Раньше ячейки разделялись
+            // пробелом: колонки от слов становились неотличимы, и шапку
+            // таблицы нельзя было ни узнать, ни повторить в куске.
+            if name == "table" {
+                let rows = tableRows(of: element)
+                if rows.count > 1 {
+                    builder.breakLine("\n\n")
+                    builder.sawTable = true
+                    // Ссылки из ячеек — **до** выхода: дальше по дереву обход
+                    // не пойдёт, а у каталога ссылки на товары живут именно
+                    // в таблице. Без этого обход сайта переставал их видеть,
+                    // и страницы товаров молча не индексировались.
+                    for href in links(in: element) { builder.link(href) }
+                    builder.append(TableText.render(rows))
+                    builder.breakLine("\n\n")
+                    return
+                }
+            }
+
+            // Перечисление открывается до обхода детей и закрывается после,
+            // иначе вложенный список сбил бы счёт внешнему.
+            if name == "ul" || name == "ol" {
+                builder.breakLine("\n\n")
+                builder.openList(ordered: name == "ol")
+                for child in element.children ?? [] { collect(child, into: &builder) }
+                builder.closeList()
+                builder.breakLine("\n\n")
+                return
+            }
+
+            if name == "li" { builder.breakLine("\n\n"); builder.item() }
+            else if blockElements.contains(name) { builder.breakLine("\n\n") }
             else if name == "br" { builder.breakLine("\n") }
-            // Ячейки таблицы разделяются пробелом, а строки — переносом:
-            // склеенная таблица превращается в одно нечитаемое слово.
             else if name == "td" || name == "th" { builder.breakLine(" ") }
             else if name == "tr" { builder.breakLine("\n") }
 
@@ -256,6 +336,48 @@ public enum HTMLParser {
         if node.kind == .text, let value = node.stringValue {
             builder.append(value)
         }
+    }
+
+    /// Все адреса из поддерева — тем же порядком, каким их встретил бы обход.
+    private static func links(in element: XMLElement) -> [String] {
+        var result: [String] = []
+        func walk(_ node: XMLElement) {
+            if (node.name ?? "").lowercased() == "a",
+               let href = node.attribute(forName: "href")?.stringValue {
+                result.append(href)
+            }
+            for child in node.children ?? [] {
+                guard let child = child as? XMLElement else { continue }
+                walk(child)
+            }
+        }
+        walk(element)
+        return result
+    }
+
+    /// Строки таблицы: по ячейке на клетку, вложенные таблицы разворачиваются
+    /// в текст своей клетки.
+    private static func tableRows(of table: XMLElement) -> [[String]] {
+        var rows: [[String]] = []
+        func walk(_ element: XMLElement) {
+            for child in element.children ?? [] {
+                guard let node = child as? XMLElement else { continue }
+                let name = (node.name ?? "").lowercased()
+                if name == "tr" {
+                    let cells = (node.children ?? []).compactMap { cell -> String? in
+                        guard let cell = cell as? XMLElement,
+                              ["td", "th"].contains((cell.name ?? "").lowercased())
+                        else { return nil }
+                        return plainText(of: cell)
+                    }
+                    if !cells.isEmpty { rows.append(cells) }
+                } else {
+                    walk(node)
+                }
+            }
+        }
+        walk(table)
+        return rows
     }
 
     private static let blockElements: Set<String> = [

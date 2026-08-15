@@ -8,6 +8,15 @@ import Foundation
 public enum CellValue: Hashable, Sendable {
     case text(String)
     case number(Double)
+    /// Число, у которого формат — часть смысла: проценты, деньги,
+    /// единицы измерения.
+    ///
+    /// Отдельным случаем от `.number`, потому что 0.15 и «15 %» — это одно
+    /// число и два разных факта. Формат читался только ради дат, и ячейка,
+    /// показанная в книге как «15 %», уходила в текст документа числом 0.15:
+    /// запрос «скидка 15 %» такую строку не находил, а фильтр приходилось
+    /// писать как `> 0.1`.
+    case measured(Double, NumberUnit)
     case date(Date)
     case boolean(Bool)
     /// Missing, blank, or an error value like `#N/A` — all of which are «nothing
@@ -15,6 +24,15 @@ public enum CellValue: Hashable, Sendable {
     case empty
 
     public var isEmpty: Bool { self == .empty }
+
+    /// Число без оформления — то, с чем считают.
+    public var numericValue: Double? {
+        switch self {
+        case .number(let value): return value
+        case .measured(let value, let unit): return unit.displayed(value)
+        default: return nil
+        }
+    }
 
     /// What the user sees in a preview. Dates go out in ISO-8601, the format
     /// this project uses everywhere for dates in metadata.
@@ -24,14 +42,62 @@ public enum CellValue: Hashable, Sendable {
         case .number(let value):
             // 4820 rather than 4820.0: a whole number that came from a
             // spreadsheet is a whole number to the person reading it.
-            if value == value.rounded(), abs(value) < 1e15 {
-                return String(Int64(value))
-            }
-            return String(value)
+            return CellValue.plainNumber(value)
+        case .measured(let value, let unit):
+            return unit.rendered(value)
         case .date(let value): return ISO8601DateFormatter().string(from: value)
         case .boolean(let value): return value ? "true" : "false"
         case .empty: return ""
         }
+    }
+
+    static func plainNumber(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 { return String(Int64(value)) }
+        return String(value)
+    }
+}
+
+/// Оформление числа: во сколько раз показанное отличается от хранимого и что
+/// стоит рядом с ним.
+///
+/// Проценты в книге хранятся долей — 0.15 при показанных 15 %, — а деньги
+/// и единицы хранятся как есть и отличаются только подписью. Оба случая —
+/// одно и то же: множитель и подпись.
+public struct NumberUnit: Hashable, Sendable {
+    /// Во сколько раз показанное больше хранимого. Для процентов — 100.
+    public var scale: Double
+    /// Что стоит перед числом: `$`, `€`.
+    public var prefix: String
+    /// Что стоит после: `%`, `₽`, `кг`.
+    public var suffix: String
+
+    public init(scale: Double = 1, prefix: String = "", suffix: String) {
+        self.scale = scale
+        self.prefix = prefix
+        self.suffix = suffix
+    }
+
+    public static let percent = NumberUnit(scale: 100, suffix: "%")
+
+    /// Число так, как его видно в книге.
+    public func displayed(_ value: Double) -> Double {
+        guard scale != 1 else { return value }
+        // Округление до девятого знака: 0.15 × 100 в двоичной арифметике даёт
+        // 15.000000000000002, и это число ушло бы и в текст, и в метаданные.
+        return (value * scale * 1e9).rounded() / 1e9
+    }
+
+    /// Как эту ячейку читает человек: «15 %», «1 234,56 ₽».
+    ///
+    /// Пробел перед подписью — везде, кроме знака процента, приклеенного
+    /// к числу в исходном формате; но и там пробел не мешает поиску, а
+    /// единообразие важнее: «15 %» и «15%» токенизируются одинаково.
+    public func rendered(_ value: Double) -> String {
+        let number = CellValue.plainNumber(displayed(value))
+        var result = number
+        if !prefix.isEmpty { result = prefix + " " + result }
+        if !suffix.isEmpty { result += " " + suffix }
+        return result
     }
 }
 
@@ -86,6 +152,8 @@ public enum XLSXWarning: Hashable, Sendable {
     case rowLimitReached(limit: Int)
     /// Excel's non-existent 29 February 1900.
     case phantomLeapDay(cells: Int)
+    /// Объединения вбок, которые остались как есть.
+    case mergedSideways(cells: Int)
 
     public var text: String {
         switch self {
@@ -95,6 +163,8 @@ public enum XLSXWarning: Hashable, Sendable {
             return String(localized: "прочитаны первые \(limit) строк — лист длиннее предела")
         case .phantomLeapDay(let count):
             return String(localized: "ячеек с 29 февраля 1900 года: \(count) — такой даты не было, это известная ошибка Excel; значения оставлены числами")
+        case .mergedSideways(let count):
+            return String(localized: "объединений ячеек вбок: \(count) — значение оставлено в первой колонке диапазона; вниз объединения размазаны по строкам")
         }
     }
 }
@@ -131,8 +201,9 @@ public struct XLSXReader {
     public let sheets: [SheetInfo]
     /// Shared strings, indexed as the cells reference them.
     private let sharedStrings: [String]
-    /// Style index → whether that style formats its number as a date.
-    private let dateStyles: Set<Int>
+    /// Style index → whether that style formats its number as a date, and
+    /// which styles carry a unit.
+    private let styles: StyleTable
     private let epoch: Date
     /// True for the old 1904 workbooks, where serial 0 is 1904-01-01.
     public let uses1904Dates: Bool
@@ -143,16 +214,18 @@ public struct XLSXReader {
 
     public struct Limits: Sendable {
         public var maxRows: Int
-        /// Copy a merged cell's value into every cell of its range.
+        /// Размазывать ли объединения **вбок**.
         ///
         /// Off by default, as asks: in a data table a merged cell usually
         /// means a heading spanning columns, and repeating it into every row
         /// would invent values nobody typed. It earns its keep in «document»
         /// mode, where the sheet is rendered as a whole.
         ///
-        /// Only honoured by `rows(of:)`. The merge ranges are declared *after*
-        /// the data in the sheet part, so a streaming pass cannot know about
-        /// them while the rows go by.
+        /// Объединения **вниз** к этому переключателю отношения не имеют:
+        /// они размазываются всегда и в обоих проходах. «Категория»,
+        /// объединённая на двадцать строк, относится ко всем двадцати — это
+        /// не заголовок, а значение, и без него девятнадцать строк уходили
+        /// в базу без поля.
         public var spreadMergedCells: Bool
         public init(maxRows: Int = 200_000, spreadMergedCells: Bool = false) {
             self.maxRows = maxRows
@@ -187,8 +260,8 @@ public struct XLSXReader {
 
         sharedStrings = (try? archive.read("xl/sharedStrings.xml"))
             .map(Self.parseSharedStrings) ?? []
-        dateStyles = (try? archive.read("xl/styles.xml"))
-            .map(Self.parseDateStyles) ?? []
+        styles = (try? archive.read("xl/styles.xml"))
+            .map(Self.parseStyles) ?? StyleTable()
         container = archive
     }
 
@@ -210,9 +283,14 @@ public struct XLSXReader {
         _ onRow: @escaping (SheetRow) -> Bool
     ) throws -> [XLSXWarning] {
         let data = try container.read(sheet.path)
+        // Объединения — до строк: в файле они объявлены после данных,
+        // а знать о них надо на каждой строке.
+        let merges = Self.mergeRanges(in: data)
         let delegate = SheetParser(
             sharedStrings: sharedStrings,
-            dateStyles: dateStyles,
+            dateStyles: styles.dateStyles,
+            unitStyles: styles.units,
+            verticalMerges: merges.filter(\.isVertical),
             epoch: epoch,
             uses1904: uses1904Dates,
             limit: limits.maxRows,
@@ -228,8 +306,11 @@ public struct XLSXReader {
     public func rows(of sheet: SheetInfo, limits: Limits = Limits()) throws -> (rows: [SheetRow], warnings: [XLSXWarning]) {
         var result: [SheetRow] = []
         let data = try container.read(sheet.path)
+        let merges = Self.mergeRanges(in: data)
         let delegate = SheetParser(
-            sharedStrings: sharedStrings, dateStyles: dateStyles, epoch: epoch,
+            sharedStrings: sharedStrings, dateStyles: styles.dateStyles,
+            unitStyles: styles.units, verticalMerges: merges.filter(\.isVertical),
+            epoch: epoch,
             uses1904: uses1904Dates, limit: limits.maxRows,
             onRow: { result.append($0); return true }
         )
@@ -237,10 +318,19 @@ public struct XLSXReader {
         parser.delegate = delegate
         parser.parse()
 
-        if limits.spreadMergedCells, !delegate.mergedRanges.isEmpty {
-            result = Self.spreading(delegate.mergedRanges, over: result)
+        // Объединения вниз уже подставлены потоком. Вбок — только по просьбе:
+        // там это обычно заголовок над колонками, и размазать его значит
+        // выдумать значения, которых никто не писал.
+        var warnings = delegate.warnings
+        let others = merges.filter { !$0.isVertical }
+        if !others.isEmpty {
+            if limits.spreadMergedCells {
+                result = Self.spreading(others, over: result)
+            } else {
+                warnings.append(.mergedSideways(cells: others.count))
+            }
         }
-        return (result, delegate.warnings)
+        return (result, warnings)
     }
 
     /// Copies each merged range's top-left value across the range.
@@ -274,6 +364,17 @@ public struct XLSXReader {
             firstColumn = min(fromColumn, toColumn)
             lastColumn = max(fromColumn, toColumn)
         }
+
+        init(firstRow: Int, lastRow: Int, firstColumn: Int, lastColumn: Int) {
+            self.firstRow = firstRow
+            self.lastRow = lastRow
+            self.firstColumn = firstColumn
+            self.lastColumn = lastColumn
+        }
+
+        /// Объединение **вниз** по одной колонке: значение относится
+        /// к каждой строке диапазона, а не к одной верхней.
+        public var isVertical: Bool { firstColumn == lastColumn && lastRow > firstRow }
     }
 
     // MARK: - Column addressing

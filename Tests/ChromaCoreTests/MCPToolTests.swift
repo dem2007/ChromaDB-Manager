@@ -143,6 +143,9 @@ final class MCPToolTests: XCTestCase {
         if tool.name == MCPToolCatalogue.deleteDocuments.name {
             object["ids"] = .array([.string("d1")])
         }
+        if tool.name == MCPToolCatalogue.getFile.name {
+            object["file"] = .string("папка/файл.md")
+        }
         return .object(object)
     }
 
@@ -1340,7 +1343,9 @@ final class MCPPermissionMatrixTests: XCTestCase {
             return MCPSearchAnswer(documents: [], metric: nil, model: nil)
         }
         func documents(_ request: MCPDocumentsRequest) async throws -> MCPDocumentsAnswer {
-            touched.names.insert("get_documents")
+            // `get_file` ходит в базу тем же путём, что и `get_documents`,
+            // и различает их только просьба об упорядоченной выдаче.
+            touched.names.insert(request.orderedByChunkIndex ? "get_file" : "get_documents")
             return MCPDocumentsAnswer(documents: [], hasMore: false)
         }
         func add(_ request: MCPAddRequest) async throws -> MCPAddAnswer {
@@ -1363,7 +1368,7 @@ final class MCPPermissionMatrixTests: XCTestCase {
     }
 
     private static let readTools: Set<String> = [
-        "list_collections", "describe_collection", "search", "get_documents",
+        "list_collections", "describe_collection", "search", "get_documents", "get_file",
     ]
 
     private func arguments(_ name: String) -> JSONValue {
@@ -1371,6 +1376,7 @@ final class MCPPermissionMatrixTests: XCTestCase {
         if name == "search" { object["query"] = .string("запрос") }
         if name == "add_documents" { object["documents"] = .array([.object(["text": .string("текст")])]) }
         if name == "delete_documents" { object["ids"] = .array([.string("d1")]) }
+        if name == "get_file" { object["file"] = .string("папка/файл.md") }
         return .object(object)
     }
 

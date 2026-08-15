@@ -308,12 +308,40 @@ public struct DocumentUpdate {
     public let document: String?
     public let embedding: [Double]?
     public let metadata: ChromaMetadata?
+    /// Ключи, которые надо **убрать** из метаданных документа.
+    ///
+    /// Нужны потому, что `update` у ChromaDB метаданные **сливает**, а не
+    /// заменяет: ключ, которого нет в запросе, остаётся прежним. Проверено
+    /// на живом сервере — снятие пометки не доходило до базы вовсе, хотя
+    /// приложение сообщало об успехе. Убирает ключ только явный `null`,
+    /// и эти ключи как раз им и посылаются.
+    public let removedMetadataKeys: [String]
 
-    public init(id: String, document: String? = nil, embedding: [Double]? = nil, metadata: ChromaMetadata? = nil) {
+    public init(
+        id: String, document: String? = nil, embedding: [Double]? = nil,
+        metadata: ChromaMetadata? = nil, removedMetadataKeys: [String] = []
+    ) {
         self.id = id
         self.document = document
         self.embedding = embedding
         self.metadata = metadata
+        self.removedMetadataKeys = removedMetadataKeys
+    }
+
+    /// Обновление, после которого метаданные документа станут **ровно**
+    /// такими, как переданные.
+    ///
+    /// Разницу считает оно само: то, что было в прежних и чего нет в новых,
+    /// уходит на удаление. Считать её в каждом месте вызова — это забыть
+    /// её ровно там, где о ней не подумали; так дефект и появился.
+    public static func replacingMetadata(
+        id: String, document: String? = nil, embedding: [Double]? = nil,
+        metadata: ChromaMetadata, previous: ChromaMetadata?
+    ) -> DocumentUpdate {
+        DocumentUpdate(
+            id: id, document: document, embedding: embedding, metadata: metadata,
+            removedMetadataKeys: (previous ?? [:]).keys.filter { metadata[$0] == nil }.sorted()
+        )
     }
 }
 

@@ -60,6 +60,23 @@ final class SourcesViewModel: ObservableObject {
     /// an explicit "Подтвердить" rather than running straight away (rule 4,
     /// Приложение 5). План этого источника показывается, пока он здесь.
     @Published var pendingConfirmations: Set<UUID> = []
+    /// Массовое исчезновение файлов, ждущее ответа человека.
+    ///
+    /// Отдельно от `pendingConfirmations`: там подтверждают объём работы,
+    /// а здесь — что диск тот самый. Ответ «да» стоит восьми тысяч
+    /// документов, и спрашивать о нём тем же способом нельзя.
+    @Published var massRemoval: MassRemovalPrompt?
+
+    struct MassRemovalPrompt: Identifiable {
+        var id: UUID { source.id }
+        let source: DataSource
+        let missing: Int
+        let known: Int
+
+        var message: String {
+            String(localized: "С диска исчезло \(missing.plainDigits) файлов из \(known.plainDigits). Так обычно выглядит отключённый диск или сетевая папка, а не удаление руками — поэтому синхронизация остановлена и из базы ничего не удалено. Проверьте, тот ли диск подключён. Если файлы удалены намеренно, подтвердите — они попадут в «требуют решения», откуда их можно убрать из базы.")
+        }
+    }
     /// Snapshotted alongside `lastPlan` — `MetricsStore` is an actor, and the
     /// plan card reads this synchronously while drawing.
     @Published var lastPlanMetrics = MetricsSnapshot()
@@ -76,6 +93,9 @@ final class SourcesViewModel: ObservableObject {
     /// ничего не знала.
     @Published var manifestsRead: Set<UUID> = []
     @Published var pendingRemovals: [UUID: [PendingRemoval]] = [:]
+    /// Исчезнувшие строки таблиц — по источникам. Отдельно от файлов:
+    /// у них свой манифест, своя единица удаления и своё «оставить в базе».
+    @Published var pendingRowRemovals: [UUID: [PendingRowRemoval]] = [:]
     /// rows indexed from tables, per source. The file manifest knows
     /// nothing about them — a source of spreadsheets would otherwise report
     /// «ещё не синхронизирован» after indexing thousands of rows.
@@ -186,7 +206,11 @@ final class SourcesViewModel: ObservableObject {
             recursive: true,
             mapping: .folderToCollection,
             collectionName: CollectionNaming.sanitize(name),
-            embeddingModel: app.settings.configuration.defaultEmbeddingModel
+            embeddingModel: app.settings.configuration.defaultEmbeddingModel,
+            // Нарезка нового источника — та, что человек назначил умолчанием
+            //. Заводские значения — частный случай: умолчание есть
+            // всегда, вопрос лишь в том, чьё оно.
+            chunking: app.settings.configuration.chunkingDefaultForNewSources
         )
         beginEditing(source, isNew: true)
     }
@@ -208,6 +232,10 @@ final class SourcesViewModel: ObservableObject {
             mapping: .singleCollectionWithRelativePath,
             collectionName: CollectionNaming.sanitize(name),
             embeddingModel: app.settings.configuration.defaultEmbeddingModel,
+            // Нарезка нового источника — та, что человек назначил умолчанием
+            //. Заводские значения — частный случай: умолчание есть
+            // всегда, вопрос лишь в том, чьё оно.
+            chunking: app.settings.configuration.chunkingDefaultForNewSources,
             git: GitSourceSettings()
         )
         beginEditing(source, isNew: true)
@@ -225,6 +253,10 @@ final class SourcesViewModel: ObservableObject {
             mapping: .folderToCollection,
             collectionName: "web",
             embeddingModel: app.settings.configuration.defaultEmbeddingModel,
+            // Нарезка нового источника — та, что человек назначил умолчанием
+            //. Заводские значения — частный случай: умолчание есть
+            // всегда, вопрос лишь в том, чьё оно.
+            chunking: app.settings.configuration.chunkingDefaultForNewSources,
             web: WebSourceSettings()
         )
         beginEditing(source, isNew: true)
@@ -247,8 +279,76 @@ final class SourcesViewModel: ObservableObject {
             recursive: true,
             mapping: .folderToCollection,
             collectionName: CollectionNaming.sanitize(name),
-            embeddingModel: app.settings.configuration.defaultEmbeddingModel
+            embeddingModel: app.settings.configuration.defaultEmbeddingModel,
+            // Нарезка нового источника — та, что человек назначил умолчанием
+            //. Заводские значения — частный случай: умолчание есть
+            // всегда, вопрос лишь в том, чьё оно.
+            chunking: app.settings.configuration.chunkingDefaultForNewSources
         ), isNew: true)
+    }
+
+    // MARK: - Умолчания нарезки
+
+    /// Запоминает нарезку черновика как умолчание её стратегии.
+    ///
+    /// Возвращает то, что надо сказать вслух: настройка, изменившая поведение
+    /// **будущих** источников, обязана объявляться — иначе человек узнает
+    /// о ней при заведении следующей папки и не поймёт, откуда взялись числа.
+    @discardableResult
+    func makeChunkingDefault(_ app: AppEnvironment) -> String? {
+        guard let source = draft else { return nil }
+        var chunking = source.chunking
+        // Разделители живут в поле ввода до сохранения черновика: без разбора
+        // умолчанием стали бы вчерашние.
+        chunking.separators = Self.parseSeparators(draftSeparators, fallback: chunking.separators)
+        app.settings.configuration.setChunkingDefault(chunking)
+        app.log.record(
+            .info, "Источники",
+            "Умолчание нарезки: \(chunking.strategy.title) — \(chunking.summaryText)"
+        )
+        return String(localized: "Новые источники будут заводиться со стратегией «\(chunking.strategy.title)» и этими значениями. У других стратегий свои умолчания — они подставятся, когда переключите стратегию.")
+    }
+
+    /// Возвращает в черновик умолчание его стратегии.
+    @discardableResult
+    func takeChunkingDefault(_ app: AppEnvironment) -> String? {
+        guard var source = draft else { return nil }
+        let strategy = source.chunking.strategy
+        source.chunking = app.settings.configuration.chunkingDefault(for: strategy)
+        applyToDraft(source)
+        return app.settings.configuration.hasOwnChunkingDefault(for: strategy)
+            ? String(localized: "Взяты ваши умолчания для стратегии «\(strategy.title)».")
+            : String(localized: "Взяты заводские значения для стратегии «\(strategy.title)»: своих у неё нет.")
+    }
+
+    /// Забывает умолчание этой стратегии — обратно к заводскому.
+    @discardableResult
+    func forgetChunkingDefault(_ app: AppEnvironment) -> String? {
+        guard let strategy = draft?.chunking.strategy else { return nil }
+        guard app.settings.configuration.hasOwnChunkingDefault(for: strategy) else { return nil }
+        app.settings.configuration.clearChunkingDefault(for: strategy)
+        app.log.record(.info, "Источники", "Умолчание нарезки для «\(strategy.title)» сброшено к заводскому")
+        return String(localized: "Умолчание стратегии «\(strategy.title)» сброшено к заводскому. Настройки этого источника не изменились.")
+    }
+
+    /// Подставляет умолчания стратегии при её переключении — **только
+    /// у нового источника**.
+    ///
+    /// У заведённого источника числа его собственные: человек их однажды
+    /// подобрал, и подменять их при переключении туда-обратно значит терять
+    /// работу молча. Там для этого есть кнопка «Взять умолчание».
+    func chunkingStrategyChanged(to strategy: ChunkStrategy, app: AppEnvironment) {
+        guard draftIsNew, var source = draft, source.chunking.strategy == strategy else { return }
+        source.chunking = app.settings.configuration.chunkingDefault(for: strategy)
+        applyToDraft(source)
+    }
+
+    /// Кладёт источник в черновик вместе с полями, которые живут отдельно.
+    private func applyToDraft(_ source: DataSource) {
+        draft = source
+        draftSeparators = source.chunking.separators
+            .map { $0.replacingOccurrences(of: "\n", with: "\\n") }
+            .joined(separator: " | ")
     }
 
     func beginEditing(_ source: DataSource, isNew: Bool = false) {
@@ -409,6 +509,7 @@ final class SourcesViewModel: ObservableObject {
             var warned: [UUID: [ManifestEntry]] = [:]
             var tableRowCounts: [UUID: Int] = [:]
             var tableFileCounts: [UUID: Int] = [:]
+            var tableRemovals: [UUID: [PendingRowRemoval]] = [:]
             var git: [UUID: GitSyncService.Status] = [:]
             var blocked: [UUID: String] = [:]
             for source in sources {
@@ -434,6 +535,24 @@ final class SourcesViewModel: ObservableObject {
                     tableRowCounts[source.id] = rows
                     tableFileCounts[source.id] = tables.count
                 }
+                // Исчезнувшие строки таблиц — из того же прочитанного, без
+                // второго похода на диск.
+                let rowRemovals = tables.values
+                    .flatMap { file in
+                        file.pendingRemovals
+                            .filter { !$0.value.rows.isEmpty }
+                            .map { sheetName, removal in
+                                PendingRowRemoval(
+                                    relativePath: file.relativePath,
+                                    sheetName: sheetName,
+                                    collectionName: file.collectionName,
+                                    rows: removal.rows.sorted { $0.rowNumber < $1.rowNumber },
+                                    noticedAt: removal.noticedAt
+                                )
+                            }
+                    }
+                    .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
+                if !rowRemovals.isEmpty { tableRemovals[source.id] = rowRemovals }
                 if !manifest.problems.isEmpty { problems[source.id] = manifest.problems.sorted { $0.relativePath < $1.relativePath } }
                 let warnedEntries = manifest.warnedEntries
                 if !warnedEntries.isEmpty { warned[source.id] = warnedEntries }
@@ -455,6 +574,7 @@ final class SourcesViewModel: ObservableObject {
                     self.warnedFiles[source.id] = warned[source.id]
                     self.tableRows[source.id] = tableRowCounts[source.id]
                     self.tableFiles[source.id] = tableFileCounts[source.id]
+                    self.pendingRowRemovals[source.id] = tableRemovals[source.id]
                     self.gitStatus[source.id] = git[source.id]
                     self.recoveryBlocks[source.id] = blocked[source.id]
                     self.manifestsRead.insert(source.id)
@@ -664,6 +784,30 @@ final class SourcesViewModel: ObservableObject {
         }
     }
 
+    /// Человек подтвердил, что файлы удалены по-настоящему.
+    ///
+    /// Отдельная команда, а не флаг у обычного запуска: подтверждают её один
+    /// раз и на один прогон, и следующий запуск снова спросит, если пропажа
+    /// повторится.
+    func confirmMassRemoval(_ prompt: MassRemovalPrompt, app: AppEnvironment) {
+        let source = prompt.source
+        guard !isBusy(source.id) else { return }
+        app.log.record(
+            .warning, "Источники",
+            "Источник «\(source.name)»: человек подтвердил исчезновение \(prompt.missing.plainDigits) файлов из \(prompt.known.plainDigits) — запускается прогон, который отправит их в «требуют решения»"
+        )
+        beginOperation()
+        busySourceIDs.insert(source.id)
+        tasks[source.id] = Task { [weak self] in
+            await self?.run(source, app: app, reason: .manual, confirmedMassRemoval: true)
+            await MainActor.run {
+                self?.endOperation()
+                self?.busySourceIDs.remove(source.id)
+                self?.tasks[source.id] = nil
+            }
+        }
+    }
+
     func cancelPendingSync(_ sourceID: UUID) {
         pendingConfirmations.remove(sourceID)
         tableEstimates[sourceID] = nil
@@ -699,7 +843,9 @@ final class SourcesViewModel: ObservableObject {
         excludedPaths: Set<String> = [],
         reextraction: SourceSyncService.ReextractionRequest? = nil,
         /// a trial run on the first rows of each sheet.
-        tableRowLimit: Int? = nil
+        tableRowLimit: Int? = nil,
+        /// человек подтвердил, что файлы исчезли по-настоящему.
+        confirmedMassRemoval: Bool = false
     ) async -> SyncSummary? {
         guard let chroma = app.client else {
             let message = "Нет подключения к ChromaDB. Подключитесь на экране «Подключение»."
@@ -808,6 +954,7 @@ final class SourcesViewModel: ObservableObject {
                     tableRowLimit: tableRowLimit,
                     reason: reason,
                     preparedPlan: preparation?.plan ?? git?.plan,
+                    confirmedMassRemoval: confirmedMassRemoval,
                     yield: { await context.yieldToHigherPriority() }
                 ) { update in
                     Task { await context.report(progress: update.fraction, detail: Self.progressLine(update)) }
@@ -836,6 +983,10 @@ final class SourcesViewModel: ObservableObject {
             staleExtraction[source.id] = summary.staleExtraction.isEmpty ? nil : summary.staleExtraction
             var updated = source
             updated.lastSyncedAt = Date()
+            // Том запоминается по удачному прогону: именно он и есть
+            // «тот самый диск», с которым потом сверяются. У источника,
+            // заведённого прежней сборкой, он появится здесь же.
+            if let volume = SourceVolume.of(source.url) { updated.volume = volume }
             app.settings.upsert(source: updated)
             if reason.isAutomatic {
                 // An automatic run must never be invisible: it lands in the log
@@ -849,6 +1000,22 @@ final class SourcesViewModel: ObservableObject {
             app.notify(summary.notice)
         } catch is CancellationError {
             app.log.record(.warning, "Источники", "Синхронизация «\(source.name)» отменена")
+        } catch SyncError.massDisappearance(let missing, let known) {
+            // Не просто ошибка: у неё есть ответ, и спрашивать его надо
+            // отдельным вопросом, а не строкой в углу экрана.
+            // Автоматический прогон не спрашивает вовсе — некого: он молча
+            // останавливается и оставляет запись в журнале.
+            app.log.record(
+                .error, "Источники",
+                "Синхронизация «\(source.name)» остановлена: с диска исчезло \(missing.plainDigits) файлов из \(known.plainDigits). Проверьте, тот ли диск подключён."
+            )
+            if !reason.isAutomatic {
+                massRemoval = MassRemovalPrompt(source: source, missing: missing, known: known)
+            }
+            app.notify(.failure(
+                kind: .sync, subject: source.name,
+                reason: String(localized: "исчезло \(missing.plainDigits) файлов из \(known.plainDigits) — синхронизация остановлена")
+            ))
         } catch {
             if reason.isAutomatic {
                 app.log.record(.error, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) не удалась: \(app.describe(error))")
@@ -1212,6 +1379,49 @@ final class SourcesViewModel: ObservableObject {
                     self?.infoMessage = String(localized: "Файлов разобрано: \(handled.plainDigits), удалено документов — \(deleted.plainDigits).")
                 case .keepInDatabase:
                     self?.infoMessage = String(localized: "Файлов разобрано: \(handled.plainDigits) — документы оставлены в базе.")
+                case .postpone:
+                    break
+                }
+                self?.lastSummary = nil
+            }
+            self?.refreshManifests(app)
+        }
+    }
+
+    /// Решение об исчезнувших строках таблиц.
+    ///
+    /// Листами, а не строками: строк в листе бывают тысячи, а решение о них
+    /// одно — «это правка файла» или «это ошибка выгрузки». По листам их
+    /// и разбирают, по одному, чтобы обрыв на середине оставлял разобранными
+    /// те листы, до которых дошло.
+    func resolveRows(
+        _ removals: [PendingRowRemoval],
+        decision: SourceSyncService.RemovalDecision,
+        source: DataSource,
+        app: AppEnvironment
+    ) {
+        guard !removals.isEmpty else { return }
+        Task { [weak self] in
+            var deleted = 0
+            var failed = 0
+            for removal in removals {
+                do {
+                    deleted += try await app.syncService.resolve(
+                        rowRemoval: removal, decision: decision, source: source, chroma: app.client
+                    )
+                } catch {
+                    failed += 1
+                    app.report(error, category: "Таблицы")
+                    await MainActor.run { self?.errorMessage = app.describe(error) }
+                }
+            }
+            let handled = removals.count - failed
+            await MainActor.run {
+                switch decision {
+                case .deleteChunks:
+                    self?.infoMessage = String(localized: "Листов разобрано: \(handled.plainDigits), удалено строк из базы — \(deleted.plainDigits).")
+                case .keepInDatabase:
+                    self?.infoMessage = String(localized: "Листов разобрано: \(handled.plainDigits) — строки оставлены в базе.")
                 case .postpone:
                     break
                 }

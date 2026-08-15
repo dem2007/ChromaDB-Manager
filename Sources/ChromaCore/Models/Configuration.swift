@@ -223,6 +223,14 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// as «требует решения», the same as a file that vanished from disk, and its
     /// chunks wait for the user's decision (rule 1 of Приложение 5).
     public var excludedPaths: [String]
+    /// Том, на котором лежала папка источника при последнем удачном прогоне
+    ///. `nil` — источник заведён прежней сборкой: тогда том запомнится
+    /// при первом же сканировании.
+    ///
+    /// Хранится, потому что путь тома не опознаёт: `/Volumes/Backup` сегодня
+    /// и завтра бывает разными дисками, а «папка пуста» на чужом диске
+    /// означает «исчезли все файлы источника».
+    public var volume: SourceVolume?
     /// Saved column mappings for table sources.
     ///
     /// On the source rather than asked per file: a folder that indexes itself on
@@ -284,6 +292,7 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         iWorkExportEnabled: Bool = false,
         iWorkExportInAutomaticRuns: Bool = false,
         excludedPaths: [String] = [],
+        volume: SourceVolume? = nil,
         tableProfiles: [TableProfile] = [],
         tableProfileAssignments: [String: UUID] = [:],
         numbersExportEnabled: Bool = false,
@@ -314,6 +323,7 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         self.iWorkExportEnabled = iWorkExportEnabled
         self.iWorkExportInAutomaticRuns = iWorkExportInAutomaticRuns
         self.excludedPaths = excludedPaths
+        self.volume = volume
         self.tableProfiles = tableProfiles
         self.tableProfileAssignments = tableProfileAssignments
         self.numbersExportEnabled = numbersExportEnabled
@@ -367,6 +377,9 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         iWorkExportEnabled = try container.decodeIfPresent(Bool.self, forKey: .iWorkExportEnabled) ?? false
         iWorkExportInAutomaticRuns = try container.decodeIfPresent(Bool.self, forKey: .iWorkExportInAutomaticRuns) ?? false
         excludedPaths = try container.decodeIfPresent([String].self, forKey: .excludedPaths) ?? []
+        // Нечитаемая запись о томе — это «не знаем», а не отказ читать
+        // источник: проверка тома вернётся при первом же сканировании.
+        volume = (try? container.decodeIfPresent(SourceVolume.self, forKey: .volume)) ?? nil
         // `try?`, а не `try`: профили, записанные до (одно сопоставление
         // на профиль вместо вариантов), больше не читаются — так решено, а не
         // забыто. Строгий разбор уронил бы **весь** файл настроек из-за одного
@@ -423,6 +436,27 @@ public struct AppConfiguration: Codable, Sendable {
     /// Промпт оценки — редактируемый; схема ответа при этом фиксирована.
     public var modelJudgePrompt: JudgePrompt
     public var dataSources: [DataSource]
+    /// Умолчания нарезки — по одному набору на стратегию.
+    ///
+    /// Ключ — `ChunkStrategy.rawValue`. Хранится **у каждой стратегии своё**:
+    /// человек, настроивший «documentBased» под свои документы, переключает
+    /// стратегию на «semantic» и обратно, и возвращаться к заводским 512
+    /// токенам при каждом переключении незачем.
+    ///
+    /// Пусто — заводские значения `ChunkingConfiguration()`. Отдельного
+    /// «включить умолчания» нет: умолчание есть всегда, вопрос лишь в том,
+    /// чьё оно — наше или человека.
+    public var chunkingDefaults: [String: ChunkingConfiguration]
+    /// Стратегия, с которой заводится новый источник. `nil` — заводская
+    /// (`ChunkingConfiguration()`, то есть recursive).
+    public var defaultChunkingStrategy: ChunkStrategy?
+    /// Профили сопоставления, общие для всех источников.
+    ///
+    /// Источник по-прежнему может держать свои — и они главнее одноимённых
+    /// общих. Здесь лежат те, про которые человек при сохранении сказал «у
+    /// всего приложения»: одинаковые книги приходят в разные папки, и разметка
+    /// «отчёт ФЭО» не должна повторяться слово в слово в каждой из них.
+    public var sharedTableProfiles: [TableProfile]
     /// Global off switch for every automatic sync — for when LM Studio is busy
     /// with something else.
     public var automaticSyncPaused: Bool
@@ -440,10 +474,32 @@ public struct AppConfiguration: Codable, Sendable {
     /// user deliberately opened it, and put back to loopback by the emergency
     /// stop.
     public var proxyExposure: NetworkExposure
+    /// Шифруется ли трафик прокси. Включено: ключ клиента ходит
+    /// заголовком, и без TLS его видит любой, кто слушает сегмент сети.
+    ///
+    /// Выключить можно — бывают отладка и клиент, который не умеет доверять
+    /// самоподписанному сертификату, — но выключается это руками и с
+    /// предупреждением. Вместе с «слушать 0.0.0.0» выключенный TLS становится
+    /// на экране «Безопасность» активным предупреждением, а не строкой
+    /// настройки.
+    public var proxyUsesTLS: Bool
+    /// Спрашивать ли GitHub о новой версии **приложения** при запуске.
+    ///
+    /// Выключено. Правило то же, что у проверки обновлений движка: не молча
+    /// при старте. Дело не в трафике — программа, которая при каждом запуске
+    /// сама куда-то ходит, обязана об этом спросить. Встроенного
+    /// автообновления не будет никогда: проверка показывает, что вышло,
+    /// и открывает страницу релиза.
+    public var checkAppUpdatesOnLaunch: Bool
     /// Режим «только чтение» на весь MCP-сервер — независимо от прав
     /// отдельных ключей. На случай «пусть агент посмотрит, но ничего
     /// не трогает».
     public var mcpReadOnly: Bool
+    /// Отдаётся ли MCP-сервер по сети, на том же слушателе, что и прокси
+    /// (HTTP-режим). Выключено: stdio работает всегда и никуда
+    /// не смотрит наружу, а HTTP — это уже открытая дверь, и открывать
+    /// её должен человек.
+    public var mcpOverHTTP: Bool
     /// Notification Center is off until the user turns it on — permission is
     /// asked at that moment, not at launch.
     public var notificationsEnabled: Bool
@@ -491,11 +547,17 @@ public struct AppConfiguration: Codable, Sendable {
         modelJudgeModel: String? = nil,
         modelJudgePrompt: JudgePrompt = JudgePrompt(),
         dataSources: [DataSource] = [],
+        chunkingDefaults: [String: ChunkingConfiguration] = [:],
+        defaultChunkingStrategy: ChunkStrategy? = nil,
+        sharedTableProfiles: [TableProfile] = [],
         automaticSyncPaused: Bool = false,
         autoStartServerOnLaunch: Bool = true,
         proxyPort: Int = 8900,
         proxyExposure: NetworkExposure = .loopback,
+        proxyUsesTLS: Bool = true,
+        checkAppUpdatesOnLaunch: Bool = false,
         mcpReadOnly: Bool = false,
+        mcpOverHTTP: Bool = false,
         notificationsEnabled: Bool = false,
         operationNotifications: OperationNotificationPolicy = .problemsOnly,
         externalClients: [ExternalClient] = [],
@@ -526,11 +588,17 @@ public struct AppConfiguration: Codable, Sendable {
         self.modelJudgeModel = modelJudgeModel
         self.modelJudgePrompt = modelJudgePrompt
         self.dataSources = dataSources
+        self.chunkingDefaults = chunkingDefaults
+        self.defaultChunkingStrategy = defaultChunkingStrategy
+        self.sharedTableProfiles = sharedTableProfiles
         self.automaticSyncPaused = automaticSyncPaused
         self.autoStartServerOnLaunch = autoStartServerOnLaunch
         self.proxyPort = proxyPort
         self.proxyExposure = proxyExposure
+        self.proxyUsesTLS = proxyUsesTLS
+        self.checkAppUpdatesOnLaunch = checkAppUpdatesOnLaunch
         self.mcpReadOnly = mcpReadOnly
+        self.mcpOverHTTP = mcpOverHTTP
         self.notificationsEnabled = notificationsEnabled
         self.operationNotifications = operationNotifications
         self.externalClients = externalClients
@@ -568,6 +636,24 @@ public struct AppConfiguration: Codable, Sendable {
         return result
     }
 
+    /// То же самое для словаря: одна нечитаемая запись не уносит остальные.
+    ///
+    /// Отдельный разбор нужен потому, что `[String: T]` декодируется целиком:
+    /// один испорченный набор параметров означал бы потерю умолчаний у всех
+    /// стратегий разом.
+    static func decodeLeniently<T: Decodable, Key: CodingKey>(
+        _ container: KeyedDecodingContainer<Key>,
+        dictionaryForKey key: Key
+    ) -> [String: T] {
+        if let all = try? container.decodeIfPresent([String: T].self, forKey: key) { return all }
+        guard let nested = try? container.nestedContainer(keyedBy: StringKey.self, forKey: key) else { return [:] }
+        var result: [String: T] = [:]
+        for entry in nested.allKeys {
+            if let value = try? nested.decode(T.self, forKey: entry) { result[entry.stringValue] = value }
+        }
+        return result
+    }
+
     /// Tolerant decoding: a config written by an older build must not wipe the
     /// user's profiles just because a key was renamed.
     public init(from decoder: Decoder) throws {
@@ -590,15 +676,31 @@ public struct AppConfiguration: Codable, Sendable {
         // source with it, and the store then saves the empty list back over the
         // file. That is not a tolerant decoder, whatever the comment above says.
         dataSources = AppConfiguration.decodeLeniently(container, forKey: .dataSources)
+        // Поэлементно по той же причине: один нечитаемый набор параметров
+        // не должен уносить умолчания остальных стратегий.
+        chunkingDefaults = AppConfiguration.decodeLeniently(container, dictionaryForKey: .chunkingDefaults)
+        defaultChunkingStrategy = (try? container.decodeIfPresent(ChunkStrategy.self, forKey: .defaultChunkingStrategy)) ?? nil
+        // Тоже поэлементно: общий профиль — такая же ручная работа человека,
+        // как источник, и один нечитаемый не должен уносить остальные.
+        sharedTableProfiles = AppConfiguration.decodeLeniently(container, forKey: .sharedTableProfiles)
         automaticSyncPaused = try container.decodeIfPresent(Bool.self, forKey: .automaticSyncPaused) ?? false
         autoStartServerOnLaunch = try container.decodeIfPresent(Bool.self, forKey: .autoStartServerOnLaunch) ?? true
         proxyPort = try container.decodeIfPresent(Int.self, forKey: .proxyPort) ?? 8900
         // A config that cannot be read must not silently come back open to the
         // network: both of these fail closed.
         proxyExposure = ((try? container.decodeIfPresent(NetworkExposure.self, forKey: .proxyExposure)) ?? nil) ?? .loopback
+        // Третье, что обязано отказывать в безопасную сторону: нечитаемая или
+        // старая настройка означает «шифровать», а не «не шифровать».
+        proxyUsesTLS = ((try? container.decodeIfPresent(Bool.self, forKey: .proxyUsesTLS)) ?? nil) ?? true
+        // Отсутствует — значит выключено: сеть по собственному почину
+        // приложение не трогает.
+        checkAppUpdatesOnLaunch = ((try? container.decodeIfPresent(Bool.self, forKey: .checkAppUpdatesOnLaunch)) ?? nil) ?? false
         // Выключен по умолчанию: это ограничение, а не защита, и включаться
         // само оно не должно — иначе запись у агента однажды пропадёт молча.
         mcpReadOnly = ((try? container.decodeIfPresent(Bool.self, forKey: .mcpReadOnly)) ?? nil) ?? false
+        // И этот отказывает в закрытую сторону: нечитаемая настройка
+        // не должна открывать дверь наружу.
+        mcpOverHTTP = ((try? container.decodeIfPresent(Bool.self, forKey: .mcpOverHTTP)) ?? nil) ?? false
         notificationsEnabled = try container.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? false
         operationNotifications = ((try? container.decodeIfPresent(OperationNotificationPolicy.self, forKey: .operationNotifications)) ?? nil) ?? .problemsOnly
         externalClients = ((try? container.decodeIfPresent([ExternalClient].self, forKey: .externalClients)) ?? nil) ?? []
@@ -624,6 +726,52 @@ public struct AppConfiguration: Codable, Sendable {
         modelJudgeEnabled = try container.decodeIfPresent(Bool.self, forKey: .modelJudgeEnabled) ?? false
         modelJudgeModel = try container.decodeIfPresent(String.self, forKey: .modelJudgeModel)
         modelJudgePrompt = ((try? container.decodeIfPresent(JudgePrompt.self, forKey: .modelJudgePrompt)) ?? nil) ?? JudgePrompt()
+    }
+}
+
+// MARK: - Умолчания нарезки
+
+extension AppConfiguration {
+    /// Параметры, с которыми открывается эта стратегия: заданные человеком
+    /// или заводские.
+    ///
+    /// Стратегия проставляется поверх сохранённого набора: запись под ключом
+    /// «semantic», внутри которой почему-то стоит `strategy: .fixed`, должна
+    /// читаться как параметры semantic, а не молча переключать стратегию.
+    public func chunkingDefault(for strategy: ChunkStrategy) -> ChunkingConfiguration {
+        var configuration = chunkingDefaults[strategy.rawValue] ?? ChunkingConfiguration()
+        configuration.strategy = strategy
+        return configuration
+    }
+
+    /// Умолчание для нового источника: стратегия и её параметры.
+    public var chunkingDefaultForNewSources: ChunkingConfiguration {
+        chunkingDefault(for: defaultChunkingStrategy ?? ChunkingConfiguration().strategy)
+    }
+
+    /// Задано ли умолчание этой стратегии человеком. Нужно на экране: «как
+    /// у нас» и «как вы задали» — разные ответы, и второй можно отменить.
+    public func hasOwnChunkingDefault(for strategy: ChunkStrategy) -> Bool {
+        chunkingDefaults[strategy.rawValue] != nil
+    }
+
+    /// Запоминает параметры как умолчание своей стратегии — и её саму как
+    /// стратегию новых источников.
+    ///
+    /// Обе половины сразу: человек, нажавший «сделать умолчанием» на экране
+    /// источника, имеет в виду «новые источники заводить вот так», а не
+    /// «запомни числа, но заводи по-старому».
+    public mutating func setChunkingDefault(_ configuration: ChunkingConfiguration) {
+        chunkingDefaults[configuration.strategy.rawValue] = configuration
+        defaultChunkingStrategy = configuration.strategy
+    }
+
+    /// Возвращает заводское умолчание этой стратегии.
+    ///
+    /// Стратегию новых источников при этом не трогает: убрать свои числа
+    /// и остаться на этой стратегии — обычное желание.
+    public mutating func clearChunkingDefault(for strategy: ChunkStrategy) {
+        chunkingDefaults.removeValue(forKey: strategy.rawValue)
     }
 }
 
@@ -700,8 +848,11 @@ public struct ConfigurationLoss: Sendable, Hashable {
     public var sources: Int
     public var profiles: Int
     public var clients: Int
+    /// Общие профили сопоставления таблиц — такая же ручная работа,
+    /// как источник, и пропадать молча им нельзя.
+    public var tableProfiles: Int
 
-    public var total: Int { sources + profiles + clients }
+    public var total: Int { sources + profiles + clients + tableProfiles }
 
     /// Что именно исчезает — словами, для журнала и для экрана.
     public var summary: String {
@@ -709,13 +860,15 @@ public struct ConfigurationLoss: Sendable, Hashable {
         if sources > 0 { parts.append(String(localized: "источников: \(sources)")) }
         if profiles > 0 { parts.append(String(localized: "профилей: \(profiles)")) }
         if clients > 0 { parts.append(String(localized: "клиентов: \(clients)")) }
+        if tableProfiles > 0 { parts.append(String(localized: "общих профилей таблиц: \(tableProfiles)")) }
         return parts.joined(separator: ", ")
     }
 
-    public init(sources: Int = 0, profiles: Int = 0, clients: Int = 0) {
+    public init(sources: Int = 0, profiles: Int = 0, clients: Int = 0, tableProfiles: Int = 0) {
         self.sources = sources
         self.profiles = profiles
         self.clients = clients
+        self.tableProfiles = tableProfiles
     }
 
     /// Что теряется при переходе от одной конфигурации к другой.
@@ -727,7 +880,8 @@ public struct ConfigurationLoss: Sendable, Hashable {
         return ConfigurationLoss(
             sources: missing(old.dataSources, new.dataSources, id: \.id),
             profiles: missing(old.serverProfiles, new.serverProfiles, id: \.id),
-            clients: missing(old.externalClients, new.externalClients, id: \.id)
+            clients: missing(old.externalClients, new.externalClients, id: \.id),
+            tableProfiles: missing(old.sharedTableProfiles, new.sharedTableProfiles, id: \.id)
         )
     }
 
@@ -1109,6 +1263,15 @@ public final class SettingsStore: ObservableObject {
     }
 }
 
+
+/// Ключ словаря, каким бы он ни был, — для поэлементного разбора.
+struct StringKey: CodingKey {
+    var stringValue: String
+    var intValue: Int? { nil }
+
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { nil }
+}
 
 /// Consumes one element of an unkeyed container without caring what it is.
 private struct AnyDecodableSkip: Decodable {

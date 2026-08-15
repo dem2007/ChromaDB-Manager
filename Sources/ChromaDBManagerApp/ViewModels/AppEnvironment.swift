@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import SwiftUI
 import ChromaCore
 
@@ -48,11 +49,29 @@ final class AppEnvironment: ObservableObject {
     let dataWipe: DataWipeService
     let processManager: ChromaProcessManager
     let bindingService: ModelBindingService
+    /// Измеренные пределы чтения моделей: переживают перезапуск,
+    /// потому что проба стоит вызовов модели.
+    let embeddingLimits = EmbeddingLimitStore()
     let audit: AuditLog
     /// documents and collections deleted from the UI, kept as a local
     /// backup so a manual delete is reversible.
     let trash: TrashService
     let proxy: ProxyServer
+    /// Сертификат, которым прокси закрывает трафик. Отдельная служба,
+    /// а не поле прокси: сертификат живёт дольше запуска, его показывают
+    /// и экспортируют при остановленном прокси.
+    let tlsCertificates = TLSCertificateService()
+
+    /// Снимок того, что нужно экрану «Безопасность»: сертификат и адреса
+    /// машины в сети.
+    ///
+    /// Именно снимок, а не чтение по требованию. `securityAssessment` —
+    /// вычисляемое свойство, и экран обращается к нему по десятку раз за
+    /// отрисовку; читать ради каждого обращения файл с диска, разбирать DER
+    /// и обходить сетевые интерфейсы на главном потоке — это ровно та беда,
+    /// которую разбирали и.
+    @Published private(set) var certificateSnapshot: TLSCertificateInfo?
+    @Published private(set) var localAddressesSnapshot: [String] = []
     let notifier: Notifier
     let keychain = KeychainStore()
     /// Passwords for individual protected documents — its own Keychain
@@ -128,6 +147,11 @@ final class AppEnvironment: ObservableObject {
     let queueMirror = QueueMirror()
     /// Identifies the current connection so its tasks can be dropped with it.
     @Published private(set) var connectionID: UUID?
+
+    /// Подписка, которой общие профили таблиц доезжают до службы
+    /// синхронизации. Держится здесь, потому что живёт столько же,
+    /// сколько само окружение.
+    private var sharedTableProfilesWatch: AnyCancellable?
 
     enum ConnectionState: Equatable {
         case disconnected
@@ -207,7 +231,7 @@ final class AppEnvironment: ObservableObject {
         self.maintenance = MaintenanceService(log: handler)
         self.dataWipe = DataWipeService(log: handler)
         self.processManager = ChromaProcessManager(log: handler)
-        self.bindingService = ModelBindingService(log: handler)
+        self.bindingService = ModelBindingService(log: handler, limits: embeddingLimits)
         let auditLog = AuditLog(maximumFileBytes: retention.bytesPerFile, log: handler)
         self.audit = auditLog
         self.proxy = ProxyServer(audit: auditLog, log: handler)
@@ -226,6 +250,20 @@ final class AppEnvironment: ObservableObject {
         // The switch is remembered, but permission is not: macOS may have been
         // revoked since, and `post` checks availability before it posts.
         notifier.isEnabled = settings.configuration.notificationsEnabled
+
+        // Общие профили сопоставления таблиц живут в настройках, а нужны
+        // фоновой службе синхронизации. Подпиской, а не вызовом
+        // из экрана: настройки меняются многими путями — правка на экране
+        // «Таблицы», перенос настроек H6, откат к прежней копии, — и один
+        // забытый вызов означал бы источник, который молча читается
+        // вчерашней разметкой. Первое значение приходит сразу при подписке.
+        let sync = syncService
+        sharedTableProfilesWatch = settings.$configuration
+            .map(\.sharedTableProfiles)
+            .removeDuplicates()
+            .sink { profiles in
+                Task { await sync.adopt(sharedTableProfiles: profiles) }
+            }
 
         // The proxy checks permissions against collection names and vector
         // sizes, and only the app has a ChromaDB client to ask for them.
@@ -281,12 +319,29 @@ final class AppEnvironment: ObservableObject {
     /// would eventually disagree about which port and which address.
     func startProxy() throws {
         guard let endpoint else { throw ProxyServer.ProxyError.notConnected }
+        // Сертификат выпускается по факту запуска, а не заранее: до первого
+        // запуска прокси он никому не нужен, а ключ в Keychain, созданный
+        // «на всякий случай», — лишняя запись в чужой связке.
+        var identity: SecIdentity?
+        if settings.configuration.proxyUsesTLS {
+            do {
+                try tlsCertificates.ensure()
+                identity = try tlsCertificates.identity()
+            } catch {
+                logHandler(.error, "Прокси", "TLS не включился: \(describe(error))")
+                throw ProxyServer.ProxyError.tlsUnavailable
+            }
+        }
         try proxy.start(
             upstreamHost: endpoint.host,
             upstreamPort: endpoint.port,
             listenPort: settings.configuration.proxyPort,
-            exposure: settings.configuration.proxyExposure
+            exposure: settings.configuration.proxyExposure,
+            identity: identity
         )
+        // Сертификат мог только что появиться, а адрес машины — смениться
+        // с прошлого запуска.
+        refreshSecuritySnapshot()
     }
 
     // MARK: - Security
@@ -294,6 +349,14 @@ final class AppEnvironment: ObservableObject {
     /// What the «Безопасность» screen shows. Only servers this app started are
     /// judged: someone else's instance is not ours to bind, and the proxy
     /// refuses to be opened in front of one anyway.
+    /// Обновляет снимок. Дёшево и явно: вызывается там, где эти сведения
+    /// действительно могли измениться, — при запуске прокси, при выпуске
+    /// сертификата и при открытии экрана.
+    func refreshSecuritySnapshot() {
+        certificateSnapshot = tlsCertificates.current()
+        localAddressesSnapshot = LocalNetwork.addresses()
+    }
+
     var securityAssessment: SecurityAssessment {
         SecurityAssessment(
             exposure: settings.configuration.proxyExposure,
@@ -304,7 +367,11 @@ final class AppEnvironment: ObservableObject {
             serverPort: processManager.isRunning ? processManager.endpoint?.port : nil,
             clients: settings.configuration.externalClients,
             proxyUptime: proxy.startedAt.map { Date().timeIntervalSince($0) },
-            sawExternalRequest: proxy.sawExternalRequest
+            sawExternalRequest: proxy.sawExternalRequest,
+            usesTLS: settings.configuration.proxyUsesTLS,
+            certificate: certificateSnapshot,
+            localAddresses: localAddressesSnapshot,
+            runningWithTLS: proxy.state.isRunning ? proxy.tls == .tls : nil
         )
     }
 
@@ -342,7 +409,11 @@ final class AppEnvironment: ObservableObject {
     }
 
     /// «Последняя активность» in the client list.
-    private func noteClientSeen(_ id: UUID) {
+    ///
+    /// Не `private`: отмечает не только прокси, но и MCP-сервер —
+    /// ключ, которым агент только что искал, обязан перестать выглядеть
+    /// «ещё не подключался».
+    func noteClientSeen(_ id: UUID) {
         guard let client = settings.configuration.client(id: id) else { return }
         // Writing on every request would rewrite the config file constantly.
         guard Date().timeIntervalSince(client.lastSeenAt ?? .distantPast) > 30 else { return }

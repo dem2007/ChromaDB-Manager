@@ -459,11 +459,16 @@ public actor ChromaClient {
         offset: Int = 0,
         filter: DocumentFilter? = nil,
         includeEmbeddings: Bool = false,
+        /// Тексты документов. Выключается там, где нужен только перечень:
+        /// упорядочивание чанков файла читает метаданные всех чанков
+        /// сразу, и тянуть при этом сами тексты — это мегабайты ради одного
+        /// поля `chunk_index`.
+        includeDocuments: Bool = true,
         ids: [String]? = nil,
         caller: String = #fileID,
         callerLine: Int = #line
     ) async throws -> [DocumentRecord] {
-        var include = ["documents", "metadatas"]
+        var include = includeDocuments ? ["documents", "metadatas"] : ["metadatas"]
         if includeEmbeddings {
             include.append("embeddings")
             // not a refusal — export asks for exactly this, legitimately —
@@ -533,7 +538,14 @@ public actor ChromaClient {
         if updates.contains(where: { $0.metadata != nil }) {
             body["metadatas"] = try updates.map { update -> Any in
                 guard let metadata = update.metadata else { return NSNull() }
-                return try encodeToJSONObject(metadata)
+                var object = try encodeToJSONObject(metadata)
+                // Явный `null` — единственное, чем у ChromaDB удаляется ключ
+                // метаданных: `update` их **сливает**, и ключ, которого нет
+                // в запросе, остаётся прежним.
+                for key in update.removedMetadataKeys where object[key] == nil {
+                    object[key] = NSNull()
+                }
+                return object
             }
         }
         try await retryingStaleID(collectionID) { id in

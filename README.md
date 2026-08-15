@@ -74,6 +74,12 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
   finer-grained access can only live here.
 - Bytes are forwarded as they are, with no header rewriting, so the official `chromadb` Python
   client works through the proxy without a single change (verified).
+- **Traffic is encrypted.** The app issues the certificate itself — self-signed, valid for a
+  year, covering this machine's addresses; the SHA-256 fingerprint and the file for a client are
+  on the Security screen, and so is reissuing. TLS terminates at the proxy: from there the
+  request travels to ChromaDB over loopback, where there is nothing to encrypt and no reason to.
+  Verified live with the real `chromadb` client: with the certificate it works, without it the
+  client gets a TLS error rather than passing silently.
 - Request parsing was built from **captured traffic of the real client**, not from the API
   documentation: `get` and `query` are reads performed with POST, `count` is a GET with a query
   string, and deleting a collection goes by name where data operations go by UUID.
@@ -253,8 +259,19 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
   Adaptive (size by text density) and LLM-based (a chat model decides the boundaries).
   Parameters unfold once a strategy is chosen; the expensive strategies show a cost warning
   **before** the run. Token counts are approximate and marked with `≈`.
+- **Chunking defaults, one set per strategy.** Tune the parameters for your documents, press
+  "Make it the default", and new sources start with them; switching strategy fills in that
+  strategy's own defaults rather than the factory ones. An existing source keeps its own
+  numbers — a default is only put there by pressing a button.
 - Text extraction: plain text, Markdown, CSV and code directly; other formats are in the
   "Document formats" block below.
+- **The environment cannot cost you data.** A source remembers its **volume** (by UUID, not
+  by path: `/Volumes/Backup` is a different disk on different days) — a different or unmounted
+  volume, and synchronisation does not start at all. If more than half the files have vanished
+  from disk, the run stops and the "needs a decision" list is **not built**: that is what an
+  unmounted disk looks like, not a person's work, and confirming it takes a separate question.
+  A large file being copied right now is not read half-way; an iCloud file with no content is
+  marked "needs downloading" and never downloaded silently; symbolic links are not indexed.
 - **Incremental synchronisation driven by a manifest.** A repeat run with nothing changed on
   disk creates no duplicates and recomputes no vectors; changing the chunking parameters or the
   model is a change too, and those files are re-chunked.
@@ -458,10 +475,14 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
 - **Synchronisation is row by row.** Editing one cell in a 20 000-row sheet re-embeds **one**
   row; changing only metadata (price, warehouse) costs no vector at all. A row that disappeared
   is not deleted but goes to "needs a decision".
-- **A mapping profile** is saved with the source and recognised by its set of headers. A file
-  with a different set of columns is not half-indexed — it goes to "needs a decision" with the
-  difference spelled out: which profile came closest, which columns are missing, which are
-  extra.
+- **A mapping profile** is recognised by its set of headers. A file without the text or key
+  column is not half-indexed — it goes to "needs a decision" with the difference spelled out:
+  which profile came closest, which columns are missing, which are extra. A missing metadata
+  column does not stop an assigned profile from reading the sheet, but it is named in the
+  report: those records will have no filter on it.
+- **A profile is kept where you say:** with this source, or with the whole app. The second is
+  for identical workbooks arriving in different folders — the mapping is not repeated in each
+  of them. A source's own profile wins over a shared one of the same name.
 - **A profile describes the whole workbook.** Inside it are variants, one per sheet: "Goods and
   services" is read by its own mapping, "Financials" next to it by another, and it is one
   profile because it is one file.
@@ -741,6 +762,12 @@ Agent applications (Claude Desktop, Claude Code and other MCP clients) connect t
 through **tools**, not through API calls. The app raises an MCP server itself while it is
 running; the agent talks to it through a `chromadb-mcp` helper inside the bundle.
 
+**In two ways.** By default only through that helper — that is, from this Mac. The
+"Serve MCP over the network" switch on the MCP card raises a `/mcp` endpoint on the same
+port and the same keys as the proxy, so an agent on another machine connects to something
+like `https://192.168.1.42:8900/mcp`. Off by default: stdio never faces outward at all,
+while HTTP is already an open door.
+
 **How this differs from the stage-3 proxy, and why it is better for agents.** The proxy exposes
 ChromaDB's own REST API — the same one any library client uses. An agent does not read that
 documentation: it reads tool descriptions. But that is not the main difference.
@@ -758,12 +785,14 @@ metric; long documents are truncated **with a mark**, not silently.
 **The tools.** `list_collections` and `describe_collection` (metadata fields with types and
 example values — without them a model builds filters by guesswork), `search` (by text, with a
 metadata filter in ChromaDB syntax and by substring), `get_documents` (by identifier or by
-page), `add_documents` and `delete_documents`. Creating and deleting collections through MCP is
-not possible at all.
+page), `get_file` (every chunk of one file **in order**, page by page, with the total and the
+next `offset` — it is the only tool that guarantees order), `add_documents` and
+`delete_documents`. Creating and deleting collections through MCP is not possible at all.
 
 **Permissions are the same keys the proxy uses**, on the "Clients" screen: a whitelist of
 collections, read, write, a separate permission to delete, rate and volume limits, a ceiling on
-the number of results, and a decision on whether smart search works for that key. A collection
+the number of results, character ceilings per document and per response (an agent hits those
+sooner than the result count), and a decision on whether smart search works for that key. A collection
 outside the access list is invisible and answers "not found" — the existence of somebody else's
 collection is not disclosed. A separate "read-only for all keys" switch revokes writing for
 everyone at once.
@@ -878,13 +907,17 @@ only if it is on screen at that moment — the app stores only its hash.
   `127.0.0.1` exclusively. Anyone who bypasses the proxy and reaches the database port directly
   from the same machine reaches the database with no permissions at all; the protection is
   designed against the network, not against other users of this Mac.
-- **Proxy traffic is not encrypted.** The proxy listens over plain HTTP, so a client key
-  travels in clear text and is visible to whoever listens on the segment. Opening the proxy to
-  the network only makes sense on a network you trust. TLS with a self-signed certificate will
-  arrive together with a signed build for distribution — the certificate's private key lives in
-  the Keychain, and access to it is unstable with an ad-hoc signature, so doing TLS before a
-  stable signature means doing it twice. Listening on `127.0.0.1` without encryption is fine:
-  the traffic never leaves the machine.
+- **The proxy certificate is self-signed, deliberately.** Encryption is on by default, the app
+  issues the certificate itself (Security framework, no third-party libraries), and the private
+  key lives in the Keychain and never leaves it. A client has to trust that certificate
+  explicitly — by file or by SHA-256 fingerprint, both available on the Security screen. The
+  earlier worry that Keychain access would be unstable under an ad-hoc signature did not
+  materialise in live testing: the app creates and uses the key itself, and no password prompt
+  appears.
+- **The unencrypted mode remains**, but it is turned on by hand. Listening on `127.0.0.1`
+  without TLS is fine — that traffic never leaves the machine. A proxy open to the network
+  without TLS is the loudest warning the Security screen has: the client key travels in a
+  header and is visible to whoever listens on the segment.
 - Notifications only work in an assembled app (`Scripts/build-app.sh`): outside a bundle
   Notification Center is unavailable, and the app says so honestly instead of showing a switch.
 - Exposure through ngrok or an equivalent is not implemented — opening to the local network

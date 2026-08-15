@@ -110,20 +110,48 @@ final class ClientsViewModel: ObservableObject {
         statusMessage = String(localized: "Ключ скопирован. Сохраните его — приложение его не хранит.")
     }
 
-    func snippet(for key: String, port: Int) -> String {
-        """
+    /// Пример подключения — с той схемой, которая на самом деле включена.
+    ///
+    /// `chroma_server_ssl_verify` принимает путь к файлу сертификата и уходит
+    /// прямо в `httpx.Client(verify=…)` — проверено по исходникам установленной
+    /// библиотеки, а не по памяти. Совет про `REQUESTS_CA_BUNDLE`, который
+    /// напрашивался, был бы неверным: клиент ChromaDB давно ходит через httpx,
+    /// а не через requests.
+    func snippet(for key: String, port: Int, usesTLS: Bool = false) -> String {
+        guard usesTLS else {
+            return """
+            import chromadb
+            client = chromadb.HttpClient(
+                host="127.0.0.1", port=\(port.plainDigits),
+                headers={"X-Chroma-Token": "\(key)"},
+            )
+            """
+        }
+        return """
         import chromadb
+        from chromadb.config import Settings
+
         client = chromadb.HttpClient(
-            host="127.0.0.1", port=\(port.plainDigits),
+            host="127.0.0.1", port=\(port.plainDigits), ssl=True,
             headers={"X-Chroma-Token": "\(key)"},
+            # Файл сертификата: «Безопасность» → «Сохранить сертификат…»
+            settings=Settings(chroma_server_ssl_verify="chromadb-manager.pem"),
         )
         """
     }
 
-    func copySnippet(port: Int) {
+    /// Кладёт строку в буфер и говорит об этом. Адрес MCP по сети берут
+    /// глазами и вставляют в чужую конфигурацию — набирать его руками негде.
+    func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        statusMessage = String(localized: "Скопировано: \(text)")
+    }
+
+    func copySnippet(port: Int, usesTLS: Bool = false) {
         guard let freshKey else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(snippet(for: freshKey.key, port: port), forType: .string)
+        NSPasteboard.general.setString(snippet(for: freshKey.key, port: port, usesTLS: usesTLS), forType: .string)
         statusMessage = String(localized: "Пример подключения скопирован.")
     }
 

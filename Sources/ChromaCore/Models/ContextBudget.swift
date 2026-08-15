@@ -52,7 +52,15 @@ public enum ContextBudget {
 
     public static func check(_ text: String, contextLength: Int?) -> ContextVerdict {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .empty }
-        let tokens = TokenEstimator.estimatedTokens(text)
+        // Пессимистичная оценка, а не обычная. Здесь ошибка в одну
+        // сторону безобидна — лишнее предупреждение, — а в другую означает
+        // молча обрезанный моделью текст. Замер на живом корпусе: 2.68 знака
+        // на токен для русского против 3.5, которые приложение считает
+        // «средними». По 3.5 текст в 21 400 знаков выглядит как 6114 токенов
+        // и укладывается в лимит 8192; на деле там 7990, то есть впритык.
+        let tokens = TokenEstimator.estimatedTokens(
+            text, charactersPerToken: TokenEstimator.pessimisticCharactersPerToken
+        )
 
         guard let limit = contextLength, limit > 0 else {
             return text.count > unknownLimitWarningCharacters

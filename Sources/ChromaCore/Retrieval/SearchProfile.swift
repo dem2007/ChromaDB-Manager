@@ -25,6 +25,8 @@ public enum RetrievalStage: String, Codable, Sendable, CaseIterable, Identifiabl
     case context
     /// A chat model reorders what is left.
     case rerank
+    /// Ручные пометки человека двигают список.
+    case marks
     /// Cut to `n_results`.
     case truncate
 
@@ -40,7 +42,10 @@ public enum RetrievalStage: String, Codable, Sendable, CaseIterable, Identifiabl
         case .promote: return 5
         case .context: return 6
         case .rerank: return 7
-        case .truncate: return 8
+        // Последнее слово перед обрезкой — за человеком: закреплённое им
+        // обязано попасть в выдачу, а не быть срезанным вместе с хвостом.
+        case .marks: return 8
+        case .truncate: return 9
         }
     }
 
@@ -57,6 +62,7 @@ public enum RetrievalStage: String, Codable, Sendable, CaseIterable, Identifiabl
         case .diversity: return String(localized: "Разнообразие")
         case .promote: return String(localized: "Подъём к родителю")
         case .context: return String(localized: "Расширение контекста")
+        case .marks: return String(localized: "Ручные пометки")
         case .rerank: return String(localized: "Переранжирование")
         case .truncate: return String(localized: "Усечение")
         }
@@ -219,6 +225,16 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     /// переключения режима в `<Instruct>` уезжает шаблон с `{documents}`.
     public var rerankInstruction: String
 
+    // MARK: - Stage 8: ручные пометки
+
+    /// Учитывать ли пометки человека при ранжировании.
+    ///
+    /// Включено: закреплённое поднимается, понижённое и устаревшее опускается.
+    /// Выключить это должно быть можно — иначе «почему этот документ первый»
+    /// перестало бы иметь ответ в самой выдаче, а пометки нужны и просто как
+    /// курирование базы, без влияния на порядок.
+    public var marksEnabled: Bool
+
     // MARK: - Stage 6: neighbours
 
     /// How many neighbouring chunks to attach on each side, 0 to 3.
@@ -259,6 +275,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         rerankMode: RerankMode = .chatSchema,
         rerankPrompt: String = "",
         rerankInstruction: String = "",
+        marksEnabled: Bool = true,
         contextWindow: Int? = nil
     ) {
         self.id = id
@@ -276,6 +293,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         self.searchLevel = searchLevel
         self.collapseByParent = collapseByParent
         self.promotion = promotion
+        self.marksEnabled = marksEnabled
         self.diversityEnabled = diversityEnabled
         self.diversityLambda = diversityLambda
         self.rerankEnabled = rerankEnabled
@@ -301,6 +319,9 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
             promotion: .child,
             diversityEnabled: false,
             rerankEnabled: false,
+            // Выключенный умный поиск обязан давать ровно то же, что поиск
+            // этапа 2 — в том числе не двигать список пометками.
+            marksEnabled: false,
             contextWindow: 0
         )
     }
@@ -330,6 +351,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         case searchLevel, collapseByParent, promotion
         case diversityEnabled, diversityLambda
         case rerankEnabled, rerankModel, rerankMode, rerankPrompt, rerankInstruction
+        case marksEnabled
         case contextWindow
     }
 
@@ -368,6 +390,10 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         rerankPrompt = try container.decodeIfPresent(String.self, forKey: .rerankPrompt) ?? ""
         rerankInstruction = try container.decodeIfPresent(String.self, forKey: .rerankInstruction) ?? ""
 
+        // Профиль, записанный до появления пометок, ведёт себя как новый:
+        // пометки учитываются. Иначе человек, поставивший «закрепить», не
+        // увидел бы никакого действия — и решил бы, что оно не работает.
+        marksEnabled = try container.decodeIfPresent(Bool.self, forKey: .marksEnabled) ?? true
         contextWindow = try container.decodeIfPresent(Int.self, forKey: .contextWindow)
     }
 
@@ -388,6 +414,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         // A model has to be chosen: «включено, но без модели» is a setting that
         // pretends to work.
         if rerankEnabled && !rerankModel.isEmpty { stages.insert(.rerank) }
+        if marksEnabled { stages.insert(.marks) }
         // Only when the window was set by hand. The default depends on the
         // collection and is resolved later, when its shape is known.
         if let contextWindow, contextWindow > 0 { stages.insert(.context) }

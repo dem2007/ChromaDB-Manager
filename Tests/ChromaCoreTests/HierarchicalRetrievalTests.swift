@@ -277,7 +277,9 @@ final class HierarchicalRetrievalTests: XCTestCase {
 
         XCTAssertEqual(outcome.hits.map(\.id), ["d0", "d1", "d2", "d3"])
         let ran = outcome.diagnostics.stages.filter(\.ran).map(\.stage)
-        XCTAssertEqual(ran, [.candidates, .truncate])
+        // Пометки — стадия, включённая у нового профиля: она выполняется
+        // всегда и на неразмеченной коллекции ничего не двигает.
+        XCTAssertEqual(ran, [.candidates, .marks, .truncate])
         for stage in [RetrievalStage.collapse, .promote] {
             let report = outcome.diagnostics.stages.first { $0.stage == stage }
             XCTAssertEqual(report?.note, "коллекция нарезана одним уровнем")

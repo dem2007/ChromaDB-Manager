@@ -44,6 +44,46 @@ final class EnvironmentViewModel: ObservableObject {
         backups = app.backupService.list()
     }
 
+    // MARK: - Обновления приложения
+
+    /// Итог последней проверки. `nil` — ещё не проверяли: это третье
+    /// состояние, и показывать его как «актуальна» было бы враньём.
+    @Published var appUpdate: AppUpdateOutcome?
+    @Published var isCheckingAppUpdate = false
+    @Published var appUpdateError: String?
+
+    /// Спрашивает GitHub о новой версии приложения.
+    ///
+    /// `automatic` отличает проверку при запуске от нажатия кнопки: молчаливая
+    /// проверка не должна выводить сообщение об ошибке поверх экрана, с которым
+    /// человек работает. Ошибку она пишет в журнал и остаётся ни с чем —
+    /// недоступный GitHub не повод беспокоить.
+    func checkAppUpdates(_ app: AppEnvironment, automatic: Bool = false) async {
+        guard !isCheckingAppUpdate else { return }
+        isCheckingAppUpdate = true
+        appUpdateError = nil
+        defer { isCheckingAppUpdate = false }
+        do {
+            let outcome = try await AppUpdateChecker().check()
+            appUpdate = outcome
+            switch outcome {
+            case .available(let release, let current):
+                app.logHandler(.info, "Приложение", "Доступна версия \(release.version) (установлена \(current))")
+            case .upToDate(let current):
+                app.logHandler(.info, "Приложение", "Установлена последняя версия: \(current)")
+            case .unknownCurrentVersion:
+                app.logHandler(.info, "Приложение", "Версия приложения неизвестна — сборка запущена не из бандла")
+            }
+        } catch {
+            app.logHandler(.warning, "Приложение", "Не удалось проверить обновления: \(error.localizedDescription)")
+            if !automatic { appUpdateError = app.describe(error) }
+        }
+    }
+
+    func openReleasePage(_ release: AppRelease) {
+        NSWorkspace.shared.open(release.pageURL)
+    }
+
     /// Explicit user action: this is the only place that reaches the network
     /// for version information.
     func checkForUpdates(_ app: AppEnvironment) {

@@ -166,6 +166,18 @@ final class CollectionsViewModel: ObservableObject {
     /// asked, and is not part of reading one.
     @Published var showDiagnostics = false
 
+    // Поиск по нескольким коллекциям; ядро —, MCP —
+    /// Коллекции, которые ищутся **вместе с открытой**. Пусто — обычный поиск
+    /// по одной, тот же, что и был.
+    @Published var alsoSearchIn: Set<String> = []
+    /// По строке на каждую участвовавшую коллекцию: сколько нашла и не
+    /// отказала ли. Коллекция, промолчавшая из-за ошибки, обязана быть видна —
+    /// иначе она читается как коллекция, в которой ничего не нашлось.
+    @Published var searchReports: [MultiCollectionSearch.CollectionReport] = []
+    /// Сводка последнего многоколлекционного запроса: сколько коллекций
+    /// ответило и сколько раз считался вектор.
+    @Published var searchSummary: String?
+
     // Search profiles
     @Published var profiles: [SearchProfile] = []
     /// The one the collection searches with. Switching it here is what E0.2
@@ -348,6 +360,13 @@ final class CollectionsViewModel: ObservableObject {
         selectedID = collection.id
         hits = []
         lastRetrieval = nil
+        // Выбор соседних коллекций относился к прежней открытой:
+        // среди них может оказаться и та, которую только что открыли, —
+        // тогда следующий запрос обыскал бы её дважды. Отчёт по коллекциям
+        // тоже про прошлый запрос и рядом с новой выдачей читается неверно.
+        alsoSearchIn = []
+        searchReports = []
+        searchSummary = nil
         vectorPreviews = [:]
         refreshSavedFilters(app)
         reloadProfiles(app)
@@ -990,9 +1009,13 @@ final class CollectionsViewModel: ObservableObject {
                 // Editing keeps whatever provenance the document had; one that
                 // arrives without the field was made outside this app, and the
                 // write we are doing anyway is where that gets recorded.
-                metadata.carryOrigin(from: documents.first { $0.id == existingID }?.metadata)
+                let previous = documents.first { $0.id == existingID }?.metadata
+                metadata.carryOrigin(from: previous)
                 try await client.updateDocuments(collectionID: collection.id, updates: [
-                    DocumentUpdate(id: existingID, document: text, embedding: vector, metadata: metadata)
+                    DocumentUpdate.replacingMetadata(
+                        id: existingID, document: text, embedding: vector,
+                        metadata: metadata, previous: previous
+                    )
                 ])
                 statusMessage = String(localized: "Документ \(existingID) обновлён, вектор пересчитан моделью \(model).")
             } else {
@@ -1043,8 +1066,8 @@ final class CollectionsViewModel: ObservableObject {
             return
         }
         var metadata = draft.metadata()
-        // `update` replaces the metadata wholesale, so provenance has to be
-        // carried over explicitly or an edit would erase it.
+        // Происхождение переносится руками: правка задаёт метаданные целиком,
+        // и поле, которого нет в форме, было бы удалено.
         metadata.carryOrigin(from: document.metadata)
         if let schema = schema(for: collection, app: app) {
             let validator = MetadataSchemaValidator()
@@ -1059,10 +1082,103 @@ final class CollectionsViewModel: ObservableObject {
 
         do {
             try await client.updateDocuments(collectionID: collection.id, updates: [
-                DocumentUpdate(id: document.id, metadata: metadata)
+                DocumentUpdate.replacingMetadata(
+                    id: document.id, metadata: metadata, previous: document.metadata
+                )
             ])
             statusMessage = String(localized: "Метаданные документа \(document.id) обновлены.")
             await loadDocuments(app, reset: true)
+        } catch {
+            errorMessage = app.describe(error)
+            app.report(error, category: "Коллекции")
+        }
+    }
+
+    // MARK: - Ручные пометки
+
+    /// Ставит или снимает пометку на документе.
+    ///
+    /// Пишет **только поля разметки**: остальные метаданные документа берутся
+    /// как есть и переписываются собой же. Перебирать их своими руками здесь
+    /// нельзя — обновление заменяет метаданные целиком, и потерянное поле
+    /// вернуть будет неоткуда.
+    /// - Parameter collectionName: коллекция результата при поиске по
+    /// нескольким. `nil` — открытая: в списке документов и в обычном
+    ///   поиске она одна.
+    func setMark(
+        _ mark: DocumentMark?, for document: DocumentRecord, app: AppEnvironment,
+        collectionName: String? = nil
+    ) async {
+        var marks = DocumentMarks(metadata: document.metadata)
+        // Повторное нажатие той же пометки снимает её: это переключатель,
+        // и «снять» не должно требовать отдельного пункта меню.
+        marks.mark = marks.mark == mark ? nil : mark
+        await writeMarks(marks, for: document, app: app, collectionName: collectionName)
+    }
+
+    /// Теги и заметка — **одной** записью.
+    ///
+    /// Двумя они не пишутся, и это не мелочь: каждая собирает пометки заново
+    /// из метаданных, которые были на экране до правки, — вторая запись
+    /// стёрла бы теги, записанные первой.
+    func setTagsAndNote(
+        tags raw: String, note: String, for document: DocumentRecord, app: AppEnvironment,
+        collectionName: String? = nil
+    ) async {
+        var marks = DocumentMarks(metadata: document.metadata)
+        marks.tags = DocumentMarks.parse(tags: raw)
+        marks.note = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        await writeMarks(marks, for: document, app: app, collectionName: collectionName)
+    }
+
+    private func writeMarks(
+        _ marks: DocumentMarks, for document: DocumentRecord, app: AppEnvironment,
+        collectionName: String?
+    ) async {
+        guard let client = app.client else { return }
+        // Пометка ставится на **ту** коллекцию, откуда пришёл документ.
+        // При поиске по нескольким открытая коллекция и коллекция результата
+        // — разные, а идентификаторы чанков считаются от пути внутри
+        // источника и совпадают у разных коллекций сплошь и рядом: запись
+        // «куда открыто» пометила бы чужой документ.
+        let target = collectionName.flatMap { name in collections.first { $0.name == name } }
+        guard let collection = target ?? selected else { return }
+        do {
+            // `replacingMetadata`, а не простое обновление: снятая пометка
+            // обязана **исчезнуть** из документа, а ChromaDB метаданные
+            // сливает — без явного удаления ключа она оставалась в базе,
+            // и повторное нажатие «Закрепить» ничего не меняло, хотя
+            // приложение рапортовало об успехе.
+            try await client.updateDocuments(collectionID: collection.id, updates: [
+                DocumentUpdate.replacingMetadata(
+                    id: document.id,
+                    metadata: marks.applied(to: document.metadata),
+                    previous: document.metadata
+                )
+            ])
+            statusMessage = marks.isEmpty
+                ? String(localized: "Пометки с документа \(document.id) сняты.")
+                : String(localized: "Документ \(document.id): \(marks.summaryLine).")
+            app.log.record(
+                .info, "Коллекции",
+                "Пометки документа \(document.id) в «\(collection.name)»: \(marks.isEmpty ? "сняты" : marks.summaryLine)"
+            )
+            // Список документов перечитывается, только если правили открытую
+            // коллекцию: у чужой он не изменился, а страница на сотню
+            // документов стоит запроса.
+            if collection.id == selected?.id {
+                await loadDocuments(app, reset: true)
+            }
+            // Выдача на экране показывает пометку рядом с результатом, и после
+            // изменения она обязана показывать новую, а не ту, что была.
+            hits = hits.map { hit in
+                guard hit.id == document.id,
+                      hit.collectionName == nil || hit.collectionName == collection.name
+                else { return hit }
+                var updated = hit
+                updated.metadata = marks.applied(to: hit.metadata)
+                return updated
+            }
         } catch {
             errorMessage = app.describe(error)
             app.report(error, category: "Коллекции")
@@ -1285,7 +1401,16 @@ final class CollectionsViewModel: ObservableObject {
         // The panel must never explain the previous query while the new one is
         // on screen: stale diagnostics are worse than none.
         lastRetrieval = nil
+        searchReports = []
+        searchSummary = nil
         defer { isQuerying = false }
+
+        // Выбраны ещё коллекции — это другой запрос: вектор считается по разу
+        // на модель, а списки сливаются рангами.
+        if !alsoSearchIn.isEmpty {
+            await runQueryAcrossCollections(text: text, from: collection, app: app)
+            return
+        }
 
         do {
             // Конвейер собирается там же, где и для быстрого поиска из
@@ -1344,6 +1469,123 @@ final class CollectionsViewModel: ObservableObject {
             errorMessage = app.describe(error)
             app.report(error, category: "Коллекции")
         }
+    }
+
+    /// Тот же запрос сразу по нескольким коллекциям.
+    ///
+    /// Новой механики здесь нет и быть не должно: каждая коллекция ищется
+    /// **тем же** конвейером и своим профилем, вектор считается по разу
+    /// на модель, а списки сливаются тем же RRF, что и гибридный поиск, —
+    /// ранги сопоставимы между коллекциями даже с разными метриками, а
+    /// расстояния нет. Ровно так же это устроено у агента, и это
+    /// не совпадение: агент и человек обязаны получать одну выдачу.
+    private func runQueryAcrossCollections(
+        text: String, from collection: ChromaCollection, app: AppEnvironment
+    ) async {
+        guard let client = app.client else { return }
+        // Открытая коллекция впереди, повторы убраны: одна и та же коллекция
+        // дважды — это два одинаковых поиска, удвоенные очки её документов
+        // при слиянии и две неотличимые строки в отчёте.
+        var seen: Set<String> = []
+        let chosen = ([collection.name] + alsoSearchIn.sorted()).filter { seen.insert($0).inserted }
+        var targets: [MultiCollectionSearch.Target] = []
+        var reports: [MultiCollectionSearch.CollectionReport] = []
+
+        for name in chosen {
+            guard let candidate = collections.first(where: { $0.name == name }) else { continue }
+            do {
+                let prepared = try await app.prepareSearch(for: candidate)
+                targets.append(MultiCollectionSearch.Target(
+                    collectionID: candidate.id, collectionName: candidate.name,
+                    model: prepared.model, metric: candidate.space, profile: prepared.profile
+                ))
+            } catch {
+                // Коллекция без модели или с недоступной моделью не ищется —
+                // но и не роняет остальные, и об этом говорится строкой.
+                reports.append(MultiCollectionSearch.CollectionReport(
+                    name: candidate.name, found: 0, seconds: 0,
+                    failure: app.describe(error)
+                ))
+            }
+        }
+
+        guard !targets.isEmpty else {
+            searchReports = reports
+            errorMessage = String(localized: "Ни одна из выбранных коллекций не может искать: у них не указана модель или она недоступна.")
+            return
+        }
+
+        let lmStudio: LMStudioClient
+        do {
+            lmStudio = try app.makeLMStudioClient()
+        } catch {
+            errorMessage = app.describe(error)
+            return
+        }
+        let queue = app.queue
+        let connectionID = app.connectionID
+        let shapes = app.collectionShapes
+        let requested = numberOfResults
+        let queryFilter = applyFilterToQuery && !filter.isEmpty ? filter : nil
+
+        let search = MultiCollectionSearch(
+            embed: { query, model in
+                // Через очередь и с приоритетом человека у экрана: поиск
+                // во время синхронизации не отнимает у неё модель.
+                try await queue.run(QueueTicket(
+                    title: String(localized: "Поиск по нескольким коллекциям"),
+                    priority: .interactive,
+                    group: .lmStudio,
+                    connectionID: connectionID
+                )) { _ in
+                    try await lmStudio.embed(text: query, model: model)
+                }
+            },
+            search: { target, query, vector in
+                let pipeline = RetrievalPipeline(
+                    database: client, shapes: shapes, embed: { _ in vector }
+                )
+                return try await pipeline.run(
+                    RetrievalRequest(
+                        text: query,
+                        collectionID: target.collectionID,
+                        collectionName: target.collectionName,
+                        nResults: requested,
+                        filter: queryFilter,
+                        metric: target.metric
+                    ),
+                    profile: target.profile
+                )
+            }
+        )
+
+        let answer = await search.run(query: text, targets: targets, nResults: requested)
+        hits = answer.hits.map { hit in
+            var stripped = hit
+            stripped.embedding = nil
+            return stripped
+        }
+        searchReports = reports + answer.collections
+        searchSummary = answer.line
+        // Диагностика конвейера здесь одна на коллекцию и складывать её
+        // некуда: панель «почему такой результат» относится к одному поиску.
+        // Вместо неё — отчёт по коллекциям, он отвечает на тот же вопрос.
+        lastRetrieval = nil
+        statusMessage = String(localized: "Найдено результатов: \(hits.count.plainDigits) по \(targets.count.plainDigits) коллекциям.")
+        app.log.record(
+            .info, "Коллекции",
+            "Запрос по нескольким коллекциям (\(chosen.joined(separator: ", "))): \(answer.line)"
+        )
+        app.queryHistory.record(QueryHistoryEntry(
+            text: text,
+            collectionName: chosen.joined(separator: " + "),
+            profileName: targets.first?.profile.name ?? "",
+            profileID: targets.first?.profile.id,
+            filter: queryFilter,
+            resultCount: hits.count,
+            duration: answer.seconds
+        ))
+        reloadHistory(app)
     }
 
     // MARK: - Search profiles

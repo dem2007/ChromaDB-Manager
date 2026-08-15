@@ -252,6 +252,41 @@ final class ChromaIntegrationTests: XCTestCase {
         let vectorAfterMetadata = try await client.embeddings(collectionID: collection.id, ids: [target.id])[target.id]
         XCTAssertEqual(vectorBefore, vectorAfterMetadata)
 
+        // Снятое метаданное обязано **исчезнуть** из базы.
+        //
+        // ChromaDB при `update` метаданные сливает: ключ, которого нет
+        // в запросе, остаётся прежним. Из-за этого снятие пометки не доходило
+        // до базы вовсе, а приложение сообщало об успехе. Проверяется на живом
+        // сервере, потому что это его поведение, а не наше.
+        try await client.updateDocuments(collectionID: collection.id, updates: [
+            DocumentUpdate(id: target.id, metadata: ["topic": .string("edited"), "n": .int(-1), "_cdbm_mark": .string("pinned")])
+        ])
+        let pinned = try await client.getDocuments(collectionID: collection.id, ids: [target.id])
+        XCTAssertEqual(pinned.first?.metadata?["_cdbm_mark"], .string("pinned"))
+
+        // Простое обновление без ключа его **не** убирает — это и есть та
+        // особенность сервера, ради которой заведено удаление.
+        try await client.updateDocuments(collectionID: collection.id, updates: [
+            DocumentUpdate(id: target.id, metadata: ["topic": .string("edited"), "n": .int(-1)])
+        ])
+        let stillPinned = try await client.getDocuments(collectionID: collection.id, ids: [target.id])
+        XCTAssertEqual(
+            stillPinned.first?.metadata?["_cdbm_mark"], .string("pinned"),
+            "сервер сливает метаданные — если это изменилось, удаление ключа можно упростить"
+        )
+
+        // А `replacingMetadata` убирает.
+        try await client.updateDocuments(collectionID: collection.id, updates: [
+            DocumentUpdate.replacingMetadata(
+                id: target.id,
+                metadata: ["topic": .string("edited"), "n": .int(-1)],
+                previous: stillPinned.first?.metadata
+            )
+        ])
+        let unpinned = try await client.getDocuments(collectionID: collection.id, ids: [target.id])
+        XCTAssertNil(unpinned.first?.metadata?["_cdbm_mark"], "пометка обязана исчезнуть из базы")
+        XCTAssertEqual(unpinned.first?.metadata?["topic"], .string("edited"), "соседние поля уцелели")
+
         // Text edit with a new vector — the app always sends both, because the
         // server keeps the old embedding otherwise.
         try await client.updateDocuments(collectionID: collection.id, updates: [
