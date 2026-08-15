@@ -188,7 +188,7 @@ final class RetrievalPipelineTests: XCTestCase {
         let stages = outcome.diagnostics.stages
 
         XCTAssertEqual(stages.map(\.stage), RetrievalStage.allCases.sorted { $0.order < $1.order })
-        XCTAssertEqual(stages.filter(\.ran).map(\.stage), [.candidates, .truncate])
+        XCTAssertEqual(stages.filter(\.ran).map(\.stage), [.candidates, .marks, .truncate])
         // A stage that is absent from the report is indistinguishable from one
         // that ran and changed nothing.
         for report in stages where !report.ran {
@@ -341,7 +341,7 @@ final class RetrievalStageTests: XCTestCase {
     func testTheOrderIsTheOneTheSpecificationFixes() {
         XCTAssertEqual(
             RetrievalStage.allCases.sorted { $0.order < $1.order },
-            [.candidates, .fusion, .collapse, .diversity, .promote, .context, .rerank, .truncate]
+            [.candidates, .fusion, .collapse, .diversity, .promote, .context, .rerank, .marks, .truncate]
         )
     }
 

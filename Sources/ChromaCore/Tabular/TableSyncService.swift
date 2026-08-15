@@ -14,6 +14,12 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
     /// edited profile would silently apply only to files that happened to
     /// change afterwards.
     public var profilesSignature: String
+    /// Строки, которых больше нет в файле, — по листам.
+    ///
+    /// Ровно то же, что `pendingRemovals` у файлового манифеста, и по той же
+    /// причине: удалять их приложение не вправе, а молчать о них — значит
+    /// оставить в коллекции строки, которые продолжают находиться поиском.
+    public var pendingRemovals: [String: SheetRowRemoval]
 
     public init(
         relativePath: String,
@@ -21,7 +27,8 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         sheets: [String: SheetManifest] = [:],
         modifiedAt: Date = Date(),
         size: Int64 = 0,
-        profilesSignature: String = ""
+        profilesSignature: String = "",
+        pendingRemovals: [String: SheetRowRemoval] = [:]
     ) {
         self.relativePath = relativePath
         self.collectionName = collectionName
@@ -29,9 +36,70 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         self.modifiedAt = modifiedAt
         self.size = size
         self.profilesSignature = profilesSignature
+        self.pendingRemovals = pendingRemovals
+    }
+
+    /// Манифест прошлых версий читается как есть: списка на решение в нём
+    /// просто не было.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        relativePath = try container.decode(String.self, forKey: .relativePath)
+        collectionName = try container.decode(String.self, forKey: .collectionName)
+        sheets = try container.decodeIfPresent([String: SheetManifest].self, forKey: .sheets) ?? [:]
+        modifiedAt = try container.decodeIfPresent(Date.self, forKey: .modifiedAt) ?? Date()
+        size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
+        profilesSignature = try container.decodeIfPresent(String.self, forKey: .profilesSignature) ?? ""
+        pendingRemovals = try container.decodeIfPresent([String: SheetRowRemoval].self, forKey: .pendingRemovals) ?? [:]
     }
 
     public var rowCount: Int { sheets.values.reduce(0) { $0 + $1.rowCount } }
+}
+
+/// Исчезнувшие строки одного листа, ждущие решения человека.
+public struct SheetRowRemoval: Codable, Hashable, Sendable {
+    public var rows: [TableRowRecord]
+    /// Когда их хватились впервые. Не обновляется, пока строки не вернулись:
+    /// «замечено вчера» — это про пропажу, а не про последний прогон.
+    public var noticedAt: Date
+
+    public init(rows: [TableRowRecord], noticedAt: Date = Date()) {
+        self.rows = rows
+        self.noticedAt = noticedAt
+    }
+}
+
+/// Исчезнувшие строки одного листа — так, как их показывают человеку.
+///
+/// Собирается из манифеста при чтении: в файле хранится только то, что нельзя
+/// вывести, а путь и коллекция там и так есть.
+public struct PendingRowRemoval: Hashable, Sendable, Identifiable {
+    public var id: String { "\(relativePath)\u{0}\(sheetName)" }
+    public var relativePath: String
+    public var sheetName: String
+    public var collectionName: String
+    public var rows: [TableRowRecord]
+    public var noticedAt: Date
+
+    public init(
+        relativePath: String, sheetName: String, collectionName: String,
+        rows: [TableRowRecord], noticedAt: Date
+    ) {
+        self.relativePath = relativePath
+        self.sheetName = sheetName
+        self.collectionName = collectionName
+        self.rows = rows
+        self.noticedAt = noticedAt
+    }
+
+    /// Чем строки названы человеку: ключом, если он есть, иначе номером.
+    public var rowLabels: [String] {
+        rows.map { record in
+            if let key = record.rowKey, !key.isEmpty {
+                return String(localized: "строка \(record.rowNumber.plainDigits) · \(key)")
+            }
+            return String(localized: "строка \(record.rowNumber.plainDigits)")
+        }
+    }
 }
 
 /// A sheet the run could not process, and why.
@@ -64,6 +132,9 @@ public struct TableSyncReport: Sendable {
     public var disappeared: [TableRowRecord] = []
     public var problems: [SheetProblem] = []
     public var warnings: [String] = []
+    /// Строки, которые дают тот же документ, что и строка выше:
+    /// лист → группы повторов. Записана первая из каждой группы.
+    public var duplicates: [(sheetName: String, groups: [DuplicateRowGroup])] = []
     /// Sheets whose mapping changed: a re-index, offered rather than performed.
     public var sheetsNeedingReindex: [String] = []
 
@@ -223,9 +294,11 @@ public actor TableSyncService {
         sheets: [(sheet: SheetInfo, rows: [SheetRow])],
         manifest: TableFileManifest,
         context: Context
-    ) -> (plans: [(sheet: String, mapping: TableMapping, plan: SheetSyncPlan)], problems: [SheetProblem]) {
+    ) -> (plans: [(sheet: String, mapping: TableMapping, plan: SheetSyncPlan)], problems: [SheetProblem], warnings: [String]) {
         var plans: [(String, TableMapping, SheetSyncPlan)] = []
         var problems: [SheetProblem] = []
+        /// Листы, разобранные назначенным профилем с оговорками.
+        var looseMatches: [String] = []
 
         for (index, entry) in sheets.enumerated() {
             let (shape, match) = TableSyncService.claim(
@@ -237,6 +310,18 @@ public actor TableSyncService {
             switch match {
             case .matched(_, let variant):
                 mapping = variant.mapping
+                // Совпало не точно — сказать об этом. Недостающая колонка
+                // метаданных не мешает разобрать строку, но фильтра по ней
+                // у этих записей не будет, и узнавать об этом по пустой
+                // выдаче через месяц — худший из способов.
+                let acceptance = variant.accepts(columns: shape.columns, strict: false)
+                //
+                // Предупреждением, а не «проблемой»: лист разобран и записан,
+                // а `problems` попадают в «пропущенные» — сказать про
+                // проиндексированный лист, что он пропущен, было бы враньём.
+                if acceptance.matches, !acceptance.exact, !acceptance.missing.isEmpty {
+                    looseMatches.append(String(localized: "\(entry.sheet.name): в файле нет колонок \(acceptance.missing.joined(separator: ", ")) — метаданных по ним не будет"))
+                }
             case .ambiguous(let candidates):
                 problems.append(SheetProblem(
                     relativePath: context.relativePath, sheetName: entry.sheet.name,
@@ -285,7 +370,7 @@ public actor TableSyncService {
             if let limit = context.rowLimit { sheetPlan = sheetPlan.limitedToFirstRows(limit) }
             plans.append((entry.sheet.name, mapping, sheetPlan))
         }
-        return (plans, problems)
+        return (plans, problems, looseMatches)
     }
 
     // MARK: - Writing
@@ -306,9 +391,10 @@ public actor TableSyncService {
         var report = TableSyncReport()
         report.relativePath = context.relativePath
 
-        let (plans, problems) = plan(sheets: sheets, manifest: manifest, context: context)
+        let (plans, problems, looseMatches) = plan(sheets: sheets, manifest: manifest, context: context)
         report.problems = problems
         report.sheetsSkipped = problems.map(\.sheetName)
+        report.warnings.append(contentsOf: looseMatches)
 
         // a «документ» sheet is not a set of records. It is rendered to
         // text, cut by the source's own strategy, and — the part the section
@@ -391,14 +477,22 @@ public actor TableSyncService {
 
             // Only now the previous document of a row whose identity changed —
             // after the new one is safely written.
+            let updated = TableSyncPlanner.applying(sheetPlan, to: sheetManifest, mapping: mapping)
+            // …и только то, чего в манифесте после прогона уже нет.
+            // «Прежний» документ одной строки бывает **нынешним** документом
+            // другой: без этой проверки правка в файле уносила из базы живые
+            // строки, а манифест продолжал считать их записанными — то есть
+            // ни один следующий прогон их не возвращал.
+            let alive = Set(updated.documentIDs)
             let superseded = (sheetPlan.reembedded + sheetPlan.metadataOnly)
                 .filter { $0.previousID != $0.document.id }
                 .map(\.previousID)
+                .filter { !alive.contains($0) }
             if !superseded.isEmpty {
                 try await chroma.deleteDocuments(collectionID: context.collectionID, ids: superseded)
             }
 
-            sheetManifest = TableSyncPlanner.applying(sheetPlan, to: sheetManifest, mapping: mapping)
+            sheetManifest = updated
             manifest.sheets[sheetName] = sheetManifest
 
             report.sheetsIndexed.append(sheetName)
@@ -407,8 +501,44 @@ public actor TableSyncService {
             report.rowsMetadataOnly += sheetPlan.metadataOnly.count
             report.rowsUnchanged += sheetPlan.unchanged
             report.disappeared += sheetPlan.disappeared
+            // Список на решение — в манифест, а не только в отчёт:
+            // отчёт живёт до конца прогона, а решать человек будет потом.
+            // Вернулись строки на место — список чистится сам, как у файлов
+            //: пустой `disappeared` и есть «решать больше нечего».
+            if sheetPlan.disappeared.isEmpty {
+                manifest.pendingRemovals[sheetName] = nil
+            } else {
+                manifest.pendingRemovals[sheetName] = SheetRowRemoval(
+                    rows: sheetPlan.disappeared,
+                    noticedAt: manifest.pendingRemovals[sheetName]?.noticedAt ?? Date()
+                )
+            }
             if !sheetPlan.empty.isEmpty {
                 report.warnings.append(String(localized: "лист «\(sheetName)»: строк без текста пропущено \(sheetPlan.empty.count)"))
+            }
+            // Обрезанные по длине значения: считаются по колонкам,
+            // а не по строкам, — колонка одна на все сорок тысяч, и сорок
+            // тысяч одинаковых строк в отчёте прячут всё остальное.
+            let truncated = (sheetPlan.added + sheetPlan.reembedded.map(\.document)
+                             + sheetPlan.metadataOnly.map(\.document))
+                .flatMap(\.truncatedColumns)
+            if !truncated.isEmpty {
+                let byColumn = Dictionary(grouping: truncated, by: { $0 })
+                    .map { "\($0.key) — \($0.value.count.plainDigits)" }
+                    .sorted()
+                    .joined(separator: ", ")
+                report.warnings.append(String(localized: "лист «\(sheetName)»: значений обрезано по длине (\(RowMapper.metadataValueLimit.plainDigits) знаков) — \(byColumn)"))
+                log(.warning, "Таблицы",
+                    "Лист «\(sheetName)» файла \(context.relativePath): значения длиннее \(RowMapper.metadataValueLimit.plainDigits) знаков обрезаны в метаданных — \(byColumn). Полный текст стоит держать в колонке с ролью «текст».")
+            }
+            if !sheetPlan.duplicates.isEmpty {
+                report.duplicates.append((sheetName, sheetPlan.duplicates))
+                let rows = sheetPlan.duplicates.reduce(0) { $0 + $1.skipped.count }
+                let examples = sheetPlan.duplicates.prefix(5).map(\.line).joined(separator: "; ")
+                let tail = sheetPlan.duplicates.count > 5 ? String(localized: " и ещё \(sheetPlan.duplicates.count - 5)") : ""
+                report.warnings.append(String(localized: "лист «\(sheetName)»: строк-повторов пропущено \(rows) — \(examples)\(tail)"))
+                log(.warning, "Таблицы",
+                    "Лист «\(sheetName)» файла \(context.relativePath): \(rows.plainDigits) строк дают тот же документ, что строка выше, и записаны не были — \(examples)\(tail)")
             }
         }
 
@@ -515,15 +645,55 @@ extension TableSyncService {
         // Скрытые листы не индексируются и по назначению тоже.
         if let assigned, !sheet.isHidden {
             let admitting = assigned.variants.filter { $0.sheets.admits(sheetName: sheet.name, index: index) }
-            // Сначала — вариант, чьи колонки сошлись с прочитанным листом;
-            // если таких нет, первый подходящий по выбору листов: он и скажет,
-            // с какой строки читать шапку.
-            let byColumns = admitting.first { $0.headerSignature == TableProfile.signature(of: auto.columns) }
-            if let variant = byColumns ?? admitting.first {
-                let shape = variant.mapping.headerRow
+            // Шапка читается со строки, записанной в самом варианте: назначение
+            // должно работать и на файлах, где таблица начинается не сверху.
+            func shape(for variant: TableProfile.Variant) -> SheetShape {
+                // Разметку по буквам колонок автоопределение не воспроизведёт:
+                // заголовков в этой строке нет, оно и вернёт «не вышло».
+                // Читаем так же, как размечали, — иначе профиль работал бы
+                // только в редакторе.
+                if variant.mapping.usesColumnLetters {
+                    return SheetModeDetector.lettered(rows: rows, headerRow: variant.mapping.headerRow ?? 0)
+                }
+                return variant.mapping.headerRow
                     .flatMap { SheetModeDetector.shape(rows: rows, headerRow: $0) } ?? auto
-                return (shape, .matched(profile: assigned, variant: variant))
             }
+
+            // Точный вариант вперёд неточного, а неточный — вперёд ничего.
+            var loose: (TableProfile.Variant, SheetShape)?
+            for variant in admitting {
+                let found = shape(for: variant)
+                let acceptance = variant.accepts(columns: found.columns, strict: false)
+                guard acceptance.matches else { continue }
+                if acceptance.exact { return (found, .matched(profile: assigned, variant: variant)) }
+                if loose == nil { loose = (variant, found) }
+            }
+            if let (variant, found) = loose {
+                return (found, .matched(profile: assigned, variant: variant))
+            }
+
+            // **Ни один вариант не подошёл — и это отказ, а не повод взять
+            // первый попавшийся.** Раньше здесь стояло `admitting.first`:
+            // лист, для которого в профиле разбора нет, читался разметкой
+            // соседнего листа. С вариантом «любой подходящий лист» это
+            // означало, что один разбор перехватывал всю книгу — записи
+            // получались из чужих колонок, и человек видел «перемешанные
+            // настройки». Хуже того: лист, помеченный «не индексировать»,
+            // попадал в индекс под чужим вариантом.
+            if !admitting.isEmpty {
+                var names: [String] = []
+                for column in admitting.flatMap(\.requiredColumns) where !names.contains(column) {
+                    names.append(column)
+                }
+                return (auto, .needsDecision(
+                    reason: String(localized: "профиль «\(assigned.name)» назначен файлу, но ни один его вариант не подходит листу: нет колонок \(names.joined(separator: ", "))"),
+                    closest: assigned, missing: names, extra: []
+                ))
+            }
+            return (auto, .needsDecision(
+                reason: String(localized: "профиль «\(assigned.name)» назначен файлу, но про этот лист в нём ничего не сказано"),
+                closest: assigned, missing: [], extra: []
+            ))
         }
 
         let automatic = matching(auto)

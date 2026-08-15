@@ -43,6 +43,7 @@ struct SearchProfileSheet: View {
             diversity
             neighbours
             reranking
+            marks
         } actions: {
             Button(String(localized: "Отмена"), action: onCancel)
                 .buttonStyle(.chromaNormal)
@@ -210,6 +211,22 @@ struct SearchProfileSheet: View {
                             .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
                     }
                 }
+            }
+        }
+    }
+
+    private var marks: some View {
+        SectionCard(
+            title: String(localized: "8. Ручные пометки"),
+            subtitle: String(localized: "Закреплённое человеком поднимается, понижённое и устаревшее опускается. Пометки ставятся у документа и живут в его метаданных."),
+            help: String(localized: "Стадия идёт последней — после переранжирования и до усечения: закреплённый документ обязан попасть в выдачу, а не быть срезанным вместе с хвостом. Порядок внутри групп не меняется: пометка говорит «выше» и «ниже», а не «вместо».")
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(String(localized: "Учитывать пометки"), isOn: $profile.marksEnabled)
+                    .toggleStyle(.checkbox)
+                Text("Выключите, если пометки нужны только как разметка — для курирования базы и наборов оценки, — а порядок выдачи должен оставаться чисто векторным.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

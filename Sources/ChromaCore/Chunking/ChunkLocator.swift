@@ -8,16 +8,38 @@ public struct ChunkPlacement: Hashable, Sendable {
     public var headingPath: String?
     /// The chapter or slide this chunk came from.
     public var part: DocumentPart?
+    /// Вводная фраза списка, внутри которого начинается чанк.
+    ///
+    /// Уходит в строку контекста — то есть **в вектор, но не в документ**,
+    /// по тому же правилу, что заголовок раздела.
+    public var listLeadIn: String?
+    /// Адреса, на которые ссылается этот кусок документа.
+    ///
+    /// В метаданные, **не в текст и не в вектор**: адрес — это ссылка
+    /// на источник, а не слова, по которым ищут.
+    public var links: [String]
 
-    public init(start: Int, pageNumber: Int? = nil, headingPath: String? = nil, part: DocumentPart? = nil) {
+    public init(
+        start: Int, pageNumber: Int? = nil, headingPath: String? = nil,
+        part: DocumentPart? = nil, listLeadIn: String? = nil, links: [String] = []
+    ) {
         self.start = start
         self.pageNumber = pageNumber
         self.headingPath = headingPath
         self.part = part
+        self.listLeadIn = listLeadIn
+        self.links = links
     }
 
     /// Nothing to write into the chunk metadata.
-    public var isEmpty: Bool { pageNumber == nil && headingPath == nil && part == nil }
+    ///
+    /// Вводная фраза здесь не считается: в метаданные она не пишется вовсе,
+    /// и размещение, где есть только она, писать в базу нечем — но строку
+    /// контекста оно всё равно даёт, поэтому пустым не считается.
+    public var isEmpty: Bool {
+        pageNumber == nil && headingPath == nil && part == nil
+            && listLeadIn == nil && links.isEmpty
+    }
 }
 
 /// Finds each chunk back in its source text, so `page_number` and
@@ -59,18 +81,40 @@ public enum ChunkLocator {
     /// Placement plus what the document says about that offset.
     public static func placements(of chunks: [TextChunk], in document: ExtractedDocument) -> [Int: ChunkPlacement] {
         let offsets = offsets(of: chunks, in: document.plainText)
+        // Списки размечаются один раз на документ, а не на каждый чанк:
+        // это один проход по блокам, а чанков бывают тысячи.
+        let leadIns = ListLeadIns.leadIns(in: document.plainText)
+        // Ссылки перебираются по одному разу на чанк, а не на знак: их
+        // единицы даже в документе с оглавлением.
+        let links = document.links.sorted { $0.start < $1.start }
+        let lengths = Dictionary(uniqueKeysWithValues: chunks.map { ($0.index, $0.text.count) })
+
         var result: [Int: ChunkPlacement] = [:]
         for (index, start) in offsets {
+            let end = start + (lengths[index] ?? 0)
             let placement = ChunkPlacement(
                 start: start,
                 pageNumber: document.pageNumber(forCharacter: start),
                 headingPath: document.headingPath(forCharacter: start),
-                part: document.part(forCharacter: start)
+                part: document.part(forCharacter: start),
+                listLeadIn: ListLeadIns.leadIn(at: start, in: leadIns),
+                // Адрес принадлежит чанку, если ссылка стоит **внутри** его
+                // текста. У чанков есть перекрытие, и один адрес может
+                // достаться двоим — так и есть на самом деле: обоим он
+                // источник.
+                links: Self.distinct(links.filter { $0.start >= start && $0.start < end }.map(\.url))
             )
             guard !placement.isEmpty else { continue }
             result[index] = placement
         }
         return result
+    }
+
+    /// Адреса без повторов, в порядке появления: одна и та же ссылка стоит
+    /// в документе по многу раз, а в метаданных нужна один.
+    static func distinct(_ urls: [String]) -> [String] {
+        var seen: Set<String> = []
+        return urls.filter { seen.insert($0).inserted }
     }
 
     /// Chunks in document order, each searched from just after the previous one

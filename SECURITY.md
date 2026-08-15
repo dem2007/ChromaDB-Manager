@@ -43,10 +43,14 @@ branches, and older versions receive nothing.
 These are design decisions, documented in the README. A report about them will not be treated
 as a vulnerability — though an argument that a decision is wrong is always welcome as an issue.
 
-- **Proxy traffic is not encrypted.** The proxy listens over plain HTTP, so a client key
-  travels in clear text and is visible to anyone listening on the segment. Opening the proxy to
-  a network you do not trust is not a supported configuration. TLS will arrive together with a
-  signed build for distribution.
+- **The proxy certificate is self-signed.** Encryption is on by default and the app issues the
+  certificate itself; the private key stays in the Keychain. A client must trust it explicitly,
+  by file or by fingerprint — there is no public certificate authority behind it, and a client
+  that skips verification gets no protection from it.
+- **Running the proxy without TLS is possible and stays possible.** It is off by default and has
+  to be turned on by hand. On loopback it is harmless; open to the network it means client keys
+  travel in clear text, and the app says so as its loudest warning rather than quietly allowing
+  it.
 - **The protection is against the network, not against other users of the same Mac.** ChromaDB
   itself is always started on `127.0.0.1`, and anyone who reaches that port directly from the
   same machine reaches the database with no permissions at all — because ChromaDB has neither

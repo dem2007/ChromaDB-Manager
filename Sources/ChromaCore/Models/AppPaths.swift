@@ -38,6 +38,9 @@ public enum AppPaths {
     public static var trashFile: URL { supportDirectory.appendingPathComponent("trash.jsonl") }
     /// Measured embedding and chunking times, shown on the statistics screen.
     public static var metricsFile: URL { supportDirectory.appendingPathComponent("metrics.json") }
+    /// Измеренный предел чтения моделей эмбеддинга: сколько знаков
+    /// модель берёт в один вектор, прежде чем молча отбросить остальное.
+    public static var embeddingLimitsFile: URL { supportDirectory.appendingPathComponent("embedding-limits.json") }
     /// Measured model speeds, kept apart from the accumulated averages:
     /// one is a controlled measurement, the other a running total of real work.
     public static var benchmarksFile: URL { supportDirectory.appendingPathComponent("benchmarks.json") }
@@ -68,6 +71,11 @@ public enum AppPaths {
 
     /// Где остановился прерванный импорт коллекции.
     public static var importCheckpointsDirectory: URL { supportDirectory.appendingPathComponent("import-checkpoints", isDirectory: true) }
+
+    /// Сертификат прокси. Файлом, а не в Keychain: сертификат не секрет,
+    /// его отдают клиенту — секрет только приватный ключ, и он остаётся
+    /// в Keychain.
+    public static var tlsCertificateFile: URL { supportDirectory.appendingPathComponent("proxy-certificate.der") }
 
     public static var backupsDirectory: URL { supportDirectory.appendingPathComponent("backups", isDirectory: true) }
     public static var venvDirectory: URL { supportDirectory.appendingPathComponent("venv", isDirectory: true) }

@@ -44,7 +44,7 @@ final class SheetLayoutTests: XCTestCase {
         ])
         XCTAssertNotNil(match.profile, "тот же набор колонок в другом порядке — это тот же профиль")
         let document = plan.added.first
-        XCTAssertEqual(document?.text, "Название: Болт", "в текст попало значение не той колонки")
+        XCTAssertEqual(document?.text, "Артикул: A-1\nНазвание: Болт", "в текст попало значение не той колонки")
         XCTAssertEqual(document?.metadata["артикул"], .string("A-1"))
         XCTAssertEqual(document?.metadata["цена"], .int(12))
         XCTAssertEqual(document?.rowKey, "A-1", "ключ строки взят из чужой колонки")
@@ -77,7 +77,7 @@ final class SheetLayoutTests: XCTestCase {
         ])
         XCTAssertNotNil(match.profile)
         XCTAssertEqual(plan.added.count, 1, "строка заголовков стала документом")
-        XCTAssertEqual(plan.added.first?.text, "Название: Болт")
+        XCTAssertEqual(plan.added.first?.text, "Артикул: A-1\nНазвание: Болт")
         XCTAssertFalse(
             plan.added.contains { $0.text == "Название: Название" },
             "в коллекцию попал документ, текст которого — название колонки"
@@ -94,7 +94,7 @@ final class SheetLayoutTests: XCTestCase {
         XCTAssertNotNil(match.profile, "регистр и пробелы — не другая таблица")
         // The keys stay the profile's, so both files are filterable by one name.
         XCTAssertEqual(plan.added.first?.metadata["цена"], .int(12))
-        XCTAssertEqual(plan.added.first?.text, "Название: Болт")
+        XCTAssertEqual(plan.added.first?.text, "Артикул: A-1\nНазвание: Болт")
         XCTAssertEqual(plan.added.first?.rowKey, "A-1")
     }
 

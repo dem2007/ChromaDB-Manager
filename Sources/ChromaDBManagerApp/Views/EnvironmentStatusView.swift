@@ -5,10 +5,6 @@ struct EnvironmentStatusView: View {
     @EnvironmentObject private var app: AppEnvironment
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var model: EnvironmentViewModel
-    /// Чужие процессы chroma усыновляет и останавливает та же модель, что и
-    /// раньше: переехали карточки, а не логика.
-    @ObservedObject var serverModel: ServerViewModel
-    @EnvironmentObject private var processManager: ChromaProcessManager
     /// moving this machine's setup to another one.
     @StateObject private var transfer = SettingsTransferViewModel()
     /// Какой разрез экрана открыт: «Проверки», «Установка», «Копии», «Данные».
@@ -44,6 +40,9 @@ struct EnvironmentStatusView: View {
                     // человека прыгать.
                     maintenanceCard
                 case 2:
+                    // Про само приложение, а не про движок: версия, перенос
+                    // настроек, строка меню и стирание данных — одна тема.
+                    appUpdateCard
                     wipeCard
                     transferCard
                     MenuBarSettingsCard()
@@ -54,12 +53,10 @@ struct EnvironmentStatusView: View {
                     // Python больше не карточка: он нужен только второму
                     // способу установки и живёт его параметрами.
                     installCard
-                    // Процессы chroma, оставшиеся от прошлых запусков, — это
-                    // состояние машины, а не управление нашим сервером: они
-                    // мешают запуску и держат порт, когда приложение к ним
-                    // отношения не имеет.
-                    if !processManager.orphans.isEmpty { orphansCard }
-                    if !processManager.unverified.isEmpty { unverifiedCard }
+                    // Процессы chroma от прошлых запусков переехали на «Обзор»
+                    //: они держат порт и базу, и место такой находке —
+                    // на первом экране, а не на вкладке, до которой надо
+                    // додуматься.
                     consoleCard
                     permissionsCard
                 }
@@ -73,6 +70,93 @@ struct EnvironmentStatusView: View {
         .task {
             model.refreshBackups(app)
             await model.probeMaintenance(app)
+        }
+    }
+
+    // MARK: - Обновления приложения
+
+    /// Проверка новой версии — по кнопке или с явно включённой галочкой.
+    ///
+    /// Скачивать и ставить приложение само не будет никогда: это чужая машина
+    /// и чужое решение. Кнопка открывает страницу релиза, дальше человек
+    /// разбирается сам — тем более что сборка не нотаризована, и подсунуть ей
+    /// автообновление означало бы подсунуть непроверенный бинарник.
+    private var appUpdateCard: some View {
+        SectionCard(
+            title: String(localized: "Версия приложения"),
+            subtitle: String(localized: "Проверка спрашивает страницу релизов на GitHub и ничего не скачивает. Обновление ставится руками."),
+            help: String(localized: "Встроенного автообновления в приложении нет и не будет: сборка распространяется через GitHub, и решение обновиться остаётся за вами.")
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text(AppUpdateChecker.currentVersion().map { String(localized: "Установлена версия \($0)") }
+                        ?? String(localized: "Версия неизвестна: приложение запущено не из бандла"))
+                        .font(Theme.Font.body)
+                    Spacer()
+                    if model.isCheckingAppUpdate {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button(String(localized: "Проверить обновления")) {
+                            Task { await model.checkAppUpdates(app) }
+                        }
+                        .buttonStyle(.chromaNormal)
+                    }
+                }
+
+                if let error = model.appUpdateError {
+                    Text(error).font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
+                }
+
+                switch model.appUpdate {
+                case .available(let release, _):
+                    releaseDetails(release, isNew: true)
+                case .upToDate:
+                    Text(String(localized: "Установлена последняя версия."))
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                case .unknownCurrentVersion(let release):
+                    Text(String(localized: "Сравнить не с чем: версия есть только у собранного приложения. Последний выпущенный релиз показан ниже."))
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    if let release { releaseDetails(release, isNew: false) }
+                case .none:
+                    EmptyView()
+                }
+
+                Divider()
+
+                Toggle(String(localized: "Проверять обновления приложения при запуске"), isOn: Binding(
+                    get: { settings.configuration.checkAppUpdatesOnLaunch },
+                    set: { settings.configuration.checkAppUpdatesOnLaunch = $0 }
+                ))
+                Text(String(localized: "Выключено по умолчанию: пока галочка снята, приложение не обращается к GitHub само."))
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func releaseDetails(_ release: AppRelease, isNew: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(isNew
+                    ? String(localized: "Доступна версия \(release.version)")
+                    : String(localized: "Последний релиз: \(release.version)"))
+                    .font(Theme.Font.body)
+                    .foregroundStyle(isNew ? Theme.Palette.attention : Theme.Palette.captionText)
+                if let date = release.publishedAt {
+                    Text(date.formatted(date: .abbreviated, time: .omitted))
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                }
+            }
+            if !release.notes.isEmpty {
+                // Описание релиза показывается как есть и целиком: сокращать
+                // чужой список изменений — значит решать за человека, что ему
+                // важно. Длинный список прокручивается вместе с экраном.
+                Text(release.notes)
+                    .font(Theme.Font.caption)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button(String(localized: "Открыть страницу релиза")) { model.openReleasePage(release) }
         }
     }
 
@@ -132,6 +216,7 @@ struct EnvironmentStatusView: View {
                     planRow(String(localized: "Схемы метаданных"), plan.schemas)
                     planRow(String(localized: "Сохранённые фильтры"), plan.filters)
                     planRow(String(localized: "Клиенты"), plan.clients)
+                    planRow(String(localized: "Общие профили таблиц"), plan.tableProfiles)
                 }
             }
 
@@ -685,59 +770,6 @@ struct EnvironmentStatusView: View {
         HStack(alignment: .top, spacing: 8) {
             Text(title).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText).frame(width: 130, alignment: .leading)
             Text(value).font(Theme.Font.body).copyable(value)
-        }
-    }
-
-    private var orphansCard: some View {
-        SectionCard(
-            title: String(localized: "Найден процесс от прошлой сессии"),
-            subtitle: String(localized: "Приложение сохраняет PID запущенных им серверов и проверяет их при старте.")
-        ) {
-            ForEach(processManager.orphans) { record in
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("PID \(record.pid) · \(record.host):\(record.port)").font(Theme.Font.body)
-                        Text(record.path).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                            .lineLimit(1).truncationMode(.middle)
-                        Text(String(localized: "запущен \(record.startedAt.formatted(date: .abbreviated, time: .shortened))"))
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-                    Button(String(localized: "Остановить")) {
-                        Task { await serverModel.stopOrphan(record, app: app) }
-                    }
-                        .buttonStyle(.chromaNormal)
-                }
-                .padding(.vertical, 2)
-            }
-            Text(String(localized: "Если этот процесс обслуживает вашу локальную базу, приложение просто подключится к нему при следующем подключении."))
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-        }
-    }
-
-    /// Processes that are alive and look like ours but could not be confirmed.
-    ///
-    /// Shown rather than quietly dropped: forgetting them is exactly how four
-    /// servers once ended up running for days, holding the database, with the
-    /// app unaware they existed. The app will not signal what it cannot
-    /// identify — but it will say that something is there.
-    private var unverifiedCard: some View {
-        SectionCard(
-            title: String(localized: "Процесс, который не удалось опознать"),
-            subtitle: String(localized: "Он жив и похож на наш сервер, но одну из проверок подтвердить не вышло. Приложение не отправляет сигналы тому, в чём не уверено, — и не забывает про такие процессы.")
-        ) {
-            ForEach(processManager.unverified) { record in
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("PID \(record.pid) · \(record.host):\(record.port)").font(Theme.Font.body)
-                    Text(record.path).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        .lineLimit(1).truncationMode(.middle)
-                    Text(String(localized: "запущен \(record.startedAt.formatted(date: .abbreviated, time: .shortened))"))
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                }
-                .padding(.vertical, 2)
-            }
-            Text(String(localized: "Причина — в логе, раздел «Сервер». Часто это временно: проверьте ещё раз кнопкой обновления. Если процесс лишний, его можно снять вручную по PID."))
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
         }
     }
 

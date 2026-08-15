@@ -377,6 +377,161 @@ final class SecurityAssessmentTests: XCTestCase {
         // processes bypass the proxy entirely. Nothing else fires.
         XCTAssertEqual(assessment.warnings.map(\.id), ["local-access"])
     }
+
+    // MARK: - Шифрование
+
+    private func certificate(
+        daysLeft: Double = 300,
+        hosts: [String] = ["localhost", "127.0.0.1"]
+    ) -> TLSCertificateInfo {
+        TLSCertificateInfo(
+            commonName: "ChromaDB Manager Proxy",
+            notBefore: Date().addingTimeInterval(-86400),
+            notAfter: Date().addingTimeInterval(daysLeft * 86400),
+            fingerprint: "AA:BB",
+            hosts: hosts
+        )
+    }
+
+    func testOpenToTheNetworkWithoutEncryptionIsTheLoudestThingOnTheScreen() {
+        let assessment = SecurityAssessment(
+            exposure: .allInterfaces, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: false
+        )
+        XCTAssertEqual(assessment.warnings.first?.id, "exposed-without-tls")
+        XCTAssertEqual(assessment.warnings.first?.severity, .critical)
+    }
+
+    func testLoopbackWithoutEncryptionSaysNothing() {
+        // Прямо оговорено в пункте: по петле открытый трафик за пределы Мака
+        // не выходит, и предупреждать не о чем.
+        let assessment = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: false
+        )
+        XCTAssertFalse(ids(assessment).contains("exposed-without-tls"))
+        XCTAssertTrue(assessment.warnings.isEmpty)
+    }
+
+    func testExpiredCertificateIsCriticalAndSoonToExpireIsNot() {
+        let expired = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate(daysLeft: -1)
+        )
+        XCTAssertEqual(expired.warnings.first?.id, "certificate-expired")
+        XCTAssertEqual(expired.warnings.first?.severity, .critical)
+
+        let soon = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate(daysLeft: 10)
+        )
+        XCTAssertEqual(soon.warnings.first?.id, "certificate-expires-soon")
+        XCTAssertEqual(soon.warnings.first?.severity, .caution)
+        // Одно предупреждение о сроке, а не два сразу.
+        XCTAssertFalse(ids(soon).contains("certificate-expired"))
+    }
+
+    func testAHealthyCertificateIsNotWorthAWord() {
+        let assessment = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate()
+        )
+        XCTAssertTrue(assessment.warnings.isEmpty)
+    }
+
+    func testAddressTheCertificateDoesNotCoverIsFlaggedOnlyWhenExposed() {
+        let exposed = SecurityAssessment(
+            exposure: .allInterfaces, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate(),
+            localAddresses: ["192.168.1.42"]
+        )
+        XCTAssertTrue(ids(exposed).contains("certificate-address-mismatch"))
+
+        // На петле адрес в сети никого не касается: по нему никто не придёт.
+        let local = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate(),
+            localAddresses: ["192.168.1.42"]
+        )
+        XCTAssertFalse(ids(local).contains("certificate-address-mismatch"))
+    }
+
+    func testACoveredAddressIsNotFlagged() {
+        let assessment = SecurityAssessment(
+            exposure: .allInterfaces, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            certificate: certificate(hosts: ["localhost", "127.0.0.1", "192.168.1.42"]),
+            localAddresses: ["192.168.1.42"]
+        )
+        XCTAssertFalse(ids(assessment).contains("certificate-address-mismatch"))
+    }
+
+    func testSettingChangedButTheProxyStillRunsTheOldWay() {
+        // Включили шифрование, а прокси работает по-старому: клиент придёт
+        // по https и не получит ничего, а экран показывал бы «зашифровано».
+        let turnedOn = SecurityAssessment(
+            exposure: .allInterfaces, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: true, certificate: certificate(), runningWithTLS: false
+        )
+        XCTAssertTrue(ids(turnedOn).contains("tls-restart-needed"))
+        XCTAssertEqual(
+            turnedOn.warnings.first(where: { $0.id == "tls-restart-needed" })?.severity,
+            .critical,
+            "порт открыт наружу и не шифрует прямо сейчас — намерение это не отменяет"
+        )
+        // И тут же честно сказано, что происходит: настройка настройкой,
+        // а трафик идёт открытым.
+        XCTAssertTrue(ids(turnedOn).contains("exposed-without-tls"))
+        XCTAssertFalse(turnedOn.effectiveTLS)
+
+        // На петле та же рассинхронизация не опасна: наружу ничего не идёт.
+        let local = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: true, certificate: certificate(), runningWithTLS: false
+        )
+        XCTAssertEqual(local.warnings.first?.id, "tls-restart-needed")
+        XCTAssertEqual(local.warnings.first?.severity, .caution)
+
+        // Обратный случай мягче: работающий прокси всё ещё шифрует, то есть
+        // ничего не утекает — просто настройка ещё не применилась.
+        let turnedOff = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: false, runningWithTLS: true
+        )
+        XCTAssertEqual(turnedOff.warnings.first?.id, "tls-restart-needed")
+        XCTAssertEqual(turnedOff.warnings.first?.severity, .caution)
+    }
+
+    func testNoRestartWarningWhenTheProxyMatchesTheSetting() {
+        let assessment = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: true, certificate: certificate(), runningWithTLS: true
+        )
+        XCTAssertTrue(assessment.warnings.isEmpty)
+    }
+
+    func testCertificateWarningsStaySilentWhenEncryptionIsOff() {
+        // Выключенный TLS уже назван своим предупреждением; добавлять к нему
+        // «а ещё сертификат просрочен» — шум: он ни на что не влияет.
+        let assessment = SecurityAssessment(
+            exposure: .loopback, proxyIsRunning: true, proxyPort: 8900,
+            serverIsRunning: false,
+            usesTLS: false,
+            certificate: certificate(daysLeft: -5)
+        )
+        XCTAssertTrue(assessment.warnings.isEmpty)
+    }
 }
 
 @MainActor

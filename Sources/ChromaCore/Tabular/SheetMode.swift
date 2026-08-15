@@ -168,6 +168,30 @@ public enum SheetModeDetector {
         return shape(.dataTable, String(localized: "под ним однородные строки"))
     }
 
+    /// Форма листа, у которого заголовков нет вовсе: колонки называются
+    /// буквами, как в самой таблице.
+    ///
+    /// Нужна там, где на листе одни данные — без шапки, или с шапкой, которую
+    /// не прочитать: объединённые ячейки, пустая строка, номера столбцов.
+    /// Автоопределение такой лист объявляет «документом», и разметить его
+    /// построчно было нечем. Названия человек задаёт сам, полем «Своё
+    /// название»: буква — это адрес колонки, а не её смысл.
+    ///
+    /// `headerRow == 0` означает «заголовка нет, данные с первой строки»:
+    /// строки с номером ноль в файле не бывает, и это единственное значение,
+    /// которое нельзя перепутать с настоящей строкой.
+    public static func lettered(rows: [SheetRow], headerRow: Int) -> SheetShape {
+        let width = rows.map { $0.lastColumn + 1 }.max() ?? 0
+        return SheetShape(
+            mode: .dataTable,
+            headerRow: headerRow,
+            columns: (0..<max(0, width)).map(XLSXReader.columnName),
+            reason: headerRow == 0
+                ? String(localized: "заголовков нет — колонки названы буквами, данные с первой строки")
+                : String(localized: "заголовков в строке \(headerRow) нет — колонки названы буквами")
+        )
+    }
+
     /// Column titles, with unnamed columns given their spreadsheet letter rather
     /// than an empty name — an empty key would be unusable downstream.
     ///
@@ -212,7 +236,7 @@ public enum SheetModeDetector {
         var named = 0
         for column in columns {
             switch row.value(at: column) {
-            case .number, .date, .boolean:
+            case .number, .measured, .date, .boolean:
                 return false
             case .text(let value):
                 if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { named += 1 }
@@ -252,7 +276,9 @@ public enum SheetModeDetector {
     private static func kind(of value: CellValue) -> String {
         switch value {
         case .text: return "text"
-        case .number: return "number"
+        // Число с единицей — то же число: колонка, где половина ячеек
+        // с процентом, а половина без, однородна.
+        case .number, .measured: return "number"
         case .date: return "date"
         case .boolean: return "boolean"
         case .empty: return "empty"

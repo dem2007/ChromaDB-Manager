@@ -133,19 +133,55 @@ extension XLSXReader {
         return delegate.strings
     }
 
+    // MARK: - Объединения ячеек
+
+    /// Объединённые диапазоны листа — **до** разбора его строк.
+    ///
+    /// В файле `<mergeCells>` стоит после `<sheetData>`, поэтому потоковый
+    /// проход узнаёт о них, когда строки уже ушли. Отдельный разбор всего
+    /// XML ради двух десятков ссылок — расточительство, поэтому кусок
+    /// находится поиском по байтам: литеральный `<mergeCells` не может
+    /// оказаться внутри значения, там `<` записан как `&lt;`.
+    static func mergeRanges(in data: Data) -> [MergedRange] {
+        let open = Data("<mergeCells".utf8)
+        let close = Data("</mergeCells>".utf8)
+        guard let start = data.range(of: open) else { return [] }
+        let tail = data[start.lowerBound...]
+        let end = tail.range(of: close)?.upperBound ?? tail.endIndex
+        guard let fragment = String(data: data[start.lowerBound..<end], encoding: .utf8) else { return [] }
+
+        var ranges: [MergedRange] = []
+        var rest = Substring(fragment)
+        while let reference = rest.range(of: "ref=\"") {
+            rest = rest[reference.upperBound...]
+            guard let quote = rest.firstIndex(of: "\"") else { break }
+            if let range = MergedRange(reference: String(rest[..<quote])) { ranges.append(range) }
+            rest = rest[quote...]
+        }
+        return ranges
+    }
+
     // MARK: - xl/styles.xml
 
     /// Built-in number formats that mean «this is a date or a time».
     static let builtInDateFormats: Set<Int> = Set(14...22).union(Set(45...47))
 
-    /// Which style indices format their number as a date.
+    /// Что стиль говорит о числе: дата это или число с единицей.
+    struct StyleTable {
+        /// Which style indices format their number as a date.
+        var dateStyles: Set<Int> = []
+        /// Индекс стиля → единица измерения, если формат её называет.
+        var units: [Int: NumberUnit] = [:]
+    }
+
+    /// Which style indices format their number as a date, and which carry a unit.
     ///
-    /// This is the only way to tell a date from a number in XLSX: both are
-    /// stored as a serial number, and only the cell's format says which.
-    static func parseDateStyles(_ data: Data) -> Set<Int> {
+    /// The date part is the only way to tell a date from a number in XLSX: both
+    /// are stored as a serial number, and only the cell's format says which.
+    static func parseStyles(_ data: Data) -> StyleTable {
         final class Delegate: NSObject, XMLParserDelegate {
-            /// Custom format id → whether its mask is a date mask.
-            var customDateFormats: [Int: Bool] = [:]
+            /// Custom format id → its mask.
+            var customFormats: [Int: String] = [:]
             var cellFormats: [Int] = []
             private var insideCellXfs = false
 
@@ -154,7 +190,7 @@ extension XLSXReader {
                 switch localName(name) {
                 case "numFmt":
                     if let id = attributes["numFmtId"].flatMap(Int.init) {
-                        customDateFormats[id] = XLSXReader.maskIsDate(attributes["formatCode"] ?? "")
+                        customFormats[id] = attributes["formatCode"] ?? ""
                     }
                 case "cellXfs":
                     insideCellXfs = true
@@ -183,10 +219,18 @@ extension XLSXReader {
         parser.shouldProcessNamespaces = false
         parser.parse()
 
-        var result: Set<Int> = []
+        var result = StyleTable()
         for (index, formatID) in delegate.cellFormats.enumerated() {
-            if builtInDateFormats.contains(formatID) || delegate.customDateFormats[formatID] == true {
-                result.insert(index)
+            let mask = delegate.customFormats[formatID]
+            if builtInDateFormats.contains(formatID) || mask.map(maskIsDate) == true {
+                result.dateStyles.insert(index)
+                continue
+            }
+            // Своя маска главнее встроенной: id перекрыт именно ради неё.
+            if let mask, let unit = maskUnit(mask) {
+                result.units[index] = unit
+            } else if let unit = builtInUnits[formatID] {
+                result.units[index] = unit
             }
         }
         return result
@@ -220,6 +264,88 @@ extension XLSXReader {
         if lower.contains("h") || lower.contains("s") { return true }
         return false
     }
+
+    /// Единицы всех встроенных форматов, где они есть.
+    ///
+    /// 9 и 10 — проценты; 5–8 и 37–44 — деньги, но символ там зависит от
+    /// локали книги и в самом файле не записан. Поэтому денежные встроенные
+    /// форматы здесь не значатся: подпись, взятая с потолка, хуже её
+    /// отсутствия. Формат с явной маской — `#,##0" ₽"` или `[$₽-419]` —
+    /// разбирается как обычно.
+    static let builtInUnits: [Int: NumberUnit] = [9: .percent, 10: .percent]
+
+    /// Единица измерения из маски формата.
+    ///
+    /// Берётся первая секция маски: секции за `;` описывают отрицательные
+    /// числа, ноль и текст, а единица у них та же.
+    static func maskUnit(_ mask: String) -> NumberUnit? {
+        guard !mask.isEmpty, mask != "General", !maskIsDate(mask) else { return nil }
+        let section = mask.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? mask
+
+        var isPercent = false
+        var before = ""
+        var after = ""
+        /// Числовая часть встретилась — дальше литералы идут в подпись.
+        var sawNumber = false
+        var insideQuotes = false
+        var bracket = ""
+        var insideBrackets = false
+        var escaped = false
+
+        func append(_ text: String) {
+            if sawNumber { after += text } else { before += text }
+        }
+
+        for character in section {
+            if escaped {
+                escaped = false
+                // Экранированный символ — литерал: `\ ` или `\-`.
+                append(String(character))
+                continue
+            }
+            if insideBrackets {
+                if character == "]" {
+                    insideBrackets = false
+                    // `[$₽-419]` — символ валюты между `$` и дефисом. Всё
+                    // остальное в скобках — цвет или условие, и это не подпись.
+                    if bracket.hasPrefix("$") {
+                        let body = bracket.dropFirst()
+                        let symbol = body.split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+                        if !symbol.isEmpty { append(symbol) }
+                    }
+                    bracket = ""
+                } else {
+                    bracket.append(character)
+                }
+                continue
+            }
+            switch character {
+            case "\\": escaped = true
+            case "\"": insideQuotes.toggle()
+            case "[": insideBrackets = true
+            case "%":
+                if insideQuotes { append("%") } else { isPercent = true }
+            case "0", "#", "?":
+                if insideQuotes { append(String(character)) } else { sawNumber = true }
+            case ".", ",", "E", "e", "+", "-", "/":
+                if insideQuotes { append(String(character)) }
+            case "*", "_":
+                // Заполнение и отступ шириной символа — оформление, не подпись.
+                // Следующий символ относится к ним и в подпись не идёт.
+                escaped = true
+            default:
+                if insideQuotes { append(String(character)) }
+                else if !character.isWhitespace, !character.isNumber { append(String(character)) }
+            }
+        }
+
+        let prefix = before.trimmingCharacters(in: .whitespaces)
+        var suffix = after.trimmingCharacters(in: .whitespaces)
+        if isPercent { suffix = suffix.isEmpty ? "%" : "% " + suffix }
+        guard !prefix.isEmpty || !suffix.isEmpty else { return nil }
+        return NumberUnit(scale: isPercent ? 100 : 1, prefix: prefix, suffix: suffix)
+    }
 }
 
 // MARK: - The sheet itself
@@ -232,6 +358,13 @@ extension XLSXReader {
 final class SheetParser: NSObject, XMLParserDelegate {
     private let sharedStrings: [String]
     private let dateStyles: Set<Int>
+    /// Индекс стиля → единица измерения.
+    private let unitStyles: [Int: NumberUnit]
+    /// Объединения вниз, найденные до разбора строк: в файле они
+    /// объявлены **после** данных, и потоковый проход о них иначе не узнал бы.
+    private let verticalMerges: [Int: [XLSXReader.MergedRange]]
+    /// Действующие объединения: колонка → (значение, последняя строка).
+    private var spans: [Int: (value: CellValue, lastRow: Int)] = [:]
     private let epoch: Date
     private let uses1904: Bool
     private let limit: Int
@@ -254,10 +387,14 @@ final class SheetParser: NSObject, XMLParserDelegate {
     private var text = ""
     private var capturing = false
 
-    init(sharedStrings: [String], dateStyles: Set<Int>, epoch: Date, uses1904: Bool,
+    init(sharedStrings: [String], dateStyles: Set<Int>, unitStyles: [Int: NumberUnit] = [:],
+         verticalMerges: [XLSXReader.MergedRange] = [],
+         epoch: Date, uses1904: Bool,
          limit: Int, onRow: @escaping (SheetRow) -> Bool) {
+        self.verticalMerges = Dictionary(grouping: verticalMerges, by: \.firstRow)
         self.sharedStrings = sharedStrings
         self.dateStyles = dateStyles
+        self.unitStyles = unitStyles
         self.epoch = epoch
         self.uses1904 = uses1904
         self.limit = limit
@@ -319,6 +456,20 @@ final class SheetParser: NSObject, XMLParserDelegate {
                 parser.abortParsing()
                 return
             }
+            // Объединение вниз относится к каждой строке диапазона.
+            // Верхняя ячейка приходит первой, поэтому запомнить её и
+            // подставлять дальше — всё, что нужно.
+            for range in verticalMerges[rowNumber] ?? [] {
+                if let value = cells[range.firstColumn], !value.isEmpty {
+                    spans[range.firstColumn] = (value, range.lastRow)
+                }
+            }
+            if !spans.isEmpty {
+                spans = spans.filter { $0.value.lastRow >= rowNumber }
+                for (column, span) in spans where cells[column] == nil {
+                    cells[column] = span.value
+                }
+            }
             if !onRow(SheetRow(number: rowNumber, cells: cells)) {
                 stopped = true
                 parser.abortParsing()
@@ -360,7 +511,14 @@ final class SheetParser: NSObject, XMLParserDelegate {
             guard let number = Double(raw) else {
                 return raw.isEmpty ? .empty : .text(raw)
             }
-            guard let styleIndex, dateStyles.contains(styleIndex) else { return .number(number) }
+            guard let styleIndex, dateStyles.contains(styleIndex) else {
+                // Единица — часть смысла числа: 0.15 при формате `0%`
+                // человек читает как «15 %», и искать он будет именно это.
+                if let styleIndex, let unit = unitStyles[styleIndex] {
+                    return .measured(number, unit)
+                }
+                return .number(number)
+            }
             guard let date = XLSXReader.date(fromSerial: number, epoch: epoch, uses1904: uses1904) else {
                 phantomDates += 1
                 return .number(number)

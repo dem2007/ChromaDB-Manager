@@ -35,7 +35,7 @@ struct MCPConnection: Identifiable, Hashable {
 final class MCPService: ObservableObject {
     /// Работает ли слушатель прямо сейчас — для экрана и для диагностики.
     @Published private(set) var isListening = false
-    @Published private(set) var lastError: String?
+    @Published var lastError: String?
     /// Сколько раз агент обращался за сеанс.
     @Published private(set) var callCount = 0
     /// Кто подключён прямо сейчас. Порядок — по времени подключения:
@@ -83,9 +83,22 @@ final class MCPService: ObservableObject {
                 isReadOnlyServer: { [flag = readOnlyFlag] in flag.value },
                 // Тот же журнал доступа, что у прокси: вопрос «что делали
                 // с базой чужими руками» один.
-                audit: { [audit = app.audit] entry in audit.record(entry) }
+                audit: { [audit = app.audit] entry in audit.record(entry) },
+                // …и та же отметка «ключ работал», что у прокси.
+                // Без неё карточка клиента говорила «ещё не подключался» про
+                // ключ, которым минуту назад искали, — и это видно на экране
+                // рядом с журналом, где те же вызовы перечислены поимённо.
+                onClientSeen: { [weak app] id in
+                    Task { @MainActor [weak app] in app?.noteClientSeen(id) }
+                }
             )
         )
+
+        // Тот же сервер обслуживает и сокет, и HTTP: инструменты, права
+        // и журнал у обоих транспортов одни. Второй экземпляр означал
+        // бы, что «через сокет можно, а по сети нельзя» — и наоборот.
+        self.server = server
+        applyHTTPMode(app)
 
         listener.onConnection = { [weak self] channel in
             let state = ChannelState()
@@ -143,6 +156,74 @@ final class MCPService: ObservableObject {
         app.log.record(.info, "MCP", value
             ? "MCP переведён в режим только чтения — запись запрещена всем ключам"
             : "Режим только чтения снят: ключи с правом записи снова могут писать")
+    }
+
+    // MARK: - HTTP-режим
+
+    /// Сервер, общий для сокета и HTTP. Хранится, чтобы HTTP-режим можно было
+    /// включить и выключить, не перезапуская слушатель сокета.
+    private var server: MCPServer?
+
+    /// Отдаётся ли MCP по сети прямо сейчас — для экрана.
+    @Published private(set) var isServedOverHTTP = false
+
+    /// Адрес, который получит агент. `nil`, когда отдавать нечего.
+    func httpAddress(_ app: AppEnvironment) -> String? {
+        // `isServedOverHTTP`, а не настройка: пока сервер MCP не поднялся,
+        // отдавать по сети нечего, и показывать адрес, по которому придёт
+        // отказ, — хуже, чем не показывать ничего.
+        guard isServedOverHTTP, case .running(let address, let port) = app.proxy.state else {
+            return nil
+        }
+        let scheme = app.proxy.tls.scheme
+        // Адрес показывается тот, по которому клиент действительно придёт:
+        // `0.0.0.0` — это «слушаем везде», а не адрес для подключения.
+        let host = address == "0.0.0.0" ? (LocalNetwork.addresses().first ?? "127.0.0.1") : address
+        return "\(scheme)://\(host):\(port.plainDigits)\(MCPHTTPTransport.endpointPath)"
+    }
+
+    func setHTTP(_ value: Bool, app: AppEnvironment) {
+        app.settings.configuration.mcpOverHTTP = value
+        // Сразу на диск: настройка про то, открыта ли дверь наружу.
+        app.settings.saveNow()
+        applyHTTPMode(app)
+        guard value else {
+            app.log.record(.info, "MCP", "MCP по сети выключен — остаётся только stdio")
+            return
+        }
+        // Включить настройку и включить режим — не одно и то же: без
+        // поднятого сервера MCP отдавать нечего, и рапортовать об успехе
+        // в этом случае значит соврать.
+        if isServedOverHTTP {
+            app.log.record(.info, "MCP", "MCP отдаётся по сети на \(httpAddress(app) ?? MCPHTTPTransport.endpointPath)")
+        } else {
+            lastError = String(localized: "MCP-сервер не запущен, поэтому по сети он пока недоступен.")
+            app.log.record(.warning, "MCP", "Режим по сети включён, но сервер MCP не запущен — отдавать нечего")
+        }
+    }
+
+    /// Ставит или снимает обработчик у прокси по текущей настройке.
+    ///
+    /// Обработчик живёт у прокси, а не у его слушателя, и перезапуск прокси
+    /// (смена режима доступа, включение TLS) его не теряет — проверено тем,
+    /// что `stop()` его не трогает.
+    func applyHTTPMode(_ app: AppEnvironment) {
+        guard let server, app.settings.configuration.mcpOverHTTP else {
+            app.proxy.mcp = nil
+            isServedOverHTTP = false
+            return
+        }
+        let transport = MCPHTTPTransport(
+            server: server,
+            // Список origin'ов у приложения уже есть — в правах клиентов.
+            isOriginAllowed: { [access = app.proxy.access] origin in
+                await access.originIsAllowedByAnyClient(origin)
+            }
+        )
+        app.proxy.mcp = { method, headers, body, key in
+            await transport.handle(method: method, headers: headers, body: body, key: key)
+        }
+        isServedOverHTTP = true
     }
 
     private func handle(
@@ -297,6 +378,11 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
 
     func search(_ request: MCPSearchRequest) async throws -> MCPSearchAnswer {
         let app = try await environment()
+        // Несколько коллекций — отдельным путём: вектор запроса
+        // считается по разу на модель, а не на коллекцию.
+        if request.isMultiCollection {
+            return try await searchAcross(request, app: app)
+        }
         let collection = try await collection(named: request.collection)
         // Тот же конвейер, что у экрана поиска: профиль, стадии,
         // переранжирование и настройки, которые человек подкрутил, действуют
@@ -360,6 +446,107 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         )
     }
 
+    /// Поиск сразу по нескольким коллекциям (ядро —.
+    ///
+    /// Каждая коллекция ищется **тем же** конвейером и своим профилем, как
+    /// и при обычном поиске: агент обязан получать ту же выдачу, что
+    /// человек за экраном, а не вторую реализацию поиска.
+    private func searchAcross(
+        _ request: MCPSearchRequest, app: AppEnvironment
+    ) async throws -> MCPSearchAnswer {
+        var targets: [MultiCollectionSearch.Target] = []
+        var missing: [String] = []
+        for name in request.collections {
+            guard let collection = try? await collection(named: name) else {
+                missing.append(name)
+                continue
+            }
+            let prepared = try await app.prepareSearch(
+                for: collection, smartSearch: request.smartSearch, priority: .agent
+            )
+            targets.append(MultiCollectionSearch.Target(
+                collectionID: collection.id, collectionName: collection.name,
+                model: prepared.model ?? "", metric: collection.space, profile: prepared.profile
+            ))
+        }
+
+        // Вектор считается здесь и по разу на модель, а не внутри конвейера
+        // каждой коллекции: в этом весь выигрыш. Через ту же очередь
+        // и с тем же приоритетом агента, что и обычный поиск.
+        let (lmStudio, queue, connectionID) = try await MainActor.run {
+            (try app.makeLMStudioClient(), app.queue, app.connectionID)
+        }
+        let client = try await client()
+        let shapes = app.collectionShapes
+
+        let search = MultiCollectionSearch(
+            embed: { text, model in
+                try await queue.run(QueueTicket(
+                    title: String(localized: "Поиск агента по нескольким коллекциям"),
+                    priority: .agent,
+                    group: .lmStudio,
+                    connectionID: connectionID
+                )) { _ in
+                    try await lmStudio.embed(text: text, model: model)
+                }
+            },
+            search: { target, query, vector in
+                // Тот же `RetrievalPipeline`, что и везде, только
+                // с уже посчитанным вектором — как в стенде оценки.
+                let pipeline = RetrievalPipeline(
+                    database: client, shapes: shapes, embed: { _ in vector }
+                )
+                return try await pipeline.run(
+                    RetrievalRequest(
+                        text: query,
+                        collectionID: target.collectionID,
+                        collectionName: target.collectionName,
+                        nResults: request.nResults,
+                        filter: request.filter,
+                        metric: target.metric
+                    ),
+                    profile: target.profile
+                )
+            }
+        )
+        let answer = await search.run(
+            query: request.query, targets: targets, nResults: request.nResults
+        )
+
+        let payloads = answer.hits.map { hit in
+            MCPDocumentPayload(
+                id: hit.id, text: hit.document, metadata: hit.metadata,
+                distance: hit.distance, role: hit.role, note: hit.collapsedNote,
+                collection: hit.collectionName
+            )
+        }
+
+        var notes = [answer.line]
+        if !missing.isEmpty {
+            notes.append(String(localized: "Не найдены коллекции: \(missing.joined(separator: ", ")) — проверь имена через list_collections."))
+        }
+        for report in answer.collections where report.failure != nil {
+            notes.append(String(localized: "Коллекция «\(report.name)» не ответила: \(report.failure ?? "")"))
+        }
+
+        await MainActor.run {
+            app.log.record(
+                .info, "MCP",
+                "Поиск агента по коллекциям \(request.collections.joined(separator: ", ")): «\(request.query.prefix(80))», \(answer.line)"
+            )
+        }
+
+        return MCPSearchAnswer(
+            documents: payloads,
+            // Метрика у коллекций разная, и одна на всю выдачу была бы
+            // неправдой: у каждого результата она своя, а расстояния между
+            // коллекциями и так несравнимы — выдача упорядочена рангами.
+            metric: nil,
+            model: nil,
+            note: notes.joined(separator: " ")
+        )
+    }
+
     func documents(_ request: MCPDocumentsRequest) async throws -> MCPDocumentsAnswer {
         let client = try await client()
         let collection = try await collection(named: request.collection)
@@ -369,6 +556,10 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                 collectionID: collection.id, limit: request.ids.count, ids: request.ids
             )
             return MCPDocumentsAnswer(documents: records.map(Self.payload), hasMore: false)
+        }
+
+        if request.orderedByChunkIndex {
+            return try await orderedChunks(of: collection.id, request: request, client: client)
         }
 
         // На один документ больше, чем нужно: «ровно limit» и «есть ещё»
@@ -382,6 +573,49 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         return MCPDocumentsAnswer(
             documents: records.prefix(request.limit).map(Self.payload),
             hasMore: records.count > request.limit
+        )
+    }
+
+    /// Чанки файла по порядку.
+    ///
+    /// Порядок требует **всей** выборки: `get` у ChromaDB его не обещает, и
+    /// отсортировать страницу, взятую произвольно, значит отдать не те куски
+    /// в правильном на вид порядке. Поэтому сначала перечисляются все чанки
+    /// файла — без текстов, одни метаданные, — потом берётся окно, и только
+    /// за ним запрашиваются тексты.
+    ///
+    /// Две ходки вместо одной — цена детерминированного листания: агент,
+    /// читающий файл страницами, получает одни и те же границы при каждом
+    /// вызове, а не «как база отдала в этот раз».
+    private func orderedChunks(
+        of collectionID: String, request: MCPDocumentsRequest, client: ChromaClient
+    ) async throws -> MCPDocumentsAnswer {
+        let (scanned, overflowed) = try await MCPFileChunks.collect { limit, offset in
+            try await client.getDocuments(
+                collectionID: collectionID, limit: limit, offset: offset,
+                filter: request.filter, includeDocuments: false
+            ).map(Self.payload)
+        }
+        let ordered = overflowed ? scanned : MCPFileChunks.ordered(scanned)
+        let window = MCPFileChunks.page(ordered, offset: request.offset, limit: request.limit)
+        guard !window.page.isEmpty else {
+            return MCPDocumentsAnswer(
+                documents: [], hasMore: false, total: ordered.count, orderUnavailable: overflowed
+            )
+        }
+
+        // Тексты — только у окна. Порядок восстанавливается по списку id:
+        // выдача `get` по идентификаторам тоже не обязана его сохранять.
+        let ids = window.page.map(\.id)
+        let records = try await client.getDocuments(
+            collectionID: collectionID, limit: ids.count, ids: ids
+        )
+        let byID = Dictionary(records.map { ($0.id, Self.payload($0)) }, uniquingKeysWith: { first, _ in first })
+        return MCPDocumentsAnswer(
+            documents: ids.compactMap { byID[$0] },
+            hasMore: window.hasMore,
+            total: ordered.count,
+            orderUnavailable: overflowed
         )
     }
 

@@ -181,6 +181,43 @@ struct ClientsView: View {
 
                 Divider()
 
+                // Доступ по сети (HTTP-режим). Отдельно от «только
+                // чтения»: тот про права, этот про то, откуда вообще можно
+                // прийти.
+                Toggle(String(localized: "Отдавать MCP по сети (HTTP)"), isOn: Binding(
+                    get: { settings.configuration.mcpOverHTTP },
+                    set: { mcp.setHTTP($0, app: app) }
+                ))
+                if settings.configuration.mcpOverHTTP {
+                    if let address = mcp.httpAddress(app) {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(address).font(Theme.Font.mono).textSelection(.enabled)
+                            Button {
+                                model.copy(address)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .buttonStyle(.borderless)
+                            .help(String(localized: "Скопировать адрес"))
+                        }
+                        if app.proxy.tls == .plain {
+                            Text(String(localized: "Трафик не шифруется: ключ агента пойдёт по сети открытым текстом. Включите TLS на экране «Безопасность»."))
+                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        Text(String(localized: "Адрес появится, когда заработает прокси: MCP по сети живёт на том же порту и с теми же ключами."))
+                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text(String(localized: "Агент подключается только через вспомогательный файл на этом Маке. По сети MCP недоступен."))
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider()
+
                 Text(String(localized: "Подключены сейчас")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                 if mcp.connections.isEmpty {
                     Text(String(localized: "Никто не подключён. Соединение появляется, когда агентское приложение запускает вспомогательный файл chromadb-mcp."))
@@ -220,14 +257,21 @@ struct ClientsView: View {
 
                 codeBlock(
                     String(localized: "Пример подключения на Python"),
-                    model.snippet(for: fresh.key, port: settings.configuration.proxyPort)
+                    model.snippet(
+                        for: fresh.key,
+                        port: settings.configuration.proxyPort,
+                        usesTLS: settings.configuration.proxyUsesTLS
+                    )
                 )
 
                 HStack {
                     Button(String(localized: "Скопировать ключ")) { model.copyFreshKey() }
                         .buttonStyle(.chromaPrimary)
                     Button(String(localized: "Скопировать пример")) {
-                        model.copySnippet(port: settings.configuration.proxyPort)
+                        model.copySnippet(
+                            port: settings.configuration.proxyPort,
+                            usesTLS: settings.configuration.proxyUsesTLS
+                        )
                     }
                     // Настроить подключение агента проще всего **сейчас**:
                     // потом ключ подставить будет нечем (7.4).
@@ -459,6 +503,27 @@ struct ClientsView: View {
                 title: String(localized: "Результатов в MCP"),
                 value: permissions.maxSearchResults,
                 placeholder: String(localized: "по умолчанию 10")
+            )
+            // Символьные потолки — рядом с ним, потому что упирается агент
+            // обычно в них: счётчик результатов подняли, а ответ всё
+            // равно обрывается по объёму. Всё это уходит в контекст модели.
+            limitField(
+                title: String(localized: "Символов в документе"),
+                value: permissions.maxDocumentCharacters,
+                placeholder: String(localized: "по умолчанию 4000")
+            )
+            limitField(
+                title: String(localized: "Символов в ответе"),
+                value: permissions.maxResponseCharacters,
+                placeholder: String(localized: "по умолчанию 24000")
+            )
+            // сколько коллекций агент обыскивает одним вызовом. Десять
+            // коллекций — это десять поисков на один вызов, и упереться в это
+            // должен ключ.
+            limitField(
+                title: String(localized: "Коллекций в поиске"),
+                value: permissions.maxSearchCollections,
+                placeholder: String(localized: "по умолчанию 5")
             )
             // Умный поиск решается отдельно от коллекции: человек у экрана
             // видит выдачу и правит запрос, а агент — нет.

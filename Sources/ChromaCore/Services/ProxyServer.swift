@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 
 /// One request read off a client connection.
 public struct ProxiedRequest: Sendable {
@@ -127,6 +128,19 @@ public final class ProxyServer: ObservableObject {
         }
     }
 
+    /// Защищён ли трафик прокси.
+    ///
+    /// Ключ клиента ходит заголовком. Без TLS он виден всем, кто слушает
+    /// сегмент сети, — для инструмента, который сам себя называет контролем
+    /// доступа, это противоречие. Поэтому «без TLS» остаётся возможным, но
+    /// выбирается явно, а не достаётся по умолчанию.
+    public enum TLSMode: Equatable, Sendable {
+        case plain
+        case tls
+
+        public var scheme: String { self == .tls ? "https" : "http" }
+    }
+
     @Published public private(set) var state: State = .stopped
     @Published public private(set) var upstreamDescription: String?
     @Published public private(set) var activeConnections = 0
@@ -134,6 +148,10 @@ public final class ProxyServer: ObservableObject {
     @Published public private(set) var rejectedRequests = 0
     /// What the running listener is bound to. Not the setting — the fact.
     @Published public private(set) var exposure: NetworkExposure = .loopback
+    /// Защищён ли трафик у **работающего** прокси. Как и `exposure`, это факт,
+    /// а не настройка: настройку можно переключить, не перезапустив прокси,
+    /// и тогда экран показывал бы не то, что происходит.
+    @Published public private(set) var tls: TLSMode = .plain
     /// When the listener came up, and whether anything from outside this
     /// machine has reached it since.
     @Published public private(set) var startedAt: Date?
@@ -192,14 +210,29 @@ public final class ProxyServer: ObservableObject {
         set { core.onRejection = newValue }
     }
 
+    /// Обработчик конечной точки MCP (HTTP-режим).
+    ///
+    /// Пустой — значит HTTP-режим выключен, и путь `/mcp` уходит на ChromaDB
+    /// как любой другой, то есть получает от неё честный отказ. Ставится
+    /// приложением: инструменты и права живут там, прокси только доставляет.
+    public var mcp: MCPHTTPHandler? {
+        get { core.mcp }
+        set { core.mcp = newValue }
+    }
+
     /// Starts listening. `exposure` decides whether the listener is bound to
     /// loopback or to every interface; the upstream ChromaDB is
     /// never the thing exposed.
+    ///
+    /// `identity` включает TLS. Она приходит снаружи, а не берётся здесь:
+    /// прокси занимается трафиком и правами, а выпуск и хранение сертификата —
+    /// дело `TLSCertificateService`.
     public func start(
         upstreamHost: String,
         upstreamPort: Int,
         listenPort: Int,
-        exposure: NetworkExposure = .loopback
+        exposure: NetworkExposure = .loopback,
+        identity: SecIdentity? = nil
     ) throws {
         stop()
         do {
@@ -213,9 +246,11 @@ public final class ProxyServer: ObservableObject {
                 upstreamHost: upstreamHost,
                 upstreamPort: upstreamPort,
                 listenPort: listenPort,
-                bindHost: exposure.bindHost
+                bindHost: exposure.bindHost,
+                identity: identity
             )
             self.exposure = exposure
+            self.tls = identity == nil ? .plain : .tls
             upstreamDescription = "\(upstreamHost):\(upstreamPort.plainDigits)"
         } catch {
             state = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -229,6 +264,7 @@ public final class ProxyServer: ObservableObject {
         activeConnections = 0
         state = .stopped
         startedAt = nil
+        tls = .plain
         upstreamDescription = nil
         if wasRunning { log(.info, "Прокси", "Прокси остановлен") }
     }
@@ -239,6 +275,7 @@ public final class ProxyServer: ObservableObject {
         case listenFailed(String)
         case notConnected
         case upstreamNotLoopback(String)
+        case tlsUnavailable
 
         public var errorDescription: String? {
             switch self {
@@ -252,6 +289,8 @@ public final class ProxyServer: ObservableObject {
                 return String(localized: "Прокси нечего проксировать: приложение не подключено к ChromaDB.")
             case .upstreamNotLoopback(let host):
                 return String(localized: "Нельзя открыть прокси наружу: сам ChromaDB работает на \(host), а не на 127.0.0.1.")
+            case .tlsUnavailable:
+                return String(localized: "Не удалось включить TLS: сертификат недоступен.")
             }
         }
 
@@ -259,12 +298,25 @@ public final class ProxyServer: ObservableObject {
             switch self {
             case .upstreamNotLoopback:
                 return String(localized: "Наружу открывается только прокси — он проверяет права. Сервер должен оставаться на локальном адресе.")
+            case .tlsUnavailable:
+                return String(localized: "Выпустите сертификат на экране «Безопасность». Прокси не запускается без него: открыть порт наружу с ключами в открытом виде хуже, чем не открыть вовсе.")
             default:
                 return nil
             }
         }
     }
 }
+
+/// Обработчик HTTP-запроса к конечной точке MCP.
+///
+/// Отдельным типом, а не ссылкой на службу: прокси не должен знать ни про
+/// инструменты, ни про права — он опознаёт путь и передаёт запрос дальше.
+public typealias MCPHTTPHandler = @Sendable (
+    _ method: String,
+    _ headers: [(name: String, value: String)],
+    _ body: Data,
+    _ key: String?
+) async -> MCPHTTPTransport.Response
 
 /// Owns the listener and the live connections. Nothing here touches the main
 /// actor, so traffic keeps flowing while the interface is busy.
@@ -284,6 +336,18 @@ final class ProxyCore {
     var onClientSeen: (@Sendable (UUID) -> Void)?
     var onRejection: (@Sendable (String, String) -> Void)?
 
+    /// Конечная точка MCP, когда HTTP-режим включён.
+    ///
+    /// Под замком, как `listener` и `stats`: пишется с главного актора
+    /// (переключатель на экране), читается на очереди прокси при каждом
+    /// запросе. Без замка это гонка, а у настройки, которая закрывает дверь
+    /// наружу, гонок быть не должно.
+    var mcp: MCPHTTPHandler? {
+        get { lock.withLock { storedMCP } }
+        set { lock.withLock { storedMCP = newValue } }
+    }
+    private var storedMCP: MCPHTTPHandler?
+
     private let audit: AuditLog
     private let access: AccessController
     private let queue = DispatchQueue(label: "io.github.chromadbmanager.proxy")
@@ -297,7 +361,13 @@ final class ProxyCore {
         self.access = access
     }
 
-    func start(upstreamHost: String, upstreamPort: Int, listenPort: Int, bindHost: String) throws {
+    func start(
+        upstreamHost: String,
+        upstreamPort: Int,
+        listenPort: Int,
+        bindHost: String,
+        identity: SecIdentity? = nil
+    ) throws {
         guard PortUtility.isAvailable(host: bindHost, port: listenPort) else {
             throw ProxyServer.ProxyError.portBusy(listenPort)
         }
@@ -305,7 +375,20 @@ final class ProxyCore {
             throw ProxyServer.ProxyError.invalidPort(listenPort)
         }
 
-        let parameters = NWParameters.tcp
+        // TLS обрывается здесь: наружу — шифрованный канал, дальше на ChromaDB
+        // запрос идёт по 127.0.0.1 открытым текстом. Шифровать петлю нечем
+        // и незачем — сам движок TLS не умеет, а слушает он только этот Мак.
+        let parameters: NWParameters
+        if let identity {
+            guard let secIdentity = sec_identity_create(identity) else {
+                throw ProxyServer.ProxyError.tlsUnavailable
+            }
+            let options = NWProtocolTLS.Options()
+            sec_protocol_options_set_local_identity(options.securityProtocolOptions, secIdentity)
+            parameters = NWParameters(tls: options)
+        } else {
+            parameters = .tcp
+        }
         parameters.allowLocalEndpointReuse = true
         // Pinning the local endpoint is what keeps the listener off the network;
         // for `0.0.0.0` the endpoint is left unset, which is how `NWListener`
@@ -377,6 +460,12 @@ final class ProxyCore {
             client: connection,
             upstream: upstream,
             queue: queue,
+            // Не значение, а способ его спросить. Соединение живёт минутами
+            // и обслуживает много запросов подряд (keep-alive); скопированный
+            // сюда обработчик продолжал бы работать после того, как режим
+            // выключили на экране, — то есть дверь оставалась бы открытой
+            // ровно у того, кто уже вошёл.
+            mcp: { [weak self] in self?.mcp },
             audit: audit,
             access: access,
             onRejected: { [weak self] client, reason in
@@ -428,6 +517,10 @@ final class ProxyConnection: @unchecked Sendable {
     private let onClose: (ObjectIdentifier) -> Void
     private let peer: String
     private let session: URLSession
+    /// Как узнать текущий обработчик MCP. Спрашивается на каждом запросе,
+    /// а не запоминается: режим выключают на экране, и уже открытое
+    /// соединение обязано это заметить.
+    private let mcp: @Sendable () -> MCPHTTPHandler?
 
     private var parser = HTTPRequestParser()
     private var isHandling = false
@@ -437,6 +530,7 @@ final class ProxyConnection: @unchecked Sendable {
         client: NWConnection,
         upstream: URL,
         queue: DispatchQueue,
+        mcp: @escaping @Sendable () -> MCPHTTPHandler? = { nil },
         audit: AuditLog,
         access: AccessController,
         onRejected: @escaping (String, String) -> Void,
@@ -446,6 +540,7 @@ final class ProxyConnection: @unchecked Sendable {
         self.client = client
         self.upstream = upstream
         self.queue = queue
+        self.mcp = mcp
         self.audit = audit
         self.access = access
         self.onRejected = onRejected
@@ -542,6 +637,15 @@ final class ProxyConnection: @unchecked Sendable {
         // forwarded: the upstream server has nothing to say about it.
         if request.method.uppercased() == "OPTIONS" {
             await answerPreflight(request, started: started)
+            return
+        }
+
+        // Конечная точка MCP (HTTP-режим). Отвечаем сами и на ChromaDB
+        // не пересылаем: там такого пути нет и быть не должно. Права проверяет
+        // тот же слой инструментов, что и на stdio, — по тому же ключу, чтобы
+        // «через сокет можно, а по сети нельзя» не стало сюрпризом.
+        if MCPHTTPTransport.isEndpoint(path: request.path), let mcp = mcp() {
+            await answerMCP(request, using: mcp, started: started)
             return
         }
 
@@ -713,6 +817,69 @@ final class ProxyConnection: @unchecked Sendable {
             note: allowed ? nil : String(localized: "origin не разрешён ни одному клиенту")
         ))
         onFinished(!allowed, nil)
+    }
+
+    /// Отвечает на запрос к конечной точке MCP (HTTP-режим).
+    ///
+    /// В журнал доступа попадает так же, как всё остальное: вопрос «что делали
+    /// с базой чужими руками» один, и агент по сети — не исключение из него.
+    private func answerMCP(_ request: ProxiedRequest, using mcp: MCPHTTPHandler, started: Date) async {
+        // Имя метода MCP берём из заголовка: он обязателен и сверяется с телом
+        // в самом транспорте, так что разбирать тело второй раз незачем.
+        let method = request.header(MCPHTTPTransport.methodHeader) ?? "?"
+        let corsHeaders = await corsHeaders(for: request)
+
+        // Ключ проверяется **до** обращения к серверу MCP.
+        //
+        // Без этого `server/discover`, `ping` и `initialize` отвечали бы кому
+        // угодно из сети: они доходят до ответа раньше, чем слой инструментов
+        // спрашивает про права. Отдавать неизвестному имя сервера, версию и
+        // подсказку модели о том, как пользоваться базой, незачем.
+        //
+        // Поиск по ключу не расходует лимит частоты: у известного клиента его
+        // возьмёт слой инструментов, а неизвестному брать нечего.
+        guard let client = await access.client(withKey: request.accessKey) else {
+            let message = String(localized: "Ключ доступа не передан или не зарегистрирован.")
+            respond(
+                status: 401,
+                headers: corsHeaders + [("Content-Type", "application/json; charset=utf-8")],
+                body: MCPHTTPTransport.encode(.unidentifiedFailure(JSONRPCError(
+                    code: JSONRPCError.invalidRequest,
+                    message: message
+                )))
+            )
+            audit.record(AuditEntry(
+                client: peer, method: request.method, path: request.path,
+                operation: "mcp_\(method)", access: .service, collection: nil,
+                requestBytes: request.body.count, responseStatus: 401, responseBytes: 0,
+                durationSeconds: Date().timeIntervalSince(started), note: message
+            ))
+            onRejected(peer, message)
+            onFinished(true, nil)
+            return
+        }
+
+        let response = await mcp(request.method, request.headers, request.body, request.accessKey)
+        respond(
+            status: response.status,
+            headers: response.headers.map { ($0.name, $0.value) } + corsHeaders,
+            body: response.body
+        )
+        audit.record(AuditEntry(
+            // Имя клиента, а не адрес: журнал отвечает на вопрос «кто», и
+            // строка с одним лишь IP на него не отвечает.
+            client: client.name,
+            method: request.method,
+            path: request.path,
+            operation: "mcp_\(method)",
+            access: .service,
+            collection: nil,
+            requestBytes: request.body.count,
+            responseStatus: response.status,
+            responseBytes: response.body.count,
+            durationSeconds: Date().timeIntervalSince(started)
+        ))
+        onFinished(response.status >= 400, client.id)
     }
 
     private func respond(status: Int, headers: [(String, String)], body: Data) {

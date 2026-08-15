@@ -246,6 +246,78 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
     /// Ordered separators for the recursive strategy.
     public var separators: [String]
 
+    /// Дописывать ли перед текстом чанка строку «Документ → Раздел →
+    /// Подраздел» **перед вычислением вектора**.
+    ///
+    /// Почти бесплатно и заметно помогает: чанк «превышение допустимого
+    /// значения приводит к отказу» сам по себе бесполезен — в базе на десять
+    /// тысяч документов он не находится ничем, потому что в нём нет ни одного
+    /// слова о том, о чём он.
+    ///
+    /// **В вектор, но не в текст документа.** Иначе человек и агент читали бы
+    /// служебную строку в каждом результате, а `content_hash` считался бы
+    /// от строки, которой в файле нет.
+    ///
+    /// Выключено по умолчанию: включение меняет содержимое коллекции,
+    /// то есть требует переиндексации, и решать это должен человек.
+    public var contextPrefix: Bool
+
+    /// Дописывать ли перед текстом чанка одно-два предложения, **написанные
+    /// чат-моделью**: о чём документ и где в нём этот фрагмент.
+    ///
+    /// То же, что `contextPrefix`, но дороже и умнее. Структурная строка берёт
+    /// заголовки — она бесплатна и молчит там, где заголовков нет; здесь
+    /// модель читает сам фрагмент и говорит, о чём он.
+    ///
+    /// **Цена — один вызов чат-модели на чанк.** На коллекции в десять тысяч
+    /// чанков это часы работы локальной модели, поэтому опция выключена по
+    /// умолчанию, а экран обязан показать оценку до запуска: сколько вызовов
+    /// и сколько это займёт.
+    ///
+    /// В вектор, но не в текст документа — по тому же правилу.
+    public var contextEnrichment: Bool
+    /// Модель для обогащения. Пусто — берётся `chatModel` источника.
+    public var enrichmentModel: String?
+
+    /// До какой длины в знаках может дорасти чанк при этих настройках
+    ///. `nil` — предела нет вовсе.
+    ///
+    /// Нужно, чтобы форма могла сказать «этот размер больше того, что модель
+    /// читает», **до** прогона, а не после него. Считается по той настройке,
+    /// которая ограничивает размер у выбранной стратегии, — у каждой она своя,
+    /// и общего «максимума чанка» в конфигурации нет.
+    public var largestChunkCharacters: Int? {
+        switch strategy {
+        case .fixed, .recursive:
+            return chunkSizeInCharacters
+        case .documentBased:
+            // «Не делить» — размер секции ничем не ограничен: сколько нашлось
+            // между заголовками, столько и уйдёт в модель.
+            return oversizedFallback == .keep ? nil : maxSectionSizeInCharacters
+        case .hierarchical:
+            // Родитель крупнее ребёнка по построению — по нему и считаем.
+            return max(parentSizeInCharacters, childSizeInCharacters)
+        case .semantic, .adaptive:
+            return maxSizeInCharacters
+        case .llmBased:
+            // Границы расставляет чат-модель, и предел ей не задан ничем:
+            // сколько она вернёт одним фрагментом, столько и будет.
+            return nil
+        }
+    }
+
+    /// Какой моделью пойдёт обогащение — одним ответом для экрана и прогона.
+    ///
+    /// Пустая строка здесь равна `nil`: поле обещает откат к `chatModel`,
+    /// и «выбрана пустая модель» — это не выбор. Считается в одном месте,
+    /// потому что экран, называющий одну модель, и прогон, зовущий другую,
+    /// расходятся молча.
+    public var resolvedEnrichmentModel: String? {
+        [enrichmentModel, chatModel]
+            .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty }
+    }
+
     // Document-based
     public var sourceFormat: DocumentSourceFormat
     /// Markdown heading level to split on: 2 means `##`.
@@ -308,6 +380,9 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         sizeUnit: SizeUnit = .tokens,
         overlapPercent: Double = 15,
         separators: [String] = ["\n\n", "\n", ". ", " "],
+        contextPrefix: Bool = false,
+        contextEnrichment: Bool = false,
+        enrichmentModel: String? = nil,
         sourceFormat: DocumentSourceFormat = .auto,
         splitHeaderLevel: Int = 2,
         splitTags: [String] = ["section", "article"],
@@ -343,6 +418,9 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         self.sizeUnit = sizeUnit
         self.overlapPercent = overlapPercent
         self.separators = separators
+        self.contextPrefix = contextPrefix
+        self.contextEnrichment = contextEnrichment
+        self.enrichmentModel = enrichmentModel
         self.sourceFormat = sourceFormat
         self.splitHeaderLevel = splitHeaderLevel
         self.splitTags = splitTags
@@ -386,6 +464,9 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         sizeUnit = value(.sizeUnit, fallback.sizeUnit)
         overlapPercent = value(.overlapPercent, fallback.overlapPercent)
         separators = value(.separators, fallback.separators)
+        contextPrefix = value(.contextPrefix, fallback.contextPrefix)
+        contextEnrichment = value(.contextEnrichment, fallback.contextEnrichment)
+        enrichmentModel = value(.enrichmentModel, fallback.enrichmentModel)
         sourceFormat = value(.sourceFormat, fallback.sourceFormat)
         splitHeaderLevel = value(.splitHeaderLevel, fallback.splitHeaderLevel)
         splitTags = value(.splitTags, fallback.splitTags)
@@ -453,6 +534,13 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
     public var signature: String {
         let unit = sizeUnit == .tokens ? "t" : "c"
         var parts = [strategy.rawValue]
+        // контекстный префикс меняет то, что уходит в модель, при любой
+        // стратегии — значит это часть рецепта коллекции, а не настройка
+        // показа.
+        if contextPrefix { parts.append("ctx") }
+        // Обогащение стоит вызова модели на чанк — оно обязано быть видно
+        // в строке настроек источника, а не только в форме.
+        if contextEnrichment { parts.append("ctx+llm") }
 
         switch strategy {
         case .fixed:
@@ -630,6 +718,23 @@ public protocol Chunking {
 public enum TokenEstimator {
     /// ~4 characters per token is the common rule of thumb for English;
     /// for Russian text it is closer to 3, so we use 3.5 as a middle ground.
+    ///
+    /// **Это число завышено, и менять его нельзя молча**. Замер
+    /// токенизатором Qwen3 на корпусе русской Википедии: 2.68 знака на токен
+    /// (разброс 2.54–2.77 по шести файлам). То есть «512 токенов» в форме
+    /// превращаются в 1792 знака ≈ 669 настоящих токенов — на 31 % больше
+    /// заказанного.
+    ///
+    /// Почему константа всё-таки осталась: она переводит **настройку**
+    /// в знаки, и её правка сдвинула бы границы чанков у всех источников,
+    /// не меняя подписи стратегии, — коллекция набралась бы смесью старой
+    /// и новой нарезки по мере правки файлов. Честный выход для того, кому
+    /// нужна точность, — единица «знаки»: их приложение знает наверняка,
+    /// а токены не знает никогда (у эндпойнта эмбеддингов LM Studio
+    /// `usage.prompt_tokens` равен нулю — проверено).
+    ///
+    /// Там, где ошибка опасна, а не косметична, берётся
+    /// `pessimisticCharactersPerToken`.
     ///
     /// Годится, чтобы **показать** человеку порядок величины. Не годится,
     /// чтобы на этом основании решать, влезет ли промпт: см. ниже.

@@ -52,6 +52,17 @@ public struct SecurityAssessment: Sendable {
     /// tell «никто не подключался» from «файрвол не пускает».
     public var proxyUptime: TimeInterval?
     public var sawExternalRequest: Bool
+    /// Настройка «шифровать трафик прокси» — то, что выбрано, а не то,
+    /// что происходит сейчас.
+    public var usesTLS: Bool
+    /// Выпущенный сертификат, если он есть.
+    public var certificate: TLSCertificateInfo?
+    /// Адреса этого Мака в сети — с ними сверяется, покрывает ли их сертификат.
+    public var localAddresses: [String]
+    /// Шифрует ли **работающий** прокси. `nil`, когда он остановлен. Отдельно
+    /// от `usesTLS` по той же причине, по которой факт вообще отделён
+    /// от настройки: настройку можно переключить, не перезапустив прокси.
+    public var runningWithTLS: Bool?
 
     public init(
         exposure: NetworkExposure,
@@ -62,10 +73,18 @@ public struct SecurityAssessment: Sendable {
         serverPort: Int? = nil,
         clients: [ExternalClient] = [],
         proxyUptime: TimeInterval? = nil,
-        sawExternalRequest: Bool = false
+        sawExternalRequest: Bool = false,
+        usesTLS: Bool = true,
+        certificate: TLSCertificateInfo? = nil,
+        localAddresses: [String] = [],
+        runningWithTLS: Bool? = nil
     ) {
         self.proxyUptime = proxyUptime
         self.sawExternalRequest = sawExternalRequest
+        self.usesTLS = usesTLS
+        self.certificate = certificate
+        self.localAddresses = localAddresses
+        self.runningWithTLS = runningWithTLS
         self.exposure = exposure
         self.proxyIsRunning = proxyIsRunning
         self.proxyPort = proxyPort
@@ -93,6 +112,11 @@ public struct SecurityAssessment: Sendable {
         guard serverIsRunning, let host = serverHost else { return false }
         return !Self.isLoopback(host)
     }
+
+    /// Шифруется ли трафик **на самом деле**: у работающего прокси — так, как
+    /// он запущен, у остановленного — так, как выбрано. Экран обязан описывать
+    /// происходящее, а не намерение: пока прокси работает, значение имеет он.
+    public var effectiveTLS: Bool { runningWithTLS ?? usesTLS }
 
     public static func isLoopback(_ host: String) -> Bool {
         ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
@@ -145,6 +169,70 @@ public struct SecurityAssessment: Sendable {
                 severity: .caution,
                 text: String(localized: "Прокси открыт в локальную сеть на порту \(proxyPort.plainDigits)."),
                 suggestion: String(localized: "Подключиться сможет любой, у кого есть действующий ключ. Отзыв ключа действует сразу.")
+            ))
+        }
+
+        // Наружу и без шифрования — то, ради чего пункт C1 вообще написан.
+        // Ключ клиента ходит заголовком: без TLS его читает любой, кто слушает
+        // сегмент. Это не «настройка со своими плюсами», а дыра, поэтому
+        // предупреждение самое строгое из возможных.
+        if exposure.isExposed && !effectiveTLS {
+            found.append(SecurityWarning(
+                id: "exposed-without-tls",
+                severity: .critical,
+                text: String(localized: "Прокси открыт в сеть без шифрования: ключ клиента передаётся в открытом виде и виден всем, кто слушает сеть."),
+                suggestion: String(localized: "Включите TLS. Если клиент не умеет доверять самоподписанному сертификату, оставьте прокси на 127.0.0.1 — по петле открытый трафик за пределы Мака не выходит.")
+            ))
+        }
+
+        // Слушать петлю без TLS — нормально, и говорить об этом нечего:
+        // такой трафик не покидает машину.
+        if usesTLS || runningWithTLS == true, let certificate {
+            if certificate.isExpired() {
+                found.append(SecurityWarning(
+                    id: "certificate-expired",
+                    severity: .critical,
+                    text: String(localized: "Сертификат прокси истёк \(certificate.notAfter.formatted(date: .abbreviated, time: .omitted))."),
+                    suggestion: String(localized: "Клиенты уже получают ошибку. Выпустите сертификат заново и передайте новый отпечаток тем, кто подключается.")
+                ))
+            } else if certificate.expiresSoon() {
+                found.append(SecurityWarning(
+                    id: "certificate-expires-soon",
+                    severity: .caution,
+                    text: String(localized: "Сертификат прокси действует ещё \(certificate.daysRemaining().plainDigits) дн."),
+                    suggestion: String(localized: "Перевыпуск меняет отпечаток: клиентам понадобится новый. Лучше сделать это заранее, а не в день, когда всё перестанет работать.")
+                ))
+            }
+
+            // Адрес Мака в сети сменился, а сертификат остался прежним:
+            // клиент получит ошибку имени и будет думать на что угодно, кроме
+            // выданного вчера адреса.
+            if exposure.isExposed {
+                let uncovered = localAddresses.filter { !certificate.covers($0) }
+                if !uncovered.isEmpty {
+                    found.append(SecurityWarning(
+                        id: "certificate-address-mismatch",
+                        severity: .caution,
+                        text: String(localized: "Сертификат не выписан на адрес этого Мака: \(uncovered.joined(separator: ", "))."),
+                        suggestion: String(localized: "Подключение по этому адресу клиент отвергнет по несовпадению имени. Выпустите сертификат заново — новый возьмёт текущие адреса.")
+                    ))
+                }
+            }
+        }
+
+        // Настройку переключили, а прокси работает по-старому. Молчать об этом
+        // нельзя: экран показывал бы выбранное как действующее, а клиент
+        // получал бы обратное — и разбираться в этом пришлось бы на его стороне.
+        if proxyIsRunning, let runningWithTLS, runningWithTLS != usesTLS {
+            found.append(SecurityWarning(
+                id: "tls-restart-needed",
+                // Строгость — по тому, что происходит, а не по тому, что
+                // выбрано: открытый порт наружу опаснее любого намерения.
+                severity: !runningWithTLS && exposure.isExposed ? .critical : .caution,
+                text: runningWithTLS
+                    ? String(localized: "Шифрование выключено в настройках, но работающий прокси всё ещё шифрует трафик.")
+                    : String(localized: "Шифрование включено в настройках, но работающий прокси принимает соединения без него."),
+                suggestion: String(localized: "Перезапустите прокси — настройка применяется при запуске.")
             ))
         }
 

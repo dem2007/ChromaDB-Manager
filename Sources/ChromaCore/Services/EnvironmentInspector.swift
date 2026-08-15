@@ -258,19 +258,35 @@ public struct PyPIClient {
     }
 }
 
-/// GitHub Releases, used for the standalone CLI (install path A).
-public struct GitHubReleaseClient {
+/// GitHub Releases, used for the standalone CLI (install path A) and — with
+/// another repository — for the app's own update check.
+public struct GitHubReleaseClient: Sendable {
     public static let repository = "chroma-core/chroma"
     /// CLI releases are tagged `cli-<version>`, mixed in with engine releases.
     public static let cliTagPrefix = "cli-"
 
-    public init() {}
+    /// Чей список релизов спрашиваем. По умолчанию — движок: так этот клиент
+    /// работал до появления H5, и все прежние вызовы остались прежними.
+    public let repository: String
 
-    public struct Release: Decodable {
+    public init(repository: String = GitHubReleaseClient.repository) {
+        self.repository = repository
+    }
+
+    public struct Release: Decodable, Sendable {
         public let tag_name: String
         public let assets: [Asset]
+        /// Поля ниже нужны проверке обновлений приложения и не приходят
+        /// у части релизов, поэтому необязательные: отсутствие описания
+        /// не должно ронять разбор всего списка.
+        public let name: String?
+        public let body: String?
+        public let html_url: String?
+        public let draft: Bool?
+        public let prerelease: Bool?
+        public let published_at: String?
 
-        public struct Asset: Decodable {
+        public struct Asset: Decodable, Sendable {
             public let name: String
             public let browser_download_url: String
             public let size: Int
@@ -278,7 +294,7 @@ public struct GitHubReleaseClient {
     }
 
     public func releases() async throws -> [Release] {
-        guard let url = URL(string: "https://api.github.com/repos/\(Self.repository)/releases?per_page=30") else {
+        guard let url = URL(string: "https://api.github.com/repos/\(repository)/releases?per_page=30") else {
             throw ChromaError.decoding("некорректный URL GitHub")
         }
         var request = URLRequest(url: url)

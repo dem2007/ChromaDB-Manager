@@ -75,8 +75,32 @@ final class CollectionNameValidationTests: XCTestCase {
 // MARK: - A7: text against the model's context
 
 final class ContextBudgetTests: XCTestCase {
+    /// Текст, который **проверяющий** сочтёт за столько токенов.
+    ///
+    /// Считает он пессимистично — по два знака на токен, — и строить
+    /// образец по обычной оценке в 3.5 значило бы проверять не границу,
+    /// а расхождение двух коэффициентов.
     private func text(tokens: Int) -> String {
-        String(repeating: "я", count: TokenEstimator.characters(forTokens: tokens))
+        String(
+            repeating: "я",
+            count: Int(Double(tokens) * TokenEstimator.pessimisticCharactersPerToken)
+        )
+    }
+
+    /// Оценка ошибается в сторону предупреждения, а не молчания.
+    ///
+    /// Замер на живом корпусе: 2.68 знака на токен для русского. По обычной
+    /// оценке в 3.5 текст выглядит короче, чем он есть, и проверка бюджета
+    /// пропускала бы то, что модель молча обрежет.
+    func testTheEstimateErrsTowardsWarning() {
+        // 7000 знаков: по 3.5 это 2000 «токенов» и запас до лимита,
+        // по факту (2.68) — 2612, по осторожной оценке — 3500.
+        let sample = String(repeating: "я", count: 7000)
+        XCTAssertTrue(ContextBudget.check(sample, contextLength: 3000).blocksSending)
+        XCTAssertFalse(
+            ContextBudget.check(sample, contextLength: 8000).blocksSending,
+            "с большим запасом осторожность не должна мешать работать"
+        )
     }
 
     func testUnderTheThresholdNothingIsSaid() {

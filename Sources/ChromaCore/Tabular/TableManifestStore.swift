@@ -90,6 +90,28 @@ public struct TableStatisticsRow: Hashable, Sendable, Identifiable {
 }
 
 extension TableManifestStore {
+    /// Исчезнувшие строки всех таблиц источника — то, что ждёт решения.
+    ///
+    /// По листам, а не по файлам: решение принимают о строках одного листа,
+    /// и «прайс.xlsx — 40 строк» не сказало бы, о каком из двух листов речь.
+    public func pendingRemovals(sourceID: UUID) -> [PendingRowRemoval] {
+        load(sourceID: sourceID).values
+            .flatMap { file in
+                file.pendingRemovals
+                    .filter { !$0.value.rows.isEmpty }
+                    .map { sheetName, removal in
+                        PendingRowRemoval(
+                            relativePath: file.relativePath,
+                            sheetName: sheetName,
+                            collectionName: file.collectionName,
+                            rows: removal.rows.sorted { $0.rowNumber < $1.rowNumber },
+                            noticedAt: removal.noticedAt
+                        )
+                    }
+            }
+            .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
+    }
+
     /// «сколько строк из каких таблиц проиндексировано».
     ///
     /// Per sheet rather than per file: one workbook routinely holds a catalogue

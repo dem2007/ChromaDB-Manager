@@ -39,6 +39,7 @@ struct SecurityView: View {
                     // наружу»; на «Сервере» жила вторая его половина, и
                     // настройки расходились между двумя экранами.
                     exposureCard
+                    encryptionCard
                     proxyCard
                 case 2:
                     notificationsCard
@@ -53,6 +54,9 @@ struct SecurityView: View {
             .padding(.top, 4)
             .pageContentPadding()
         }
+        // Сертификат и адреса машины читаются здесь — один раз на открытие
+        // экрана, а не на каждое обращение к оценке.
+        .task { app.refreshSecuritySnapshot() }
     }
 
     /// Экстренная остановка — карточкой, а не кнопкой в шапке.
@@ -208,6 +212,118 @@ struct SecurityView: View {
         case .info: return Theme.Palette.stopped
         case .caution: return Theme.Palette.attention
         case .critical: return Theme.Palette.danger
+        }
+    }
+
+    // MARK: - Шифрование
+
+    /// Сертификат: отпечаток, срок, имена, перевыпуск и экспорт.
+    ///
+    /// Отпечаток стоит первым и целиком, а не «первые восемь знаков»: он и есть
+    /// то, чем клиент проверяет, что говорит с нами. Прятать его под кнопку
+    /// значит заставлять человека сверять по памяти.
+    private var encryptionCard: some View {
+        SectionCard(
+            title: String(localized: "Шифрование"),
+            subtitle: String(localized: "Ключ клиента передаётся заголовком. Без шифрования его видит любой, кто слушает сеть между клиентом и этим Маком.")
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(String(localized: "Шифровать трафик прокси (TLS)"), isOn: Binding(
+                    get: { settings.configuration.proxyUsesTLS },
+                    set: { model.setTLS($0, app: app) }
+                ))
+
+                if !settings.configuration.proxyUsesTLS {
+                    Text(settings.configuration.proxyExposure.isExposed
+                        ? String(localized: "Прокси открыт наружу и не шифрует: ключи уходят в сеть открытым текстом.")
+                        : String(localized: "Прокси слушает только этот Мак — такой трафик не покидает машину."))
+                        .font(Theme.Font.caption)
+                        .foregroundStyle(settings.configuration.proxyExposure.isExposed
+                            ? Theme.Palette.danger
+                            : Theme.Palette.captionText)
+                }
+
+                if settings.configuration.proxyUsesTLS {
+                    if let certificate = assessment.certificate {
+                        certificateDetails(certificate)
+                    } else {
+                        // Кнопка нужна до запуска, а не после: отпечаток
+                        // отдают клиенту заранее, вместе с ключом. Без неё
+                        // единственный способ увидеть сертификат — запустить
+                        // прокси, то есть открыть порт, чтобы посмотреть бумагу.
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(String(localized: "Сертификат выпустится сам при первом запуске прокси."))
+                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                            Button(String(localized: "Выпустить сейчас")) { model.reissueCertificate(app) }
+                                .help(String(localized: "Чтобы отдать клиенту отпечаток и файл заранее, не запуская прокси"))
+                        }
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(localized: "Как подключается клиент")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(model.connectionExample(app: app))
+                            .font(Theme.Font.mono)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            model.copy(model.connectionExample(app: app))
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.borderless)
+                        .help(String(localized: "Скопировать пример"))
+                    }
+                }
+            }
+            .confirmationDialog(
+                String(localized: "Выпустить сертификат заново?"),
+                isPresented: $model.isConfirmingReissue,
+                titleVisibility: .visible
+            ) {
+                Button(String(localized: "Выпустить"), role: .destructive) { model.reissueCertificate(app) }
+                Button(String(localized: "Отмена"), role: .cancel) {}
+            } message: {
+                Text(String(localized: "Отпечаток изменится. Все, кто уже доверился прежнему сертификату, получат ошибку соединения, пока не получат новый отпечаток или новый файл сертификата.\n\nДелать это стоит, когда сертификат подходит к концу срока или когда у Мака сменился адрес в сети."))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func certificateDetails(_ certificate: TLSCertificateInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(String(localized: "Отпечаток SHA-256")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                HStack(alignment: .top, spacing: 6) {
+                    Text(certificate.fingerprint)
+                        .font(Theme.Font.mono)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        model.copy(certificate.fingerprint)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(String(localized: "Скопировать отпечаток"))
+                }
+                Text(String(localized: "Клиент видит ровно этот отпечаток. Совпал — соединение то самое."))
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+            }
+
+            proxyRow(String(localized: "Действует до"), certificate.notAfter.formatted(date: .abbreviated, time: .shortened))
+            proxyRow(String(localized: "Осталось"), certificate.isExpired()
+                ? String(localized: "истёк")
+                : String(localized: "\(certificate.daysRemaining().plainDigits) дн."))
+            proxyRow(String(localized: "Выписан на"), certificate.hosts.joined(separator: ", "))
+
+            HStack(spacing: 8) {
+                Button(String(localized: "Сохранить сертификат…")) { model.exportCertificate(app) }
+                Button(String(localized: "Выпустить заново")) { model.isConfirmingReissue = true }
+            }
         }
     }
 
@@ -389,10 +505,15 @@ struct SecurityView: View {
                 if proxy.state.isRunning {
                     proxyRow(String(localized: "Пересылает в"), proxy.upstreamDescription ?? "—")
                     proxyRow(String(localized: "Доступен"), proxy.exposure.title)
+                    proxyRow(String(localized: "Трафик"), proxy.tls == .tls
+                        ? String(localized: "шифруется (TLS)")
+                        : String(localized: "без шифрования"))
                     proxyRow(String(localized: "Соединений"), proxy.activeConnections.plainDigits)
                     proxyRow(String(localized: "Запросов"), proxy.totalRequests.plainDigits)
                     proxyRow(String(localized: "Отказов"), proxy.rejectedRequests.plainDigits)
-                    Text(String(localized: "Клиент подключается так: chromadb.HttpClient(host=\"127.0.0.1\", port=\(settings.configuration.proxyPort.plainDigits))"))
+                    Text(proxy.tls == .tls
+                        ? String(localized: "Клиент подключается так: chromadb.HttpClient(host=\"127.0.0.1\", port=\(settings.configuration.proxyPort.plainDigits), ssl=True)")
+                        : String(localized: "Клиент подключается так: chromadb.HttpClient(host=\"127.0.0.1\", port=\(settings.configuration.proxyPort.plainDigits))"))
                         .font(Theme.Font.mono)
                         .foregroundStyle(Theme.Palette.captionText)
                         .textSelection(.enabled)

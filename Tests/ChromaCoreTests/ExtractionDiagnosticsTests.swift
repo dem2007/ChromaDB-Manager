@@ -361,24 +361,80 @@ final class PlannedChunksTests: XCTestCase {
         }
     }
 
-    /// А структурная стратегия без структуры — подменяется, и говорит об этом.
-    func testAStructuralStrategyWithoutStructureIsSubstitutedAndSaysSo() async throws {
+    /// Document-based, которой не за что зацепиться, — подменяется и говорит
+    /// об этом. ~~И hierarchical вместе с ней~~ — больше нет, см. следующий
+    /// тест.
+    func testADocumentBasedStrategyWithNothingToCutOnIsSubstitutedAndSaysSo() async throws {
         var scanned = document(parts: [], text: String(repeating: "распознанный текст. ", count: 40), ocr: true)
         scanned.containerFormat = "pdf"
 
-        for strategy in [ChunkStrategy.documentBased, .hierarchical] {
-            let decision = SourceSyncService.substitution(for: configuration(strategy), document: scanned)
-            guard case .noStructure(let named)? = decision else {
-                return XCTFail("\(strategy) без структуры обязана подмениться")
-            }
-            XCTAssertEqual(named, strategy, "в пометке должна стоять та стратегия, которую подменили")
-
-            let chunks = try await SourceSyncService.plannedChunks(
-                of: scanned, fileExtension: "pdf", pipeline: pipeline, ocrPipeline: pipeline,
-                configuration: configuration(strategy)
-            )
-            XCTAssertTrue(chunks.allSatisfy { $0.note?.contains("структура") == true })
+        let decision = SourceSyncService.substitution(for: configuration(.documentBased), document: scanned)
+        guard case .noStructure(let named)? = decision else {
+            return XCTFail("резать нечего — стратегия обязана подмениться")
         }
+        XCTAssertEqual(named, .documentBased, "в пометке должна стоять та стратегия, которую подменили")
+
+        let chunks = try await SourceSyncService.plannedChunks(
+            of: scanned, fileExtension: "pdf", pipeline: pipeline, ocrPipeline: pipeline,
+            configuration: configuration(.documentBased)
+        )
+        XCTAssertTrue(chunks.allSatisfy { $0.note?.contains("структура") == true })
+    }
+
+    /// Hierarchical не подменяется никогда: структура ей не нужна вовсе —
+    /// родители режутся по размеру, дети внутри родителей.
+    ///
+    /// Прежнее правило лишало коллекцию родительских чанков и связи
+    /// `parent_chunk_id` на каждом документе без оглавления — то есть почти
+    /// на всех.
+    func testHierarchicalIsNeverSubstituted() async throws {
+        var scanned = document(parts: [], text: String(repeating: "распознанный текст. ", count: 200), ocr: true)
+        scanned.containerFormat = "pdf"
+
+        XCTAssertNil(SourceSyncService.substitution(for: configuration(.hierarchical), document: scanned))
+
+        var settings = configuration(.hierarchical)
+        settings.levels = 2
+        settings.sizeUnit = .characters
+        settings.parentChunkSize = 900
+        settings.childChunkSize = 250
+        let chunks = try await SourceSyncService.plannedChunks(
+            of: scanned, fileExtension: "pdf", pipeline: ChunkingPipeline(configuration: settings),
+            ocrPipeline: pipeline, configuration: settings
+        )
+        XCTAssertTrue(chunks.contains { $0.level == 1 }, "родительские чанки обязаны быть")
+        XCTAssertTrue(chunks.contains { $0.level == 0 }, "дочерние тоже")
+        XCTAssertTrue(chunks.allSatisfy { $0.note == nil }, "подменять было не за что")
+    }
+
+    /// Markdown без оглавления в `structure` — тот самый случай, ради которого
+    /// правило переписано: экстрактор структуру не заполняет, а заголовки
+    /// в тексте есть, и Document-based режет по ним сама.
+    func testMarkdownHeadingsAreEnoughForDocumentBased() async throws {
+        var markdown = document(parts: [], text: """
+        # Руководство
+
+        ## Установка
+        Скачайте и распакуйте архив.
+
+        ## Настройка
+        Откройте файл настроек и укажите путь.
+        """)
+        markdown.containerFormat = "md"
+        XCTAssertTrue(markdown.structure.isEmpty, "проверяем именно документ без разобранной структуры")
+
+        XCTAssertNil(
+            SourceSyncService.substitution(for: configuration(.documentBased), document: markdown),
+            "заголовки в тексте есть — подменять стратегию не на что"
+        )
+        // Нарезка — той самой стратегией, а не общей для теста: иначе
+        // проверялся бы Recursive.
+        let settings = configuration(.documentBased)
+        let chunks = try await SourceSyncService.plannedChunks(
+            of: markdown, fileExtension: "md", pipeline: ChunkingPipeline(configuration: settings),
+            ocrPipeline: pipeline, configuration: settings
+        )
+        XCTAssertEqual(chunks.count, 3, "заголовок документа плюс два раздела: \(chunks.map(\.text))")
     }
 
     /// Текстовый слой без оглавления — тот же случай: дело не в OCR.

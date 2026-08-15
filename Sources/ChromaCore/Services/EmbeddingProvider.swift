@@ -16,10 +16,33 @@ public protocol EmbeddingProvider: Sendable {
     /// в 30 000 символов проходит через модель, загруженную с 2048;
     /// на порождающих вызовах не наращивает и отвечает 400.
     func contextLength(of model: String) async -> Int?
+
+    /// То же, но **мимо кэша векторов**.
+    ///
+    /// Нужно пробе предела чтения: она отправляет несколько текстов
+    /// по 64 000 знаков, которые больше никогда не понадобятся, и оседать
+    /// в кэше им незачем — они вытеснят оттуда векторы настоящих чанков.
+    func embedIgnoringCache(texts: [String], model: String) async throws -> [[Double]]
+
+    /// Контекст, с которым модель загружена **сейчас**. Меняется
+    /// при перезагрузке модели — то есть ровно тогда, когда измеренный
+    /// предел чтения перестаёт быть верным. `nil` — неизвестно.
+    ///
+    /// **Спрашивает, но не будит**. Признак свежести не стоит того,
+    /// чтобы ради него грузить модель: порождающий вызов к эмбеддинг-модели и
+    /// ответит ошибкой, и заставит LM Studio поднять её по JIT, выгрузив
+    /// занятую — то самое, из-за чего падала индексация. Не знаем —
+    /// отвечаем `nil`.
+    func reportedLoadedContextLength(of model: String) async -> Int?
 }
 
 public extension EmbeddingProvider {
     func contextLength(of model: String) async -> Int? { nil }
+    /// Кэша у провайдера может и не быть — тогда это обычный вызов.
+    func embedIgnoringCache(texts: [String], model: String) async throws -> [[Double]] {
+        try await embed(texts: texts, model: model)
+    }
+    func reportedLoadedContextLength(of model: String) async -> Int? { nil }
 }
 
 /// Whatever answers a chat prompt — used only by LLM-based chunking.

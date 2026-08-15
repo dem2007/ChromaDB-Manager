@@ -11,7 +11,12 @@ import UniformTypeIdentifiers
 /// at a folder of a thousand files, not after.
 public struct VisionOCRExtractor: DocumentTextExtractor {
     public let id = "vision-ocr"
-    public let version = 1
+    /// 3 — таблицы распознанной страницы собираются по координатам слов
+    ///, тем же разбором, что и у PDF с текстовым слоем.
+    ///
+    /// 2 — сшивка строк в абзацы и смещения страниц, считаемые после
+    /// разделителя.
+    public let version = 3
 
     /// Rendering scale for a page before recognition. 2× the nominal 72 dpi is
     /// the usual floor for Vision on scanned text; below it the accuracy drops
@@ -44,8 +49,13 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
         let languages = try Self.resolvedLanguages(options.ocrLanguages)
         var text = ""
         var pageStarts: [Int] = []
+        var length = 0
         var confidenceSum = 0.0
         var confidenceWeight = 0.0
+        /// Нашлась ли хоть на одной странице таблица. До этого
+        /// у распознанного скана признака таблиц не было вовсе — при том,
+        /// что ведомость и смета обычно и приходят сканами.
+        var hasTables = false
 
         for index in 0..<document.pageCount {
             // Cancellation between pages, not inside one: a Vision request is a
@@ -55,15 +65,37 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
                 stage: .recognising, unit: index + 1, total: document.pageCount
             ))
 
-            pageStarts.append(text.count)
-            guard let page = document.page(at: index), let image = Self.render(page) else { continue }
+            guard let page = document.page(at: index), let image = Self.render(page) else {
+                pageStarts.append(length)
+                continue
+            }
             let recognised = try await Self.recognise(
                 image, languages: languages, timeout: options.ocrPageTimeout
             )
-            guard !recognised.text.isEmpty else { continue }
+            // Vision отдаёт по строке на наблюдение, то есть ровно ту же
+            // построчную россыпь, что и текстовый слой PDF, — и сшивается
+            // она тем же способом. Словаря документа здесь нет:
+            // страницы распознаются по одной, и ждать всех ради дефисов
+            // значило бы держать в памяти весь распознанный текст дважды.
+            // На табличной странице сшивать нечего: строка там — строка
+            // таблицы, и склеить её со следующей значило бы смешать записи.
+            let reflowed = recognised.table ?? PDFTextReflow.page(recognised.text)
+            if recognised.table != nil { hasTables = true }
+            guard !reflowed.isEmpty else {
+                pageStarts.append(length)
+                continue
+            }
 
-            if !text.isEmpty { text += "\n\n" }
-            text += recognised.text
+            // Смещение записывается **после** разделителя, как в PDFExtractor:
+            // записанное раньше, оно указывало на хвост предыдущей страницы
+            //.
+            if length > 0 {
+                text += "\n\n"
+                length += 2
+            }
+            pageStarts.append(length)
+            text += reflowed
+            length += reflowed.count
             confidenceSum += recognised.confidence * Double(recognised.text.count)
             confidenceWeight += Double(recognised.text.count)
         }
@@ -83,11 +115,14 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
             structure: [],
             pageCount: document.pageCount,
             pageStarts: pageStarts,
-            warnings: [.ocrUsed(averageConfidence: confidence)],
+            warnings: hasTables
+                ? [.ocrUsed(averageConfidence: confidence), .tablesFlattened]
+                : [.ocrUsed(averageConfidence: confidence)],
             structureSource: .none,
             containerFormat: "pdf",
             extractorID: id,
             extractorVersion: version,
+            hasTables: hasTables,
             ocrUsed: true,
             ocrConfidence: confidence,
             documentMetadata: [:]
@@ -126,6 +161,42 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
         let text: String
         /// 0…1, weighted by how much text each observation carried.
         let confidence: Double
+        /// Страница, собранная по координатам слов, если на ней таблица
+        ///. Сшивать её в абзацы нельзя: строка там — строка таблицы.
+        var table: String?
+    }
+
+    /// Слова распознанной строки с их рамками в точках изображения.
+    ///
+    /// Vision считает рамки долями страницы, а пороги разбора — в тех же
+    /// единицах, что и рост знака, поэтому доли переводятся в точки. Если
+    /// рамку слова получить не удалось, берётся рамка всего наблюдения:
+    /// одна ячейка на строку — хуже, чем колонки, но лучше, чем ничего.
+    static func words(
+        of candidate: VNRecognizedText, in image: CGImage, fallback: VNRecognizedTextObservation
+    ) -> [TableGeometry.Word] {
+        let string = candidate.string
+        var result: [TableGeometry.Word] = []
+        var start = string.startIndex
+        while start < string.endIndex {
+            guard let from = string[start...].firstIndex(where: { !$0.isWhitespace }) else { break }
+            let to = string[from...].firstIndex(where: { $0.isWhitespace }) ?? string.endIndex
+            let text = String(string[from..<to])
+            if let box = try? candidate.boundingBox(for: from..<to) {
+                result.append(TableGeometry.Word(
+                    box: VNImageRectForNormalizedRect(box.boundingBox, image.width, image.height),
+                    text: text
+                ))
+            }
+            start = to
+        }
+        guard result.isEmpty else { return result }
+        let whole = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !whole.isEmpty else { return [] }
+        return [TableGeometry.Word(
+            box: VNImageRectForNormalizedRect(fallback.boundingBox, image.width, image.height),
+            text: whole
+        )]
     }
 
     static func render(_ page: PDFPage) -> CGImage? {
@@ -164,6 +235,7 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
                         }
                         let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
                         var lines: [String] = []
+                        var words: [TableGeometry.Word] = []
                         var weighted = 0.0
                         var weight = 0.0
                         for observation in observations {
@@ -171,12 +243,22 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
                             let line = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !line.isEmpty else { continue }
                             lines.append(line)
+                            words.append(contentsOf: Self.words(of: candidate, in: image, fallback: observation))
                             weighted += Double(candidate.confidence) * Double(line.count)
                             weight += Double(line.count)
                         }
+                        // Таблица на скане — не редкость, а типичный случай:
+                        // ведомость, смета, реестр. Vision отдаёт наблюдения
+                        // россыпью, и без координат строка таблицы теряется
+                        // ровно так же, как в текстовом слое PDF.
+                        let height = TableGeometry.medianHeight(of: words)
+                        let table = height > 0
+                            ? TableGeometry.text(of: TableGeometry.lines(from: words, height: height, separated: true))
+                            : nil
                         continuation.resume(returning: PageText(
                             text: lines.joined(separator: "\n"),
-                            confidence: weight > 0 ? weighted / weight : 0
+                            confidence: weight > 0 ? weighted / weight : 0,
+                            table: table
                         ))
                     }
                     request.recognitionLevel = .accurate

@@ -659,13 +659,26 @@ public actor LMStudioClient {
 
     public func loadedContextLength(of model: String) async -> Int? {
         if let cached = loadedContextCache[model] { return cached }
-        var value = (try? await models())?.first { $0.id == model }?.loadedContextLength
+        var value = await reportedLoadedContextLength(of: model)
         if value == nil {
+            // Прогрев: незагруженная **чат**-модель о своём контексте молчит,
+            // и один короткий вызов заставляет LM Studio её поднять. Для
+            // переранжировщика это осмысленно — он всё равно сейчас нужен.
             _ = try? await rawCompletion(prompt: " ", model: model, maxTokens: 1)
-            value = (try? await models())?.first { $0.id == model }?.loadedContextLength
+            value = await reportedLoadedContextLength(of: model)
         }
         loadedContextCache[model] = value
         return value
+    }
+
+    /// То же, но **без прогрева**: только то, что рантайм уже говорит.
+    ///
+    /// Для эмбеддинг-модели будить нечем: порождающий вызов ей не подходит —
+    /// она ответит ошибкой, а LM Studio по дороге поднимет её по JIT и
+    /// выгрузит занятую. Признак свежести измеренного предела такой цены
+    /// не стоит: не знаем — отвечаем `nil`.
+    public func reportedLoadedContextLength(of model: String) async -> Int? {
+        (try? await models())?.first { $0.id == model }?.loadedContextLength
     }
 
     /// whether this model actually honours a JSON schema, asked once and

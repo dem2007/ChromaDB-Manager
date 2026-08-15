@@ -129,7 +129,17 @@ public struct CollectionInspector: Sendable {
                     rechunkPieces[parent, default: []].append((id: record.id, run: run))
                 }
 
-                if text.trimmingCharacters(in: .whitespacesAndNewlines).count < options.minimumTextLength {
+                // Ни одного слова — своя находка, и **не** вместе с короткими
+                //: такой чанк не молчит в выдаче, а лезет в неё
+                // по любому запросу. Показывать сам текст здесь можно и нужно
+                // — он в один-два знака и объясняет находку целиком.
+                if !text.isEmpty, !ChunkHygiene.carriesMeaning(text) {
+                    findings.append(InspectionFinding(
+                        category: .wordlessChunks, documentIDs: [record.id],
+                        subject: record.id,
+                        detail: String(localized: "текст: «\(text.trimmingCharacters(in: .whitespacesAndNewlines))»")
+                    ))
+                } else if text.trimmingCharacters(in: .whitespacesAndNewlines).count < options.minimumTextLength {
                     findings.append(InspectionFinding(
                         category: .emptyDocuments, documentIDs: [record.id],
                         subject: record.id,

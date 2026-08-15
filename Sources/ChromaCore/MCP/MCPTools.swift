@@ -195,7 +195,12 @@ public struct MCPCollectionDescription: Sendable, Hashable {
 /// моделью, привязанной к коллекции, и агент физически не может обратиться
 /// к базе вектором от чужой модели.
 public struct MCPSearchRequest: Sendable {
-    public let collection: String
+    /// Коллекции, по которым идёт поиск. Одна — обычный случай.
+    ///
+    /// Список, а не одно имя: агент, которому нужны документация, код
+    /// и заметки сразу, иначе платил бы тремя вызовами и тремя векторами
+    /// одного и того же запроса.
+    public let collections: [String]
     public let query: String
     public let nResults: Int
     public let filter: DocumentFilter?
@@ -204,11 +209,26 @@ public struct MCPSearchRequest: Sendable {
     /// которую человек выключил, включалась бы обратно чужим запросом.
     public let smartSearch: Bool?
 
+    /// Первая из коллекций — она же единственная в обычном случае.
+    public var collection: String { collections.first ?? "" }
+    /// Искать ли больше чем в одной.
+    public var isMultiCollection: Bool { collections.count > 1 }
+
     public init(
         collection: String, query: String, nResults: Int, filter: DocumentFilter?,
         smartSearch: Bool? = nil
     ) {
-        self.collection = collection
+        self.init(
+            collections: [collection], query: query, nResults: nResults,
+            filter: filter, smartSearch: smartSearch
+        )
+    }
+
+    public init(
+        collections: [String], query: String, nResults: Int, filter: DocumentFilter?,
+        smartSearch: Bool? = nil
+    ) {
+        self.collections = collections
         self.query = query
         self.nResults = nResults
         self.filter = filter
@@ -243,13 +263,27 @@ public struct MCPDocumentsRequest: Sendable {
     public let filter: DocumentFilter?
     public let limit: Int
     public let offset: Int
+    /// Отдавать чанки в порядке файла, а не как придётся.
+    ///
+    /// Просит `get_file`. Обычный `get_documents` этого не просит и получает
+    /// то же, что и раньше: у произвольной выборки по фильтру порядка нет
+    /// и быть не может, а обещать его — хуже, чем не обещать.
+    public let orderedByChunkIndex: Bool
 
-    public init(collection: String, ids: [String], filter: DocumentFilter?, limit: Int, offset: Int) {
+    public init(
+        collection: String,
+        ids: [String],
+        filter: DocumentFilter?,
+        limit: Int,
+        offset: Int,
+        orderedByChunkIndex: Bool = false
+    ) {
         self.collection = collection
         self.ids = ids
         self.filter = filter
         self.limit = limit
         self.offset = offset
+        self.orderedByChunkIndex = orderedByChunkIndex
     }
 }
 
@@ -259,10 +293,26 @@ public struct MCPDocumentsAnswer: Sendable {
     /// документ больше потолка: иначе «ровно limit документов» и «дальше есть
     /// ещё» неотличимы, и агент останавливается на середине коллекции.
     public let hasMore: Bool
+    /// Сколько всего документов подошло под запрос. Известно только там, где
+    /// выборка считалась целиком, — то есть у упорядоченной выдачи `get_file`.
+    public let total: Int?
+    /// Файл оказался длиннее, чем приложение готово упорядочить
+    /// (`MCPFileChunks.maximumOrdered`), и порядок не гарантируется.
+    ///
+    /// Отдельным полем, а не молчанием: агент, собирающий файл обратно,
+    /// обязан узнать, что склеивает куски в неизвестном порядке.
+    public let orderUnavailable: Bool
 
-    public init(documents: [MCPDocumentPayload], hasMore: Bool) {
+    public init(
+        documents: [MCPDocumentPayload],
+        hasMore: Bool,
+        total: Int? = nil,
+        orderUnavailable: Bool = false
+    ) {
         self.documents = documents
         self.hasMore = hasMore
+        self.total = total
+        self.orderUnavailable = orderUnavailable
     }
 }
 
@@ -492,15 +542,28 @@ public enum MCPToolCatalogue {
         К результату может прилагаться раздел-родитель, помеченный как контекст: \
         он не занимает место среди запрошенных результатов. \
         Длинные документы обрезаются с явной пометкой — полный текст берётся через \
-        get_documents по тому же id. Искать сразу по нескольким коллекциям нельзя: \
-        вызывай по одной. Коллекции вне списка доступа не ищутся.
+        get_documents по тому же id. Искать можно и **сразу по нескольким коллекциям**: \
+        передай их списком в «collections» вместо «collection» — вектор запроса \
+        считается при этом один раз, а у каждого результата сказано, из какой он \
+        коллекции. Оба параметра сразу передавать нельзя. Коллекции вне списка \
+        доступа не ищутся.
         """,
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "collection": .object([
                     "type": .string("string"),
-                    "description": .string("Имя коллекции из list_collections."),
+                    "description": .string("Имя коллекции из list_collections. Для поиска по нескольким — параметр «collections» вместо этого."),
+                ]),
+                "collections": .object([
+                    "type": .string("array"),
+                    "items": .object(["type": .string("string")]),
+                    "description": .string("""
+                    Несколько коллекций из list_collections. Применяй, когда ответ может \
+                    лежать в разных местах — документация, код, заметки: это один вызов \
+                    и один вектор запроса вместо трёх. Число коллекций ограничено правами \
+                    ключа; лишние не ищутся, и об этом сказано в ответе.
+                    """),
                 ]),
                 "query": .object([
                     "type": .string("string"),
@@ -521,16 +584,17 @@ public enum MCPToolCatalogue {
                 "filter": filterProperty,
                 "contains": containsProperty,
             ]),
-            "required": .array([.string("collection"), .string("query")]),
+            "required": .array([.string("query")]),
             "additionalProperties": .bool(false),
         ]),
         outputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "collection": .object(["type": .string("string")]),
+                "collections": .object(["type": .string("array")]),
                 "documents": .object(["type": .string("array")]),
             ]),
-            "required": .array([.string("collection"), .string("documents")]),
+            "required": .array([.string("documents")]),
         ]),
         permission: .read
     )
@@ -586,6 +650,69 @@ public enum MCPToolCatalogue {
             "properties": .object([
                 "collection": .object(["type": .string("string")]),
                 "documents": .object(["type": .string("array")]),
+            ]),
+            "required": .array([.string("collection"), .string("documents")]),
+        ]),
+        permission: .read
+    )
+
+    /// файл целиком, по порядку и страницами.
+    ///
+    /// Отдельный инструмент, а не флаг у `get_documents`: намерение другое.
+    /// «Дай мне весь файл» — это не «выбери документы по условию», и агент,
+    /// собиравший файл фильтром по `source_file`, вынужден был сам знать про
+    /// `chunk_index`, сам сортировать и надеяться, что листание по
+    /// неупорядоченной выдаче ничего не пропустит.
+    public static let getFile = MCPToolDefinition(
+        name: "get_file",
+        title: "Файл целиком",
+        description: """
+        Отдаёт все чанки одного файла **по порядку** — так, как файл был \
+        нарезан. Применяй, когда поиск нашёл фрагмент, а нужен документ \
+        целиком: имя файла возьми из поля source_file у любого результата. \
+        Порядок гарантируется этим инструментом, и только им: у get_documents \
+        по фильтру порядок произвольный. Файл почти всегда длиннее одного \
+        ответа — в ответе сказано, сколько всего чанков и с каким offset \
+        звать дальше; читай страницами до hasMore = false и склеивай подряд. \
+        Длинные чанки обрезаются с пометкой, потолки заданы правами ключа.
+        """,
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object([
+                    "type": .string("string"),
+                    "description": .string("Имя коллекции из list_collections."),
+                ]),
+                "file": .object([
+                    "type": .string("string"),
+                    "description": .string("""
+                    Значение метаданного source_file — путь файла относительно \
+                    папки источника, ровно как он записан в найденном документе. \
+                    Не имя файла и не абсолютный путь.
+                    """),
+                ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "description": .string("Сколько чанков вернуть за раз. По умолчанию 5, потолок задан правами ключа."),
+                ]),
+                "offset": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(0),
+                    "description": .string("С какого по счёту чанка продолжать — число из предыдущего ответа."),
+                ]),
+            ]),
+            "required": .array([.string("collection"), .string("file")]),
+            "additionalProperties": .bool(false),
+        ]),
+        outputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object(["type": .string("string")]),
+                "file": .object(["type": .string("string")]),
+                "documents": .object(["type": .string("array")]),
+                "total": .object(["type": .string("integer")]),
+                "hasMore": .object(["type": .string("boolean")]),
             ]),
             "required": .array([.string("collection"), .string("documents")]),
         ]),
@@ -704,14 +831,14 @@ public enum MCPToolCatalogue {
     /// детерминированный список, потому что на нём клиент строит кэш, а модель
     /// — свой контекст.
     public static let all: [MCPToolDefinition] = [
-        listCollections, describeCollection, search, getDocuments, addDocuments, deleteDocuments,
+        listCollections, describeCollection, search, getDocuments, getFile, addDocuments, deleteDocuments,
     ]
 
     /// Инструменты, которым коллекция обязательна. Список, а не флаг у
     /// определения: он же и отвечает на вопрос «по чему проверять whitelist».
     public static let collectionRequired: Set<String> = [
-        describeCollection.name, search.name, getDocuments.name, addDocuments.name,
-        deleteDocuments.name,
+        describeCollection.name, search.name, getDocuments.name, getFile.name,
+        addDocuments.name, deleteDocuments.name,
     ]
 
     /// Инструменты, доступные ключу с такими правами.
@@ -746,17 +873,27 @@ public struct MCPToolService: Sendable {
     /// вопрос «что делали с базой чужими руками» один, и разводить его по двум
     /// файлам значило бы заставить владельца сверять их глазами.
     private let audit: (@Sendable (AuditEntry) -> Void)?
+    /// Ключ только что поработал.
+    ///
+    /// Тот же обработчик, что у прокси, и по той же причине: карточка клиента
+    /// показывает «когда его видели в последний раз», и «ещё не подключался»
+    /// у ключа, которым минуту назад искали, — это неправда на экране.
+    /// Отдельно от журнала: журнал пишет **события**, а это состояние ключа,
+    /// и живёт оно в настройках.
+    private let onClientSeen: (@Sendable (UUID) -> Void)?
 
     public init(
         backend: any MCPToolBackend,
         access: AccessController,
         isReadOnlyServer: @escaping @Sendable () -> Bool = { false },
-        audit: (@Sendable (AuditEntry) -> Void)? = nil
+        audit: (@Sendable (AuditEntry) -> Void)? = nil,
+        onClientSeen: (@Sendable (UUID) -> Void)? = nil
     ) {
         self.backend = backend
         self.access = access
         self.isReadOnlyServer = isReadOnlyServer
         self.audit = audit
+        self.onClientSeen = onClientSeen
     }
 
     /// Сколько текста параметров уходит в журнал.
@@ -842,9 +979,20 @@ public struct MCPToolService: Sendable {
         // Пустая строка — это тоже «не указана»: проверка на `nil` её
         // пропускала, и вызов уходил дальше без имени коллекции.
         let collection = arguments?["collection"]?.stringValue
+        // У поиска коллекция может приехать списком — тогда «collection»
+        // пуст законно, а имена проверяются по одному ниже, после разбора.
+        // **Только у поиска**: остальные инструменты списка не принимают, и
+        // послабление для них означало бы вызов, ушедший дальше с пустым
+        // именем и упавший как «Коллекция «» не найдена».
+        let named = tool.name == MCPToolCatalogue.search.name
+            && (arguments?["collections"]?.arrayValue?.first?.stringValue).map { !$0.isEmpty } ?? false
         if MCPToolCatalogue.collectionRequired.contains(tool.name),
-           collection?.isEmpty != false {
-            return .failure(.invalidParams("Не указана коллекция: параметр «collection» обязателен."))
+           collection?.isEmpty != false, !named {
+            return .failure(.invalidParams(
+                tool.name == MCPToolCatalogue.search.name
+                    ? "Не указана коллекция: передай «collection» или список «collections»."
+                    : "Не указана коллекция: параметр «collection» обязателен."
+            ))
         }
 
         // Вектор не принимается ни одним инструментом (DoD этапа 7). Схема его
@@ -897,6 +1045,13 @@ public struct MCPToolService: Sendable {
         }
 
         guard let client = decision.client else {
+            // Ключ опознан, но вызов ему не разрешён — это всё равно работа
+            // по ключу, и на карточке она обязана быть видна.
+            // Незарегистрированный и выключенный ключи следов не оставляют:
+            // иначе перебор чужих ключей выглядел бы активностью клиента.
+            if let known = await access.client(withKey: key), known.isEnabled {
+                onClientSeen?(known.id)
+            }
             let outcome = MCPToolOutcome.failure(decision.refusal ?? "Отказано.").result
             record(
                 tool: tool, key: key, clientName: decision.clientName, collection: collection,
@@ -905,6 +1060,10 @@ public struct MCPToolService: Sendable {
             )
             return .success(outcome)
         }
+
+        // Ключ узнан и допущен — значит агент по нему работает **сейчас**,
+        // чем бы вызов ни кончился дальше.
+        onClientSeen?(client.id)
 
         let limits = MCPOutputLimits.forClient(client.permissions)
         // Вызов записывается в журнал независимо от того, чем он кончится:
@@ -938,6 +1097,29 @@ public struct MCPToolService: Sendable {
                 ) {
                 case .failure(let error): return refused(error)
                 case .success(let parsed):
+                    // Куда ходил вызов — в журнал доступа. Списком
+                    // коллекция приезжает мимо параметра «collection», и без
+                    // этой строки успешный поиск по трём коллекциям попадал
+                    // в журнал вовсе без единого их имени.
+                    if parsed.request.isMultiCollection {
+                        auditNote = String(localized: "коллекции: \(parsed.request.collections.joined(separator: ", "))")
+                    }
+                    // Права проверяются по **каждой** коллекции списка.
+                    // Решение выше видело только параметр «collection», а его
+                    // здесь может не быть вовсе — имена агент назвал сам,
+                    // и молча выбросить их из поиска нельзя: «нашлось три
+                    // документа» вместо «в эту коллекцию нельзя» — это
+                    // неверный ответ, а не ограничение.
+                    let forbidden = parsed.request.collections.filter {
+                        !client.permissions.allows(collection: $0)
+                    }
+                    guard forbidden.isEmpty else {
+                        let outcome = MCPToolOutcome.failure(String(
+                            localized: "Ключу «\(client.name)» не открыты коллекции: \(forbidden.joined(separator: ", ")). Список доступных — list_collections."
+                        )).result
+                        auditNote = String(localized: "отказ по коллекциям: \(forbidden.joined(separator: ", "))")
+                        return answered(outcome)
+                    }
                     return answered(try await search(parsed, limits: limits).result)
                 }
             case MCPToolCatalogue.getDocuments.name:
@@ -945,6 +1127,12 @@ public struct MCPToolService: Sendable {
                 case .failure(let error): return refused(error)
                 case .success(let parsed):
                     return answered(try await documents(parsed, limits: limits).result)
+                }
+            case MCPToolCatalogue.getFile.name:
+                switch Self.fileRequest(collection ?? "", arguments, limits: limits) {
+                case .failure(let error): return refused(error)
+                case .success(let parsed):
+                    return answered(try await file(parsed, limits: limits).result)
                 }
             case MCPToolCatalogue.addDocuments.name:
                 guard let writing else {
@@ -1043,6 +1231,12 @@ public struct MCPToolService: Sendable {
         let limitNote: String?
     }
 
+    private struct ParsedFile {
+        let path: String
+        let request: MCPDocumentsRequest
+        let limitNote: String?
+    }
+
     /// Имена параметров, которыми агент попытался бы передать вектор.
     private static func vectorParameter(in arguments: JSONValue?) -> String? {
         guard let object = arguments?.objectValue else { return nil }
@@ -1103,6 +1297,48 @@ public struct MCPToolService: Sendable {
         return .success(number)
     }
 
+    /// Две пометки об урезании в одну строку — или ни одной.
+    static func joined(_ parts: String?...) -> String? {
+        let text = parts.compactMap { $0 }.joined(separator: " ")
+        return text.isEmpty ? nil : text
+    }
+
+    /// Коллекции запроса: одна из «collection» или несколько из «collections»
+    ///.
+    ///
+    /// Оба сразу — отказ: угадывать, какое из двух противоречащих указаний
+    /// человек имел в виду, приложение не станет.
+    static func searchCollections(
+        _ collection: String, _ arguments: JSONValue?
+    ) -> Result<[String], JSONRPCError> {
+        let raw = arguments?["collections"]
+        guard let raw, raw != .null else {
+            guard !collection.isEmpty else {
+                return .failure(.invalidParams("Не указана коллекция: передай «collection» или список «collections»."))
+            }
+            return .success([collection])
+        }
+        guard let array = raw.arrayValue else {
+            return .failure(.invalidParams("Параметр «collections» должен быть списком имён коллекций."))
+        }
+        guard collection.isEmpty else {
+            return .failure(.invalidParams("Переданы и «collection», и «collections» — оставь что-то одно."))
+        }
+        var names: [String] = []
+        for value in array {
+            guard let name = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
+                return .failure(.invalidParams("В «collections» должны быть непустые имена коллекций."))
+            }
+            // Повтор — это не ошибка, а лишний поиск: одна и та же коллекция
+            // дважды выдаст одни и те же документы и займёт место потолка.
+            if !names.contains(name) { names.append(name) }
+        }
+        guard !names.isEmpty else {
+            return .failure(.invalidParams("Список «collections» пуст: назови хотя бы одну коллекцию."))
+        }
+        return .success(names)
+    }
+
     private static func searchRequest(
         _ collection: String, _ arguments: JSONValue?, limits: MCPOutputLimits,
         smartSearch: Bool?
@@ -1111,6 +1347,13 @@ public struct MCPToolService: Sendable {
               !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(.invalidParams("Не указан текст запроса: параметр «query» обязателен и не может быть пустым."))
         }
+
+        let names: [String]
+        switch searchCollections(collection, arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): names = value
+        }
+        let collections = limits.resolvedCollections(names)
 
         let requested: Int?
         switch integer(arguments, "n_results") {
@@ -1125,11 +1368,11 @@ public struct MCPToolService: Sendable {
         case .success(let filter):
             return .success(ParsedSearch(
                 request: MCPSearchRequest(
-                    collection: collection, query: query,
+                    collections: collections.names, query: query,
                     nResults: resolved.count, filter: filter,
                     smartSearch: smartSearch
                 ),
-                limitNote: resolved.note
+                limitNote: Self.joined(collections.note, resolved.note)
             ))
         }
     }
@@ -1184,6 +1427,46 @@ public struct MCPToolService: Sendable {
                 limitNote: note
             ))
         }
+    }
+
+    /// Разбор `get_file`.
+    ///
+    /// Фильтр строится здесь, а не отдаётся на откуп агенту: «файл целиком»
+    /// означает ровно одно условие — `source_file` равно названному пути, —
+    /// и позволить дописать к нему что-то ещё значит вернуть половину файла
+    /// под видом целого.
+    private static func fileRequest(
+        _ collection: String, _ arguments: JSONValue?, limits: MCPOutputLimits
+    ) -> Result<ParsedFile, JSONRPCError> {
+        guard let path = arguments?["file"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty
+        else {
+            return .failure(.invalidParams("Параметр «file» обязателен: это значение source_file — путь файла относительно папки источника."))
+        }
+
+        let requested: Int?
+        switch integer(arguments, "limit") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): requested = value
+        }
+        let resolved = limits.resolved(requested: requested)
+
+        let offset: Int
+        switch integer(arguments, "offset") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): offset = max(0, value ?? 0)
+        }
+
+        var filter = DocumentFilter()
+        filter.conditions = [MetadataCondition(field: "source_file", op: .equals, value: path)]
+        return .success(ParsedFile(
+            path: path,
+            request: MCPDocumentsRequest(
+                collection: collection, ids: [], filter: filter,
+                limit: resolved.count, offset: offset, orderedByChunkIndex: true
+            ),
+            limitNote: resolved.note
+        ))
     }
 
     /// Метаданные из параметров вызова.
@@ -1361,10 +1644,21 @@ public struct MCPToolService: Sendable {
         )
 
         var structured: [String: JSONValue] = [
-            "collection": .string(parsed.request.collection),
             "query": .string(parsed.request.query),
             "documents": .array(rendered.documents),
         ]
+        // Поиск шёл по нескольким — сказать, по каким именно: агент
+        // обязан знать, где искали, а не только что нашлось.
+        //
+        // И **вместо** «collection», а не рядом с ним: одно имя на выдачу
+        // из трёх коллекций — это неверный ответ, по которому агент пойдёт
+        // дочитывать документ не туда. У каждого результата коллекция своя,
+        // она стоит в самом результате. Схема поля и не требует.
+        if parsed.request.isMultiCollection {
+            structured["collections"] = .array(parsed.request.collections.map(JSONValue.string))
+        } else {
+            structured["collection"] = .string(parsed.request.collection)
+        }
         if let metric = answer.metric { structured["metric"] = .string(metric) }
         if let model = answer.model { structured["model"] = .string(model) }
         if rendered.isTruncated { structured["truncated"] = .bool(true) }
@@ -1377,7 +1671,11 @@ public struct MCPToolService: Sendable {
         guard !answer.documents.isEmpty else {
             // Пустая выдача — не ошибка, но и не молчание: чаще всего виноват
             // фильтр, и агент должен знать, куда смотреть.
-            var lines = [String(localized: "По запросу «\(parsed.request.query)» в коллекции «\(parsed.request.collection)» ничего не найдено.")]
+            var lines = [
+                parsed.request.isMultiCollection
+                    ? String(localized: "По запросу «\(parsed.request.query)» ничего не найдено в коллекциях: \(parsed.request.collections.joined(separator: ", ")).")
+                    : String(localized: "По запросу «\(parsed.request.query)» в коллекции «\(parsed.request.collection)» ничего не найдено."),
+            ]
             if parsed.request.filter != nil {
                 lines.append(String(localized: "Запрос шёл с фильтром — проверь поля и типы значений через describe_collection и попробуй без фильтра."))
             }
@@ -1385,9 +1683,13 @@ public struct MCPToolService: Sendable {
             return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
         }
 
-        var header = String(
-            localized: "Найдено в «\(parsed.request.collection)»: \(RussianCount.grouped(rendered.shown, "документ", "документа", "документов"))"
-        )
+        var header = parsed.request.isMultiCollection
+            ? String(
+                localized: "Найдено в коллекциях \(parsed.request.collections.joined(separator: ", ")): \(RussianCount.grouped(rendered.shown, "документ", "документа", "документов"))"
+            )
+            : String(
+                localized: "Найдено в «\(parsed.request.collection)»: \(RussianCount.grouped(rendered.shown, "документ", "документа", "документов"))"
+            )
         if let model = answer.model { header += String(localized: ", модель \(model)") }
         let text = ([header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
@@ -1424,6 +1726,58 @@ public struct MCPToolService: Sendable {
         let header = String(
             localized: "Из коллекции «\(parsed.request.collection)»: \(RussianCount.grouped(rendered.shown, "документ", "документа", "документов"))"
         )
+        let text = ([header] + rendered.lines + notes).joined(separator: "\n")
+        return MCPToolOutcome(text: text, structured: .object(structured))
+    }
+
+    /// `get_file` — чанки одного файла по порядку.
+    private func file(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        let answer = try await backend.documents(parsed.request)
+        let rendered = MCPDocumentRendering.render(answer.documents, limits: limits)
+        // Показано меньше, чем отдала база (сработал потолок объёма ответа), —
+        // значит следующая страница начинается там, где оборвался показ,
+        // а не там, где кончилась выборка. Иначе агент потеряет чанки
+        // в середине файла и не заметит этого.
+        let next = parsed.request.offset + rendered.shown
+        let more = answer.hasMore || rendered.isTruncated
+
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.request.collection),
+            "file": .string(parsed.path),
+            "documents": .array(rendered.documents),
+            "hasMore": .bool(more),
+            "offset": .int(parsed.request.offset),
+        ]
+        if let total = answer.total { structured["total"] = .int(total) }
+        if more { structured["nextOffset"] = .int(next) }
+
+        var notes = rendered.notes
+        if let limitNote = parsed.limitNote { notes.insert(limitNote, at: 0) }
+        if answer.orderUnavailable {
+            notes.append(String(
+                localized: "В файле больше \(MCPFileChunks.maximumOrdered.plainDigits) чанков — столько приложение по порядку не отдаёт. Куски идут в произвольном порядке; собирай их по полю chunk_index."
+            ))
+        }
+        if more {
+            notes.append(String(localized: "Файл прочитан не весь: продолжай вызовом с offset \(next.plainDigits)."))
+        }
+        if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
+
+        guard !answer.documents.isEmpty else {
+            var lines = [String(
+                localized: "В коллекции «\(parsed.request.collection)» нет документов файла «\(parsed.path)»."
+            )]
+            lines.append(String(
+                localized: "Путь берётся из поля source_file найденного документа целиком — не имя файла и не абсолютный путь."
+            ))
+            lines += notes
+            return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
+        }
+
+        var header = String(
+            localized: "Файл «\(parsed.path)»: \(RussianCount.grouped(rendered.shown, "чанк", "чанка", "чанков")) начиная с \(parsed.request.offset.plainDigits)"
+        )
+        if let total = answer.total { header += String(localized: ", всего \(total.plainDigits)") }
         let text = ([header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
     }

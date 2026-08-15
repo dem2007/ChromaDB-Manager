@@ -55,34 +55,20 @@ public enum SheetRenderer {
     /// exactly the failure this whole stage exists to avoid.
     public static func repeatingHeader(_ header: String?, in chunks: [TextChunk]) -> [TextChunk] {
         guard let header, !header.isEmpty else { return chunks }
-        return chunks.map { chunk in
-            guard !chunk.text.hasPrefix(header) else { return chunk }
-            return TextChunk(
-                index: chunk.index,
-                text: header + "\n" + chunk.text,
-                level: chunk.level,
-                parentIndex: chunk.parentIndex,
-                note: chunk.note ?? String(localized: "строка заголовков повторена — без неё чанк таблицы не читается")
-            )
-        }
+        // Дописывание — общее с остальными источниками: у листа шапка
+        // известна заранее, у документа её приходится узнавать по разделителю,
+        // но кусок в обоих случаях получается один и тот же.
+        return chunks.map { TableChunkHeaders.prepending(header, to: $0) }
     }
 
     // MARK: - Markdown
 
-    static func row(_ values: [String]) -> String {
-        "| " + values.map(escape).joined(separator: " | ") + " |"
-    }
+    /// Вид таблицы у книги и у всех остальных источников — общий:
+    /// одна и та же таблица обязана давать один и тот же текст независимо
+    /// от того, в чём её сохранили.
+    static func row(_ values: [String]) -> String { TableText.row(values) }
 
-    static func separator(width: Int) -> String {
-        "|" + String(repeating: " --- |", count: max(1, width))
-    }
+    static func separator(width: Int) -> String { TableText.separator(width: width) }
 
-    /// A pipe inside a cell would end the column early; a newline would end the
-    /// row. Both are escaped rather than dropped — the value is the user's.
-    static func escape(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "|", with: "\\|")
-            .replacingOccurrences(of: "\r\n", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-    }
+    static func escape(_ value: String) -> String { TableText.escape(value) }
 }

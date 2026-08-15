@@ -64,6 +64,7 @@ struct SourcesSection: View {
                 }
             }
 
+            chunkingDefaultsSection
             launchRulesSection
             howItWorks
         }
@@ -123,6 +124,25 @@ struct SourcesSection: View {
             if let source = model.sourcePendingRemoval {
                 Text("Папка на диске и документы в коллекции «\(source.collectionName)» останутся нетронутыми. Исчезнут настройки самого источника: стратегия и параметры нарезки, расписания, поля метаданных и профили таблиц — восстановить их будет неоткуда.")
             }
+        }
+        // столько файлов разом не исчезает по воле человека. Вопрос
+        // задаётся отдельно от всех прочих — ответ «да» стоит тысяч
+        // документов, и утонуть в строке в углу экрана он не должен.
+        .confirmationDialog(
+            model.massRemoval.map { String(localized: "Источник «\($0.source.name)»: файлы исчезли с диска") } ?? "",
+            isPresented: Binding(
+                get: { model.massRemoval != nil },
+                set: { if !$0 { model.massRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Подтвердить: файлы действительно удалены"), role: .destructive) {
+                if let prompt = model.massRemoval { model.confirmMassRemoval(prompt, app: app) }
+                model.massRemoval = nil
+            }
+            Button(String(localized: "Отмена — проверю диск"), role: .cancel) { model.massRemoval = nil }
+        } message: {
+            if let prompt = model.massRemoval { Text(prompt.message) }
         }
     }
 
@@ -412,6 +432,68 @@ struct SourcesSection: View {
 
     /// Настройки, влияющие на запуск, — рядом со списком, но свёрнуто: их
     /// трогают редко, а места они занимали столько же, сколько сам источник.
+    /// Что стоит в умолчаниях нарезки — на экране источников, а не только
+    /// в карточке одного из них.
+    ///
+    /// Правятся они по-прежнему **в карточке источника**: параметры
+    /// настраивают там теми же полями, и второй редактор тех же двадцати
+    /// значений разошёлся бы с первым — вопрос времени. Но у решения «править
+    /// только там» была цена: человек, который ищет настройку, не находил её
+    /// нигде. Здесь — ответ на вопрос «что сейчас задано и где это менять»,
+    /// и единственное действие, которому в карточке источника не место:
+    /// забыть всё разом.
+    @ViewBuilder
+    private var chunkingDefaultsSection: some View {
+        let configuration = settings.configuration
+        let own = ChunkStrategy.allCases.filter { configuration.hasOwnChunkingDefault(for: $0) }
+        let strategy = configuration.defaultChunkingStrategy ?? ChunkingConfiguration().strategy
+
+        AdvancedSection(
+            place: "sources.chunkingDefaults",
+            title: String(localized: "Умолчания нарезки")
+        ) {
+            Text("Новый источник заводится со стратегией «\(strategy.title)».")
+                .font(Theme.Font.body)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if own.isEmpty {
+                Text("Своих значений не задано ни у одной стратегии — везде заводские.")
+                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                // По строке на стратегию с её же сводкой: «свои умолчания
+                // у трёх стратегий» не отвечает на вопрос, какие именно.
+                ForEach(own) { item in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(item.title).font(Theme.Font.caption).bold()
+                            .frame(width: 150, alignment: .leading)
+                        Text(configuration.chunkingDefault(for: item).summaryText)
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+
+            Text("Задаются и правятся в карточке источника — блок «Умолчания» под параметрами стратегии. Там же они и применяются: «Взять умолчание» подставляет их в открытый источник.")
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !own.isEmpty {
+                HStack(spacing: 8) {
+                    Button(String(localized: "Забыть все умолчания")) {
+                        for item in own { settings.configuration.clearChunkingDefault(for: item) }
+                        model.infoMessage = String(localized: "Умолчания сброшены к заводским у всех стратегий. Настройки заведённых источников не изменились.")
+                    }
+                    .buttonStyle(.chromaNormal)
+                    Text("Заведённые источники это не тронет: у них свои значения.")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    Spacer()
+                }
+            }
+        }
+    }
+
     private var launchRulesSection: some View {
         AdvancedSection(place: "sources.launch", title: String(localized: "Правила запуска")) {
             // below this, «Синхронизировать» just runs; above it, the plan is
@@ -722,6 +804,24 @@ struct SourcesSection: View {
                         Text("…и ещё \(summary.skipped.count - 10)").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     }
                 }
+                // Оговорки табличного конвейера: раньше они считались и
+                // терялись по дороге. Файл, сохранённый без пересчёта
+                // формул, индексировался пустыми значениями молча.
+                if !summary.tableWarnings.isEmpty {
+                    Text("Таблицы прочитаны с оговорками: \(summary.tableWarnings.count)")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                    ForEach(Array(summary.tableWarnings.prefix(10).enumerated()), id: \.offset) { _, warning in
+                        Text("• \(warning)").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    }
+                    if summary.tableWarnings.count > 10 {
+                        Text("…и ещё \(summary.tableWarnings.count - 10)").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    }
+                }
+                if summary.tableRowsNeedingDecision > 0 {
+                    Text("Строк таблиц исчезло из файлов: \(summary.tableRowsNeedingDecision.plainDigits) — ждут решения в «Требуют решения», из базы ничего не удалено")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 // Кнопки «Обновить список коллекций» здесь больше нет: она
                 // обновляла список **другого** экрана, поэтому нажатие
                 // выглядело так, будто ничего не произошло. Экран коллекций
@@ -740,15 +840,62 @@ struct SourcesSection: View {
             return (source, removals)
         }
 
-        if !pairs.isEmpty {
+        let rowPairs = settings.configuration.dataSources.compactMap { source -> (DataSource, [PendingRowRemoval])? in
+            guard let removals = model.pendingRowRemovals[source.id], !removals.isEmpty else { return nil }
+            return (source, removals)
+        }
+
+        if !pairs.isEmpty || !rowPairs.isEmpty {
             SectionCard(
                 title: "Требуют решения",
-                subtitle: "Файлы исчезли с диска. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет."
+                subtitle: "Файлы и строки таблиц исчезли из источника. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет."
             ) {
                 VStack(alignment: .leading, spacing: 14) {
                     ForEach(pairs, id: \.0.id) { source, removals in
                         decisionGroup(source: source, removals: removals)
                     }
+                    if !pairs.isEmpty && !rowPairs.isEmpty { Divider() }
+                    ForEach(rowPairs, id: \.0.id) { source, removals in
+                        rowDecisionGroup(source: source, removals: removals)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Исчезнувшие строки таблиц одного источника.
+    ///
+    /// Решение принимается **о листе целиком**: строк там бывают тысячи, а
+    /// вопрос к ним один — «это правка файла или сбой выгрузки». Разбирать их
+    /// по одной значило бы просить о работе, которой не должно быть.
+    private func rowDecisionGroup(source: DataSource, removals: [PendingRowRemoval]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(source.name) · строки таблиц").font(Theme.Font.control).bold()
+            ForEach(removals) { removal in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(removal.relativePath) → \(removal.sheetName)")
+                            .font(Theme.Font.caption)
+                            .lineLimit(1).truncationMode(.middle)
+                        Text("коллекция «\(removal.collectionName)» · строк \(removal.rows.count.plainDigits) · замечено \(removal.noticedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        // Какие именно строки: без этого «исчезло 40» ничего
+                        // не говорит о том, правка это или сбой выгрузки.
+                        Text(removal.rowLabels.prefix(6).joined(separator: ", ")
+                             + (removal.rows.count > 6 ? String(localized: "…и ещё \(removal.rows.count - 6)") : ""))
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button(String(localized: "Оставить в базе")) {
+                        model.resolveRows([removal], decision: .keepInDatabase, source: source, app: app)
+                    }
+                    .buttonStyle(.chromaNormal)
+                    Button(String(localized: "Удалить из базы")) {
+                        model.resolveRows([removal], decision: .deleteChunks, source: source, app: app)
+                    }
+                    .buttonStyle(.chromaDanger)
+                    .disabled(!app.connection.isConnected)
                 }
             }
         }
@@ -862,6 +1009,17 @@ struct SourceEditorSheet: View {
     /// `infoMessage` экрана источников — то есть **за лист**, и кнопка со
     /// стороны выглядела нерабочей.
     @State private var schemaNotice: String?
+    /// Ответ кнопок умолчаний нарезки — по той же причине здесь, а не
+    /// в `infoMessage`: сообщение экрана источников уходит **за лист**.
+    @State private var chunkingNotice: String?
+    /// Измеренный предел чтения модели этого источника.
+    @State private var inputLimit: Int?
+    @State private var isMeasuringLimit = false
+    @State private var limitMeasured = false
+    /// Проба сорвалась. Отдельно от «предела не нашлось»: это
+    /// противоположные ответы, и путать их значит говорить «модель читает
+    /// сколько угодно» там, где на самом деле не удалось спросить.
+    @State private var limitProbeFailed = false
     @State private var showExtendedGeneration = false
 
     /// asked once per chat model and remembered, so the indicator can say
@@ -1414,14 +1572,316 @@ struct SourceEditorSheet: View {
                 }
             }
 
+            // контекст в вектор. Здесь, а не в параметрах стратегии:
+            // работает при любой из них и меняет содержимое коллекции,
+            // то есть требует переиндексации — о чём и сказано.
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(isOn: draft.chunking.contextPrefix) {
+                    Text("Дописывать контекст перед вычислением вектора")
+                }
+                .toggleStyle(.checkbox)
+                Text("Перед текстом чанка в модель уходит строка «Документ → Раздел → Подраздел». В самом документе её нет — он остаётся таким, как в файле. Чанк «превышение допустимого значения приводит к отказу» без этой строки не находится ничем: в нём нет ни одного слова о том, о чём он.\n\nСюда же попадает вводная фраза списка — та, что кончается двоеточием. Пункт «восстановление работоспособности в течение четырёх часов» без неё не говорит, чего восстановление и кто обязан: это стояло строкой выше, в «Исполнитель обязан обеспечить:».")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+                if draft.wrappedValue.chunking.contextPrefix {
+                    Label("Это меняет содержимое коллекции: при следующей синхронизации все файлы источника будут переэмбежены.", systemImage: "exclamationmark.triangle")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            // то же самое, но словами чат-модели — и по вызову на чанк.
+            // Цена стоит рядом с переключателем, а не в справке: включают её
+            // один раз, а платят часами работы модели.
+            Divider()
+            enrichmentRow
+
             if let problem = draft.wrappedValue.chunking.problem {
                 Text(problem).font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            Divider()
+            modelReadingLimit
+
+            Divider()
+            chunkingDefaults
+
             Text("Изменение параметров — это новая нарезка: при следующей синхронизации все файлы источника будут перечанкованы и переэмбежены.")
                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        // Умолчания подставляются при переключении стратегии — и только
+        // у нового источника. У заведённого числа его собственные.
+        .onChange(of: draft.wrappedValue.chunking.strategy) { _, strategy in
+            model.chunkingStrategyChanged(to: strategy, app: app)
+        }
+    }
+
+    /// Контекстное обогащение чат-моделью.
+    ///
+    /// Правило приложения 5 в самой прямой форме: операция, которая займёт
+    /// часы, обязана назвать свою цену **до** запуска. Поэтому под
+    /// переключателем стоит не описание пользы, а число вызовов и время —
+    /// и время не выдумывается: без замера скорости модели его нет вовсе.
+    @ViewBuilder
+    private var enrichmentRow: some View {
+        let chunking = draft.wrappedValue.chunking
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: draft.chunking.contextEnrichment) {
+                Text("Обогащать контекст чат-моделью")
+            }
+            .toggleStyle(.checkbox)
+            Text("Модель читает фрагмент и пишет одно-два предложения о том, о чём документ и где в нём этот фрагмент. Они уходят в вектор — в документе их нет. Заметно помогает там, где заголовков нет и структурная строка молчит.")
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if chunking.contextEnrichment {
+                Picker(String(localized: "Модель обогащения"), selection: Binding(
+                    get: { chunking.resolvedEnrichmentModel ?? "" },
+                    set: { draft.wrappedValue.chunking.enrichmentModel = $0.isEmpty ? nil : $0 }
+                )) {
+                    Text("не выбрана").tag("")
+                    ForEach(chatModelOptions, id: \.self) { id in
+                        Text(id).tag(id)
+                    }
+                }
+                .font(Theme.Font.control)
+
+                Label(enrichmentCostLine, systemImage: "clock.badge.exclamationmark")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if (chunking.resolvedEnrichmentModel ?? "").isEmpty {
+                    Text("Без выбранной модели обогащение не выполняется: фрагменты уйдут в эмбеддинг как есть.")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Цена обогащения словами: вызовов столько же, сколько чанков.
+    ///
+    /// Число чанков берётся из манифеста источника — это то, что он написал
+    /// в прошлый раз. Пока источник не синхронизирован, называть количество
+    /// нечем, и вместо выдуманного числа говорится правило. Время — только по
+    /// измеренной скорости этой модели; не измерена — не называется (правило 4
+    /// приложения 5).
+    private var enrichmentCostLine: String {
+        let chunking = draft.wrappedValue.chunking
+        let chatModel = chunking.resolvedEnrichmentModel ?? ""
+        // Строки таблиц живут в своём манифесте и в `chunks` не входят:
+        // у источника таблиц счёт вызовов был бы иначе нулевым.
+        let sourceID = draft.wrappedValue.id
+        let counted = (model.manifestInfo[sourceID]?.chunks ?? 0) + (model.tableRows[sourceID] ?? 0)
+        guard counted > 0 else {
+            return String(localized: "Один вызов чат-модели на каждый чанк. Сколько их будет, станет известно после первой синхронизации источника.")
+        }
+        // Секунды на вызов — по фактической скорости **чат-модели**, тем же
+        // счётчиком, что и у стенда оценки. Замер F3 сюда не годится:
+        // он мерит пропускную способность эмбеддинга — сотни текстов
+        // в секунду, — а генерация идёт секундами на вызов, и разница тут
+        // в три порядка. Не измерено — не называется (правило 4 приложения 5).
+        let estimate = ContextEnricher.estimate(
+            chunks: counted,
+            secondsPerCall: model.lastPlanMetrics.judgeSecondsPerCall(model: chatModel),
+            basis: .measuredWork
+        )
+        // Не `estimate.line`: та строка написана про строки таблиц и здесь
+        // читалась бы про чужое. Берём из неё только время.
+        if let duration = estimate.durationText {
+            return String(localized: "Один вызов чат-модели на чанк: \(counted.plainDigits) вызовов, \(duration) работы модели.")
+        }
+        return String(localized: "Один вызов чат-модели на чанк: \(counted.plainDigits) вызовов. Сколько это займёт — неизвестно: скорость этой модели ещё не измерялась.")
+    }
+
+    /// Сколько модель читает за раз — и влезает ли в это нарезка.
+    ///
+    /// Спрашивается здесь, потому что здесь и задаётся размер: узнать, что
+    /// чанк длиннее читаемого, посреди прогона — узнать слишком поздно.
+    /// Число не спрашивается у модели, а **измеряется**: то, что она о себе
+    /// сообщает, с её поведением не совпадает. Проба стоит семи-восьми
+    /// вызовов, поэтому она по кнопке, а не сама собой, и однажды измеренное
+    /// помнится между запусками.
+    @ViewBuilder
+    private var modelReadingLimit: some View {
+        let chunking = draft.wrappedValue.chunking
+        let largest = chunking.largestChunkCharacters
+        let model = draft.wrappedValue.embeddingModel
+            ?? settings.configuration.defaultEmbeddingModel
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Сколько модель читает").font(Theme.Font.caption)
+                if let inputLimit {
+                    Text("≈ \(inputLimit.plainDigits) знаков за раз")
+                        .font(Theme.Font.caption)
+                } else if limitProbeFailed {
+                    Text("измерить не вышло — модель не ответила")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
+                } else if limitMeasured {
+                    Text("больше \(EmbeddingInputProbe.maximumProbeCharacters.plainDigits) знаков — предела не нашлось")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                } else {
+                    Text("не измерялось").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                }
+                if isMeasuringLimit {
+                    ProgressView().controlSize(.small)
+                } else if let model, !model.isEmpty {
+                    Button(limitMeasured ? String(localized: "Измерить заново") : String(localized: "Измерить")) {
+                        Task { await measureLimit(model: model) }
+                    }
+                    .buttonStyle(.chromaNormal)
+                }
+                Spacer()
+            }
+
+            if let largest, let inputLimit, largest > inputLimit {
+                Label(
+                    String(localized: "При этих настройках чанк дорастает до \(largest.plainDigits) знаков — больше, чем модель читает. Такой файл уйдёт в пропущенные, а не в базу: вектор описывал бы только начало чанка."),
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
+                .fixedSize(horizontal: false, vertical: true)
+            } else if largest == nil {
+                Text("Размер чанка при этих настройках ничем не ограничен: у document-based это «не делить», у LLM-based — то, что вернёт чат-модель. Приложение проверит каждый чанк на прогоне и пропустит файл, если он не влезет.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Модель молча обрезает то, что не влезло, — вектор считается по началу чанка, и ни в ответе, ни в выдаче это не видно. Поэтому предел измеряется пробой, а не берётся из того, что модель о себе сообщает.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task(id: draft.wrappedValue.embeddingModel ?? "") {
+            // Сначала забыть прежнее: число принадлежит модели, и оставить
+            // его на экране после смены модели значит показать чужое.
+            inputLimit = nil
+            limitMeasured = false
+            limitProbeFailed = false
+            // Уже измеренное показывается сразу; мерить само собой — нет.
+            guard let model, !model.isEmpty else { return }
+            // Свежесть проверяется тем же признаком, что и в ядре:
+            // иначе форма одобряла бы настройки числом, которое синхронизация
+            // считает устаревшим и меряет заново.
+            let loaded = await (try? app.makeLMStudioClient())?
+                .reportedLoadedContextLength(of: model) ?? nil
+            if let known = await app.embeddingLimits.limit(for: model),
+               known.loadedContext == loaded {
+                inputLimit = known.characters
+                limitMeasured = true
+            }
+        }
+    }
+
+    private func measureLimit(model: String) async {
+        isMeasuringLimit = true
+        defer { isMeasuringLimit = false }
+        guard let lmStudio = try? app.makeLMStudioClient() else {
+            chunkingNotice = String(localized: "LM Studio недоступна — измерить предел нечем.")
+            return
+        }
+        // Прежнее не стирается до успеха: сорвавшаяся проба не должна
+        // отнимать то, что уже было измерено. Удачная — перезапишет
+        // сама, `remember` заменяет запись по имени модели.
+        // Через очередь: проба — это семь-восемь вызовов модели, то есть
+        // длительная операция, и отнимать модель у идущей синхронизации
+        // она не должна. Приоритет человека у экрана: он ждёт ответа
+        // здесь и сейчас.
+        // `do/catch`, а не `try?`: тот схлопывает вложенный `Optional`,
+        // и «очередь сорвалась» стало бы неотличимо от «предела не нашлось»
+        // — а это противоположные ответы.
+        let outcome: Int?
+        do {
+            outcome = try await app.queue.run(QueueTicket(
+                title: String(localized: "Замер предела чтения модели «\(model)»"),
+                priority: .interactive,
+                group: .lmStudio,
+                connectionID: app.connectionID
+            )) { _ in
+                // Мимо кэша векторов: тексты пробы больше не понадобятся
+                // никогда, а вытеснят они настоящие чанки.
+                await EmbeddingInputProbe.measure { text in
+                    try await lmStudio.embedIgnoringCache(texts: [text], model: model).first ?? []
+                }
+            }
+        } catch {
+            limitProbeFailed = true
+            chunkingNotice = String(localized: "Замер не удался: модель не ответила. Прежнее измеренное значение сохранено.")
+            return
+        }
+        limitProbeFailed = false
+        limitMeasured = true
+        inputLimit = outcome
+        if let measured = outcome {
+            // Контекст загрузки пишется вместе с числом: без него
+            // ядро сверяет `nil` с настоящим контекстом, признаёт запись
+            // устаревшей и гоняет пробу заново — то есть ручной замер
+            // не экономил ни одного вызова модели.
+            await app.embeddingLimits.remember(
+                MeasuredInputLimit(
+                    model: model,
+                    characters: measured,
+                    loadedContext: await lmStudio.reportedLoadedContextLength(of: model)
+                )
+            )
+            app.log.record(
+                .info, "Модели",
+                "Модель «\(model)» читает за раз не больше \(measured.plainDigits) знаков — измерено пробой"
+            )
+        }
+    }
+
+    /// Умолчания нарезки.
+    ///
+    /// Здесь, а не на отдельном экране настроек: параметры стратегии
+    /// настраивают в этом самом окне, теми же полями, и «пусть теперь так
+    /// будет у всех» — это продолжение того же движения, а не отдельная
+    /// работа в другом месте. Умолчание у каждой стратегии своё: переключение
+    /// стратегии не должно возвращать заводские 512 токенов человеку, который
+    /// уже настроил её под свои документы.
+    @ViewBuilder
+    private var chunkingDefaults: some View {
+        let strategy = draft.wrappedValue.chunking.strategy
+        let isOwn = settings.configuration.hasOwnChunkingDefault(for: strategy)
+        let isForNewSources = (settings.configuration.defaultChunkingStrategy ?? ChunkingConfiguration().strategy) == strategy
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Умолчания").font(Theme.Font.caption)
+                Button(String(localized: "Сделать умолчанием")) {
+                    chunkingNotice = model.makeChunkingDefault(app)
+                }
+                .help(String(localized: "Запомнить эти значения для стратегии «\(strategy.title)» и заводить новые источники с ней"))
+                Button(String(localized: "Взять умолчание")) {
+                    chunkingNotice = model.takeChunkingDefault(app)
+                }
+                .help(String(localized: "Подставить сюда умолчания стратегии «\(strategy.title)»"))
+                if isOwn {
+                    Button(String(localized: "Забыть умолчание")) {
+                        chunkingNotice = model.forgetChunkingDefault(app)
+                    }
+                    .help(String(localized: "Вернуть заводские значения стратегии «\(strategy.title)». Настройки этого источника не изменятся"))
+                }
+                Spacer()
+            }
+            Text(
+                isOwn
+                    ? (isForNewSources
+                       ? String(localized: "У стратегии «\(strategy.title)» ваши умолчания, и новые источники заводятся с ней.")
+                       : String(localized: "У стратегии «\(strategy.title)» ваши умолчания. Новые источники заводятся с другой стратегией."))
+                    : String(localized: "У стратегии «\(strategy.title)» пока заводские умолчания.")
+            )
+            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if let chunkingNotice {
+                Label(chunkingNotice, systemImage: "info.circle")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1515,9 +1975,34 @@ struct SourceEditorSheet: View {
                     Text(fallback.title).tag(fallback)
                 }
             }
-            if draft.wrappedValue.chunking.oversizedFallback == .recursive {
-                separatorsField
+            if draft.wrappedValue.chunking.oversizedFallback != .keep {
+                fallbackCutting(
+                    String(localized: "Этим и режется секция, которая не влезла. Перекрытие берётся отсюда обоими откатами; разделители — только Recursive."),
+                    showsSeparators: draft.wrappedValue.chunking.oversizedFallback == .recursive
+                )
             }
+        }
+    }
+
+    /// Разделители и перекрытие показываются там, где они **действуют**
+    ///.
+    ///
+    /// Их читают четыре стратегии — document-based в откате для крупных
+    /// секций, hierarchical при разбиении длинной секции, adaptive у каждого
+    /// блока и LLM-based при откате, — а поле было только у Recursive.
+    /// Человек выбирал «Крупные секции → Recursive» и не видел, чем оно
+    /// режет; поменять разделители можно было, только переключившись
+    /// на Recursive, задав их там и вернувшись обратно.
+    @ViewBuilder
+    private func fallbackCutting(_ note: String, showsSeparators: Bool = true) -> some View {
+        Divider()
+        Text(note)
+            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+            .fixedSize(horizontal: false, vertical: true)
+        if showsSeparators { separatorsField }
+        HStack {
+            Text("overlap: \(Int(draft.wrappedValue.chunking.overlapPercent))%")
+            Slider(value: draft.chunking.overlapPercent, in: 0...50, step: 5).frame(width: 200)
         }
     }
 
@@ -1540,6 +2025,7 @@ struct SourceEditorSheet: View {
                 Text("перекрытие ребёнка: \(Int(draft.wrappedValue.chunking.childOverlapPercent))%")
                 Slider(value: draft.chunking.childOverlapPercent, in: 0...50, step: 5).frame(width: 160)
             }
+            fallbackCutting(String(localized: "Раздел длиннее родителя режется на части — по этим разделителям и с этим перекрытием."))
             Text("Родительские и дочерние чанки лежат в одной коллекции: различаются полем chunk_level, ребёнок ссылается на родителя через parent_chunk_id.")
                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1595,7 +2081,8 @@ struct SourceEditorSheet: View {
                 Text("overlap: \(Int(draft.wrappedValue.chunking.overlapPercent))%")
                 Slider(value: draft.chunking.overlapPercent, in: 0...50, step: 5).frame(width: 200)
             }
-            Text("Плотный текст (числа, пунктуация, короткие предложения) режется мельче, разреженный — крупнее. Только эвристики, без модели-классификатора.")
+            separatorsField
+            Text("Плотный текст (числа, пунктуация, короткие предложения) режется мельче, разреженный — крупнее. Только эвристики, без модели-классификатора. Границы внутри блока ищутся по этим разделителям.")
                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
         }

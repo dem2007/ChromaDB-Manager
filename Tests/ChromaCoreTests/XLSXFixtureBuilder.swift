@@ -24,6 +24,10 @@ struct XLSXFixtureBuilder {
         case date(serial: Double)
         /// A formula; `cached` nil means the workbook was never recalculated.
         case formula(String, cached: Double?)
+        /// Число под маской из `customNumberMask` — проценты, деньги, единицы.
+        case measured(Double)
+        /// Число под встроенным форматом (9 — `0%`, 10 — `0.00%`).
+        case builtInFormat(Double, id: Int)
         /// Written as no cell at all, so the row is genuinely sparse.
         case absent
     }
@@ -43,9 +47,14 @@ struct XLSXFixtureBuilder {
     var uses1904 = false
     /// Extra custom number format, id → mask, so a custom date mask can be tested.
     var customDateMask: String?
+    /// Своя числовая маска — `0%`, `#,##0" ₽"`.
+    var customNumberMask: String?
 
     private static let dateStyleIndex = 1
     private static let customStyleIndex = 2
+    private static let numberMaskStyleIndex = 3
+    /// Стили 4 и 5 — встроенные проценты 9 и 10.
+    private static let builtInPercentStyles: [Int: Int] = [9: 4, 10: 5]
 
     func build() -> Data {
         var shared: [String] = []
@@ -84,6 +93,11 @@ struct XLSXFixtureBuilder {
                     case .formula(let formula, let cached):
                         let value = cached.map { "<v>\(Self.plain($0))</v>" } ?? ""
                         body += "<c r=\"\(reference)\"><f>\(Self.escape(formula))</f>\(value)</c>"
+                    case .measured(let value):
+                        body += "<c r=\"\(reference)\" s=\"\(Self.numberMaskStyleIndex)\"><v>\(Self.plain(value))</v></c>"
+                    case .builtInFormat(let value, let id):
+                        let style = Self.builtInPercentStyles[id] ?? 0
+                        body += "<c r=\"\(reference)\" s=\"\(style)\"><v>\(Self.plain(value))</v></c>"
                     }
                 }
                 rows += "<row r=\"\(number)\">\(body)</row>"
@@ -135,14 +149,21 @@ struct XLSXFixtureBuilder {
     /// Style 0 is General, style 1 is a built-in date format (14 = `m/d/yy`),
     /// style 2 uses the custom mask when one is asked for.
     private var stylesXML: String {
-        let custom = customDateMask.map {
-            "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"\(Self.escape($0))\"/></numFmts>"
-        } ?? ""
+        var formats: [String] = []
+        if let customDateMask {
+            formats.append("<numFmt numFmtId=\"164\" formatCode=\"\(Self.escape(customDateMask))\"/>")
+        }
+        if let customNumberMask {
+            formats.append("<numFmt numFmtId=\"165\" formatCode=\"\(Self.escape(customNumberMask))\"/>")
+        }
+        let custom = formats.isEmpty ? "" :
+            "<numFmts count=\"\(formats.count)\">" + formats.joined() + "</numFmts>"
         return """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\(custom)\
         <cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs>\
-        <cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs>\
+        <cellXfs count="6"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/>\
+        <xf numFmtId="165"/><xf numFmtId="9"/><xf numFmtId="10"/></cellXfs>\
         </styleSheet>
         """
     }

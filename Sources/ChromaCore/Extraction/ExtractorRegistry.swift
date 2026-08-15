@@ -139,7 +139,9 @@ public struct ExtractorRegistry: Sendable {
 /// Text, Markdown, CSV, JSON, source code — read as they are.
 public struct PlainTextExtractor: DocumentTextExtractor {
     public let id = "plaintext"
-    public let version = 1
+    /// 2 — ставится `has_tables` для Markdown с таблицей. Сам текст
+    /// не меняется: в Markdown таблица уже написана нужным видом.
+    public let version = 2
 
     public init() {}
 
@@ -165,7 +167,14 @@ public struct PlainTextExtractor: DocumentTextExtractor {
             plainText: text,
             containerFormat: url.pathExtension.lowercased(),
             extractorID: id,
-            extractorVersion: version
+            extractorVersion: version,
+            // Таблица в Markdown уже написана тем самым видом, к которому
+            // приведены остальные источники (11.13), — её надо только заметить.
+            //
+            // Дешёвая проверка впереди: разбирать стомегабайтный журнал
+            // на строки ради одного вопроса — это его копия в памяти.
+            hasTables: text.contains("---")
+                && text.components(separatedBy: .newlines).contains(where: TableText.isSeparator)
         )
     }
 

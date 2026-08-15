@@ -1315,6 +1315,7 @@
 "структура определена эвристикой, а не оглавлением" = "the structure was guessed, not taken from a table of contents";
 "структура не найдена — текст плоский" = "no structure found — the text is flat";
 "таблицы приведены к тексту, разметка потеряна" = "tables were flattened to text, the layout is lost";
+"таблицы записаны текстом: строки и колонки сохранены, оформление — нет" = "tables are written as text: rows and columns are kept, the styling is not";
 "комментарии, сноски и правки не извлекаются" = "comments, footnotes and tracked changes are not extracted";
 "заметки докладчика недоступны на этом пути извлечения" = "speaker notes are not available on this extraction path";
 "распознавание: страница %lld из %lld" = "recognising: page %lld of %lld";
@@ -2034,6 +2035,10 @@
 "Адрес страницы" = "Page address";
 "Ветка" = "Branch";
 "Пустые и слишком короткие документы" = "Empty and too short documents";
+"Чанки без единого слова" = "Chunks without a single word";
+"В тексте нет ни буквы, ни цифры — одни знаки препинания. Такой чанк не «ничего не находит», а находится сам: у текста без слов нет направления в пространстве смыслов, и он оказывается близко к любому запросу. Замеренный пример: до запроса «услуги связи» расстояние от чанка «)» — 0.33, а от предложения ровно про услуги связи — 0.42. Скобка выигрывает у ответа." = "The text holds no letter and no digit — punctuation only. Such a chunk does not merely fail to be found: it finds itself. Text without words has no direction in meaning space, so it lands close to any query at all. Measured: for a query about telecom services the distance to the chunk «)» is 0.33, and to a sentence squarely on that topic — 0.42. The bracket beats the answer.";
+"Удалить: текст из одних знаков препинания не нужен ни человеку, ни агенту. Новые такие чанки приложение больше не создаёт — нарезка приклеивает их к соседу; эти остались от прежних прогонов." = "Delete them: punctuation-only text is of no use to a human or to an agent. The app no longer creates such chunks — chunking now glues them onto a neighbour; these are left over from earlier runs.";
+"текст: «%@»" = "text: «%@»";
 "Документы без метаданных" = "Documents with no metadata";
 "Несоответствие схеме" = "Schema mismatch";
 "Чанки-сироты" = "Orphan chunks";
@@ -2923,6 +2928,7 @@
 "фрагмент найден целиком" = "the fragment was found whole";
 "совпали начало и конец фрагмента" = "the fragment’s beginning and end matched";
 "совпало самое длинное предложение фрагмента" = "the fragment’s longest sentence matched";
+"совпало без учёта дефисов и переносов" = "matched with hyphens and line breaks ignored";
 "Точное место в документе определить не удалось — открыта страница %lld целиком." = "The exact place in the document could not be determined — the whole of page %lld was opened.";
 "фрагмент найден на странице %lld, хотя при индексации записана другая" = "the fragment was found on page %lld, though a different one was recorded at indexing time";
 "показано строк: %lld" = "rows shown: %lld";
@@ -3016,3 +3022,320 @@
 "пропускается — в профиль не войдёт" = "skipped — will not go into the profile";
 "профиль «%@» назначен этому файлу вручную" = "profile “%@” is assigned to this file by hand";
 "сервер ещё не отвечал" = "the server has not answered yet";
+
+/* C1 — шифрование трафика прокси */
+"Собственной аутентификации у этой версии движка нет — проверено на живом сервере. Прокси защищает от сетевых клиентов, а не от локальных программ." = "This engine version has no authentication of its own — verified against a live server. The proxy protects against network clients, not against local programs.";
+"Прокси открыт в сеть без шифрования: ключ клиента передаётся в открытом виде и виден всем, кто слушает сеть." = "The proxy is open to the network without encryption: the client key travels in clear text and is visible to anyone listening.";
+"Включите TLS. Если клиент не умеет доверять самоподписанному сертификату, оставьте прокси на 127.0.0.1 — по петле открытый трафик за пределы Мака не выходит." = "Turn TLS on. If the client cannot trust a self-signed certificate, keep the proxy on 127.0.0.1 — unencrypted traffic over loopback never leaves this Mac.";
+"Сертификат прокси истёк %@." = "The proxy certificate expired on %@.";
+"Клиенты уже получают ошибку. Выпустите сертификат заново и передайте новый отпечаток тем, кто подключается." = "Clients are already failing. Issue a new certificate and pass the new fingerprint to whoever connects.";
+"Сертификат прокси действует ещё %@ дн." = "The proxy certificate is valid for another %@ days.";
+"Перевыпуск меняет отпечаток: клиентам понадобится новый. Лучше сделать это заранее, а не в день, когда всё перестанет работать." = "Reissuing changes the fingerprint, and clients will need the new one. Better done in advance than on the day everything stops.";
+"Сертификат не выписан на адрес этого Мака: %@." = "The certificate does not cover this Mac's address: %@.";
+"Подключение по этому адресу клиент отвергнет по несовпадению имени. Выпустите сертификат заново — новый возьмёт текущие адреса." = "A client connecting to that address will refuse it as a name mismatch. Issue a new certificate — it picks up the current addresses.";
+"Шифрование выключено в настройках, но работающий прокси всё ещё шифрует трафик." = "Encryption is off in the settings, but the running proxy is still encrypting.";
+"Шифрование включено в настройках, но работающий прокси принимает соединения без него." = "Encryption is on in the settings, but the running proxy accepts connections without it.";
+"Перезапустите прокси — настройка применяется при запуске." = "Restart the proxy — the setting is applied at start.";
+"Не удалось включить TLS: сертификат недоступен." = "TLS could not be enabled: the certificate is unavailable.";
+"Выпустите сертификат на экране «Безопасность». Прокси не запускается без него: открыть порт наружу с ключами в открытом виде хуже, чем не открыть вовсе." = "Issue a certificate on the Security screen. The proxy will not start without one: opening a port with keys in clear text is worse than not opening it at all.";
+"Не удалось создать ключ сертификата: %@" = "Could not create the certificate key: %@";
+"Не удалось подписать сертификат: %@" = "Could not sign the certificate: %@";
+"Сертификат повреждён и не читается." = "The certificate is damaged and cannot be read.";
+"Сертификат ещё не выпущен." = "No certificate has been issued yet.";
+"Выпустите сертификат заново на экране «Безопасность» — старый при этом заменяется, клиентам понадобится новый отпечаток." = "Issue a new certificate on the Security screen — it replaces the old one, and clients will need the new fingerprint.";
+"Прокси будет шифровать трафик при следующем запуске." = "The proxy will encrypt traffic the next time it starts.";
+"Прокси будет принимать соединения без шифрования при следующем запуске." = "The proxy will accept unencrypted connections the next time it starts.";
+"Прокси перезапущен и шифрует трафик." = "The proxy has restarted and is encrypting traffic.";
+"Прокси перезапущен и работает без шифрования." = "The proxy has restarted and is running without encryption.";
+"Сертификат выпущен заново. Новый отпечаток: %@… — передайте его клиентам." = "A new certificate has been issued. New fingerprint: %@… — pass it to your clients.";
+"Этот файл передаётся клиенту, чтобы он доверял прокси. Секрета в нём нет." = "Give this file to a client so it can trust the proxy. It holds no secret.";
+"Сертификат сохранён: %@" = "Certificate saved: %@";
+"Шифрование" = "Encryption";
+"Ключ клиента передаётся заголовком. Без шифрования его видит любой, кто слушает сеть между клиентом и этим Маком." = "The client key travels in a header. Without encryption, anyone listening between the client and this Mac can read it.";
+"Шифровать трафик прокси (TLS)" = "Encrypt proxy traffic (TLS)";
+"Прокси открыт наружу и не шифрует: ключи уходят в сеть открытым текстом." = "The proxy is open to the network and unencrypted: keys go out in clear text.";
+"Прокси слушает только этот Мак — такой трафик не покидает машину." = "The proxy listens on this Mac only — that traffic never leaves the machine.";
+"Сертификат выпустится сам при первом запуске прокси." = "A certificate will be issued automatically the first time the proxy starts.";
+"Как подключается клиент" = "How a client connects";
+"Выпустить сертификат заново?" = "Issue a new certificate?";
+"Выпустить" = "Issue";
+"Отпечаток изменится. Все, кто уже доверился прежнему сертификату, получат ошибку соединения, пока не получат новый отпечаток или новый файл сертификата.\n\nДелать это стоит, когда сертификат подходит к концу срока или когда у Мака сменился адрес в сети." = "The fingerprint will change. Anyone who already trusted the old certificate will get a connection error until they have the new fingerprint or the new certificate file.\n\nWorth doing when the certificate is near its expiry or when this Mac's network address has changed.";
+"Отпечаток SHA-256" = "SHA-256 fingerprint";
+"Скопировать отпечаток" = "Copy the fingerprint";
+"Клиент видит ровно этот отпечаток. Совпал — соединение то самое." = "A client sees exactly this fingerprint. If it matches, the connection is the right one.";
+"Действует до" = "Valid until";
+"Осталось" = "Remaining";
+"истёк" = "expired";
+"Выписан на" = "Issued for";
+"Сохранить сертификат…" = "Save the certificate…";
+"Выпустить заново" = "Issue a new one";
+"Трафик" = "Traffic";
+"шифруется (TLS)" = "encrypted (TLS)";
+"без шифрования" = "not encrypted";
+"Клиент подключается так: chromadb.HttpClient(host=\"127.0.0.1\", port=%@, ssl=True)" = "A client connects like this: chromadb.HttpClient(host=\"127.0.0.1\", port=%@, ssl=True)";
+"Выпустить сейчас" = "Issue now";
+"Чтобы отдать клиенту отпечаток и файл заранее, не запуская прокси" = "So you can hand a client the fingerprint and the file in advance, without starting the proxy";
+"Сертификат выпущен. Отпечаток: %@…" = "Certificate issued. Fingerprint: %@…";
+
+/* H5 — проверка обновлений приложения */
+"Версия приложения" = "App version";
+"Проверка спрашивает страницу релизов на GitHub и ничего не скачивает. Обновление ставится руками." = "The check asks the GitHub releases page and downloads nothing. Updates are installed by hand.";
+"Встроенного автообновления в приложении нет и не будет: сборка распространяется через GitHub, и решение обновиться остаётся за вами." = "There is no built-in auto-update and there never will be: builds are distributed through GitHub, and the decision to update stays yours.";
+"Установлена версия %@" = "Installed version %@";
+"Версия неизвестна: приложение запущено не из бандла" = "Version unknown: the app is running outside a bundle";
+"Проверить обновления" = "Check for updates";
+"Установлена последняя версия." = "You are on the latest version.";
+"Сравнить не с чем: версия есть только у собранного приложения. Последний выпущенный релиз показан ниже." = "Nothing to compare against: only an assembled app carries a version. The latest published release is shown below.";
+"Проверять обновления приложения при запуске" = "Check for app updates at launch";
+"Выключено по умолчанию: пока галочка снята, приложение не обращается к GitHub само." = "Off by default: while this is unchecked, the app never contacts GitHub on its own.";
+"Последний релиз: %@" = "Latest release: %@";
+"Открыть страницу релиза" = "Open the release page";
+
+/* D2.2 — HTTP-режим MCP */
+"Отдавать MCP по сети (HTTP)" = "Serve MCP over the network (HTTP)";
+"Трафик не шифруется: ключ агента пойдёт по сети открытым текстом. Включите TLS на экране «Безопасность»." = "Traffic is not encrypted: the agent's key will travel in clear text. Turn TLS on from the Security screen.";
+"Адрес появится, когда заработает прокси: MCP по сети живёт на том же порту и с теми же ключами." = "The address appears once the proxy is running: MCP over the network shares its port and its keys.";
+"Агент подключается только через вспомогательный файл на этом Маке. По сети MCP недоступен." = "Agents connect only through the helper on this Mac. MCP is not reachable over the network.";
+
+/* Правки по итогам разбора кода */
+"Ключ доступа не передан или не зарегистрирован." = "The access key is missing or not registered.";
+"MCP-сервер не запущен, поэтому по сети он пока недоступен." = "The MCP server is not running, so it is not reachable over the network yet.";
+"%@ Прокси перезапущен с прежними настройками." = "%@ The proxy has been restarted with its previous settings.";
+"%@ Прокси остановлен: %@" = "%@ The proxy is stopped: %@";
+"Сертификат выпущен, но прокси не запустился: %@" = "The certificate was issued, but the proxy did not start: %@";
+
+/* Разбор отчёта по таблицам */
+"заголовков нет — колонки названы буквами, данные с первой строки" = "no headers — columns named by letter, data starts at the first row";
+"заголовков в строке %lld нет — колонки названы буквами" = "no headers in row %lld — columns named by letter";
+"%@: в файле нет колонок %@ — метаданных по ним не будет" = "%@: the file has no columns %@ — there will be no metadata for them";
+"профиль «%@» назначен файлу, но ни один его вариант не подходит листу: нет колонок %@" = "profile “%@” is assigned to this file, but none of its variants fits this sheet: no columns %@";
+"профиль «%@» назначен файлу, но про этот лист в нём ничего не сказано" = "profile “%@” is assigned to this file, but says nothing about this sheet";
+"В листе «%@» нет ни одной колонки с данными." = "Sheet “%@” has no column with data in it.";
+"Колонки названы буквами, данные читаются с первой строки. Задайте названия в поле «Своё название» — они уйдут в ключи метаданных." = "Columns are named by letter and data is read from the first row. Give them names in the “Own name” field — those become the metadata keys.";
+"Колонки названы буквами, данные читаются со строки %lld. Задайте названия в поле «Своё название»." = "Columns are named by letter and data is read from row %lld. Give them names in the “Own name” field.";
+"Разметка сброшена к предположению по файлу, назначение профиля снято. Сохранение создаст новый профиль — под другим именем." = "The mapping is back to what the file suggests and the profile assignment is cleared. Saving now creates a new profile — under a different name.";
+"Сохранять нечего: ни один лист книги не размечен." = "Nothing to save: no sheet of the workbook is mapped.";
+"Заголовков нет — назвать колонки самому" = "No headers — name the columns myself";
+"В строке %@ заголовков нет" = "No headers in row %@";
+"Считать эту строку служебной: колонки назвать буквами, данные читать со следующей" = "Treat this row as a service row: name columns by letter and read data from the next one";
+"Разметить заново" = "Map from scratch";
+"Забыть подставленный профиль и собрать разметку этого файла с нуля" = "Forget the profile that was filled in and build this file's mapping from scratch";
+
+/* Область хранения профилей сопоставления */
+"у этого источника" = "with this source";
+"у всего приложения" = "with the whole app";
+"Профиль виден только файлам этого источника — как было раньше." = "The profile is visible only to this source's files — as before.";
+"Профиль виден всем источникам: та же книга в другой папке разметится сама. Свой профиль источника с таким же именем всё равно главнее." = "The profile is visible to every source: the same workbook in another folder maps itself. A source's own profile of the same name still wins.";
+"Хранить профиль" = "Keep the profile";
+"Профили" = "Profiles";
+"общий" = "shared";
+"общий, перекрыт своим" = "shared, overridden by an own profile";
+"%@ · общий" = "%@ · shared";
+"общий профиль «%@» назначен этому файлу вручную" = "shared profile “%@” is assigned to this file by hand";
+"лист узнан общим профилем «%@»" = "the sheet is recognised by the shared profile “%@”";
+"Профиль «%@» сохранён %@. Он применится к файлам с тем же набором колонок; файл с другим набором попадёт в «требуют решения»." = "Profile “%@” is saved %@. It applies to files with the same set of columns; a file with a different set goes to “needs a decision”.";
+"Профиль «%@» сохранён %@: вариантов %lld, по одному на лист. Каждый лист читается своим — тот же файл целиком." = "Profile “%@” is saved %@: %lld variants, one per sheet. Each sheet is read by its own — the whole file at once.";
+"Из области «%@» он убран: профиль живёт в одной области, иначе на лист претендовали бы два одинаковых." = "It has been taken out of “%@”: a profile lives in one place only, or two identical ones would claim the same sheet.";
+"Профиль общий: он исчезнет у всех источников, и их файлы вернутся к подбору по колонкам" = "The profile is shared: it disappears for every source, and their files go back to matching by columns";
+"Профиль исчезнет у этого источника; назначенные ему файлы вернутся к подбору по колонкам" = "The profile disappears for this source; files assigned to it go back to matching by columns";
+"Профилей нет ни у источника, ни у приложения — выгружать нечего." = "There are no profiles, neither with the source nor with the app — nothing to export.";
+"не индексировать — так и записано в профиле" = "do not index — recorded in the profile as such";
+"общих профилей таблиц: %lld" = "shared table profiles: %lld";
+"Общие профили таблиц" = "Shared table profiles";
+"Импортировано из %@: профилей %@, источников %@, схем %@, фильтров %@, клиентов %@, общих профилей таблиц %@." = "Imported from %@: %@ profiles, %@ sources, %@ schemas, %@ filters, %@ clients, %@ shared table profiles.";
+
+/* Умолчания нарезки */
+"Умолчания" = "Defaults";
+"Сделать умолчанием" = "Make it the default";
+"Взять умолчание" = "Take the default";
+"Забыть умолчание" = "Forget the default";
+"Запомнить эти значения для стратегии «%@» и заводить новые источники с ней" = "Remember these values for the “%@” strategy and create new sources with it";
+"Подставить сюда умолчания стратегии «%@»" = "Fill this in with the defaults of the “%@” strategy";
+"Вернуть заводские значения стратегии «%@». Настройки этого источника не изменятся" = "Restore the factory values of the “%@” strategy. This source's settings stay as they are";
+"Новые источники будут заводиться со стратегией «%@» и этими значениями. У других стратегий свои умолчания — они подставятся, когда переключите стратегию." = "New sources will be created with the “%@” strategy and these values. Other strategies have defaults of their own — they are filled in when you switch strategy.";
+"Взяты ваши умолчания для стратегии «%@»." = "Your defaults for the “%@” strategy have been taken.";
+"Взяты заводские значения для стратегии «%@»: своих у неё нет." = "The factory values for the “%@” strategy have been taken: it has none of your own.";
+"Умолчание стратегии «%@» сброшено к заводскому. Настройки этого источника не изменились." = "The default of the “%@” strategy is back to the factory one. This source's settings have not changed.";
+"У стратегии «%@» ваши умолчания, и новые источники заводятся с ней." = "The “%@” strategy has your defaults, and new sources are created with it.";
+"У стратегии «%@» ваши умолчания. Новые источники заводятся с другой стратегией." = "The “%@” strategy has your defaults. New sources are created with a different strategy.";
+"У стратегии «%@» пока заводские умолчания." = "The “%@” strategy still has the factory defaults.";
+
+/* Файл целиком через MCP */
+"Файл «%@»: %@ начиная с %@" = "File “%@”: %@ starting at %@";
+", всего %@" = ", %@ in total";
+"Файл прочитан не весь: продолжай вызовом с offset %@." = "The file is not read in full: continue with offset %@.";
+"В файле больше %@ чанков — столько приложение по порядку не отдаёт. Куски идут в произвольном порядке; собирай их по полю chunk_index." = "The file has more than %@ chunks — the app does not order that many. The pieces come in an arbitrary order; assemble them by the chunk_index field.";
+"В коллекции «%@» нет документов файла «%@»." = "Collection “%@” has no documents of the file “%@”.";
+"Путь берётся из поля source_file найденного документа целиком — не имя файла и не абсолютный путь." = "The path is the source_file field of a found document, taken whole — not the file name and not an absolute path.";
+"Символов в документе" = "Characters per document";
+"по умолчанию 4000" = "4000 by default";
+"Символов в ответе" = "Characters per response";
+"по умолчанию 24000" = "24000 by default";
+
+/* Ловушки среды: том, массовая пропажа, облако, недописанный файл */
+"неизвестный том" = "unknown volume";
+"с диска исчезло %@ файлов из %@" = "%@ files out of %@ have vanished from disk";
+"Папка источника лежит на другом томе: ожидался «%@», сейчас подключён «%@». Синхронизация не запускалась." = "The source folder is on a different volume: “%@” was expected, “%@” is mounted. Synchronisation did not start.";
+"Том «%@», на котором лежит источник, не подключён. Синхронизация не запускалась." = "The volume “%@” the source lives on is not mounted. Synchronisation did not start.";
+"Подключите тот же диск (или сетевую шару) и запустите синхронизацию заново. Если папка действительно переехала, укажите новый путь в настройках источника — том запомнится заново." = "Mount the same disk (or network share) and run the synchronisation again. If the folder really did move, set the new path in the source settings — the volume will be remembered anew.";
+"С диска исчезло %@ файлов из %@ — это похоже на отключённый диск, а не на правку папки. Синхронизация остановлена, из базы ничего не удалено." = "%@ files out of %@ have vanished from disk — that looks like an unmounted disk rather than an edited folder. Synchronisation is stopped and nothing has been deleted from the database.";
+"Проверьте, что диск с папкой подключён и это тот самый диск. Если файлы удалены намеренно, запустите синхронизацию ещё раз и подтвердите массовое исчезновение — только тогда они попадут в «требуют решения»." = "Check that the disk with the folder is mounted and that it is the same disk. If the files were deleted on purpose, run the synchronisation again and confirm the mass disappearance — only then do they go to “needs a decision”.";
+"С диска исчезло %@ файлов из %@. Так обычно выглядит отключённый диск или сетевая папка, а не удаление руками — поэтому синхронизация остановлена и из базы ничего не удалено. Проверьте, тот ли диск подключён. Если файлы удалены намеренно, подтвердите — они попадут в «требуют решения», откуда их можно убрать из базы." = "%@ files out of %@ have vanished from disk. That is what an unmounted disk or network folder usually looks like, not a manual deletion — so synchronisation is stopped and nothing has been deleted from the database. Check that the right disk is mounted. If the files were deleted on purpose, confirm — they will go to “needs a decision”, from where they can be removed from the database.";
+"исчезло %@ файлов из %@ — синхронизация остановлена" = "%@ files out of %@ vanished — synchronisation stopped";
+"Источник «%@»: файлы исчезли с диска" = "Source “%@”: files have vanished from disk";
+"Подтвердить: файлы действительно удалены" = "Confirm: the files really are deleted";
+"Отмена — проверю диск" = "Cancel — I will check the disk";
+"файл изменялся секунду назад — возможно, он ещё пишется; будет прочитан следующим прогоном" = "the file changed a second ago — it may still be being written; it will be read by the next run";
+"файл хранится в облаке и не загружен на диск — откройте его в Finder («Загрузить сейчас») или отключите оптимизацию хранилища" = "the file lives in the cloud and is not downloaded — open it in Finder (“Download Now”) or turn off storage optimisation";
+
+/* Контекстный префикс */
+"Дописывать контекст перед вычислением вектора" = "Prepend context before computing the vector";
+"Перед текстом чанка в модель уходит строка «Документ → Раздел → Подраздел». В самом документе её нет — он остаётся таким, как в файле. Чанк «превышение допустимого значения приводит к отказу» без этой строки не находится ничем: в нём нет ни одного слова о том, о чём он.\n\nСюда же попадает вводная фраза списка — та, что кончается двоеточием. Пункт «восстановление работоспособности в течение четырёх часов» без неё не говорит, чего восстановление и кто обязан: это стояло строкой выше, в «Исполнитель обязан обеспечить:»." = "A line “Document → Section → Subsection” goes to the model before the chunk's text. It is not in the document itself — that stays exactly as it is in the file. A chunk saying “exceeding the permitted value causes a failure” is found by nothing without that line: it contains not one word about what it is about.\n\nThe lead-in of a list goes there too — the phrase that ends with a colon. The item “restoring service within four hours” does not say by itself what is restored or who is obliged: that stood a line above, in “The contractor shall ensure:”.";
+"Это меняет содержимое коллекции: при следующей синхронизации все файлы источника будут переэмбежены." = "This changes what the collection holds: at the next synchronisation every file of the source is re-embedded.";
+
+/* Поиск по нескольким коллекциям */
+"Коллекций в поиске" = "Collections per search";
+"по умолчанию 5" = "5 by default";
+", коллекция «%@»" = ", collection “%@”";
+"Найдено в коллекциях %@: %@" = "Found in collections %@: %@";
+"По запросу «%@» ничего не найдено в коллекциях: %@." = "Nothing found for “%@” in the collections: %@.";
+"коллекций %@, найдено %@, векторов запроса %@" = "%@ collections, %@ found, %@ query vectors";
+"; не ответили: %@" = "; did not answer: %@";
+"Запрошено коллекций: %@, обыскано %@ — это потолок, заданный правами ключа. Остальные — следующим вызовом." = "Collections requested: %@, searched %@ — that is the ceiling set by the key's permissions. The rest go in the next call.";
+"Ключу «%@» не открыты коллекции: %@. Список доступных — list_collections." = "The key “%@” has no access to these collections: %@. The available ones are in list_collections.";
+"отказ по коллекциям: %@" = "refused over collections: %@";
+"Не найдены коллекции: %@ — проверь имена через list_collections." = "Collections not found: %@ — check the names with list_collections.";
+"Коллекция «%@» не ответила: %@" = "Collection “%@” did not answer: %@";
+"Поиск агента по нескольким коллекциям" = "Agent search across several collections";
+"Искать ещё в…" = "Search also in…";
+"Искать ещё в: %@" = "Search also in: %@";
+"%@ — нет модели" = "%@ — no model";
+"Только эта коллекция" = "This collection only";
+"ищем в: %@" = "searching in: %@";
+"Вектор запроса считается по разу на модель: моделей %@." = "The query vector is computed once per model: %@ models.";
+" Метрики у коллекций разные, поэтому порядок задаётся слиянием рангов, а не расстояниями." = " The collections use different metrics, so the order comes from rank fusion rather than from distances.";
+"Поиск по нескольким коллекциям" = "Search across several collections";
+"Ни одна из выбранных коллекций не может искать: у них не указана модель или она недоступна." = "None of the selected collections can search: they have no model set, or it is unavailable.";
+"Найдено результатов: %@ по %@ коллекциям." = "Results found: %@ across %@ collections.";
+"%@ — не ответила: %@" = "%@ — did not answer: %@";
+"%@ — найдено %@, %@ мс" = "%@ — %@ found, %@ ms";
+"закреплён" = "pinned";
+"понижен" = "demoted";
+"устарел" = "stale";
+"Закрепить" = "Pin";
+"Понизить" = "Demote";
+"Пометить устаревшим" = "Mark as stale";
+"теги: %@" = "tags: %@";
+"заметка есть" = "has a note";
+"пометок нет" = "no marks";
+"помеченных документов в выдаче нет" = "no marked documents in the results";
+"закреплённых %@" = "%@ pinned";
+"понижённых %@" = "%@ demoted";
+"устаревших %@" = "%@ stale";
+"Ручные пометки" = "Manual marks";
+"Пометки с документа %@ сняты." = "Marks removed from document %@.";
+"Документ %@: %@." = "Document %@: %@.";
+"Закрепить, понизить или пометить устаревшим" = "Pin, demote or mark as stale";
+"Теги и заметка…" = "Tags and note…";
+"теги видны агенту и годятся для фильтра по метаданным" = "tags are visible to the agent and work in the metadata filter";
+"8. Ручные пометки" = "8. Manual marks";
+"Закреплённое человеком поднимается, понижённое и устаревшее опускается. Пометки ставятся у документа и живут в его метаданных." = "What you pinned rises; what you demoted or marked stale sinks. Marks are set on a document and live in its metadata.";
+"Стадия идёт последней — после переранжирования и до усечения: закреплённый документ обязан попасть в выдачу, а не быть срезанным вместе с хвостом. Порядок внутри групп не меняется: пометка говорит «выше» и «ниже», а не «вместо»." = "The stage runs last — after reranking and before truncation: a pinned document has to reach the results rather than be cut off with the tail. The order inside each group is untouched: a mark says “higher” and “lower”, not “instead”.";
+"Учитывать пометки" = "Apply marks";
+"Выключите, если пометки нужны только как разметка — для курирования базы и наборов оценки, — а порядок выдачи должен оставаться чисто векторным." = "Turn this off if marks are only a labelling tool — for curating the base and building evaluation sets — and the ranking should stay purely vector-based.";
+"Обогащать контекст чат-моделью" = "Enrich context with a chat model";
+"Модель читает фрагмент и пишет одно-два предложения о том, о чём документ и где в нём этот фрагмент. Они уходят в вектор — в документе их нет. Заметно помогает там, где заголовков нет и структурная строка молчит." = "The model reads the fragment and writes one or two sentences about what the document is and where the fragment sits in it. They go into the vector — the document itself does not carry them. It helps most where there are no headings and the structural line has nothing to say.";
+"Модель обогащения" = "Enrichment model";
+"Без выбранной модели обогащение не выполняется: фрагменты уйдут в эмбеддинг как есть." = "With no model chosen the enrichment does not run: fragments are embedded as they are.";
+"Один вызов чат-модели на каждый чанк. Сколько их будет, станет известно после первой синхронизации источника." = "One chat-model call per chunk. How many there will be becomes known after the source is synchronised for the first time.";
+"Один вызов чат-модели на чанк: %@ вызовов. %@" = "One chat-model call per chunk: %@ calls. %@";
+"Один вызов чат-модели на чанк: %@ вызовов, %@ работы модели." = "One chat-model call per chunk: %@ calls, %@ of model time.";
+"Один вызов чат-модели на чанк: %@ вызовов. Сколько это займёт — неизвестно: скорость этой модели ещё не измерялась." = "One chat-model call per chunk: %@ calls. How long that takes is unknown: this model's speed has never been measured.";
+
+/* ── ── */
+"Движок ChromaDB не установлен — без него нет ни базы, ни поиска" = "The ChromaDB engine is not installed — without it there is neither a database nor search";
+"В базе нет ни одной коллекции — добавьте источник, он её и создаст" = "The database holds no collections — add a source and it will create one";
+"Источников нет — коллекции наполнены не приложением, обновлять их некому" = "No sources — these collections were filled by something other than this app, and nothing will refresh them";
+"Умолчания нарезки" = "Chunking defaults";
+"Новый источник заводится со стратегией «%@»." = "A new source starts with the «%@» strategy.";
+"Своих значений не задано ни у одной стратегии — везде заводские." = "No strategy has values of your own — the factory ones are used everywhere.";
+"Задаются и правятся в карточке источника — блок «Умолчания» под параметрами стратегии. Там же они и применяются: «Взять умолчание» подставляет их в открытый источник." = "They are set and edited in the source card — the «Defaults» block under the strategy parameters. They are applied there too: «Take the default» fills them into the open source.";
+"Забыть все умолчания" = "Forget all defaults";
+"Умолчания сброшены к заводским у всех стратегий. Настройки заведённых источников не изменились." = "Defaults reset to factory values for every strategy. Settings of existing sources are unchanged.";
+"Заведённые источники это не тронет: у них свои значения." = "This leaves existing sources alone: they carry values of their own.";
+
+/* ── ── */
+"Плотный текст (числа, пунктуация, короткие предложения) режется мельче, разреженный — крупнее. Только эвристики, без модели-классификатора. Границы внутри блока ищутся по этим разделителям." = "Dense text (numbers, punctuation, short sentences) is cut finer, airy text coarser. Heuristics only, no classifier model. Boundaries inside a block are found by these separators.";
+"Раздел длиннее родителя режется на части — по этим разделителям и с этим перекрытием." = "A section longer than the parent is cut into pieces — by these separators and with this overlap.";
+"Уменьшите предельный размер чанка у источника (для document-based — «max_section_size» и откат для крупных секций), либо возьмите модель, читающую больше. Предел измерен пробой самой модели: то, что она сообщает о своём контексте, с ним не совпадает." = "Lower the maximum chunk size on the source (for document-based — «max_section_size» and the oversized-section fallback), or pick a model that reads more. The limit was measured by probing the model itself: what it reports about its context does not match it.";
+"Файл «%@»: чанк в %@ знаков длиннее того, что модель «%@» читает за раз — измерено %@ знаков. Модель приняла бы его молча, посчитав вектор только по началу, поэтому файл пропущен." = "File «%@»: a chunk of %@ characters is longer than what the model «%@» reads at once — measured %@ characters. The model would have accepted it silently, computing the vector from the beginning only, so the file was skipped.";
+"Этим и режется секция, которая не влезла. Перекрытие берётся отсюда обоими откатами; разделители — только Recursive." = "This is what cuts a section that did not fit. Both fallbacks take the overlap from here; separators are used by Recursive only.";
+
+/* ── ── */
+"Сколько модель читает" = "How much the model reads";
+"≈ %@ знаков за раз" = "≈ %@ characters at a time";
+"больше %@ знаков — предела не нашлось" = "more than %@ characters — no limit found";
+"не измерялось" = "not measured";
+"При этих настройках чанк дорастает до %@ знаков — больше, чем модель читает. Такой файл уйдёт в пропущенные, а не в базу: вектор описывал бы только начало чанка." = "With these settings a chunk grows to %@ characters — more than the model reads. Such a file goes to skipped rather than into the database: the vector would describe the beginning of the chunk only.";
+"Размер чанка при этих настройках ничем не ограничен: у document-based это «не делить», у LLM-based — то, что вернёт чат-модель. Приложение проверит каждый чанк на прогоне и пропустит файл, если он не влезет." = "Chunk size is unbounded with these settings: for document-based that is «do not split», for LLM-based it is whatever the chat model returns. The app checks every chunk during the run and skips the file if it does not fit.";
+"Модель молча обрезает то, что не влезло, — вектор считается по началу чанка, и ни в ответе, ни в выдаче это не видно. Поэтому предел измеряется пробой, а не берётся из того, что модель о себе сообщает." = "The model silently cuts whatever did not fit — the vector is computed from the start of the chunk, and neither the response nor the results show it. That is why the limit is measured by probing rather than taken from what the model reports about itself.";
+"LM Studio недоступна — измерить предел нечем." = "LM Studio is unavailable — there is nothing to measure the limit with.";
+"Замер предела чтения модели «%@»" = "Measuring the reading limit of the model «%@»";
+
+/* ── ── */
+"Замер не удался: модель не ответила. Прежнее измеренное значение сохранено." = "The measurement failed: the model did not answer. The previously measured value is kept.";
+"измерить не вышло — модель не ответила" = "measurement failed — the model did not answer";
+
+/* ── ── */
+" и ещё %lld" = " and %lld more";
+"«%@» — строки %@" = "«%@» — rows %@";
+"строки %@ совпадают целиком" = "rows %@ are fully identical";
+"повторов пропущено %lld" = "duplicates skipped %lld";
+"лист «%@»: строк-повторов пропущено %lld — %@%@" = "sheet «%@»: duplicate rows skipped %lld — %@%@";
+"строк-повторов не записано %lld: %@%@. Записана первая строка из каждой группы; выберите другую ключевую колонку или уберите повторы в файле" = "duplicate rows not written %lld: %@%@. The first row of each group was written; choose a different key column or remove the duplicates in the file";
+"В колонке «%@» значения повторяются уже в показанных строках: %@%@. Ключ определяет документ, поэтому из каждой такой группы запишется только первая строка. Выберите колонку, где значение своё у каждой строки." = "Values in the column «%@» already repeat among the rows shown: %@%@. The key decides the document, so only the first row of each such group will be written. Choose a column whose value is unique to every row.";
+
+/* ── ── */
+"Таблицы прочитаны с оговорками: %lld" = "Tables read with caveats: %lld";
+"Строк таблиц исчезло из файлов: %@ — ждут решения в «Требуют решения», из базы ничего не удалено" = "Table rows gone from the files: %@ — awaiting a decision under «Needs a decision»; nothing was deleted from the database";
+"%@ · строки таблиц" = "%@ · table rows";
+"%@ → %@" = "%@ → %@";
+"коллекция «%@» · строк %@ · замечено %@" = "collection «%@» · rows %@ · noticed %@";
+"строка %@ · %@" = "row %@ · %@";
+"строка %@" = "row %@";
+"%@ → %@: сопоставление изменилось — лист нужно переиндексировать вручную, сам он не пересчитывается" = "%@ → %@: the mapping changed — the sheet has to be re-indexed by hand, it is not recomputed on its own";
+"Листов разобрано: %@, удалено строк из базы — %@." = "Sheets resolved: %@, rows deleted from the database — %@.";
+"Листов разобрано: %@ — строки оставлены в базе." = "Sheets resolved: %@ — the rows were kept in the database.";
+"Файлы и строки таблиц исчезли из источника. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет." = "Files and table rows are gone from the source. The documents stay in the database until you decide otherwise — the app never deletes anything on its own.";
+"объединений ячеек вбок: %lld — значение оставлено в первой колонке диапазона; вниз объединения размазаны по строкам" = "cells merged sideways: %lld — the value was left in the first column of the range; merges running down were spread across the rows";
+"Без ключевой колонки строка узнаётся по содержимому: вставка и перестановка строк ничего не стоят, но правка создаёт новый документ, а прежний попадает в «Требуют решения» — его нужно будет разобрать. Выберите колонку с артикулом, кодом или адресом почты, если такая есть." = "Without a key column a row is recognised by its contents: inserting and reordering rows costs nothing, but an edit creates a new document and the previous one lands in «Needs a decision» for you to resolve. Pick a column with an article number, a code or an e-mail address if there is one.";
+"лист «%@»: значений обрезано по длине (%@ знаков) — %@" = "sheet «%@»: values cut to the length limit (%@ characters) — %@";
+
+/* ── ── */
+"Колонтитул: %@" = "Header: %@";
+"Нижний колонтитул: %@" = "Footer: %@";
+"Сноска %@: %@" = "Footnote %@: %@";
+"пропущено скрытых абзацев: %@ — Word их не показывает и не печатает" = "hidden paragraphs skipped: %@ — Word neither shows nor prints them";
+"формат %@ не контейнер: правки, комментарии и сноски в нём не проверялись" = "the %@ format is not a container: revisions, comments and footnotes in it were not checked";
+
+/* ── ── */
+"Комментарий (%@): %@" = "Comment (%@): %@";
+"Комментарий: %@" = "Comment: %@";
+"в документе есть правки: индексируется финальная редакция, удалённый текст в базу не идёт" = "the document carries tracked changes: the final revision is indexed, deleted text does not reach the database";
+"комментарии, сноски и правки не извлечены" = "comments, footnotes and tracked changes were not extracted";
+
+/* ── ── */
+"файл не похож на составной документ OLE2" = "the file does not look like an OLE2 compound document";
+"составной документ обрезан или повреждён" = "the compound document is truncated or damaged";
+"размер сектора %@ не поддерживается" = "sector size %@ is not supported";
+"в документе нет потока «%@»" = "the document has no «%@» stream";
+"составной документ повреждён: %@" = "the compound document is damaged: %@";
+"файл больше предела чтения" = "the file is larger than the reading limit";
+"нет таблицы размещения" = "there is no allocation table";
+"в каталоге нет корневой записи" = "the directory has no root entry";
+"цепочка секторов зациклена" = "the sector chain loops back on itself";
+"в документе есть %@ (%@) — текст не извлекается" = "the document holds %@ (%@) — the text is not extracted";
+"в колонтитулах %@ — они не извлекаются, а гриф документа живёт именно там" = "headers and footers hold %@ — they are not extracted, and a document's classification mark lives exactly there";
+"в концевых сносках %@ — они не извлекаются" = "endnotes hold %@ — they are not extracted";
+"в надписях и врезках %@ — они не извлекаются" = "text boxes hold %@ — they are not extracted";
+"правки в этом формате не проверялись: индексируется то, что вернул системный импортёр" = "tracked changes are not checked in this format: what the system importer returned is what gets indexed";

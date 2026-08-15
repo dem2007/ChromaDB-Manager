@@ -19,8 +19,9 @@ import Foundation
 ///   — where this machine is connected right now. Importing them would point
 ///   the app at another machine's database and disconnect it from its own.
 /// - `preferredPythonPath` — an absolute path to another machine's interpreter.
-/// - `dataSources`, `serverProfiles`, `externalClients` — carried as their own
-///   lists, because they merge by identity instead of overwriting.
+/// - `dataSources`, `serverProfiles`, `externalClients`, `sharedTableProfiles`
+///   — carried as their own lists, because they merge by identity instead of
+///   overwriting.
 /// - `automaticSyncPaused` — the state of this session, not a preference.
 public struct TransferablePreferences: Codable, Equatable, Sendable {
     public var lmStudioBaseURL: String
@@ -38,6 +39,12 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
     public var trashLimitBytes: Int64
     public var syncPreviewThresholdFiles: Int
     public var preferredInstallPath: EngineInstallPath
+    /// Умолчания нарезки по стратегиям и стратегия новых источников.
+    /// Это настройка, а не данные: она ничего не переиндексирует и на другой
+    /// машине значит ровно то же самое. Необязательные — файл, записанный
+    /// раньше, их не содержит.
+    public var chunkingDefaults: [String: ChunkingConfiguration]?
+    public var defaultChunkingStrategy: ChunkStrategy?
 
     public init(from configuration: AppConfiguration) {
         lmStudioBaseURL = configuration.lmStudioBaseURL
@@ -55,6 +62,8 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
         trashLimitBytes = configuration.trashLimitBytes
         syncPreviewThresholdFiles = configuration.syncPreviewThresholdFiles
         preferredInstallPath = configuration.preferredInstallPath
+        chunkingDefaults = configuration.chunkingDefaults
+        defaultChunkingStrategy = configuration.defaultChunkingStrategy
     }
 
     public func apply(to configuration: inout AppConfiguration) {
@@ -73,6 +82,10 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
         configuration.trashLimitBytes = trashLimitBytes
         configuration.syncPreviewThresholdFiles = syncPreviewThresholdFiles
         configuration.preferredInstallPath = preferredInstallPath
+        // Только если в файле они есть: пустой список умолчаний — это «файл
+        // записан старой сборкой», а не «умолчаний нет».
+        if let chunkingDefaults { configuration.chunkingDefaults = chunkingDefaults }
+        if let defaultChunkingStrategy { configuration.defaultChunkingStrategy = defaultChunkingStrategy }
     }
 }
 
@@ -96,6 +109,14 @@ public struct SettingsBundle: Codable, Sendable {
     /// Names and permissions only. Every one of them arrives revoked — see
     /// `SettingsTransfer.export`.
     public var clients: [ExternalClient]
+    /// Общие профили сопоставления таблиц. Профили источников едут
+    /// внутри самих источников; эти — ничьи, и без них файл, собранный на
+    /// машине с общей разметкой, привёз бы источники, которые нечем читать.
+    ///
+    /// Необязательное поле: файлы, записанные до, его не содержат, а
+    /// отказываться их читать из-за отсутствия ключа было бы отказом ради
+    /// формы. Отсутствие — это пустой список.
+    public var sharedTableProfiles: [TableProfile]?
 
     public init(
         schemaVersion: Int = SettingsBundle.currentSchemaVersion,
@@ -106,7 +127,8 @@ public struct SettingsBundle: Codable, Sendable {
         sources: [DataSource] = [],
         schemas: [String: MetadataSchema] = [:],
         savedFilters: [SavedFilter] = [],
-        clients: [ExternalClient] = []
+        clients: [ExternalClient] = [],
+        sharedTableProfiles: [TableProfile] = []
     ) {
         self.schemaVersion = schemaVersion
         self.exportedAt = exportedAt
@@ -117,6 +139,7 @@ public struct SettingsBundle: Codable, Sendable {
         self.schemas = schemas
         self.savedFilters = savedFilters
         self.clients = clients
+        self.sharedTableProfiles = sharedTableProfiles
     }
 }
 
@@ -163,6 +186,8 @@ public struct SettingsImportPlan: Sendable {
     public let schemas: Category
     public let filters: Category
     public let clients: Category
+    /// Общие профили сопоставления таблиц.
+    public let tableProfiles: Category
 
     /// Source folders named in the file that do not exist on this machine. Not
     /// an error — the disk may simply be elsewhere — but it must be visible,
@@ -178,13 +203,13 @@ public struct SettingsImportPlan: Sendable {
 
     public var isEmpty: Bool {
         profiles.isEmpty && sources.isEmpty && schemas.isEmpty
-            && filters.isEmpty && clients.isEmpty
+            && filters.isEmpty && clients.isEmpty && tableProfiles.isEmpty
     }
 
     /// Anything already here that the import would overwrite.
     public var replacesAnything: Bool {
         profiles.replaced + sources.replaced + schemas.replaced
-            + filters.replaced + clients.replaced > 0
+            + filters.replaced + clients.replaced + tableProfiles.replaced > 0
     }
 }
 
@@ -219,7 +244,8 @@ public enum SettingsTransfer {
                 stripped.revokeKey()
                 stripped.lastSeenAt = nil
                 return stripped
-            }
+            },
+            sharedTableProfiles: configuration.sharedTableProfiles
         )
     }
 
@@ -283,6 +309,10 @@ public enum SettingsTransfer {
             ),
             filters: split(bundle.savedFilters, existing: existingFilters, id: \.id),
             clients: split(bundle.clients, existing: existingClients, id: \.id),
+            tableProfiles: split(
+                bundle.sharedTableProfiles ?? [],
+                existing: Set(configuration.sharedTableProfiles.map(\.id)), id: \.id
+            ),
             missingFolders: bundle.sources.map(\.path).filter { !folderExists($0) },
             profilesNeedingToken: bundle.serverProfiles.filter { !hasToken($0) }.map(\.name),
             clientsNeedingKey: bundle.clients
@@ -313,6 +343,9 @@ public enum SettingsTransfer {
         configuration.serverProfiles = merge(configuration.serverProfiles, bundle.serverProfiles, id: \.id)
         configuration.dataSources = merge(configuration.dataSources, bundle.sources, id: \.id)
         configuration.externalClients = mergeClients(configuration.externalClients, bundle.clients)
+        configuration.sharedTableProfiles = merge(
+            configuration.sharedTableProfiles, bundle.sharedTableProfiles ?? [], id: \.id
+        )
         savedFilters = merge(savedFilters, bundle.savedFilters, id: \.id)
         for (collection, schema) in bundle.schemas {
             schemas[collection] = schema

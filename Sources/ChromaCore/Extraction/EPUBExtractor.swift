@@ -47,12 +47,17 @@ public struct EPUBExtractor: DocumentTextExtractor {
         var text = ""
         var parts: [DocumentPart] = []
         var chapterHeadings: [(chapter: Int, nodes: [DocumentNode])] = []
+        /// Таблицы в книге — обычное дело: расписания, характеристики,
+        /// сравнения. Без этого признака фильтр «документы с таблицами»
+        /// не видел ни одной книги.
+        var hasTables = false
 
         for (index, item) in package.spine.enumerated() {
             guard let data = try? reader.read(item.path) else { continue }
             let rendered = try await Self.renderHTML(data)
             let paragraphs = OfficeExtractor.paragraphs(of: rendered)
             guard let chapterText = PlainTextExtractor.sanitized(OfficeExtractor.render(paragraphs)) else { continue }
+            if paragraphs.contains(where: { $0.table != nil }) { hasTables = true }
 
             if !text.isEmpty { text += "\n\n" }
             let start = text.count
@@ -91,6 +96,7 @@ public struct EPUBExtractor: DocumentTextExtractor {
             containerFormat: "epub",
             extractorID: id,
             extractorVersion: version,
+            hasTables: hasTables,
             documentMetadata: options.includeDocumentMetadata ? package.metadata : [:]
         )
     }

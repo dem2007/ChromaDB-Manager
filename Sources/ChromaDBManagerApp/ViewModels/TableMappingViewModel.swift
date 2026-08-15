@@ -13,6 +13,19 @@ final class TableMappingViewModel: ObservableObject {
         let shape: SheetShape
         /// The first rows, as read — twenty is what asks to show.
         let rows: [SheetRow]
+
+        /// Строки для предпросмотра — **подряд по номерам**, включая пустые.
+        ///
+        /// XLSX не хранит строки без единой ячейки: их просто нет в файле,
+        /// а значит не было и в списке. Выглядело это так, что по строке 7
+        /// нельзя щёлкнуть, — при том что именно её человек и хотел назначить
+        /// заголовком, глядя в свой файл в Excel, где эта строка есть.
+        var previewRows: [SheetRow] {
+            let byNumber = Dictionary(rows.map { ($0.number, $0) }, uniquingKeysWith: { first, _ in first })
+            let last = min(rows.map(\.number).max() ?? 0, TableMappingViewModel.previewRowCount + 1)
+            guard last > 0 else { return [] }
+            return (1...last).map { byNumber[$0] ?? SheetRow(number: $0, cells: [:]) }
+        }
     }
 
     /// A table file the source itself indexes.
@@ -49,6 +62,13 @@ final class TableMappingViewModel: ObservableObject {
     /// правит, и читать при этом слепок, снятый при открытии, значит показывать
     /// вчерашний список.
     @Published var profiles: [TableProfile] = []
+    /// Профили, общие для всех источников.
+    @Published var sharedProfiles: [TableProfile] = []
+    /// Куда сохранять следующий профиль — выбор человека, а не умолчание
+    /// приложения. При открытии файла подставляется область того
+    /// профиля, которым файл узнан: повторное сохранение не должно молча
+    /// раздваивать разметку на общую и свою.
+    @Published var scope: TableProfileScope = .source
     /// Какой профиль назначен файлу: путь → id профиля.
     @Published var assignments: [String: UUID] = [:]
     @Published var isBusy = false
@@ -58,7 +78,33 @@ final class TableMappingViewModel: ObservableObject {
     @Published var matchNote: String?
 
     /// 8 asks for the first twenty rows.
-    static let previewRowCount = 20
+    /// `nonisolated`: к ней обращается вложенный `SheetPreview`, который
+    /// главному потоку не принадлежит. Число это постоянная, а не состояние.
+    nonisolated static let previewRowCount = 20
+
+    /// Все профили, которыми читается этот источник: свои плюс общие.
+    ///
+    /// Ровно тот же список и в том же порядке, что увидит прогон: экран,
+    /// показывающий не то, чем файл будет прочитан, хуже отсутствия экрана.
+    var allProfiles: [TableProfile] {
+        TableProfile.resolved(own: profiles, shared: sharedProfiles)
+    }
+
+    /// Список для экрана: свои, затем общие, без повторов по `id`.
+    var listedProfiles: [TableProfile] {
+        var seen: Set<UUID> = []
+        return (profiles + sharedProfiles).filter { seen.insert($0.id).inserted }
+    }
+
+    /// Профиль общий — то есть виден всем источникам.
+    func isShared(_ profile: TableProfile) -> Bool {
+        sharedProfiles.contains { $0.id == profile.id }
+    }
+
+    /// Одноимённый общий профиль перекрыт своим и в подборе не участвует.
+    func isOverridden(_ profile: TableProfile) -> Bool {
+        isShared(profile) && !allProfiles.contains { $0.id == profile.id }
+    }
 
     var preview: SheetPreview? {
         sheets.first { $0.sheet.name == selectedSheet } ?? sheets.first
@@ -83,19 +129,49 @@ final class TableMappingViewModel: ObservableObject {
         sheetSelections[sheetName] ?? .named([sheetName])
     }
 
-    /// Варианты, которые сохранятся в профиле: по одному на лист, который
-    /// человек размечал как таблицу или как документ.
+    /// Варианты, которые сохранятся в профиле: по одному на лист.
     ///
-    /// Листы в режиме «пропустить» вариантами не становятся: вариант — это
-    /// указание, как читать, а «не читать» — это его отсутствие.
+    /// **«Не индексировать» сохраняется наравне с остальными**, и это
+    /// исправление. Считалось, что «не читать» — это отсутствие варианта;
+    /// на деле отсутствие означало «про этот лист ничего не сказано», и при
+    /// следующем открытии режим определялся заново. Хуже того: лист без
+    /// варианта подхватывал чужой разбор и попадал в индекс — ровно то,
+    /// от чего его пометили.
+    ///
+    /// Не сохраняются только пустышки: разбор «таблица данных» без единой
+    /// колонки не описывает ничего, а его пустая подпись совпадает с любым
+    /// листом, у которого не нашлось заголовка.
     var variantsToSave: [TableProfile.Variant] {
         sheets.compactMap { entry in
-            guard let mapping = drafts[entry.sheet.name], mapping.mode != .skip else { return nil }
+            guard let mapping = drafts[entry.sheet.name] else { return nil }
+            if mapping.mode == .dataTable && mapping.columns.isEmpty { return nil }
             return TableProfile.Variant(
                 sheets: sheetSelection(for: entry.sheet.name),
                 mapping: mapping
             )
         }
+    }
+
+    /// Листы открытой книги — по ним решается, какие варианты профиля
+    /// эта книга описывает, а какие остались от других файлов.
+    private var openSheetNames: [(name: String, index: Int)] {
+        sheets.enumerated().map { ($0.element.sheet.name, $0.offset) }
+    }
+
+    /// Варианты сохраняемого профиля: разбор открытой книги плюс всё, что
+    /// профиль знал про **другие** файлы.
+    ///
+    /// Раньше сохранение заменяло варианты целиком тем, что видно в открытой
+    /// книге. Профиль, описывавший две книги, после правки одной из них терял
+    /// половину — молча, без единого слова. В журнале это выглядело как
+    /// «вариантов 14» → «вариантов 9».
+    func mergedVariants(with existing: TableProfile?) -> [TableProfile.Variant] {
+        let fresh = variantsToSave
+        guard let existing else { return fresh }
+        let kept = existing.variants.filter { variant in
+            !openSheetNames.contains { variant.sheets.admits(sheetName: $0.name, index: $0.index) }
+        }
+        return kept + fresh
     }
 
     // MARK: - Opening
@@ -109,6 +185,7 @@ final class TableMappingViewModel: ObservableObject {
         // Профили и назначения читаются один раз при открытии экрана и дальше
         // живут здесь: правит их этот же экран.
         profiles = source.tableProfiles
+        sharedProfiles = app.settings.configuration.sharedTableProfiles
         assignments = source.tableProfileAssignments
         isScanning = true
         Task {
@@ -172,8 +249,9 @@ final class TableMappingViewModel: ObservableObject {
                 sheetSelections = [:]
                 // Назначенный этому файлу профиль — впереди подбора:
                 // человек уже ответил на вопрос, который подбор угадывает.
+                let visible = allProfiles
                 let assigned = openedPath.flatMap { assignments[$0] }
-                    .flatMap { id in profiles.first { $0.id == id } }
+                    .flatMap { id in visible.first { $0.id == id } }
 
                 for (index, entry) in sheets.enumerated() {
                     let suggestion = TableMapping.suggested(sheetName: entry.sheet.name, shape: entry.shape)
@@ -181,28 +259,34 @@ final class TableMappingViewModel: ObservableObject {
                        let variant = assigned.variants.first(where: {
                            $0.sheets.admits(sheetName: entry.sheet.name, index: index)
                        }) {
-                        drafts[entry.sheet.name] = variant.mapping
+                        drafts[entry.sheet.name] = apply(variant, to: index)
                         sheetSelections[entry.sheet.name] = variant.sheets
                         if entry.sheet.name == selectedSheet {
-                            matchNote = String(localized: "профиль «\(assigned.name)» назначен этому файлу вручную")
+                            matchNote = isShared(assigned)
+                                ? String(localized: "общий профиль «\(assigned.name)» назначен этому файлу вручную")
+                                : String(localized: "профиль «\(assigned.name)» назначен этому файлу вручную")
                             profileName = assigned.name
+                            scope = isShared(assigned) ? .application : .source
                         }
                         continue
                     }
 
                     let match = TableProfileMatcher.match(
-                        profiles: profiles,
+                        profiles: visible,
                         sheetName: entry.sheet.name,
                         sheetIndex: index,
                         columns: entry.shape.columns
                     )
                     switch match {
                     case .matched(let profile, let variant):
-                        drafts[entry.sheet.name] = variant.mapping
+                        drafts[entry.sheet.name] = apply(variant, to: index)
                         sheetSelections[entry.sheet.name] = variant.sheets
                         if entry.sheet.name == selectedSheet {
-                            matchNote = String(localized: "лист узнан профилем «\(profile.name)»")
+                            matchNote = isShared(profile)
+                                ? String(localized: "лист узнан общим профилем «\(profile.name)»")
+                                : String(localized: "лист узнан профилем «\(profile.name)»")
                             profileName = profile.name
+                            scope = isShared(profile) ? .application : .source
                         }
                     case .needsDecision(let reason, _, _, _):
                         drafts[entry.sheet.name] = suggestion
@@ -220,6 +304,20 @@ final class TableMappingViewModel: ObservableObject {
                 errorMessage = "\(url.lastPathComponent): \(SourceSyncService.reason(for: error))"
             }
         }
+    }
+
+    /// Разметка варианта, пересчитанная на колонки открытого файла.
+    ///
+    /// Заголовок читается со строки, записанной в варианте: у книги, где та же
+    /// таблица начинается ниже, иначе прочиталась бы не та строка. Побочно
+    /// обновляется и форма листа — от неё зависит подсветка в предпросмотре.
+    private func apply(_ variant: TableProfile.Variant, to index: Int) -> TableMapping {
+        let entry = sheets[index]
+        guard variant.mapping.mode == .dataTable else { return variant.mapping }
+        let shape = variant.mapping.headerRow
+            .flatMap { SheetModeDetector.shape(rows: entry.rows, headerRow: $0) } ?? entry.shape
+        sheets[index] = SheetPreview(sheet: entry.sheet, shape: shape, rows: entry.rows)
+        return variant.mapping.rebased(on: shape)
     }
 
     // MARK: - The preview of one document
@@ -271,7 +369,37 @@ final class TableMappingViewModel: ObservableObject {
 
     var keyColumnWarning: String? {
         guard let mapping = draft, mapping.mode == .dataTable, mapping.keyColumn == nil else { return nil }
-        return String(localized: "Без ключевой колонки идентификатор строки считается от её содержимого: вставка строк безопасна, но любая правка создаёт новый документ, а старый придётся удалить вручную. Выберите колонку с артикулом, кодом или адресом почты, если такая есть.")
+        return String(localized: "Без ключевой колонки строка узнаётся по содержимому: вставка и перестановка строк ничего не стоят, но правка создаёт новый документ, а прежний попадает в «Требуют решения» — его нужно будет разобрать. Выберите колонку с артикулом, кодом или адресом почты, если такая есть.")
+    }
+
+    /// Ключевая колонка, в которой значения повторяются.
+    ///
+    /// Смотрит только показанные строки — их двадцать, и большего экрану
+    /// не нужно: колонка вроде «Категория», выбранная ключом по ошибке,
+    /// повторяется в первом же десятке. Отсутствие повтора здесь ничего
+    /// не обещает — настоящая проверка идёт в прогоне и попадает в отчёт.
+    var keyColumnDuplicates: String? {
+        guard let mapping = draft, mapping.mode == .dataTable,
+              let key = mapping.keyColumn, let preview
+        else { return nil }
+        let layout = SheetLayout(shape: preview.shape)
+        guard let index = layout.index(of: key) else { return nil }
+        let firstDataRow = (layout.headerRow ?? 0) + 1
+
+        var rowsByValue: [String: [Int]] = [:]
+        for row in preview.rows where row.number >= firstDataRow {
+            let value = row.value(at: index).displayText
+            guard !value.isEmpty else { continue }
+            rowsByValue[value, default: []].append(row.number)
+        }
+        let repeats = rowsByValue.filter { $0.value.count > 1 }.sorted { ($0.value.first ?? 0) < ($1.value.first ?? 0) }
+        guard !repeats.isEmpty else { return nil }
+
+        let examples = repeats.prefix(3)
+            .map { "«\($0.key)» — строки \($0.value.map(\.plainDigits).joined(separator: ", "))" }
+            .joined(separator: "; ")
+        let tail = repeats.count > 3 ? String(localized: " и ещё \(repeats.count - 3)") : ""
+        return String(localized: "В колонке «\(mapping.title(of: key))» значения повторяются уже в показанных строках: \(examples)\(tail). Ключ определяет документ, поэтому из каждой такой группы запишется только первая строка. Выберите колонку, где значение своё у каждой строки.")
     }
 
     // MARK: - Строка заголовка
@@ -332,6 +460,49 @@ final class TableMappingViewModel: ObservableObject {
         infoMessage = note
     }
 
+    /// Размечать по буквам колонок: заголовков на листе нет.
+    ///
+    /// `row == 0` — заголовка нет вовсе, данные с первой строки. Иначе строка
+    /// считается служебной: она есть, но названий колонок в ней не прочитать
+    /// — объединённые ячейки, номера столбцов, пустая строка. Названия человек
+    /// задаёт полем «Своё название»: буква — это адрес колонки, а не смысл.
+    func useColumnLetters(startingAfter row: Int, for sheetName: String) {
+        guard let index = sheets.firstIndex(where: { $0.sheet.name == sheetName }) else { return }
+        let entry = sheets[index]
+        let shape = SheetModeDetector.lettered(rows: entry.rows, headerRow: row)
+        guard !shape.columns.isEmpty else {
+            errorMessage = String(localized: "В листе «\(sheetName)» нет ни одной колонки с данными.")
+            return
+        }
+        errorMessage = nil
+        sheets[index] = SheetPreview(sheet: entry.sheet, shape: shape, rows: entry.rows)
+        let previous = drafts[sheetName] ?? TableMapping(sheetName: sheetName)
+        drafts[sheetName] = previous.rebased(on: shape)
+        infoMessage = row == 0
+            ? String(localized: "Колонки названы буквами, данные читаются с первой строки. Задайте названия в поле «Своё название» — они уйдут в ключи метаданных.")
+            : String(localized: "Колонки названы буквами, данные читаются со строки \(row + 1). Задайте названия в поле «Своё название».")
+    }
+
+    /// Забыть подставленный профиль и разметить книгу заново.
+    ///
+    /// Открытие файла подставляет профиль, которым он читается, — иначе
+    /// правка существующей разметки была бы невозможна. Но и обратное верно:
+    /// пока подстановка происходит всегда, на основе однажды распознанного
+    /// файла нельзя собрать **другую** разметку. Эта команда снимает
+    /// назначение и возвращает первое предположение по файлу.
+    func startOver(_ app: AppEnvironment, source: DataSource) {
+        for entry in sheets {
+            drafts[entry.sheet.name] = TableMapping.suggested(sheetName: entry.sheet.name, shape: entry.shape)
+            sheetSelections[entry.sheet.name] = .named([entry.sheet.name])
+        }
+        matchNote = nil
+        if let path = openedPath, assignments[path] != nil {
+            assign(profileID: nil, to: path, app: app, source: source)
+        }
+        profileName = fileName.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? profileName
+        infoMessage = String(localized: "Разметка сброшена к предположению по файлу, назначение профиля снято. Сохранение создаст новый профиль — под другим именем.")
+    }
+
     // MARK: - Saving
 
     /// Сохраняет разбор **всей книги** одним профилем.
@@ -350,49 +521,75 @@ final class TableMappingViewModel: ObservableObject {
             errorMessage = String(localized: "В шаблоне есть поля, которых нет среди колонок: \(templateProblems.joined(separator: ", ")).")
             return
         }
-        let variants = variantsToSave
+        // Одноимённый профиль ищется в **обеих** областях: сохранение под тем
+        // же именем — это правка того же профиля, где бы он ни лежал, а не
+        // второй такой же рядом.
+        let existing = allProfiles.first { $0.name == name } ?? sharedProfiles.first { $0.name == name }
+        let variants = mergedVariants(with: existing)
         guard !variants.isEmpty else {
-            errorMessage = String(localized: "Сохранять нечего: все листы книги стоят «пропустить».")
+            errorMessage = String(localized: "Сохранять нечего: ни один лист книги не размечен.")
             return
         }
 
-        var updated = source
-        updated.tableProfiles = profiles
         let profile = TableProfile(
-            id: profiles.first { $0.name == name }?.id ?? UUID(),
+            // `id` переживает смену области: за ним закреплены назначения
+            // файлов, и новый идентификатор молча снял бы их все.
+            id: existing?.id ?? UUID(),
             name: name,
             variants: variants
         )
-        if let index = updated.tableProfiles.firstIndex(where: { $0.id == profile.id }) {
-            updated.tableProfiles[index] = profile
-        } else {
-            updated.tableProfiles.append(profile)
+        let movedFrom: TableProfileScope? = existing.map { isShared($0) ? .application : .source }
+            .flatMap { $0 == scope ? nil : $0 }
+
+        // Профиль лежит ровно в одной области. Оставить его в прежней значило
+        // бы получить два профиля на один лист — то есть `.ambiguous`, при
+        // котором лист не индексируется вовсе.
+        var own = profiles.filter { $0.id != profile.id && $0.name != name }
+        var shared = sharedProfiles.filter { $0.id != profile.id && $0.name != name }
+        switch scope {
+        case .source: own.append(profile)
+        case .application: shared.append(profile)
         }
+
+        var updated = source
+        updated.tableProfiles = own
         // Открытый файл сразу закрепляется за этим профилем: человек только что
         // разметил именно его, и заставлять его после этого выбирать профиль
         // в списке значило бы спрашивать о том, что уже сказано.
         if let path = openedPath { updated.tableProfileAssignments[path] = profile.id }
 
-        persist(updated, app: app)
+        persist(updated, shared: shared, app: app)
         app.log.record(
             .info, "Таблицы",
-            "Источник «\(source.name)»: сохранён профиль «\(name)» — вариантов \(variants.count.plainDigits) "
+            "Источник «\(source.name)»: сохранён профиль «\(name)» (\(scope.title)) — вариантов \(variants.count.plainDigits) "
             + "(\(variants.map { "\($0.title): \($0.mapping.columns.count) колонок" }.joined(separator: "; ")))"
         )
-        infoMessage = variants.count == 1
-            ? String(localized: "Профиль «\(name)» сохранён. Он применится к файлам с тем же набором колонок; файл с другим набором попадёт в «требуют решения».")
-            : String(localized: "Профиль «\(name)» сохранён: вариантов \(variants.count), по одному на лист. Каждый лист читается своим — тот же файл целиком.")
+        var note = variants.count == 1
+            ? String(localized: "Профиль «\(name)» сохранён \(scope.title). Он применится к файлам с тем же набором колонок; файл с другим набором попадёт в «требуют решения».")
+            : String(localized: "Профиль «\(name)» сохранён \(scope.title): вариантов \(variants.count), по одному на лист. Каждый лист читается своим — тот же файл целиком.")
+        if let movedFrom {
+            note += " " + String(localized: "Из области «\(movedFrom.title)» он убран: профиль живёт в одной области, иначе на лист претендовали бы два одинаковых.")
+        }
+        infoMessage = note
     }
 
+    /// Удаляет профиль из той области, где он лежит — из обеих, если
+    /// одноимённые есть и там и там.
     func removeProfile(named name: String, app: AppEnvironment, source: DataSource) {
         var updated = source
-        let removed = profiles.filter { $0.name == name }.map(\.id)
+        let removed = (profiles + sharedProfiles).filter { $0.name == name }.map(\.id)
         updated.tableProfiles = profiles.filter { $0.name != name }
+        let shared = sharedProfiles.filter { $0.name != name }
         // Назначения на удалённый профиль снимаются здесь же: оставленные,
         // они молча превратились бы в «подбором, как раньше», и человек узнал
         // бы об этом по результату следующего прогона.
+        //
+        // Только у этого источника: у чужих источников назначения на общий
+        // профиль тоже перестанут работать, но снять их отсюда — значит
+        // править чужие настройки вслепую. Прогон скажет об этом словами:
+        // «профиль не найден — подбором по колонкам».
         updated.tableProfileAssignments = assignments.filter { !removed.contains($0.value) }
-        persist(updated, app: app)
+        persist(updated, shared: shared, app: app)
         app.log.record(.warning, "Таблицы", "Источник «\(source.name)»: профиль «\(name)» удалён")
     }
 
@@ -410,7 +607,7 @@ final class TableMappingViewModel: ObservableObject {
         }
         persist(updated, app: app)
 
-        let name = profileID.flatMap { id in profiles.first { $0.id == id }?.name }
+        let name = profileID.flatMap { id in allProfiles.first { $0.id == id }?.name }
         app.log.record(
             .info, "Таблицы",
             name.map { "Источник «\(source.name)»: файлу \(relativePath) назначен профиль «\($0)»" }
@@ -420,21 +617,35 @@ final class TableMappingViewModel: ObservableObject {
 
     /// Что показывать в списке файлов рядом с выбором профиля.
     func assignmentTitle(for relativePath: String) -> String? {
-        assignments[relativePath].flatMap { id in profiles.first { $0.id == id }?.name }
+        assignments[relativePath].flatMap { id in allProfiles.first { $0.id == id }?.name }
     }
 
-    private func persist(_ source: DataSource, app: AppEnvironment) {
+    /// Записывает правку и в источник, и — когда она была — в общий список.
+    ///
+    /// `shared == nil` означает «общие не трогаем»: назначение файла профилю
+    /// или импорт в источник к ним отношения не имеют.
+    private func persist(_ source: DataSource, shared: [TableProfile]? = nil, app: AppEnvironment) {
         profiles = source.tableProfiles
         assignments = source.tableProfileAssignments
+        if let shared {
+            sharedProfiles = shared
+            app.settings.configuration.sharedTableProfiles = shared
+        }
         app.settings.upsert(source: source)
     }
 
     // MARK: - Перенос профилей
 
-    /// Выгружает профили источника в файл.
+    /// Выгружает в файл профили, которыми читается этот источник.
+    ///
+    /// Свои и общие вместе: на экране они одним списком, и файл, в котором
+    /// половины из увиденного нет, — это ловушка. Область хранения при этом
+    /// не переносится: на другой машине всё уляжется у источника, а сделать
+    /// общим — отдельное решение, которое там принимают заново.
     func exportProfiles(_ app: AppEnvironment, source: DataSource) {
+        let profiles = allProfiles
         guard !profiles.isEmpty else {
-            errorMessage = String(localized: "У источника нет ни одного профиля — выгружать нечего.")
+            errorMessage = String(localized: "Профилей нет ни у источника, ни у приложения — выгружать нечего.")
             return
         }
         let panel = NSSavePanel()

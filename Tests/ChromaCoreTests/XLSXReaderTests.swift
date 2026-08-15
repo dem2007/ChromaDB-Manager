@@ -314,6 +314,96 @@ final class XLSXReaderTests: XCTestCase {
         XCTAssertEqual(Set(XLSXReader.refusedExtensions), ["xls", "xlsb"])
     }
 
+    // MARK: - Проценты, деньги, единицы
+
+    private func unit(_ value: CellValue) -> NumberUnit? {
+        guard case .measured(_, let unit) = value else { return nil }
+        return unit
+    }
+
+    func testAPercentCellKeepsItsPercent() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "0%"
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(0.15), .number(0.15)]])]
+        let rows = try readRows(builder)
+
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "15 %")
+        XCTAssertEqual(unit(rows[0].value(at: 0))?.scale, 100)
+        // То же число без формата остаётся числом — решает формат, и только он.
+        XCTAssertEqual(rows[0].value(at: 1), .number(0.15))
+        XCTAssertEqual(rows[0].value(at: 1).displayText, "0.15")
+    }
+
+    /// Проценты бывают и встроенным форматом — 9 и 10, без своей маски.
+    func testTheBuiltInPercentFormatsCountToo() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.sheets = [.init(name: "Лист", rows: [[
+            .builtInFormat(0.2, id: 9), .builtInFormat(0.075, id: 10),
+        ]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "20 %")
+        XCTAssertEqual(rows[0].value(at: 1).displayText, "7.5 %")
+    }
+
+    /// Двоичная арифметика: 0.15 × 100 = 15.000000000000002, и это число ушло
+    /// бы и в текст, и в метаданные.
+    func testTheHundredfoldDoesNotLeaveATail() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "0.0%"
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(0.15), .measured(0.29)]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "15 %")
+        XCTAssertEqual(rows[0].value(at: 1).displayText, "29 %")
+    }
+
+    func testACurrencyMaskBecomesTheSuffix() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "#,##0.00\" ₽\""
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(1234.5)]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "1234.5 ₽")
+        // Множителя нет: деньги хранятся как есть, отличается только подпись.
+        XCTAssertEqual(unit(rows[0].value(at: 0))?.scale, 1)
+    }
+
+    /// Валюта в квадратных скобках — как её пишет Excel: `[$₽-419]`.
+    func testACurrencyInBracketsIsReadFromItsLocaleSection() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "#,##0[$₽-419]"
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(90)]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "90 ₽")
+    }
+
+    func testAUnitLiteralBecomesTheSuffix() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "0\" кг\""
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(48)]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "48 кг")
+    }
+
+    /// Маска без единицы не выдумывает её: `#,##0.00` — просто число.
+    func testAPlainMaskLeavesTheNumberAlone() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "#,##0.00"
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(12)]])]
+        let rows = try readRows(builder)
+        XCTAssertEqual(rows[0].value(at: 0), .number(12))
+    }
+
+    /// Цвет и условие в скобках — оформление, а не подпись.
+    func testColoursAndConditionsAreNotUnits() {
+        XCTAssertNil(XLSXReader.maskUnit("[Red]#,##0"))
+        XCTAssertNil(XLSXReader.maskUnit("[>1000]#,##0;[Red]0"))
+        XCTAssertNil(XLSXReader.maskUnit("General"))
+    }
+
+    /// Секции за `;` описывают отрицательные числа и ноль — единица там та же.
+    func testOnlyTheFirstSectionOfTheMaskIsRead() {
+        XCTAssertEqual(XLSXReader.maskUnit("0\" ₽\";-0\" ₽\"")?.suffix, "₽")
+    }
+
     // MARK: -
 
     /// The rule the whole stage rests on: a spreadsheet must not be reachable
@@ -356,6 +446,65 @@ extension XLSXReaderTests {
         XCTAssertEqual(rows[0].value(at: 0), .text("Итого за квартал"))
         XCTAssertEqual(rows[0].value(at: 1), .text("Итого за квартал"))
         XCTAssertEqual(rows[1].value(at: 1), .number(62), "строки вне диапазона не трогаются")
+    }
+
+    /// объединение вниз — не заголовок, а значение.
+    ///
+    /// «Категория», объединённая на все строки раздела, относится к каждой
+    /// из них. Раньше значение получала только верхняя, а остальные уходили
+    /// в базу без поля — молча.
+    private func verticallyMergedFixture() -> XLSXFixtureBuilder {
+        var builder = XLSXFixtureBuilder()
+        builder.sheets = [.init(
+            name: "Лист",
+            rows: [
+                [.shared("Категория"), .shared("Товар")],
+                [.shared("Крепёж"), .shared("Болт")],
+                [.absent, .shared("Гайка")],
+                [.absent, .shared("Шайба")],
+                [.shared("Профиль"), .shared("Уголок")],
+            ],
+            merges: ["A2:A4"]
+        )]
+        return builder
+    }
+
+    func testAVerticalMergeReachesEveryRowOfItsRange() throws {
+        let rows = try readRows(verticallyMergedFixture())
+        XCTAssertEqual(rows[1].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[2].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[3].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[4].value(at: 0), .text("Профиль"), "за диапазоном — своё значение")
+        XCTAssertEqual(rows[0].value(at: 0), .text("Категория"))
+    }
+
+    /// Потоковый проход обязан видеть то же самое: `<mergeCells>` объявлен
+    /// после данных, и раньше поток о нём просто не знал.
+    func testTheStreamingPassSeesVerticalMergesToo() throws {
+        let reader = try XLSXReader(url: try write(verticallyMergedFixture()))
+        var seen: [CellValue] = []
+        try reader.forEachRow(of: reader.sheets[0]) { seen.append($0.value(at: 0)); return true }
+        XCTAssertEqual(seen, [
+            .text("Категория"), .text("Крепёж"), .text("Крепёж"), .text("Крепёж"), .text("Профиль"),
+        ])
+    }
+
+    /// Объединение вбок так и остаётся в первой колонке — и об этом говорится.
+    func testASidewaysMergeIsReportedRatherThanSpread() throws {
+        let reader = try XLSXReader(url: try write(mergedFixture()))
+        let result = try reader.rows(of: reader.sheets[0])
+        XCTAssertEqual(result.rows[0].value(at: 1), .empty)
+        XCTAssertEqual(result.warnings, [.mergedSideways(cells: 1)])
+    }
+
+    func testMergeRangesAreFoundWithoutParsingTheWholeSheet() {
+        let xml = Data("""
+        <worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>&lt;mergeCells</t></is></c></row>\
+        </sheetData><mergeCells count="2"><mergeCell ref="A2:A4"/><mergeCell ref="B1:C1"/></mergeCells></worksheet>
+        """.utf8)
+        let ranges = XLSXReader.mergeRanges(in: xml)
+        XCTAssertEqual(ranges.count, 2)
+        XCTAssertEqual(ranges.filter(\.isVertical).map(\.lastRow), [4])
     }
 
     func testAMergeReferenceIsParsedBothWays() {

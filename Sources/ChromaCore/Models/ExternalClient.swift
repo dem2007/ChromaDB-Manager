@@ -32,6 +32,23 @@ public struct ClientPermissions: Codable, Hashable, Sendable {
     /// Ограничение не от недоверия: выдача попадает в контекст модели целиком,
     /// и полсотни документов вытесняют оттуда сам разговор.
     public var maxSearchResults: Int?
+    /// Потолок длины текста **одного** документа в ответе MCP, символы.
+    /// `nil` — 4000, как в D2.4.
+    ///
+    /// Настройкой, а не константой: «отдай агенту файл целиком»
+    /// упиралось не в счётчик результатов, а сюда — и упиралось молча для
+    /// того, кто счётчик уже поднял.
+    public var maxDocumentCharacters: Int?
+    /// Потолок суммарного объёма текста в одном ответе MCP, символы.
+    /// `nil` — 24 000.
+    public var maxResponseCharacters: Int?
+    /// Сколько коллекций агент может обыскать одним вызовом.
+    /// `nil` — умолчание, пять.
+    ///
+    /// Не из недоверия: десять коллекций — это десять поисков и десять пулов
+    /// кандидатов на один вызов, и упереться в это должен ключ, а не терпение
+    /// человека.
+    public var maxSearchCollections: Int?
     /// Умный поиск для запросов этого ключа. `nil` — как настроено
     /// у самой коллекции.
     ///
@@ -55,10 +72,16 @@ public struct ClientPermissions: Codable, Hashable, Sendable {
         writesPerMinute: Int = 30,
         allowedOrigins: [String] = [],
         maxSearchResults: Int? = nil,
+        maxDocumentCharacters: Int? = nil,
+        maxResponseCharacters: Int? = nil,
+        maxSearchCollections: Int? = nil,
         smartSearch: Bool? = nil,
         allowsDelete: Bool = false
     ) {
         self.maxSearchResults = maxSearchResults.map { max(1, $0) }
+        self.maxDocumentCharacters = maxDocumentCharacters.map { max(1, $0) }
+        self.maxResponseCharacters = maxResponseCharacters.map { max(1, $0) }
+        self.maxSearchCollections = maxSearchCollections.map { max(1, $0) }
         self.smartSearch = smartSearch
         self.allowsDelete = allowsDelete
         self.collections = collections
@@ -84,6 +107,9 @@ public struct ClientPermissions: Codable, Hashable, Sendable {
         writesPerMinute = max(1, ((try? container.decodeIfPresent(Int.self, forKey: .writesPerMinute)) ?? nil) ?? 30)
         allowedOrigins = ((try? container.decodeIfPresent([String].self, forKey: .allowedOrigins)) ?? nil) ?? []
         maxSearchResults = ((try? container.decodeIfPresent(Int.self, forKey: .maxSearchResults)) ?? nil).map { max(1, $0) }
+        maxDocumentCharacters = ((try? container.decodeIfPresent(Int.self, forKey: .maxDocumentCharacters)) ?? nil).map { max(1, $0) }
+        maxResponseCharacters = ((try? container.decodeIfPresent(Int.self, forKey: .maxResponseCharacters)) ?? nil).map { max(1, $0) }
+        maxSearchCollections = ((try? container.decodeIfPresent(Int.self, forKey: .maxSearchCollections)) ?? nil).map { max(1, $0) }
         smartSearch = (try? container.decodeIfPresent(Bool.self, forKey: .smartSearch)) ?? nil
         // Право, которого в старой конфигурации не было, не появляется само:
         // отсутствие записи о нём — это «нельзя».

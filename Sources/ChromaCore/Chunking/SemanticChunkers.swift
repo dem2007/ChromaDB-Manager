@@ -172,8 +172,19 @@ public struct SemanticChunker: AsyncChunking {
                 current = ""
             }
         }
-        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            result.append(TextChunk(index: result.count, text: current))
+        // Хвост подчиняется тому же минимуму, что и все остальные границы
+        //. Раньше он был единственным исключением: цикл выше не режет,
+        // пока не набралось `minimum`, а всё, что осталось после последней
+        // границы, становилось чанком независимо от размера. Так в коллекции
+        // и появлялись чанки из одной закрывающей скобки — все до единого
+        // последние в своём файле.
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            if tail.count < minimum, let last = result.popLast() {
+                result.append(TextChunk(index: last.index, text: ChunkHygiene.joined(last.text, current)))
+            } else {
+                result.append(TextChunk(index: result.count, text: current))
+            }
         }
         return result
     }
@@ -678,6 +689,25 @@ public struct ChunkingPipeline {
         from text: String,
         fileExtension: String? = nil,
         structure: [DocumentNode] = []
+    ) async throws -> [TextChunk] {
+        // Гигиена — здесь, в единственной точке входа: кусок без
+        // единого слова получается у любой стратегии, а в базе он становится
+        // ложным попаданием по **каждому** запросу. Чинить это в шести
+        // чанкерах по отдельности значит починить в пяти.
+        //
+        // Здесь же и шапка таблицы, и по той же причине: кусок,
+        // начавшийся в середине таблицы, — сетка значений без названий колонок,
+        // и получается он у любой стратегии.
+        TableChunkHeaders.applied(
+            to: ChunkHygiene.merged(try await produce(from: text, fileExtension: fileExtension, structure: structure)),
+            in: text
+        )
+    }
+
+    private func produce(
+        from text: String,
+        fileExtension: String?,
+        structure: [DocumentNode]
     ) async throws -> [TextChunk] {
         switch configuration.strategy {
         case .fixed, .recursive, .documentBased, .hierarchical, .adaptive:
