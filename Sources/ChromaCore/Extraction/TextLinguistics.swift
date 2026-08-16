@@ -71,6 +71,17 @@ public enum TextLinguistics {
 
         let tagger = NLTagger(tagSchemes: [.lemma, .lexicalClass])
         tagger.string = text
+        // Язык называется прямо, а не оставляется на догадку.
+        //
+        // Определять его разборщик умеет сам, но на коротком тексте не успевает
+        // и тогда **не отдаёт лемм вовсе** — проверено: «Значение отпуска
+        // указано в документе» без объявленного языка даёт `nil`, с ним —
+        // «отпуск». Язык к этому моменту уже известен: он либо пришёл
+        // от документа, либо определён строкой выше, и не сказать его — значит
+        // выбросить то, что мы знаем.
+        if let code, let language = NLLanguage(rawValue: code) as NLLanguage? {
+            tagger.setLanguage(language, range: text.startIndex..<text.endIndex)
+        }
 
         var counts: [String: Int] = [:]
         var order: [String: Int] = [:]

@@ -1,4 +1,5 @@
 import XCTest
+import NaturalLanguage
 @testable import ChromaCore
 
 /// Язык и ключевые слова средствами системы.
@@ -8,6 +9,29 @@ import XCTest
 /// на леммах и списке пустых слов. Если это перестанет работать, в метаданные
 /// базы поедет мусор, который потом придётся вычищать переиндексацией.
 final class TextLinguisticsTests: XCTestCase {
+    /// Приводит ли **эта** система слово к начальной форме.
+    ///
+    /// Словарь лемм `NLTagger` меняется от версии macOS, и на этом держались
+    /// проверки, которые от версии зависеть не должны. Замер: на macOS 26.5
+    /// лемматизируются все 29 слов образца, а на сборщике GitHub «насоса»
+    /// остаётся «насоса» — и «давление» с «давления» попадают в ключевые
+    /// слова **двумя разными**, то есть ровно тем, чего приём избегает.
+    ///
+    /// Проверка, упавшая от такого расхождения, проверяет словарь системы,
+    /// а не отбор, который мы написали. Поэтому спрашиваем прямо.
+    static func lemmatises(_ word: String, to base: String) -> Bool {
+        let sentence = "Значение \(word) указано в документе."
+        let tagger = NLTagger(tagSchemes: [.lemma])
+        tagger.string = sentence
+        // Язык называется прямо: на короткой фразе система его не распознаёт
+        // и лемм не даёт вовсе — проба без этого объявляла бы «лемм нет»
+        // на машине, где они есть.
+        tagger.setLanguage(.russian, range: sentence.startIndex..<sentence.endIndex)
+        guard let range = sentence.range(of: word) else { return false }
+        let lemma = tagger.tag(at: range.lowerBound, unit: .word, scheme: .lemma).0?.rawValue
+        return lemma?.lowercased() == base
+    }
+
     // MARK: - Язык
 
     func testTheLanguageOfAProperSentenceIsRecognised() {
@@ -25,7 +49,13 @@ final class TextLinguisticsTests: XCTestCase {
 
     // MARK: - Ключевые слова: русский
 
-    func testRussianKeywordsComeBackInTheirBaseForm() {
+    func testRussianKeywordsComeBackInTheirBaseForm() throws {
+        // Эта проверка **о леммах**, и на системе без них она проверяет
+        // не наш отбор, а чужой словарь.
+        try XCTSkipUnless(
+            Self.lemmatises("отпуска", to: "отпуск"),
+            "система не приводит русские слова к начальной форме — проверять нечего"
+        )
         let text = """
         Отпуск оформляется заявлением за две недели до начала. Заявление \
         на отпуск подписывает руководитель отдела. Отпуска переносятся \
@@ -41,6 +71,11 @@ final class TextLinguisticsTests: XCTestCase {
     }
 
     /// Частое слово идёт первым: по нему и фильтруют.
+    ///
+    /// Проверяется **порядок**, а не лемматизация: слово о трёх упоминаниях
+    /// обязано опередить слова об одном, и это наша логика. В какой форме
+    /// оно при этом окажется, решает словарь системы — там, где он полон,
+    /// это «насос», где нет — «насоса».
     func testTheMostFrequentWordLeads() {
         let text = """
         Превышение допустимого значения давления приводит к отказу насоса. \
@@ -48,8 +83,17 @@ final class TextLinguisticsTests: XCTestCase {
         в журнал. Насос останавливается автоматически.
         """
         let words = TextLinguistics.keywords(in: text)
-        XCTAssertEqual(words.first, "насос", "насос встречается трижды: \(words)")
-        XCTAssertTrue(words.contains("давление"), words.joined(separator: ", "))
+        XCTAssertEqual(
+            words.first?.hasPrefix("насос"), true,
+            "насос встречается трижды и обязан быть первым: \(words)"
+        )
+        XCTAssertTrue(words.contains { $0.hasPrefix("давлени") }, words.joined(separator: ", "))
+
+        // А там, где система лемматизирует, форма обязана быть начальной:
+        // иначе мы не заметим, если сломается уже наш отбор.
+        if Self.lemmatises("насоса", to: "насос") {
+            XCTAssertEqual(words.first, "насос", words.joined(separator: ", "))
+        }
     }
 
     /// Слова, которые есть в любом документе, в ключевые не попадают —
