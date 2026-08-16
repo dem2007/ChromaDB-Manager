@@ -264,10 +264,26 @@ public actor TableSyncService {
             let sheet = SheetInfo(name: url.deletingPathExtension().lastPathComponent, isHidden: false, path: url.path)
             return ([(sheet, rows)], [], nil)
 
-        // One branch for both: `.numbers` and `.xls` are read the same way —
-        // the application that owns the format converts it to `.xlsx` and the
-        // reader of 5.1 takes over.
-        case .numbers, .legacyExcel:
+        // Старая книга — своей читалкой: формат тот же контейнер OLE2,
+        // что и у `.doc`, и просить чужую программу открыть его больше незачем.
+        // Numbers остаётся запасным путём — для книг Excel 5.0 и старше,
+        // у которых внутри другой поток.
+        case .legacyExcel:
+            if let reader = try? XLSReader(url: url) {
+                return (
+                    try Self.collect(reader.sheets) {
+                        try reader.rows(of: $0, limits: XLSReader.Limits(maxRows: limits.maxRows))
+                    },
+                    [], nil
+                )
+            }
+            let (reader, temporary) = try await NumbersReader()
+                .workbook(at: url, allowApplicationExport: allowApplicationExport)
+            return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], temporary)
+
+        // `.numbers` читается только так: формат закрыт, и открывает его
+        // приложение, которому он принадлежит.
+        case .numbers:
             let (reader, temporary) = try await NumbersReader()
                 .workbook(at: url, allowApplicationExport: allowApplicationExport)
             return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], temporary)

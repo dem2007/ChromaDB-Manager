@@ -32,6 +32,9 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// re-extract rather than into work.
     public var version: Int { Self.currentVersion }
 
+    /// 8 — замечания и сноски `.odt` извлекаются текстом: импортёр
+    /// отдавал номер сноски и молчал про её текст, а замечание терял целиком.
+    ///
     /// 7 — адрес ссылки больше не дописывается к тексту абзаца, а уходит
     /// в метаданные чанка: в векторе адрес — набор цифр, а не слова,
     /// по которым ищут.
@@ -48,7 +51,7 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// сноски, замечания рецензентов и надписи, которых системный импортёр
     /// не отдаёт вовсе, приходят текстом; удалённый правкой и скрытый текст
     /// в базу не идут.
-    public static let currentVersion = 7
+    public static let currentVersion = 8
 
     /// A paragraph this much larger than the body is a heading.
     static let headingSizeRatio: CGFloat = 1.15
@@ -86,28 +89,33 @@ public struct OfficeExtractor: DocumentTextExtractor {
             throw ExtractionError.unsupportedFormat(url.pathExtension)
         }
 
-        // Своя читалка частей — только для `.docx`. Остальным трём
-        // форматам идти по-прежнему через систему: `.doc` и `.rtf` не
-        // контейнеры вовсе, а у `.odt` своя разметка, и делать вид, что это
-        // один разбор, значило бы написать два разбора под одним именем.
-        if documentType == .officeOpenXML,
-           let reader = DocxPartsReader(url: url), let parts = reader.read(),
+        // Своя читалка частей — для `.docx` и для двоичного `.doc`
+        //. Форматы разные до последнего байта, а сборка дальше одна:
+        // иначе документ, сохранённый в двух форматах, дал бы разные чанки.
+        //
+        // **Выбирает содержимое, а не имя**. Читалка `.docx` требует
+        // внутри `word/document.xml`, читалка `.doc` — подписи OLE2 и годного
+        // заголовка FIB; ни одна не притворится, что поняла чужой файл.
+        // Раньше обе включались по расширению, и документ Word 97, названный
+        // `.docx`, не читался вовсе — при том, что читалка для него есть.
+        if let reader = DocxPartsReader(url: url), let parts = reader.read(),
            let native = try? Self.assemble(parts, url: url, type: type, options: options) {
             return native
         }
-        // Двоичный `.doc` — своей читалкой OLE2. Формат другой
-        // до последнего байта, но результат тот же: дальше идёт та же сборка,
-        // что и у `.docx`, — иначе один документ, сохранённый в двух форматах,
-        // дал бы в базе разные чанки.
-        if documentType == .docFormat,
-           let reader = DocPartsReader(url: url), let parts = reader.read(),
+        if let reader = DocPartsReader(url: url), let parts = reader.read(),
            let native = try? Self.assemble(parts, url: url, type: type, options: options) {
             return native
         }
 
         let parsed = try await Self.parse(url: url, documentType: documentType)
         let paragraphs = Self.paragraphs(of: parsed.text)
-        guard let plainText = PlainTextExtractor.sanitized(Self.render(paragraphs)) else {
+        var body = Self.render(paragraphs)
+        // Замечания и сноски OpenDocument импортёр не отдаёт: тело документа
+        // он собирает, а текст сноски и текст замечания теряет.
+        // Берём их из `content.xml` и дописываем тем же видом, что у Word.
+        let extras = documentType == .openDocument ? ODTPartsReader(url: url)?.read() : nil
+        if let extras { body += Self.rendered(extras) }
+        guard let plainText = PlainTextExtractor.sanitized(body) else {
             throw ExtractionError.empty
         }
 
@@ -122,7 +130,17 @@ public struct OfficeExtractor: DocumentTextExtractor {
         // Only the two ZIP-based formats: `.rtf` and `.doc` are not containers,
         // and there is nowhere in them to look.
         let isContainer = documentType == .officeOpenXML || documentType == .openDocument
-        if isContainer {
+        if documentType == .openDocument {
+            // Оговорка ставится только там, где она правда: если замечания
+            // и сноски извлечены, говорить «не извлечены» значит врать
+            // о самом приложении.
+            if extras == nil, Self.containsCommentsOrRevisions(at: url) {
+                warnings.append(.commentsSkipped)
+            }
+            if extras?.hasRevisions == true {
+                warnings.append(.other(String(localized: "в документе есть правки: индексируется финальная редакция, удалённый текст в базу не идёт")))
+            }
+        } else if isContainer {
             if Self.containsCommentsOrRevisions(at: url) { warnings.append(.commentsSkipped) }
         } else if documentType == .docFormat, let reader = DocPartsReader(url: url) {
             // Не контейнер — но заглянуть всё-таки есть куда: заголовок
@@ -466,6 +484,25 @@ public struct OfficeExtractor: DocumentTextExtractor {
             if markers.contains(where: { xml.contains($0) }) { return true }
         }
         return false
+    }
+
+    /// Замечания и сноски OpenDocument — текстом, тем же видом, что у Word.
+    ///
+    /// В конце документа, а не при своих абзацах: тело собирает импортёр,
+    /// и мест, куда вставлять, он не называет. Это осознанный предел —
+    /// у `.docx`, где разбор свой, сноска стоит при своём абзаце.
+    static func rendered(_ extras: ODTPartsReader.Extras) -> String {
+        var lines: [String] = []
+        for footnote in extras.footnotes {
+            lines.append(String(localized: "Сноска \(footnote.id): \(footnote.text)"))
+        }
+        for comment in extras.comments {
+            lines.append(comment.author.isEmpty
+                ? String(localized: "Комментарий: \(comment.text)")
+                : String(localized: "Комментарий (\(comment.author)): \(comment.text)"))
+        }
+        guard !lines.isEmpty else { return "" }
+        return separator + lines.joined(separator: separator)
     }
 
     // MARK: - Что лежит в двоичном `.doc`

@@ -2090,6 +2090,13 @@
 "PDF не открывается" = "the PDF does not open";
 "языки распознавания %@ недоступны на этой системе" = "the recognition languages %@ are not available on this system";
 "файл не похож на ZIP-архив" = "the file does not look like a ZIP archive";
+"файл не читается как старая книга Excel: %@" = "the file cannot be read as a legacy Excel workbook: %@";
+"книга сохранена Excel 5.0 или старше — этот формат не читается" = "the workbook was saved by Excel 5.0 or older — that format is not read";
+"книга защищена паролем" = "the workbook is password-protected";
+"книга повреждена: %@" = "the workbook is damaged: %@";
+"в контейнере нет потока книги" = "the container has no workbook stream";
+"глобальный подпоток не закончился" = "the global substream never ended";
+"подпоток листа «%@» не закончился" = "the substream of sheet “%@” never ended";
 "архив обрезан или повреждён" = "the archive is truncated or damaged";
 "архив в формате ZIP64 не поддерживается" = "ZIP64 archives are not supported";
 "метод сжатия %@ не поддерживается" = "compression method %@ is not supported";

@@ -19,8 +19,27 @@ public enum TabularFormat: String, Sendable, CaseIterable {
     /// refused rather than half-parsed.
     case legacyBinary
 
+    /// Формат книги — по содержимому, а не по имени файла.
+    ///
+    /// Имя — обещание, подпись — факт. Тот же принцип уже записан у офисных
+    /// документов: «`.docx`, переименованный в `.doc`, остался `.docx`».
+    /// У книг он не соблюдался, и это стоило заказчику 49 файлов: все они
+    /// названы `.xlsx`, а внутри — старый двоичный Excel, и отказ звучал как
+    /// «файл не похож на ZIP-архив», то есть не называл ни причины, ни выхода.
     public static func of(_ url: URL) -> TabularFormat? {
-        switch url.pathExtension.lowercased() {
+        guard let named = named(url.pathExtension.lowercased()) else { return nil }
+        switch (named, signature(of: url)) {
+        // Старая книга под именем новой: читается через приложение, как `.xls`.
+        case (.workbook, .ole2): return .legacyExcel
+        // И наоборот: `.xlsx`, переименованный в `.xls`, читается своей
+        // читалкой — просить у Numbers то, что умеем сами, незачем.
+        case (.legacyExcel, .zip), (.legacyBinary, .zip): return .workbook
+        default: return named
+        }
+    }
+
+    static func named(_ extension: String) -> TabularFormat? {
+        switch `extension` {
         case "xlsx", "xlsm": return .workbook
         case "csv", "tsv": return .delimited
         case "ods": return .openDocument
@@ -31,8 +50,26 @@ public enum TabularFormat: String, Sendable, CaseIterable {
         }
     }
 
+    /// Что за файл на самом деле — по первым байтам.
+    enum Signature {
+        case zip, ole2, other
+    }
+
+    static func signature(of url: URL) -> Signature {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .other }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 8), head.count >= 8 else { return .other }
+        if head.prefix(4).elementsEqual([0x50, 0x4B, 0x03, 0x04]) { return .zip }
+        if head.elementsEqual([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) { return .ole2 }
+        return .other
+    }
+
     /// Formats read by asking the application that owns them — off by default,
     /// and never in an automatic run.
+    ///
+    /// `.xls` остаётся в списке как **запасной** путь: с старые книги
+    /// читаются своей читалкой, и приложение спрашивают только про те,
+    /// что сохранены Excel 5.0 и старше.
     public static let applicationExportExtensions = ["numbers", "xls"]
 
     public static var allExtensions: [String] {
