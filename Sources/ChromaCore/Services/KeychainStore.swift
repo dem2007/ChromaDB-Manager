@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 /// Access tokens live in the login Keychain — never in UserDefaults, the JSON
-/// config or the logs (see spec. The rest of a server profile is plain
+/// config or the logs. The rest of a server profile is plain
 /// configuration and stays in `config.json`.
 public struct KeychainStore {
     public enum KeychainError: LocalizedError {

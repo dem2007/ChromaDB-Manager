@@ -106,17 +106,34 @@ final class MCPService: ObservableObject {
                 guard let self else { return }
                 self.channels[ObjectIdentifier(channel)] = state
                 self.connections.append(MCPConnection(id: state.id, connectedAt: Date()))
+                // В журнал, а не только в живой список на экране.
+                // Список показывает, кто подключён **сейчас**; вопрос «рвутся
+                // ли сессии» — про прошлое, и до этой записи ответить на него
+                // было нечем: в журнале за сутки не было ни одной строки
+                // о мостах, только «сервер слушает» после запуска.
+                app.log.record(.info, "MCP", "Мост подключился (соединений: \(self.connections.count.plainDigits))")
             }
             channel.onMessage = { [weak self] message in
                 Task { @MainActor [weak self] in
                     await self?.handle(message, from: channel, state: state, server: server)
                 }
             }
-            channel.onClose = { [weak self] _ in
+            channel.onClose = { [weak self] error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.channels[ObjectIdentifier(channel)] = nil
+                    let closing = self.connections.first { $0.id == state.id }
                     self.connections.removeAll { $0.id == state.id }
+                    // Кто ушёл, сколько успел спросить и сколько прожил —
+                    // и по чьей вине, если связь оборвалась с ошибкой.
+                    let name = closing?.clientName ?? String(localized: "без ключа")
+                    let calls = closing?.callCount ?? 0
+                    let lived = closing.map { Int(Date().timeIntervalSince($0.connectedAt)) } ?? 0
+                    if let error {
+                        app.log.record(.warning, "MCP", "Мост «\(name)» отключён с ошибкой: \(error.localizedDescription) (вызовов \(calls.plainDigits), \(lived.plainDigits) с)")
+                    } else {
+                        app.log.record(.info, "MCP", "Мост «\(name)» отключился (вызовов \(calls.plainDigits), \(lived.plainDigits) с)")
+                    }
                 }
             }
         }
@@ -252,6 +269,13 @@ final class MCPService: ObservableObject {
     /// по хешу на каждом вызове значило бы платить за это на горячем пути.
     private func name(_ state: ChannelState) async {
         let client = await app?.proxy.access.client(withKey: state.key)
+        // Подключение — это уже активность ключа. Раньше отметка
+        // ставилась только на вызове инструмента, и агент, который поднял
+        // мост и ничего не спросил, оставался «ещё не подключался» —
+        // при том что соединение в этот момент открыто и видно рядом.
+        if let client, client.isEnabled {
+            app?.noteClientSeen(client.id)
+        }
         guard let index = connections.firstIndex(where: { $0.id == state.id }) else { return }
         connections[index].clientName = client?.name
         connections[index].hasKey = state.key?.isEmpty == false
@@ -446,7 +470,7 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         )
     }
 
-    /// Поиск сразу по нескольким коллекциям (ядро —.
+    /// Поиск сразу по нескольким коллекциям — тем же ядром, что и на экране.
     ///
     /// Каждая коллекция ищется **тем же** конвейером и своим профилем, как
     /// и при обычном поиске: агент обязан получать ту же выдачу, что
@@ -466,7 +490,7 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
             )
             targets.append(MultiCollectionSearch.Target(
                 collectionID: collection.id, collectionName: collection.name,
-                model: prepared.model ?? "", metric: collection.space, profile: prepared.profile
+                model: prepared.model, metric: collection.space, profile: prepared.profile
             ))
         }
 

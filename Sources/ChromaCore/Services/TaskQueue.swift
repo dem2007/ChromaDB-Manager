@@ -39,14 +39,26 @@ public enum ResourceGroup: String, Codable, Sendable, CaseIterable {
     case filesystem
     /// Reads and writes to ChromaDB that do not touch the model.
     case database
+    /// Операции, которые останавливают локальный сервер.
+    ///
+    /// Бэкап копирует папку базы, а для этого сервер приходится погасить —
+    /// значит на это время в базе не может работать никто. Такая задача
+    /// ждёт, пока очередь опустеет, и держит её, пока не кончится.
+    /// Живой случай: два «Переизвлечь и переэмбедить» подряд — бэкап второго
+    /// гасил сервер и снимал задачу первого, из шести источников доживал один.
+    case exclusive
 
-    public var isSerial: Bool { self == .lmStudio }
+    public var isSerial: Bool { self == .lmStudio || self == .exclusive }
+
+    /// Задача этой группы не терпит рядом никого.
+    public var needsEmptyQueue: Bool { self == .exclusive }
 
     public var title: String {
         switch self {
         case .lmStudio: return String(localized: "локальная модель")
         case .filesystem: return String(localized: "файлы")
         case .database: return String(localized: "база")
+        case .exclusive: return String(localized: "вся база целиком")
         }
     }
 }
@@ -75,6 +87,17 @@ public struct QueueTicket: Sendable {
         self.group = group
         self.connectionID = connectionID
         self.resumable = resumable
+    }
+
+    /// Тот же тикет, но у другого подключения.
+    ///
+    /// Нужен на плановой остановке сервера: ожидающая задача переживает её,
+    /// но подключение после подъёма — уже другое.
+    func rebound(to connectionID: UUID?) -> QueueTicket {
+        QueueTicket(
+            title: title, priority: priority, group: group,
+            connectionID: connectionID, resumable: resumable
+        )
     }
 }
 
@@ -111,7 +134,7 @@ public struct QueuedTaskInfo: Identifiable, Sendable, Equatable {
     public let title: String
     public let priority: QueuePriority
     public let group: ResourceGroup
-    public let connectionID: UUID?
+    public var connectionID: UUID?
     public let submittedAt: Date
     public var startedAt: Date?
     public var state: State
@@ -173,7 +196,7 @@ public enum QueueError: LocalizedError {
 public actor TaskQueue {
     private struct Waiter {
         let id: UUID
-        let ticket: QueueTicket
+        var ticket: QueueTicket
         let submittedAt: Date
         /// Resumed when the task is admitted, or thrown into when it is cancelled.
         let continuation: CheckedContinuation<Void, Error>
@@ -186,6 +209,9 @@ public actor TaskQueue {
     private var running: [UUID: QueuedTaskInfo] = [:]
     private var queuedInfo: [UUID: QueuedTaskInfo] = [:]
     private var cancellers: [UUID: @Sendable () -> Void] = [:]
+    /// Ожидающие, отвязанные от подключения на время плановой остановки
+    /// сервера. Им вернут подключение, когда сервер поднимется.
+    private var detached: Set<UUID> = []
     private var isPaused = false
 
     private let log: LogHandler
@@ -259,6 +285,7 @@ public actor TaskQueue {
         if let index = waiters.firstIndex(where: { $0.id == id }) {
             let waiter = waiters.remove(at: index)
             queuedInfo.removeValue(forKey: id)
+            detached.remove(id)
             waiter.continuation.resume(throwing: QueueError.cancelled(waiter.ticket.title))
             // Уступившая место задача стоит среди ожидающих, но её код
             // **выполняется** — она отошла в точке уступки внутри собственной
@@ -280,6 +307,54 @@ public actor TaskQueue {
             cancellers[id]?()
             log(.info, "Задачи", "Задача «\(info.title)» отменяется")
         }
+    }
+
+    /// Сервер гасят и поднимут снова — бэкап, сжатие, восстановление копии
+    ///. Отменяется только то, что **работает**: у него на руках
+    /// клиент, который сейчас исчезнет.
+    ///
+    /// Ожидающие остаются в очереди. Клиента у них ещё нет — они берут его,
+    /// когда доходит очередь, — и снимать их незачем: через несколько секунд
+    /// та же база вернётся на место. Живой случай, ради которого это и
+    /// сделано: четыре «Переизвлечь и переэмбедить» подряд, и копия каждого
+    /// следующего снимала из очереди работу предыдущих. В очереди оставались
+    /// одни копии, а переэмбединга не случалось вовсе.
+    public func pauseTasks(connectionID: UUID) -> Int {
+        let doomed = running.keys.filter { running[$0]?.connectionID == connectionID }
+        for id in doomed {
+            cancellers[id]?()
+            log(.info, "Задачи", "Задача «\(running[id]?.title ?? "")» отменяется — сервер останавливается")
+        }
+        var kept = 0
+        for index in waiters.indices where waiters[index].ticket.connectionID == connectionID {
+            let id = waiters[index].id
+            waiters[index].ticket = waiters[index].ticket.rebound(to: nil)
+            queuedInfo[id]?.connectionID = nil
+            detached.insert(id)
+            kept += 1
+        }
+        if kept > 0 {
+            log(.info, "Задачи", "Ждут возвращения сервера: \(kept.plainDigits)")
+        }
+        return kept
+    }
+
+    /// Сервер поднялся — ожидавшие получают новое подключение.
+    public func resumeTasks(connectionID: UUID) {
+        guard !detached.isEmpty else { return }
+        for index in waiters.indices where detached.contains(waiters[index].id) {
+            waiters[index].ticket = waiters[index].ticket.rebound(to: connectionID)
+            queuedInfo[waiters[index].id]?.connectionID = connectionID
+        }
+        detached.removeAll()
+    }
+
+    /// Сервер не вернулся: ждать больше нечего, и молчать об этом нельзя.
+    public func dropDetachedTasks() {
+        guard !detached.isEmpty else { return }
+        log(.warning, "Задачи", "Сервер не поднялся — снимаются задачи, ждавшие его: \(detached.count.plainDigits)")
+        for id in detached { cancel(id: id) }
+        detached.removeAll()
     }
 
     /// Everything belonging to a connection that is closing: the client
@@ -370,12 +445,17 @@ public actor TaskQueue {
     /// search looks like a broken app.
     private func canStart(_ group: ResourceGroup, priority: QueuePriority) -> Bool {
         guard !isPaused || priority == .interactive else { return false }
+        // Задача, гасящая сервер, начинается только на пустой очереди —
+        // и, пока идёт, не пускает никого.
+        if group.needsEmptyQueue { return running.isEmpty }
+        if running.values.contains(where: { $0.group.needsEmptyQueue }) { return false }
         guard group.isSerial else { return true }
         return !isRunning(group: group)
     }
 
     private func start(id: UUID, ticket: QueueTicket, submittedAt: Date) {
         queuedInfo.removeValue(forKey: id)
+        detached.remove(id)
         running[id] = QueuedTaskInfo(
             id: id, title: ticket.title, priority: ticket.priority, group: ticket.group,
             connectionID: ticket.connectionID, submittedAt: submittedAt,

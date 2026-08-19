@@ -24,6 +24,17 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
     case nearDuplicates
     case supersededPieces
     case substitutedChunking
+    /// Файла, из которого сделаны эти чанки, на диске больше нет.
+    ///
+    /// Обычная причина — переименованная папка: для приложения это исчезнувший
+    /// файл и появившийся новый, и в базе остаются чанки под старым путём.
+    /// Проверка выполняется, только если о ней попросили: обход папок стоит
+    /// времени, а «файла нет» на отключённом диске значит совсем другое.
+    case filesGoneFromDisk
+    /// Путь записан в старой форме либо у чанков нет отпечатка `file_id`
+    ///. Не дефект данных, а след прежних сборок — но след, из-за
+    /// которого файл не находится по собственному пути.
+    case legacyFilePaths
 
     public var id: String { rawValue }
 
@@ -42,6 +53,8 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
         case .nearDuplicates: return String(localized: "Похожие документы")
         case .supersededPieces: return String(localized: "Вытесненные куски перенарезки")
         case .substitutedChunking: return String(localized: "Нарезано не выбранной стратегией")
+        case .filesGoneFromDisk: return String(localized: "Файлов больше нет на диске")
+        case .legacyFilePaths: return String(localized: "Пути записаны прежними сборками")
         }
     }
 
@@ -51,6 +64,11 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
     public var isInformational: Bool {
         self == .outsideSources || self == .substitutedChunking
     }
+
+    /// Находка чинится своей операцией, а не удалением документов: список
+    /// в интерфейсе не должен предлагать «удалить выбранное» там, где надо
+    /// переписать поле.
+    public var isRepairable: Bool { self == .legacyFilePaths }
 
     public var explanation: String {
         switch self {
@@ -78,6 +96,10 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
             return String(localized: "Тексты почти совпадают — обычно это одно и то же, проиндексированное дважды.")
         case .substitutedChunking:
             return String(localized: "Эти чанки нарезаны не той стратегией, что записана у коллекции: у документа не нашлось структуры, либо это презентация, где слайд идёт одним чанком. Сравнивать такую коллекцию с другой по стратегии нельзя — сравниваются одинаково нарезанные данные.")
+        case .legacyFilePaths:
+            return String(localized: "У этих чанков путь записан так, как его отдала файловая система: «й» двумя знаками вместо одного. Для базы это другая строка, чем та, что набирает человек в фильтре или агент, читающий выдачу, — файл лежит в коллекции и не находится по собственному пути. У них же нет поля file_id, которым файл просят целиком.")
+        case .filesGoneFromDisk:
+            return String(localized: "Файла, из которого сделаны эти чанки, в папке источника нет. Чаще всего это переименованная или переехавшая папка: путь у файла новый, и он проиндексирован заново, а чанки под прежним путём остались.")
         case .supersededPieces:
             return String(localized: "Остались от прошлой перенарезки: последний пересчёт нарезал этот документ на меньшее число кусков, а лишние никто не убрал. Векторы у них от прежней модели, и в выдачу они попадают наравне с текущими.")
         }
@@ -105,8 +127,12 @@ public enum InspectionCategory: String, Codable, Sendable, CaseIterable, Identif
             return String(localized: "Пересчитать коллекцию одной моделью — экран «Пересчёт».")
         case .substitutedChunking:
             return String(localized: "Ничего чинить не нужно: подмена честная. Но если коллекция заводилась ради сравнения стратегий — сравнение по этим файлам не состоялось.")
+        case .filesGoneFromDisk:
+            return String(localized: "Проверьте, что это не отключённый диск, и удалите выбранные — сами они не удаляются: автоматических удалений в приложении нет.")
         case .supersededPieces:
             return String(localized: "Просмотреть и удалить — приложение само их не трогает: автоматических удалений в нём нет.")
+        case .legacyFilePaths:
+            return String(localized: "Нажмите «Привести пути к единой форме»: приложение перепишет поля, не трогая текст и не пересчитывая векторы.")
         }
     }
 }

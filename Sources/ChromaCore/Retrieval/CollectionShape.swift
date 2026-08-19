@@ -73,13 +73,56 @@ public actor CollectionShapeCache {
         return shape
     }
 
+    // MARK: - Есть ли в коллекции закреплённые документы
+
+    private var pinned: [String: Bool] = [:]
+
+    /// Стоит ли добирать закреплённое в выдачу этой коллекции.
+    ///
+    /// Спрашивается тем же способом, что и форма: точечным запросом с
+    /// `limit: 1`, ответ которого не зависит от того, сколько просмотрено.
+    /// И кешируется по той же причине: иначе каждый поиск платил бы обходом
+    /// метаданных коллекции ради ответа «нет», который на подавляющем
+    /// большинстве коллекций не меняется никогда.
+    ///
+    /// Кеш сбрасывается там же, где ставится пометка (`forgetMarks`): между
+    /// «человек закрепил документ» и «закреплённое появилось в выдаче» не
+    /// должно быть перезапуска приложения.
+    public func hasPinnedDocuments(
+        collectionID: String, database: any RetrievalDatabase
+    ) async -> Bool {
+        if let known = pinned[collectionID] { return known }
+        let filter = DocumentFilter(conditions: [
+            MetadataCondition(
+                field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
+            ),
+        ])
+        guard let found = try? await database.anyDocument(
+            collectionID: collectionID, matching: filter
+        ) else {
+            // Не смогли спросить — считаем, что закреплённых нет: выдача
+            // тогда просто остаётся такой, какой её дал поиск. И не кешируем:
+            // следующий запрос спросит заново.
+            return false
+        }
+        pinned[collectionID] = found
+        return found
+    }
+
+    /// Забыть ответ про пометки — после того, как человек их изменил.
+    public func forgetMarks(collectionID: String) {
+        pinned.removeValue(forKey: collectionID)
+    }
+
     /// Forget one collection — after a re-index changed how it is cut.
     public func forget(collectionID: String) {
         known.removeValue(forKey: collectionID)
+        pinned.removeValue(forKey: collectionID)
     }
 
     /// Forget everything — a new connection may be a different database.
     public func reset() {
         known.removeAll()
+        pinned.removeAll()
     }
 }

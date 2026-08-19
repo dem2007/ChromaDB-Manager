@@ -25,6 +25,9 @@ struct SearchProfileSheet: View {
     /// settings are shown either way, greyed with the reason: hiding them would
     /// make «почему схлопывание не работает» unanswerable.
     let isHierarchical: Bool
+    /// Метрика коллекции: штраф за длину честно считается только на косинусе,
+    /// и форма обязана сказать это до нажатия, а не после.
+    let metric: DistanceMetric?
     let onCancel: () -> Void
     let onSave: () -> Void
 
@@ -83,7 +86,63 @@ struct SearchProfileSheet: View {
                 )
                 .frame(width: 220)
             }
+
+            Divider().padding(.vertical, 4)
+
+            // Длина кандидата. Здесь же, в стадии 1: порядок стадий
+            // из E0.1 неизменен, а отсекать и штрафовать надо там, где
+            // кандидаты ещё есть — стадии 3–7 не вернут того, чего нет.
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(String(localized: "Штраф за длину"), isOn: $profile.lengthPenaltyEnabled)
+                    .toggleStyle(.checkbox)
+                    .help(String(localized: "Оценка умножается на min(1, длина / цель) в степени. Чанк из одного слова перестаёт обыгрывать абзац."))
+                Text(String(localized: "Схожесть меряет совпадение темы, а не полезность: чанк из одного слова «Сервер» отвечает запросу «сервер» дословно, схожесть 1.00. Замер на nomic-embed-text-v1.5: шапка таблицы близка к любому запросу — 0.70 к «сервер», 0.69 к «СКАЛА-Р», 0.74 к «отпуск сотрудника». Штраф ставит содержательные куски вперёд и не стоит ни одного пересчёта векторов."))
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+                if profile.lengthPenaltyEnabled {
+                    HStack(spacing: 16) {
+                        Stepper(
+                            String(localized: "цель: \(profile.lengthTarget) знаков"),
+                            value: $profile.lengthTarget, in: 50...4000, step: 50
+                        )
+                        .frame(width: 220)
+                        HStack(spacing: 4) {
+                            Text("степень").font(Theme.Font.caption)
+                            TextField("", value: $profile.lengthPenaltyPower, format: .number)
+                                .textFieldStyle(.roundedBorder).frame(width: 60)
+                        }
+                        .help(String(localized: "0.5 — мягко, 1.0 — вдвое жёстче. Ноль выключает штраф."))
+                        Text(lengthExample)
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    }
+                    if metric != .cosine {
+                        Text(String(localized: "Метрика коллекции не даёт схожести — штраф применён не будет, и панель «Как получен этот результат» скажет об этом. Честно домножать можно только косинус."))
+                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Stepper(
+                    profile.minimumCharacters > 0
+                        ? String(localized: "отбрасывать короче \(profile.minimumCharacters) знаков")
+                        : String(localized: "не отбрасывать по длине"),
+                    value: $profile.minimumCharacters, in: 0...2000, step: 50
+                )
+                .frame(width: 320)
+                .help(String(localized: "Жёсткая отсечка. Выбрасывает и те короткие чанки, которые изредка и есть ответ, — артикул, код ошибки, номер постановления."))
+            }
         }
+    }
+
+    /// Что штраф делает с тремя длинами — на нынешних параметрах.
+    private var lengthExample: String {
+        let sample = [30, 150, profile.lengthTarget]
+        let parts = sample.map { length -> String in
+            let factor = LengthPreference.factor(
+                length: length, target: profile.lengthTarget, power: profile.lengthPenaltyPower
+            )
+            return "\(length): ×\(String(format: "%.2f", factor))"
+        }
+        return parts.joined(separator: ", ")
     }
 
     private var sources: some View {
@@ -122,7 +181,36 @@ struct SearchProfileSheet: View {
                     Text(String(localized: "Разбиение ищет слова через $or. Поддержка проверена на установленной версии сервера; целиком — надёжнее и по умолчанию."))
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 }
+
+                Divider()
+                queryPrefixField
             }
+        }
+    }
+
+    /// Приставка к запросу перед вектором.
+    private var queryPrefixField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(String(localized: "Приставка к запросу"))
+                .font(Theme.Font.caption)
+            TextField(String(localized: "без приставки"), text: $profile.queryPrefix, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...3)
+                .font(Theme.Font.monoCell)
+                .disabled(!profile.vectorSearchEnabled)
+            Text(String(localized: "Дописывается перед текстом запроса **только для вектора** — поиск по словам её не видит. Модели Qwen3-Embedding и nomic обучены на несимметричной паре: документ идёт как есть, запрос — с инструкцией. Пустое поле — прежнее поведение."))
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button(String(localized: "Qwen3")) {
+                    profile.queryPrefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+                }
+                Button(String(localized: "nomic")) { profile.queryPrefix = "search_query: " }
+                Button(String(localized: "Убрать")) { profile.queryPrefix = "" }
+                    .disabled(profile.queryPrefix.isEmpty)
+            }
+            .buttonStyle(.chromaSecondary)
+            .disabled(!profile.vectorSearchEnabled)
         }
     }
 

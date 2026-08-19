@@ -228,10 +228,33 @@ public struct TableRowDocument: Hashable, Sendable {
     }
 }
 
+/// Сколько листов книги вообще попало в базу.
+///
+/// Живой случай: в книге четырнадцать листов, размечено пять — в базу попали
+/// 73 строки из полутора тысяч, а лист с ценами не попал вовсе. Строка,
+/// пришедшая из такой книги, обязана нести это с собой: агент, считающий
+/// по ней смету, должен знать, что перед ним часть, а не всё.
+public struct SheetCoverage: Sendable, Hashable {
+    public var indexed: Int
+    public var total: Int
+
+    public init(indexed: Int, total: Int) {
+        self.indexed = indexed
+        self.total = total
+    }
+
+    /// Книга в базе не целиком. Только в этом случае поля и пишутся: у книги,
+    /// размеченной полностью, они были бы шумом в каждой строке.
+    public var isPartial: Bool { indexed < total && total > 0 }
+}
+
 /// Turns rows into documents.
 public enum RowMapper {
     /// Auto fields every table row carries (Приложение 4).
-    public static let autoMetadataKeys = ["source_file", "sheet_name", "row_number", "row_key", "table_mode"]
+    public static let autoMetadataKeys = [
+        "source_file", "file_id", "sheet_name", "row_number", "row_key", "table_mode",
+        "sheets_indexed", "sheets_total",
+    ]
 
     // MARK: - Text
 
@@ -414,6 +437,10 @@ public enum RowMapper {
     /// и в двадцать раз меньше того случая.
     public static let metadataValueLimit = 2000
 
+    /// Чем оканчивается поле с единицей измерения колонки: у колонки
+    /// `цена` это `цена_unit` со значением `₽`.
+    public static let unitKeySuffix = "_unit"
+
     /// Значение с обрезкой по пределу. `nil` во втором члене — обрезки не было.
     static func fitting(_ value: MetadataValue) -> (value: MetadataValue, truncated: Bool) {
         guard case .string(let text) = value, text.count > metadataValueLimit else {
@@ -441,21 +468,36 @@ public enum RowMapper {
         mapping: TableMapping,
         layout: SheetLayout,
         sourceFile: String,
-        rowKey: String?
+        rowKey: String?,
+        coverage: SheetCoverage? = nil
     ) -> (metadata: ChromaMetadata, truncated: [String]) {
         var result: ChromaMetadata = [
             "source_file": .string(sourceFile),
+            // Тот же отпечаток файла, что и у обычных документов:
+            // строка таблицы — тоже часть файла, и просить её целиком агент
+            // должен тем же способом.
+            "file_id": .string(SourceSyncService.fileFingerprint(sourceFile)),
             "sheet_name": .string(mapping.sheetName),
             "row_number": .int(row.number),
             "table_mode": .string(mapping.mode.rawValue),
         ]
         if let rowKey, !rowKey.isEmpty { result["row_key"] = .string(rowKey) }
 
+        // Книга в базе не целиком: строка несёт это с собой, чтобы
+        // тот, кто по ней считает, знал, что видит часть.
+        if let coverage, coverage.isPartial {
+            result["sheets_indexed"] = .int(coverage.indexed)
+            result["sheets_total"] = .int(coverage.total)
+        }
+
         // The key names come from the mapping and the positions from the file:
         // two files writing «Цена» and «цена » must end up filterable by one
         // key, and must each be read from their own column.
         let keys = mapping.keyMap
         var truncated: [String] = []
+        // Единицы дописываются после всех колонок, чтобы настоящая колонка
+        // с именем вроде «цена_unit» всегда выигрывала у нашего поля.
+        var units: [String: MetadataValue] = [:]
         for column in mapping.metadataColumns {
             // Позиция — по заголовку **из файла**, ключ — по тому имени,
             // которое человек выбрал. Это разные строки, когда
@@ -463,10 +505,41 @@ public enum RowMapper {
             guard let index = layout.index(of: column),
                   let key = keys.key(for: mapping.title(of: column))
             else { continue }
-            guard let value = metadataValue(row.value(at: index)) else { continue }
+            let cell = row.value(at: index)
+            guard let value = metadataValue(cell) else { continue }
             let fitted = fitting(value)
             if fitted.truncated { truncated.append(mapping.title(of: column)) }
             result[key] = fitted.value
+            // В метаданные идёт показанное число, а единица — отдельным
+            // полем рядом. оставлял её тексту документа, и это
+            // работает, только пока колонка помечена как текст: у колонки
+            // с процентами, помеченной метаданными, «4 %» не оставалось
+            // нигде — ни в тексте, ни в полях. Число без единицы
+            // неотличимо от рублей и штук, и «инфляция 4 %» такую строку
+            // не находило.
+            //
+            // Отдельным полем, а не строкой «4 %» в самом поле: строкой
+            // сломались бы числовые сравнения, ради которых метаданные
+            // и заводились. Приём в проекте уже принят — так же рядом
+            // с датой пишется `<ключ>_ts`.
+            if case .measured(_, let unit) = cell, let label = unit.label {
+                units["\(key)\(Self.unitKeySuffix)"] = .string(label)
+            }
+        }
+        // Имя, занятое колонкой файла, наше поле не занимает — какой бы роли
+        // та колонка ни была. Колонка, помеченная текстом, метаданных не пишет,
+        // и «свободным» её ключ выглядит только на первый взгляд: человек уже
+        // назвал этим словом свою колонку, и два разных смысла под одним
+        // именем — это путаница, которую потом не распутать.
+        //
+        // Считается только когда есть что дописывать: эта функция зовётся
+        // на **каждую** строку листа, а лист без процентов и валюты платил бы
+        // за проход по всем колонкам, ответ которого никому не нужен.
+        if !units.isEmpty {
+            let taken = Set(mapping.columns.compactMap { keys.key(for: mapping.title(of: $0)) })
+            for (key, value) in units where result[key] == nil && !taken.contains(key) {
+                result[key] = value
+            }
         }
         return (result, truncated)
     }
@@ -511,7 +584,8 @@ public enum RowMapper {
         mapping: TableMapping,
         layout: SheetLayout,
         sourceID: UUID,
-        sourceFile: String
+        sourceFile: String,
+        coverage: SheetCoverage? = nil
     ) -> TableRowDocument? {
         // A row whose text columns are all empty has nothing to embed. It is
         // not an error and not a silent drop — the caller counts it. Считается
@@ -539,7 +613,7 @@ public enum RowMapper {
         )
         let fields = metadataAndTruncations(
             for: row, mapping: mapping, layout: layout,
-            sourceFile: sourceFile, rowKey: rowKey
+            sourceFile: sourceFile, rowKey: rowKey, coverage: coverage
         )
         return TableRowDocument(
             id: id,

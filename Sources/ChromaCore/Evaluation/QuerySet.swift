@@ -54,6 +54,16 @@ public struct ExpectedFragment: Codable, Hashable, Sendable, Identifiable {
     /// Where it came from: the run that produced it, for «откуда это взялось».
     public var note: String
 
+    // Самое ценное в файле — здесь: это и есть ручная разметка.
+    // Недостающая заметка не повод потерять оценку, которую человек поставил.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        fragment = try container.decode(String.self, forKey: .fragment)
+        grade = try container.decodeIfPresent(RelevanceGrade.self, forKey: .grade) ?? .relevant
+        note = try container.decodeIfPresent(String.self, forKey: .note) ?? ""
+    }
+
     public init(
         id: UUID = UUID(),
         fragment: String,
@@ -145,6 +155,28 @@ public struct EvaluationQuery: Codable, Hashable, Sendable, Identifiable {
         self.documents = documents
     }
 
+    // Разбор терпим к недостающим полям — по той же причине, что у профиля
+    // поиска. Здесь она даже весомее: в наборе живёт эталон, то есть
+    // ручная разметка человека, и одно поле, которого не оказалось в файле,
+    // роняло разбор **всего файла** — со всеми наборами и всей разметкой
+    // разом. Живой случай: набор, записанный без `tags` и `comment`, дал
+    // «Не удалось прочитать данные, так как они отсутствуют», и экран остался
+    // без единого набора.
+    //
+    // `id` и `text` обязательны и умолчания не имеют: запрос без текста —
+    // это не запрос, и подставлять ему пустую строку значило бы прятать
+    // испорченный файл вместо того, чтобы о нём сказать.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        text = try container.decode(String.self, forKey: .text)
+        filter = try container.decodeIfPresent(DocumentFilter.self, forKey: .filter)
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        comment = try container.decodeIfPresent(String.self, forKey: .comment) ?? ""
+        fragments = try container.decodeIfPresent([ExpectedFragment].self, forKey: .fragments) ?? []
+        documents = try container.decodeIfPresent([ExpectedDocument].self, forKey: .documents) ?? []
+    }
+
     /// Whether anything is known about what a good answer looks like.
     ///
     /// Metrics are computed only where this is true — a query with no
@@ -216,6 +248,19 @@ public struct QuerySet: Codable, Hashable, Sendable, Identifiable {
         self.queries = queries
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    // Те же соображения, что у запроса. Даты по умолчанию — «сейчас»:
+    // набор без них существует, а неверная дата ничего не решает, тогда как
+    // отказ читать файл стоит человеку всей разметки.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        note = try container.decodeIfPresent(String.self, forKey: .note) ?? ""
+        queries = try container.decodeIfPresent([EvaluationQuery].self, forKey: .queries) ?? []
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 
     public var markedQueryCount: Int { queries.filter(\.hasGroundTruth).count }

@@ -388,10 +388,29 @@ public enum TableProfileMatcher {
         guard !named.isEmpty else {
             return .needsDecision(String(localized: "в строке \(headerRow) нет названий колонок"))
         }
-        guard Set(titles).count == titles.count else {
-            let duplicates = Dictionary(grouping: titles, by: { $0 }).filter { $0.value.count > 1 }.keys
-            return .needsDecision(String(localized: "в строке \(headerRow) повторяются названия колонок: \(duplicates.sorted().joined(separator: ", "))"))
+        // Повтор названий — не отказ, а различимые имена.
+        //
+        // Строку заголовков называет человек, и он смотрит в свой файл: там
+        // шапка в два этажа, и «Стоимость» стоит под каждым годом. Отказ
+        // означал, что выбрать такую строку нельзя вовсе — при том что
+        // ниже по конвейеру коллизии имён и так разрешаются, просто
+        // на входе стоял запрет.
+        return .headers(uniqued(titles))
+    }
+
+    /// Повторяющиеся названия — с номерами: «Стоимость», «Стоимость (2)».
+    ///
+    /// Номер дописывается ко **второму** и дальше: первая колонка сохраняет
+    /// имя, которое человек видит в файле, и переименовывать её незачем.
+    /// Если имя с номером тоже занято — номер растёт, пока не найдётся
+    /// свободное: в шапке бывает и «Стоимость», и «Стоимость (2)» сразу.
+    public static func uniqued(_ titles: [String]) -> [String] {
+        var seen: Set<String> = []
+        return titles.map { title in
+            guard !seen.insert(title).inserted else { return title }
+            var number = 2
+            while !seen.insert("\(title) (\(number))").inserted { number += 1 }
+            return "\(title) (\(number))"
         }
-        return .headers(titles)
     }
 }

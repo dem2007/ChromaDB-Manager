@@ -93,14 +93,18 @@ public actor EvaluationRunner {
                 var reused = false
 
                 if variant.needsVector {
-                    let key = VectorKey(text: query.text, model: variant.model)
+                    // Приставка входит в ключ, а не только в вызов:
+                    // иначе вариант «с приставкой» достал бы из запаса вектор,
+                    // посчитанный без неё, и сравнивал бы приставку саму с собой.
+                    let asked = variant.profile.embeddedQuery(query.text)
+                    let key = VectorKey(text: asked, model: variant.model)
                     if let cached = vectors[key] {
                         vector = cached
                         reused = true
                     } else {
                         let started = Date()
                         do {
-                            let computed = try await embed(query.text, variant.model)
+                            let computed = try await embed(asked, variant.model)
                             vectors[key] = computed
                             vector = computed
                             embeddingSeconds = Date().timeIntervalSince(started)

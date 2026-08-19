@@ -25,10 +25,13 @@ final class CollectionRouterTests: XCTestCase {
         XCTAssertTrue(outcome.route?.extraMetadata.isEmpty ?? false)
     }
 
-    func testSingleCollectionKeepsRelativePath() {
+    /// Путь файла хранит `source_file`, который пишет синхронизация всем
+    /// режимам разом. Второе поле с тем же содержимым маршрутизатор больше
+    /// не добавляет.
+    func testSingleCollectionAddsNoSecondPathField() {
         let outcome = router.route(relativePath: "sub/deep/a.md", source: source(.singleCollectionWithRelativePath))
         XCTAssertEqual(outcome.route?.collectionName, "docs_col")
-        XCTAssertEqual(outcome.route?.extraMetadata["relative_path"], .string("sub/deep/a.md"))
+        XCTAssertNil(outcome.route?.extraMetadata["relative_path"])
     }
 
     func testSubfoldersBecomeCollections() {
@@ -181,7 +184,7 @@ final class DocumentExtractionTests: XCTestCase {
 
     /// `.docx` is read since 4.4, so a broken one is no longer «формат не
     /// поддерживается» — it is a file that did not open, with the reason the
-    /// system gave: never a silent skip).
+    /// system gave (: never a silent skip).
     func testABrokenOfficeFileIsRefusedWithItsOwnReason() async throws {
         let url = try write("PK\u{0003}\u{0004}", "report.docx")
         await XCTAssertThrowsErrorAsync(try await extract(url)) { error in
@@ -554,7 +557,11 @@ final class SourceSchemaCoverageTests: XCTestCase {
         XCTAssertFalse(report.isSatisfied)
     }
 
-    func testRelativePathIsProvidedOnlyByPathAwareModes() async {
+    /// Схема, требующая `relative_path`, больше не покрывается ничем: поле
+    /// перестало писаться. Сказать об этом честно важнее, чем
+    /// промолчать: коллекция со строгой схемой иначе получила бы чанки без
+    /// обязательного поля.
+    func testASchemaAskingForRelativePathIsNoLongerCovered() async {
         let schema = MetadataSchema(collectionName: "docs_col", fields: [
             MetadataField(key: "relative_path", type: .string, isRequired: true),
         ])
@@ -565,7 +572,18 @@ final class SourceSchemaCoverageTests: XCTestCase {
             source: source(mapping: .singleCollectionWithRelativePath),
             schema: schema
         )
-        XCTAssertTrue(pathAware.isSatisfied)
+        XCTAssertEqual(pathAware.uncoveredRequiredFields, ["relative_path"])
+    }
+
+    /// А путь файла покрыт всегда и любым режимом — полем `source_file`,
+    /// вместе с отпечатком `file_id`.
+    func testThePathAndTheFingerprintAreAlwaysProvided() async {
+        let schema = MetadataSchema(collectionName: "docs_col", fields: [
+            MetadataField(key: "source_file", type: .string, isRequired: true),
+            MetadataField(key: "file_id", type: .string, isRequired: true),
+        ])
+        let report = await service.coverage(source: source(), schema: schema)
+        XCTAssertTrue(report.isSatisfied, "\(report.uncoveredRequiredFields)")
     }
 
     func testStrictSchemaDoesNotFightTheSourcePipeline() {

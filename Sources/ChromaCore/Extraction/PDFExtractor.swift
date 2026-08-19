@@ -9,6 +9,16 @@ import UniformTypeIdentifiers
 /// came from.
 public struct PDFExtractor: DocumentTextExtractor {
     public let id = "pdfkit"
+    /// 6 — рост знака считается по буквам, а не по отточию оглавления
+    ///: страница с точками-заполнителями рассыпалась на слоги и
+    /// уходила в базу markdown-таблицей из них. Текст меняется —
+    /// обязано предложить перечитать файлы.
+    ///
+    /// 5 — знаки препинания возвращены в свою строку таблицы:
+    /// «31 585 738,00» приходило как «31 585 738 00», а номер позиции
+    /// «11.1» — как «11 1». Меняется сам текст, значит обязано
+    /// предложить перечитать файлы.
+    ///
     /// 4 — адреса ссылок доходят до метаданных чанка: раньше они
     /// терялись целиком, потому что живут аннотациями, а не текстом.
     ///
@@ -18,7 +28,7 @@ public struct PDFExtractor: DocumentTextExtractor {
     ///
     /// 2 — сшивка строк в абзацы меняет сам текст, а не только
     /// оговорки к нему: обязано предложить перечитать файлы.
-    public let version = 4
+    public let version = 6
 
     /// Below this many characters per page on average, a PDF is a picture of
     /// text rather than an empty document — the distinction decides whether the
@@ -71,12 +81,17 @@ public struct PDFExtractor: DocumentTextExtractor {
         /// уже разобрана, и ни сшивать абзацы, ни доверять порядку строк
         /// от PDFKit на них не нужно.
         var tables: [Int: String] = [:]
+        /// Страницы, где таблица была, а собрать её не вышло.
+        var unassembled = 0
         raw.reserveCapacity(document.pageCount)
         for index in 0..<document.pageCount {
             try Task.checkCancellation()
             let page = document.page(at: index)
             raw.append((page?.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
-            if let page, let table = PDFPageTables.page(page) { tables[index] = table }
+            guard let page else { continue }
+            let assessed = PDFPageTables.assess(page)
+            if let table = assessed.text { tables[index] = table }
+            if assessed.unassembledTable { unassembled += 1 }
         }
 
         let vocabulary = PDFTextReflow.vocabulary(ofPages: raw)
@@ -145,6 +160,11 @@ public struct PDFExtractor: DocumentTextExtractor {
         }
 
         if !tables.isEmpty { warnings.append(.tablesFlattened) }
+        // Отдельная оговорка, и она о другом: не «оформление
+        // потеряно», а «колонки не разделены». По такой странице нельзя
+        // сказать, где цена, а где итог, — и агент, считающий по ней смету,
+        // должен знать это до того, как посчитает.
+        if unassembled > 0 { warnings.append(.tablesNotAssembled(pages: unassembled)) }
 
         return ExtractedDocument(
             plainText: plainText,

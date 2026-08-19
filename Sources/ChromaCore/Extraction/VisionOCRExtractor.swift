@@ -16,12 +16,57 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
     ///
     /// 2 — сшивка строк в абзацы и смещения страниц, считаемые после
     /// разделителя.
-    public let version = 3
+    /// 4 — большие страницы распознаются плитками: лист А0 приходил
+    /// пустым, потому что при обзорном масштабе буквы на нём мельче, чем
+    /// видит Vision. Меняется сам текст — предложит перечитать файлы.
+    public let version = 4
 
     /// Rendering scale for a page before recognition. 2× the nominal 72 dpi is
     /// the usual floor for Vision on scanned text; below it the accuracy drops
     /// sharply, above it the time grows faster than the accuracy.
     static let renderScale: CGFloat = 2
+
+    /// Страница крупнее этого по любой стороне распознаётся плитками.
+    ///
+    /// Замер на живом файле — схеме архитектуры размером 1649×1040 мм:
+    /// страница целиком при двукратном увеличении даёт изображение
+    /// 9354×5901 и **ноль** распознанных строк, четверть страницы при
+    /// четырёхкратном — сорок две. Дело не в числе пикселей, а в размере
+    /// буквы: на плакате шрифт мелкий, и при обзорном масштабе от него
+    /// остаётся несколько точек.
+    static let tileThreshold: CGFloat = 1_600
+    /// Сторона плитки в пунктах — примерно лист A4.
+    static let tileSide: CGFloat = 1_000
+    /// Перекрытие плиток: строка, попавшая на стык, должна целиком войти
+    /// хотя бы в одну из них.
+    static let tileOverlap: CGFloat = 48
+    /// Плитка мельче страницы, поэтому её можно рисовать крупнее.
+    static let tileScale: CGFloat = 4
+
+    /// Нужны ли этой странице плитки.
+    static func needsTiling(_ page: PDFPage) -> Bool {
+        let bounds = page.bounds(for: .mediaBox)
+        return max(bounds.width, bounds.height) > tileThreshold
+    }
+
+    /// Плитки страницы — слева направо, сверху вниз, с перекрытием.
+    static func tiles(of bounds: CGRect) -> [CGRect] {
+        let step = tileSide - tileOverlap
+        guard step > 0 else { return [bounds] }
+        var result: [CGRect] = []
+        var top = bounds.maxY
+        while top > bounds.minY {
+            let height = min(tileSide, top - bounds.minY)
+            var left = bounds.minX
+            while left < bounds.maxX {
+                let width = min(tileSide, bounds.maxX - left)
+                result.append(CGRect(x: left, y: top - height, width: width, height: height))
+                left += step
+            }
+            top -= step
+        }
+        return result
+    }
 
     public init() {}
 
@@ -65,13 +110,27 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
                 stage: .recognising, unit: index + 1, total: document.pageCount
             ))
 
-            guard let page = document.page(at: index), let image = Self.render(page) else {
+            guard let page = document.page(at: index) else {
                 pageStarts.append(length)
                 continue
             }
-            let recognised = try await Self.recognise(
-                image, languages: languages, timeout: options.ocrPageTimeout
-            )
+            let recognised: PageText
+            if Self.needsTiling(page) {
+                // Плакат, чертёж, схема на лист А0: целиком такая
+                // страница распознаётся в ноль строк — буквы на ней мельче,
+                // чем видит Vision при обзорном масштабе.
+                recognised = try await Self.recogniseByTiles(
+                    page, languages: languages, timeout: options.ocrPageTimeout
+                )
+            } else {
+                guard let image = Self.render(page) else {
+                    pageStarts.append(length)
+                    continue
+                }
+                recognised = try await Self.recognise(
+                    image, languages: languages, timeout: options.ocrPageTimeout
+                )
+            }
             // Vision отдаёт по строке на наблюдение, то есть ровно ту же
             // построчную россыпь, что и текстовый слой PDF, — и сшивается
             // она тем же способом. Словаря документа здесь нет:
@@ -199,10 +258,10 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
         )]
     }
 
-    static func render(_ page: PDFPage) -> CGImage? {
-        let bounds = page.bounds(for: .mediaBox)
-        let width = Int(bounds.width * renderScale)
-        let height = Int(bounds.height * renderScale)
+    static func render(_ page: PDFPage, region: CGRect? = nil, scale: CGFloat = renderScale) -> CGImage? {
+        let bounds = region ?? page.bounds(for: .mediaBox)
+        let width = Int(bounds.width * scale)
+        let height = Int(bounds.height * scale)
         guard width > 0, height > 0 else { return nil }
 
         guard let context = CGContext(
@@ -214,10 +273,52 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
 
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.scaleBy(x: renderScale, y: renderScale)
+        context.scaleBy(x: scale, y: scale)
         context.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
         page.draw(with: .mediaBox, to: context)
         return context.makeImage()
+    }
+
+    /// Большая страница — по плиткам.
+    ///
+    /// Плитки идут слева направо и сверху вниз, с перекрытием, и их тексты
+    /// склеиваются в том же порядке. Порядок чтения у схемы условен, но
+    /// «сверху вниз» — то же, что делает человек, а главное, текст вообще
+    /// попадает в базу: до этого лист А0 приходил пустым.
+    static func recogniseByTiles(
+        _ page: PDFPage, languages: [String], timeout: TimeInterval
+    ) async throws -> PageText {
+        let bounds = page.bounds(for: .mediaBox)
+        var parts: [String] = []
+        var confidenceSum = 0.0
+        var counted = 0
+
+        for tile in tiles(of: bounds) {
+            try Task.checkCancellation()
+            guard let image = render(page, region: tile, scale: tileScale) else { continue }
+            let recognised = try await recognise(image, languages: languages, timeout: timeout)
+            let text = (recognised.table ?? recognised.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            parts.append(text)
+            confidenceSum += recognised.confidence
+            counted += 1
+        }
+
+        guard !parts.isEmpty else { return PageText(text: "", confidence: 0, table: nil) }
+        // Перекрытие плиток повторяет строки на стыках — повторы убираются
+        // здесь, иначе половина строк схемы придёт дважды.
+        var seen: Set<String> = []
+        let lines = parts.joined(separator: "\n").split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                guard line.count > 2 else { return true }
+                return seen.insert(line).inserted
+            }
+        return PageText(
+            text: lines.joined(separator: "\n"),
+            confidence: counted > 0 ? confidenceSum / Double(counted) : 0,
+            table: nil
+        )
     }
 
     /// One page through Vision, bounded in time.

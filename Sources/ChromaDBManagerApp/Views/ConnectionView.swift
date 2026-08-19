@@ -7,6 +7,10 @@ struct ConnectionView: View {
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var model: ConnectionViewModel
     @ObservedObject var collectionsModel: CollectionsViewModel
+    /// Раскрыт ли список таймаутов по классам. Своим состоянием, а не
+    /// внутренним у `DisclosureGroup`: заголовок должен нажиматься целиком,
+    /// а для этого им надо управлять.
+    @State private var showingTimeoutClasses = false
 
     var body: some View {
         ScrollView {
@@ -137,7 +141,7 @@ struct ConnectionView: View {
     /// for a local server and only a slow remote one needs them touched.
     private var timeoutsCard: some View {
         SectionCard(title: String(localized: "Таймауты")) {
-            DisclosureGroup(String(localized: "Значения по классам операций")) {
+            DisclosureGroup(isExpanded: $showingTimeoutClasses) {
                 HStack {
                     VStack(alignment: .leading, spacing: 8) {
                         timeoutField(String(localized: "Проверка доступности"), keyPath: \.liveness)
@@ -155,6 +159,9 @@ struct ConnectionView: View {
                     Spacer(minLength: 0)
                 }
                 .padding(.top, 8)
+            } label: {
+                Text(String(localized: "Значения по классам операций"))
+                    .togglesDisclosure($showingTimeoutClasses)
             }
         }
     }

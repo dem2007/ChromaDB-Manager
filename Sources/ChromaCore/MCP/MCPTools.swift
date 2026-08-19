@@ -519,6 +519,27 @@ public enum MCPToolCatalogue {
         """),
     ])
 
+    /// Тип исходного файла человеческим словом.
+    ///
+    /// Без него агенту пришлось бы знать наизусть, что «Excel» в базе — это
+    /// шесть разных расширений, и он ставил бы `file_ext = "xlsx"`, молча
+    /// теряя `xls`, `ods` и остальное.
+    private static let fileTypesProperty = JSONValue.object([
+        "type": .string("array"),
+        "items": .object(["type": .string("string")]),
+        "description": .string("""
+        Оставить только документы, полученные из файлов такого типа. \
+        Значения: word — .docx, .doc, .odt, .rtf, .pages; excel — .xlsx, .xls, \
+        .xlsm, .ods, .numbers, .csv, .tsv; pdf; presentation — .key (Keynote); \
+        text — .txt, .md; \
+        web; book; code; data. Можно передать и само расширение, например «docx»: \
+        оно есть у каждого результата в поле file_ext. Несколько значений \
+        складываются по «или»: ["word", "pdf"] вернёт и то и другое. \
+        Складывается с «filter» по «и», так что тип файла и условие по \
+        метаданным можно ставить вместе.
+        """),
+    ])
+
     private static let containsProperty = JSONValue.object([
         "type": .string("string"),
         "description": .string("""
@@ -546,7 +567,11 @@ public enum MCPToolCatalogue {
         передай их списком в «collections» вместо «collection» — вектор запроса \
         считается при этом один раз, а у каждого результата сказано, из какой он \
         коллекции. Оба параметра сразу передавать нельзя. Коллекции вне списка \
-        доступа не ищутся.
+        доступа не ищутся. Если в выдаче таблица: одна строка таблицы — одна \
+        позиция, и её цена относится ко всей строке. Перечисление внутри ячейки \
+        (два товара через «;») новых позиций не создаёт и цену не удваивает. \
+        Считать по фрагментам вообще ненадёжно: фрагмент — это кусок файла, \
+        а не весь файл; для расчётов бери файл целиком через get_file.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -582,6 +607,7 @@ public enum MCPToolCatalogue {
                     """),
                 ]),
                 "filter": filterProperty,
+                "file_types": fileTypesProperty,
                 "contains": containsProperty,
             ]),
             "required": .array([.string("query")]),
@@ -627,6 +653,7 @@ public enum MCPToolCatalogue {
                     """),
                 ]),
                 "filter": filterProperty,
+                "file_types": fileTypesProperty,
                 "contains": containsProperty,
                 "limit": .object([
                     "type": .string("integer"),
@@ -669,12 +696,16 @@ public enum MCPToolCatalogue {
         description: """
         Отдаёт все чанки одного файла **по порядку** — так, как файл был \
         нарезан. Применяй, когда поиск нашёл фрагмент, а нужен документ \
-        целиком: имя файла возьми из поля source_file у любого результата. \
-        Порядок гарантируется этим инструментом, и только им: у get_documents \
-        по фильтру порядок произвольный. Файл почти всегда длиннее одного \
-        ответа — в ответе сказано, сколько всего чанков и с каким offset \
-        звать дальше; читай страницами до hasMore = false и склеивай подряд. \
-        Длинные чанки обрезаются с пометкой, потолки заданы правами ключа.
+        целиком. Проси файл по file_id — это короткий отпечаток из метаданных \
+        любого результата; путь тоже принимается, но его легко испортить \
+        при перепечатке. Порядок гарантируется этим инструментом, и только \
+        им: у get_documents по фильтру порядок произвольный. Файл почти \
+        всегда длиннее одного ответа — в ответе сказано, сколько всего чанков \
+        и с каким offset звать дальше; читай страницами до hasMore = false и \
+        склеивай подряд. В ответе есть и полный путь файла. Длинные чанки \
+        обрезаются с пометкой, потолки заданы правами ключа. Если в файле \
+        таблица: одна её строка — одна позиция, и цена относится ко всей \
+        строке; перечисление внутри ячейки новых позиций не создаёт.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -683,12 +714,22 @@ public enum MCPToolCatalogue {
                     "type": .string("string"),
                     "description": .string("Имя коллекции из list_collections."),
                 ]),
+                "file_id": .object([
+                    "type": .string("string"),
+                    "description": .string("""
+                    Отпечаток файла — значение метаданного file_id у любого \
+                    его чанка. Надёжнее пути: шестнадцать знаков, которые \
+                    нечем испортить. Если задан, параметр file не нужен.
+                    """),
+                ]),
                 "file": .object([
                     "type": .string("string"),
                     "description": .string("""
                     Значение метаданного source_file — путь файла относительно \
                     папки источника, ровно как он записан в найденном документе. \
-                    Не имя файла и не абсолютный путь.
+                    Не имя файла и не абсолютный путь. Годится, когда file_id \
+                    в метаданных нет: коллекции, наполненные прежними сборками, \
+                    его ещё не несут.
                     """),
                 ]),
                 "limit": .object([
@@ -702,7 +743,9 @@ public enum MCPToolCatalogue {
                     "description": .string("С какого по счёту чанка продолжать — число из предыдущего ответа."),
                 ]),
             ]),
-            "required": .array([.string("collection"), .string("file")]),
+            // Обязательна только коллекция: файл называют либо отпечатком,
+            // либо путём, и требовать оба значит требовать невозможного.
+            "required": .array([.string("collection")]),
             "additionalProperties": .bool(false),
         ]),
         outputSchema: .object([
@@ -710,6 +753,7 @@ public enum MCPToolCatalogue {
             "properties": .object([
                 "collection": .object(["type": .string("string")]),
                 "file": .object(["type": .string("string")]),
+                "fileId": .object(["type": .string("string")]),
                 "documents": .object(["type": .string("array")]),
                 "total": .object(["type": .string("integer")]),
                 "hasMore": .object(["type": .string("boolean")]),
@@ -1232,7 +1276,10 @@ public struct MCPToolService: Sendable {
     }
 
     private struct ParsedFile {
+        /// Путь, которым назвали файл. Пуст, когда файл спросили отпечатком —
+        /// тогда путь узнаётся из найденных документов и возвращается агенту.
         let path: String
+        let fingerprint: String?
         let request: MCPDocumentsRequest
         let limitNote: String?
     }
@@ -1253,6 +1300,11 @@ public struct MCPToolService: Sendable {
         var filter = DocumentFilter()
         var used = false
 
+        // Условий по метаданным может быть два — своё у агента и наше по типу
+        // файла. Складываются они через `$and`, а не затирают друг
+        // друга: «таблицы за 2024 год» — это оба условия сразу.
+        var whereClauses: [String] = []
+
         if let raw = arguments?["filter"], raw != .null {
             guard let object = raw.objectValue else {
                 return .failure(.invalidParams("Параметр «filter» должен быть объектом: {\"поле\": {\"$eq\": значение}}."))
@@ -1261,9 +1313,34 @@ public struct MCPToolService: Sendable {
                 guard let text = raw.jsonString else {
                     return .failure(.invalidParams("Параметр «filter» не удалось прочитать как JSON."))
                 }
-                filter.rawWhereJSON = text
-                used = true
+                whereClauses.append(text)
             }
+        }
+
+        if let raw = arguments?["file_types"], raw != .null {
+            guard let list = raw.arrayValue else {
+                return .failure(.invalidParams("Параметр «file_types» должен быть списком строк: [\"excel\", \"word\"]."))
+            }
+            let names = list.compactMap(\.stringValue)
+            guard names.count == list.count else {
+                return .failure(.invalidParams("Параметр «file_types» должен быть списком строк: [\"excel\", \"word\"]."))
+            }
+            switch DocumentKind.extensions(for: names) {
+            case .unknown(let message):
+                return .failure(.invalidParams(message))
+            case .extensions(let extensions):
+                if let clause = DocumentKind.whereClause(extensions: extensions) {
+                    whereClauses.append(clause)
+                }
+            }
+        }
+
+        if whereClauses.count == 1 {
+            filter.rawWhereJSON = whereClauses[0]
+            used = true
+        } else if whereClauses.count > 1 {
+            filter.rawWhereJSON = "{\"$and\": [\(whereClauses.joined(separator: ", "))]}"
+            used = true
         }
 
         if let contains = arguments?["contains"], contains != .null {
@@ -1284,6 +1361,12 @@ public struct MCPToolService: Sendable {
         }
 
         return .success(used ? filter : nil)
+    }
+
+    /// Та же сборка фильтра, доступная тестам: складывание условий по «и»
+    /// проверяется на разборе, а не на живом сервере.
+    static func filterForTesting(_ arguments: JSONValue?) -> Result<DocumentFilter?, JSONRPCError> {
+        filter(arguments)
     }
 
     /// Целое из параметров — или отказ, называющий параметр.
@@ -1438,10 +1521,15 @@ public struct MCPToolService: Sendable {
     private static func fileRequest(
         _ collection: String, _ arguments: JSONValue?, limits: MCPOutputLimits
     ) -> Result<ParsedFile, JSONRPCError> {
-        guard let path = arguments?["file"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !path.isEmpty
-        else {
-            return .failure(.invalidParams("Параметр «file» обязателен: это значение source_file — путь файла относительно папки источника."))
+        func argument(_ name: String) -> String? {
+            let value = arguments?[name]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty ?? true) ? nil : value
+        }
+        // Отпечаток предпочтительнее пути, поэтому спрашивается первым.
+        let fingerprint = argument("file_id")
+        let path = argument("file")
+        guard fingerprint != nil || path != nil else {
+            return .failure(.invalidParams("Назови файл: «file_id» — отпечаток из метаданных найденного документа, либо «file» — значение source_file, путь относительно папки источника."))
         }
 
         let requested: Int?
@@ -1457,16 +1545,30 @@ public struct MCPToolService: Sendable {
         case .success(let value): offset = max(0, value ?? 0)
         }
 
-        var filter = DocumentFilter()
-        filter.conditions = [MetadataCondition(field: "source_file", op: .equals, value: path)]
         return .success(ParsedFile(
-            path: path,
+            path: path ?? "",
+            fingerprint: fingerprint,
             request: MCPDocumentsRequest(
-                collection: collection, ids: [], filter: filter,
+                collection: collection, ids: [],
+                filter: fingerprint.map { fingerprintFilter($0) } ?? fileFilter(path ?? ""),
                 limit: resolved.count, offset: offset, orderedByChunkIndex: true
             ),
             limitNote: resolved.note
         ))
+    }
+
+    /// Условие «этот и только этот файл».
+    static func fileFilter(_ path: String) -> DocumentFilter {
+        var filter = DocumentFilter()
+        filter.conditions = [MetadataCondition(field: "source_file", op: .equals, value: path)]
+        return filter
+    }
+
+    /// То же, но по отпечатку файла.
+    static func fingerprintFilter(_ fingerprint: String) -> DocumentFilter {
+        var filter = DocumentFilter()
+        filter.conditions = [MetadataCondition(field: "file_id", op: .equals, value: fingerprint)]
+        return filter
     }
 
     /// Метаданные из параметров вызова.
@@ -1581,7 +1683,8 @@ public struct MCPToolService: Sendable {
         }
         // Фильтр отвергается вслух: агент, чей фильтр молча выбросили, решил
         // бы, что удалилось ровно то, что он описал.
-        if arguments?["filter"] != nil || arguments?["contains"] != nil {
+        if arguments?["filter"] != nil || arguments?["contains"] != nil
+            || arguments?["file_types"] != nil {
             return .failure(.invalidParams("Удаление по фильтру не предоставляется: перечисли идентификаторы в «ids». Найти их можно через get_documents с тем же фильтром."))
         }
         return .success(MCPDeleteRequest(collection: collection, ids: ids))
@@ -1732,7 +1835,12 @@ public struct MCPToolService: Sendable {
 
     /// `get_file` — чанки одного файла по порядку.
     private func file(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
-        let answer = try await backend.documents(parsed.request)
+        let found = try await fileChunks(parsed)
+        let answer = found.answer
+        // Файл, спрошенный отпечатком, называется в ответе путём: агент
+        // покажет человеку документ, а не шестнадцать знаков.
+        let path = found.path.isEmpty ? Self.storedPath(of: answer.documents) : found.path
+        let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: answer.documents)
         let rendered = MCPDocumentRendering.render(answer.documents, limits: limits)
         // Показано меньше, чем отдала база (сработал потолок объёма ответа), —
         // значит следующая страница начинается там, где оборвался показ,
@@ -1743,11 +1851,17 @@ public struct MCPToolService: Sendable {
 
         var structured: [String: JSONValue] = [
             "collection": .string(parsed.request.collection),
-            "file": .string(parsed.path),
+            // Путь, под которым файл лежит в базе, а не тот, которым его
+            // спросили: они различаются формой записи, и следующая страница
+            // должна запрашиваться тем, что сработало.
+            "file": .string(path),
             "documents": .array(rendered.documents),
             "hasMore": .bool(more),
             "offset": .int(parsed.request.offset),
         ]
+        // Отпечаток отдаётся и тогда, когда спрашивали путём: следующая
+        // страница обойдётся без пути вовсе.
+        if let fingerprint { structured["fileId"] = .string(fingerprint) }
         if let total = answer.total { structured["total"] = .int(total) }
         if more { structured["nextOffset"] = .int(next) }
 
@@ -1764,21 +1878,128 @@ public struct MCPToolService: Sendable {
         if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
 
         guard !answer.documents.isEmpty else {
+            guard parsed.fingerprint == nil else {
+                // Отпечаток испортить нечем, поэтому промах по нему значит
+                // одно из двух: коллекция не та или файла в ней нет.
+                // Отдельная беда — коллекции прежних сборок, где поля file_id
+                // ещё нет; о ней говорится прямо, иначе агент будет повторять
+                // тот же вызов.
+                let lines = [
+                    String(localized: "В коллекции «\(parsed.request.collection)» нет чанков с file_id «\(parsed.fingerprint ?? "")»."),
+                    String(localized: "Если коллекция наполнена прежними сборками, поля file_id в ней ещё нет — зови get_file с параметром file, взяв путь из поля source_file найденного документа."),
+                ] + notes
+                return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
+            }
             var lines = [String(
                 localized: "В коллекции «\(parsed.request.collection)» нет документов файла «\(parsed.path)»."
             )]
-            lines.append(String(
-                localized: "Путь берётся из поля source_file найденного документа целиком — не имя файла и не абсолютный путь."
-            ))
+            // Что делать дальше, а не только чем ошибся: файл с этим именем
+            // почти всегда в коллекции есть — агент потерял верхние папки
+            // пути. Живой случай: спросили «125326/Документ/…», а лежит
+            // «ФНС России/ЦОД/125326/Документ/…», и агент бросил читать.
+            let similar = await similarFiles(to: parsed.path, in: parsed.request.collection)
+            if similar.isEmpty {
+                lines.append(String(
+                    localized: "Путь берётся из поля source_file найденного документа целиком — не имя файла и не абсолютный путь."
+                ))
+            } else {
+                lines.append(String(
+                    localized: "Файл с таким именем в коллекции есть — путь целиком другой. Зови get_file с одним из них:"
+                ))
+                lines += similar.map { "• \($0)" }
+                structured["similarFiles"] = .array(similar.map(JSONValue.string))
+            }
             lines += notes
             return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
         }
 
         var header = String(
-            localized: "Файл «\(parsed.path)»: \(RussianCount.grouped(rendered.shown, "чанк", "чанка", "чанков")) начиная с \(parsed.request.offset.plainDigits)"
+            localized: "Файл «\(path)»: \(RussianCount.grouped(rendered.shown, "чанк", "чанка", "чанков")) начиная с \(parsed.request.offset.plainDigits)"
         )
         if let total = answer.total { header += String(localized: ", всего \(total.plainDigits)") }
         let text = ([header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
     }
+
+    /// Чанки файла — в любой форме записи пути.
+    ///
+    /// Один и тот же путь Unicode позволяет записать по-разному, и файловая
+    /// система выбирает не ту форму, в которой путь перепечатает агент.
+    /// Для базы это разные строки, поэтому спрашиваем по очереди, пока файл
+    /// не найдётся. Обычно хватает первой попытки: лишние запросы уходят
+    /// только там, где файл иначе не нашёлся бы вовсе.
+    private func fileChunks(_ parsed: ParsedFile) async throws -> (answer: MCPDocumentsAnswer, path: String) {
+        let first = try await backend.documents(parsed.request)
+        // По отпечатку перебирать нечего: он один и тот же в любой записи.
+        guard first.documents.isEmpty, parsed.fingerprint == nil else { return (first, parsed.path) }
+
+        for variant in FilePathKey.variants(parsed.path).dropFirst() {
+            let retry = MCPDocumentsRequest(
+                collection: parsed.request.collection,
+                ids: [],
+                filter: Self.fileFilter(variant),
+                limit: parsed.request.limit,
+                offset: parsed.request.offset,
+                orderedByChunkIndex: parsed.request.orderedByChunkIndex
+            )
+            let answer = try await backend.documents(retry)
+            if !answer.documents.isEmpty { return (answer, variant) }
+        }
+        return (first, parsed.path)
+    }
+
+    /// Пути файлов с тем же именем — подсказка на промах.
+    ///
+    /// По `file_name`, а не перебором коллекции: имя файла лежит в метаданных
+    /// отдельным полем, и один запрос по нему стоит дешевле обхода базы.
+    /// Ошибки здесь молчат намеренно: подсказка не обязана быть, а ответ
+    /// «нет документов» должен дойти в любом случае.
+    private func similarFiles(to path: String, in collection: String, limit: Int = 3) async -> [String] {
+        let name = (path as NSString).lastPathComponent
+        guard !name.isEmpty else { return [] }
+
+        for variant in FilePathKey.variants(name) {
+            var filter = DocumentFilter()
+            filter.conditions = [MetadataCondition(field: "file_name", op: .equals, value: variant)]
+            let request = MCPDocumentsRequest(
+                collection: collection, ids: [], filter: filter,
+                limit: Self.similarFilesScan, offset: 0
+            )
+            guard let answer = try? await backend.documents(request) else { continue }
+
+            var paths: [String] = []
+            for document in answer.documents {
+                guard case .string(let file)? = document.metadata?["source_file"] else { continue }
+                guard !paths.contains(where: { FilePathKey.matches($0, file) }) else { continue }
+                paths.append(file)
+                if paths.count == limit { return paths }
+            }
+            if !paths.isEmpty { return paths }
+        }
+        return []
+    }
+
+    /// Путь файла, как он записан у его чанков.
+    private static func storedPath(of documents: [MCPDocumentPayload]) -> String {
+        for document in documents {
+            if case .string(let path)? = document.metadata?["source_file"], !path.isEmpty { return path }
+        }
+        return ""
+    }
+
+    /// Отпечаток файла, как он записан у его чанков. `nil` у коллекций
+    /// прежних сборок: поля там ещё нет, и выдумывать его нельзя — агент
+    /// позвал бы с ним и получил пустоту.
+    private static func storedFingerprint(of documents: [MCPDocumentPayload]) -> String? {
+        for document in documents {
+            if case .string(let value)? = document.metadata?["file_id"], !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    /// Сколько чанков просматривается ради подсказки.
+    ///
+    /// Чанки одного файла идут подряд, поэтому три разных пути в выдаче по
+    /// одному имени — это уже три разных файла, а не три куска одного.
+    private static let similarFilesScan = 60
 }

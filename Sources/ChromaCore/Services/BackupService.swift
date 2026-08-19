@@ -43,7 +43,13 @@ public struct BackupEvidence: Sendable {
 ///
 /// Used before every upgrade of the `chromadb` package, before re-embedding,
 /// and available manually.
-public final class BackupService {
+/// Потокобезопасен по построению, и это объявлено: всё состояние —
+/// `let`, каталог и обработчик журнала задаются при создании и не меняются,
+/// а `FileManager.default` для этих операций документирован как безопасный.
+/// Без пометки компилятор обязан считать каждое обращение из очереди
+/// непроверенным — три предупреждения в `EnvironmentViewModel` были именно
+/// об этом, и в Swift 6 они станут ошибками сборки.
+public final class BackupService: @unchecked Sendable {
     private let log: LogHandler
     private let fileManager = FileManager.default
     /// Where copies and exports go. Injectable so tests never write into the

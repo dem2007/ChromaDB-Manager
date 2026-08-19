@@ -56,17 +56,27 @@ public struct CollectionInspector: Sendable {
         public var schema: MetadataSchema?
         /// Пары, которые человек уже посмотрел и признал не дублями.
         public var acknowledgedPairs: Set<String>
+        /// Файлы, которые сейчас лежат на диске, по источникам: идентификатор
+        /// источника → относительные пути.
+        ///
+        /// `nil` — не спрашивали, и тогда проверка «файла больше нет»
+        /// не делается вовсе. Разница принципиальная: пустой набор значит
+        /// «в папке нет ни одного файла», а это либо правда, либо отключённый
+        /// диск, — и молчать тут честнее, чем угадывать.
+        public var filesOnDisk: [String: Set<String>]?
 
         public init(
             collection: ChromaCollection,
             knownSourceIDs: Set<String> = [],
             schema: MetadataSchema? = nil,
-            acknowledgedPairs: Set<String> = []
+            acknowledgedPairs: Set<String> = [],
+            filesOnDisk: [String: Set<String>]? = nil
         ) {
             self.collection = collection
             self.knownSourceIDs = knownSourceIDs
             self.schema = schema
             self.acknowledgedPairs = acknowledgedPairs
+            self.filesOnDisk = filesOnDisk
         }
     }
 
@@ -95,6 +105,13 @@ public struct CollectionInspector: Sendable {
         var rechunkPieces: [String: [(id: String, run: String?)]] = [:]
         /// Файлы, у чанков которых стоит пометка о подменённой стратегии.
         var substitutedChunking: [String: Set<String>] = [:]
+        /// Чанки файлов, которых на диске уже нет: по файлу, а не по чанку —
+        /// у одного документа их сотни, и сотня одинаковых находок скрыла бы
+        /// всё остальное.
+        var goneFromDisk: [String: [String]] = [:]
+        /// Чанки, у которых путь в старой форме или нет отпечатка —
+        /// тоже по файлу: находка на каждый чанк утопила бы остальные.
+        var legacyPaths: [String: [String]] = [:]
         var firstIDs: [String] = []
 
         progress?(0, min(total, options.sampleSize), String(localized: "Чтение документов"))
@@ -189,6 +206,22 @@ public struct CollectionInspector: Sendable {
                     chunkIndexes[file, default: []].insert(index)
                 }
 
+                // Файл переименовали или перенесли: путь у него теперь другой,
+                // он проиндексирован заново, а чанки под прежним путём остались
+                //. Спрашивается только у источников, папку которых
+                // удалось прочитать: «файла нет» на отключённом диске значит
+                // совсем другое.
+                if let onDisk = context.filesOnDisk,
+                   case .string(let sourceID)? = metadata["source_id"],
+                   case .string(let file)? = metadata["source_file"],
+                   let known = onDisk[sourceID], !known.contains(file) {
+                    goneFromDisk[file, default: []].append(record.id)
+                }
+
+                if FilePathRepair.needsRepair(metadata), case .string(let file)? = metadata["source_file"] {
+                    legacyPaths[FilePathKey.canonical(file), default: []].append(record.id)
+                }
+
                 let hash = Self.textHash(of: record)
                 var group = byHash[hash] ?? (ids: [], files: [], sample: Self.opening(of: record.document))
                 group.ids.append(record.id)
@@ -199,6 +232,22 @@ public struct CollectionInspector: Sendable {
                 if firstIDs.count < options.nearDuplicateSampleSize { firstIDs.append(record.id) }
             }
             progress?(examined, min(total, options.sampleSize), String(localized: "Чтение документов"))
+        }
+
+        for (file, ids) in legacyPaths.sorted(by: { $0.key < $1.key }) {
+            findings.append(InspectionFinding(
+                category: .legacyFilePaths, documentIDs: ids.sorted(),
+                subject: file,
+                detail: String(localized: "чанков: \(ids.count.plainDigits)")
+            ))
+        }
+
+        for (file, ids) in goneFromDisk.sorted(by: { $0.key < $1.key }) {
+            findings.append(InspectionFinding(
+                category: .filesGoneFromDisk, documentIDs: ids.sorted(),
+                subject: file,
+                detail: String(localized: "чанков: \(ids.count.plainDigits)")
+            ))
         }
 
         // Дубли по тексту — по тексту самого документа.

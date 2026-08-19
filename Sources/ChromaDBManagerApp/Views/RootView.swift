@@ -110,7 +110,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         // разговор, и держать их на разных вкладках значило просить человека
         // прыгать между «чего не хватает» и «как поставить».
         case .environment: return [
-            String(localized: "Установка"), String(localized: "Копии"),
+            String(localized: "Установка"), String(localized: "Резервные копии"),
             String(localized: "Управление данными"),
         ]
         case .logs: return [
@@ -211,7 +211,6 @@ struct RootView: View {
     @StateObject private var sourcesModel = SourcesViewModel()
     @StateObject private var autoSync = AutoSyncCoordinator()
     @StateObject private var reembedding = ReembeddingViewModel()
-    @StateObject private var mcp = MCPService()
     /// Что бросили на окно и о чём ещё не спросили.
     @State private var droppedItems: DroppedItems?
 
@@ -450,13 +449,6 @@ struct RootView: View {
         // экрана и пять листов, и до этого он появлялся, только если человек
         // сам нажал «Проверить соединение».
         embeddingsModel.startAutomaticRefresh(app)
-
-        // Сокет MCP поднимается вместе с окном: агент подключается к
-        // запущенному приложению, и «запустите приложение» — это и есть
-        // условие работы моста. Это не сеть: файл сокета лежит в
-        // каталоге пользователя, и без зарегистрированного ключа ни один
-        // инструмент ничего не отдаёт.
-        mcp.start(app)
     }
 
     /// Шапка экрана: строка о том, чему посвящён раздел, и его вкладки.
@@ -536,7 +528,8 @@ struct RootView: View {
         case .sources:
             SourcesScreen(
                 model: sourcesModel, embeddings: embeddingsModel,
-                autoSync: autoSync, tab: openTab
+                autoSync: autoSync, tab: openTab,
+                openTab: { index in tabs[.sources] = index }
             )
         case .models:
             EmbeddingsView(
@@ -551,7 +544,7 @@ struct RootView: View {
         case .trash:
             TrashView(model: trashModel)
         case .clients:
-            ClientsView(model: clientsModel, mcp: mcp, tab: openTab)
+            ClientsView(model: clientsModel, mcp: app.mcp, tab: openTab)
         case .security:
             SecurityView(model: securityModel, serverModel: serverModel, tab: openTab)
         case .environment:

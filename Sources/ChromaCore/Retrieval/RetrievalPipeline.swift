@@ -170,6 +170,18 @@ public struct RetrievalHit: Identifiable, Hashable, Sendable {
     /// The candidate's vector, carried only while MMR needs it. Never
     /// shown and never stored — a page of embeddings is megabytes.
     public var embedding: [Double]?
+    /// Оценка, с которой кандидат идёт дальше по конвейеру.
+    ///
+    /// `nil` значит «считайте по расстоянию», как было всегда. Заполняется
+    /// там, где расстояние перестаёт быть всей правдой о полезности, —
+    /// сейчас это штраф за длину.
+    ///
+    /// Без этого поля штраф двигал **только порядок массива**, а первая же
+    /// стадия, которая считает релевантность сама, возвращала всё назад:
+    /// MMR берёт `1 - расстояние` и переупорядочивает пул по нему. Живой
+    /// замер: у профиля с разнообразием выдача со штрафом и без совпадала
+    /// до последнего идентификатора.
+    public var relevance: Double?
     /// Коллекция, из которой пришёл результат.
     ///
     /// `nil` у обычного поиска: там коллекция одна и известна спрашивающему.
@@ -345,6 +357,12 @@ public struct RetrievalDiagnostics: Sendable {
     /// stage — and a panel where every stage says «в профиле не включено» would
     /// name the wrong cause.
     public var note: String?
+    /// Ни одна необязательная стадия не изменила выдачу.
+    ///
+    /// Отдельным полем, а не текстом в `note`: `note` пишет приложение — им
+    /// оно объясняет **свой** переключатель, — а это факт о прогоне, и знать
+    /// его должен всякий, кто смотрит на диагностику.
+    public var unchangedByProfile = false
     public var stages: [StageReport] = []
     /// Time spent turning the query into a vector, or `nil` when no vector was
     /// needed at all («только текстовый поиск»).
@@ -494,7 +512,7 @@ public actor RetrievalPipeline {
         var vector: [Double] = []
         if wantsVector {
             let embeddingStarted = Date()
-            vector = try await embed(request.text)
+            vector = try await embed(profile.embeddedQuery(request.text))
             diagnostics.embeddingDuration = Date().timeIntervalSince(embeddingStarted)
         }
 
@@ -520,13 +538,59 @@ public actor RetrievalPipeline {
             textNote = found.note
         }
 
+        // Длина кандидата — работа **внутри** стадии 1, а не новая стадия
+        // в середине конвейера: порядок стадий из E0.1 неизменен,
+        // а отсекать и штрафовать надо там, где кандидаты ещё есть.
+        // Каждому списку — свой проход: у текстового поиска своя выдача,
+        // и слияние ниже считает ранги уже по исправленному порядку.
+        var lengthNotes: [String] = []
+        // Работа по длине — не стадия конвейера, поэтому «профиль ничего
+        // не изменил» не увидел бы её сам: считаем отдельно.
+        var lengthChangedSomething = false
+        // Отсечка — здесь, до слияния: слишком короткий кандидат не должен
+        // попасть в списки вовсе. А **штраф** считается один раз и после
+        // слияния: он домножает ту оценку, по которой список и
+        // упорядочен, а до слияния такой оценки ещё нет.
+        if profile.minimumCharacters > 0 {
+            let vectorOutcome = LengthPreference.applied(
+                to: vectorHits, minimumCharacters: profile.minimumCharacters, penalty: false,
+                target: profile.lengthTarget, power: profile.lengthPenaltyPower, metric: request.metric
+            )
+            vectorHits = vectorOutcome.hits
+            if let note = vectorOutcome.note { lengthNotes.append(note) }
+            lengthChangedSomething = vectorOutcome.dropped > 0
+
+            if !textHits.isEmpty {
+                let textOutcome = LengthPreference.applied(
+                    to: textHits, minimumCharacters: profile.minimumCharacters, penalty: false,
+                    target: profile.lengthTarget, power: profile.lengthPenaltyPower, metric: request.metric
+                )
+                textHits = textOutcome.hits
+                if textOutcome.dropped > 0 {
+                    lengthNotes.append(String(localized: "в текстовом списке отброшено \(textOutcome.dropped.plainDigits)"))
+                    lengthChangedSomething = true
+                }
+            }
+        }
+
         var hits = vectorHits
         var candidateNote = pool == nResults
             ? String(localized: "запрошено \(pool) — пул не нужен, дальше ничего не отсеивает")
             : String(localized: "запрошено \(pool)")
         if !wantsVector { candidateNote = String(localized: "векторный поиск выключен") }
         if let levelNote { candidateNote += ", \(levelNote)" }
+        // Приставка к запросу — в отчёт: иначе две выдачи с разным
+        // вектором одного и того же запроса выглядели бы необъяснимо.
+        if wantsVector, !profile.queryPrefix.isEmpty {
+            // Многоточие — только там, где вправду обрезали: приставка nomic
+            // короче сорока знаков, и «search_query:…» отправило бы читателя
+            // искать продолжение, которого нет.
+            let shown = profile.queryPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cut = shown.count > 40 ? shown.prefix(40) + "…" : shown[...]
+            candidateNote += ", " + String(localized: "приставка к запросу: \(String(cut))")
+        }
         if let textNote { candidateNote += ", \(textNote)" }
+        for note in lengthNotes { candidateNote += ", \(note)" }
         diagnostics.stages.append(.init(
             stage: .candidates, ran: true, inputCount: 0,
             outputCount: vectorHits.count + textHits.count,
@@ -567,6 +631,32 @@ public actor RetrievalPipeline {
                     stage: .fusion, ran: false, inputCount: hits.count, outputCount: hits.count,
                     note: String(localized: "второй источник кандидатов не включён")
                 ))
+            }
+        }
+
+        // Штраф за длину — один раз, поверх оценки слияния.
+        //
+        // Считать его внутри каждого списка бесполезно: RRF складывает ранги
+        // заново, и короткий чанк, найденный обоими источниками, выходит
+        // вперёд мимо штрафа — замер на живой базе, запрос «сервер»: чанк
+        // в 54 знака стоял первым, вторым, третьим и четвёртым (дубли),
+        // получив по вкладу от каждого источника.
+        if profile.lengthPenaltyEnabled {
+            let outcome = LengthPreference.applied(
+                to: hits, minimumCharacters: 0, penalty: true,
+                target: profile.lengthTarget, power: profile.lengthPenaltyPower,
+                metric: request.metric
+            )
+            hits = outcome.hits
+            if outcome.moved > 0 { lengthChangedSomething = true }
+            if let note = outcome.note, let last = diagnostics.stages.indices.last {
+                let report = diagnostics.stages[last]
+                diagnostics.stages[last] = .init(
+                    stage: report.stage, outcome: report.outcome,
+                    inputCount: report.inputCount, outputCount: report.outputCount,
+                    duration: report.duration,
+                    note: [report.note, note].compactMap { $0 }.joined(separator: ", ")
+                )
             }
         }
 
@@ -701,12 +791,35 @@ public actor RetrievalPipeline {
         if stages.contains(.marks) {
             let marksStarted = Date()
             let before = hits.count
+            // Закреплённое сначала **добирается**, и только потом
+            // список двигается. Стадия работала с тем, что вернул вектор,
+            // а закрепляют как раз то, что вектор находить не хочет: при
+            // n_results 5 документ, стоящий восьмым по близости, в кандидаты
+            // не попадал вовсе — и «Закрепить» не делало ровно ничего.
+            // Отдельным запросом, а не расширением пула: помеченных
+            // документов единицы, а пул платили бы все поиски подряд, и
+            // «выключенный конвейер даёт то же, что этап 2» перестало бы
+            // быть правдой буквально.
+            //
+            // Спрашиваем базу только там, где закреплённые вообще есть:
+            // ответ на этот вопрос кеширован на коллекцию, иначе каждый поиск
+            // платил бы обходом метаданных ради «нет».
+            var pinnedNote: String?
+            let worthAsking = await shapes.hasPinnedDocuments(
+                collectionID: request.collectionID, database: database
+            )
+            if worthAsking, let added = try? await pinnedBeyond(
+                hits, collectionID: request.collectionID, filter: request.filter
+            ), !added.isEmpty {
+                hits += added
+                pinnedNote = String(localized: "добрано закреплённых: \(added.count.plainDigits)")
+            }
             let marked = Self.applyingMarks(hits)
             hits = marked.hits
             diagnostics.stages.append(.init(
                 stage: .marks, ran: true, inputCount: before, outputCount: hits.count,
                 duration: Date().timeIntervalSince(marksStarted),
-                note: marked.note
+                note: [pinnedNote, marked.note].compactMap { $0 }.joined(separator: ", ")
             ))
         } else {
             diagnostics.stages.append(.init(
@@ -727,6 +840,20 @@ public actor RetrievalPipeline {
                 : String(localized: "отбрасывать нечего: кандидатов не больше, чем запрошено")
         ))
 
+        // Сказать вслух, когда «умный поиск» не отличается от обычного.
+        //
+        // Заводской профиль включает три стадии: свёртку по родителю, подъём
+        // к разделу и пометки человека. Первые две коллекции, нарезанной одним
+        // уровнем, недоступны вовсе, а третья без единой пометки ничего
+        // не двигает — и запрос уходит в базу тем же вектором, с тем же
+        // n_results, и возвращает ровно тот же список, что и с выключенным
+        // переключателем. Человек, который специально включил галочку и не
+        // увидел разницы, вправе считать её сломанной; правило 2 требует
+        // назвать причину, а не оставлять его гадать.
+        diagnostics.unchangedByProfile = Self.profileChangedNothing(
+            stages: diagnostics.stages, requested: profile.requestedStages,
+            lengthChangedSomething: lengthChangedSomething
+        )
         diagnostics.totalDuration = Date().timeIntervalSince(started)
         log(.debug, "Поиск",
             "Запрос к «\(request.collectionName)»: \(RussianCount.phrase(hits.count, "результат", "результата", "результатов")), \(diagnostics.summary)")
@@ -738,6 +865,84 @@ public actor RetrievalPipeline {
             log(.debug, "Поиск", "  \(report.line)")
         }
         return RetrievalOutcome(hits: hits, diagnostics: diagnostics)
+    }
+
+    /// Закреплённые документы коллекции, которых нет в выдаче.
+    ///
+    /// Спрашивается только у стадии пометок и только по самой пометке:
+    /// `_cdbm_mark == pinned`. Закреплённых в коллекции единицы — человек
+    /// ставит эту пометку руками, — поэтому запрос дешёвый и предел ему
+    /// поставлен небольшой: закрепить пол-коллекции и ждать, что всё это
+    /// приедет в каждую выдачу, значит не искать вовсе.
+    ///
+    /// Понижённые и устаревшие не добираются: они говорят «ниже», а не
+    /// «покажи», и притаскивать их в выдачу ради того, чтобы опустить
+    /// в самый низ, — работа впустую.
+    ///
+    /// Фильтр человека уважается: закреплённое, не подходящее под условия
+    /// запроса, не показывается — «только за прошлый год» остаётся правдой.
+    private func pinnedBeyond(
+        _ hits: [RetrievalHit], collectionID: String, filter: DocumentFilter?
+    ) async throws -> [RetrievalHit] {
+        var pinnedFilter = filter ?? DocumentFilter()
+        // Фильтр, написанный руками в JSON, не трогается: дописать в него
+        // условие — значит переписать чужой запрос (то же правило, что
+        // и у выбора уровня иерархии).
+        guard !pinnedFilter.usesRawJSON else { return [] }
+        pinnedFilter.root = .group(.and, pinnedFilter.root.children + [
+            .leaf(MetadataCondition(
+                field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
+            )),
+        ])
+        let known = Set(hits.map(\.id))
+        let found = try await database.documents(
+            collectionID: collectionID, matching: pinnedFilter, limit: Self.pinnedLimit
+        )
+        return found
+            .filter { !known.contains($0.id) }
+            // Ни расстояния, ни места в списке источника: этот документ нашёл
+            // не поиск, а пометка человека. Врать про расстояние, которого
+            // никто не мерил, нельзя — карточка результата покажет пометку,
+            // и по ней видно, почему он здесь.
+            .map {
+                RetrievalHit(
+                    id: $0.id, document: $0.document, metadata: $0.metadata,
+                    distance: nil, sources: [], placements: []
+                )
+            }
+    }
+
+    /// Сколько закреплённых документов доберётся в выдачу.
+    static let pinnedLimit = 20
+
+    /// Ни одна необязательная стадия не тронула выдачу.
+    ///
+    /// Считается по отчётам стадий, а не по настройкам: стадия могла быть
+    /// включена в профиле и всё равно не сработать — потому что коллекция
+    /// плоская, потому что в выдаче нет ни одной пометки, потому что модель
+    /// переранжировщика не выбрана. Именно результат, а не намерение, отвечает
+    /// на вопрос «почему галочка ничего не изменила».
+    ///
+    /// Пометки — особый случай: стадия отработала, но при отсутствии
+    /// помеченных документов она возвращает список как есть, и это видно
+    /// по её собственной заметке.
+    static func profileChangedNothing(
+        stages: [RetrievalDiagnostics.StageReport], requested: Set<RetrievalStage>,
+        lengthChangedSomething: Bool = false
+    ) -> Bool {
+        // Штраф и отсечка по длине живут внутри стадии 1 и своей строки
+        // в отчёте стадий не имеют — а выдачу меняют.
+        if lengthChangedSomething { return false }
+        guard !requested.isEmpty else { return true }
+        for report in stages where report.stage.isOptional {
+            guard report.ran else { continue }
+            if report.stage == .marks, report.outputCount == report.inputCount,
+               report.note == String(localized: "помеченных документов в выдаче нет") {
+                continue
+            }
+            return false
+        }
+        return true
     }
 
     // MARK: - Stage 8: ручные пометки
@@ -937,12 +1142,25 @@ public actor RetrievalPipeline {
             collectionID: request.collectionID, matching: textFilter, limit: limit
         )
         let ranked = TextRelevance.ranked(records, terms: terms)
+        // Текстовый кандидат несёт свою оценку дальше по конвейеру.
+        //
+        // Расстояния у него нет и быть не может: `$contains` отвечает
+        // «содержит», а не «насколько похоже». Зато есть вес по редкости
+        // слов, которым эта половина и упорядочена, — приведённый к 0…1
+        // по лучшему в списке. Без него штраф за длину до текстовой
+        // половины не доходил, и она возвращала в верхушку ровно тот
+        // короткий мусор, который он убирал: на живом замере коротких
+        // чанков в первой пятёрке было 4.2 из 5 — столько же, сколько
+        // без всякого штрафа.
+        let best = ranked.first?.score ?? 1
         let hits = ranked.enumerated().map { position, entry in
-            RetrievalHit(
+            var hit = RetrievalHit(
                 id: entry.record.id, document: entry.record.document,
                 metadata: entry.record.metadata, distance: nil, sources: [.text],
                 placements: [SourcePlacement(source: .text, position: position + 1)]
             )
+            hit.relevance = best > 0 ? entry.score / best : 0
+            return hit
         }
         var note = String(localized: "текстовый поиск: найдено \(records.count), с ненулевым весом \(hits.count), написаний запрошено \(variants.count)")
         // Фраза ищется целиком — и «astra linux орел» не находится там, где эти
@@ -980,9 +1198,26 @@ public actor RetrievalPipeline {
         for hit in text { byID[hit.id] = hit }
         for hit in vector { byID[hit.id] = hit }
 
+        // Лучшая оценка слияния — единица шкалы.
+        //
+        // Сырое значение RRF мало по устройству: у первого места это
+        // 1/(k+1) ≈ 0.016. Отдать его дальше как «релевантность» нельзя —
+        // стадия разнообразия сравнивает её с косинусной похожестью
+        // кандидатов в 0…1, и слагаемое релевантности оказывается в тридцать
+        // раз легче слагаемого повторности: MMR перестаёт смотреть, о чём
+        // вообще документ. Приводим к 0…1, как это уже сделано у текстовой
+        // половины.
+        let bestFused = fused.first?.score ?? 1
         let hits = fused.compactMap { entry -> RetrievalHit? in
             guard var hit = byID[entry.id] else { return nil }
             hit.sources = entry.sources
+            // Оценка слияния идёт дальше по конвейеру: у
+            // документа, найденного обоими источниками, она выше, и штраф
+            // за длину обязан домножать именно её. Иначе он считается внутри
+            // каждого списка по отдельности, а RRF потом складывает ранги
+            // заново — и короткий чанк, попавший в оба списка, выходит вперёд
+            // мимо всякого штрафа.
+            hit.relevance = bestFused > 0 ? entry.score / bestFused : 0
             // Where each source had it before the merge — the one thing the
             // fused order itself no longer shows.
             hit.placements = entry.placements.map {
@@ -1010,9 +1245,18 @@ public actor RetrievalPipeline {
     /// E4 applies to fusion.
     ///
     /// Candidates whose vector did not come back cannot be compared to anything.
-    /// They keep their places at the end rather than disappearing: losing a
-    /// result because its embedding was missing would be a worse failure than
-    /// showing it out of order.
+    /// They keep their places rather than disappearing: losing a result because
+    /// its embedding was missing would be a worse failure than showing it out
+    /// of order.
+    ///
+    /// **Место — по рангу слияния, а не в конце списка**. Текстовая
+    /// половина гибридного поиска приходит без векторов: `$contains` отдаёт
+    /// документы, а не эмбеддинги. Пока такие кандидаты сваливались в хвост,
+    /// усечение до `n_results` выбрасывало их **все** — то есть при включённом
+    /// разнообразии текстовый поиск не влиял на выдачу вообще. Живой замер:
+    /// на запросе «ФНС сервера» текстовая половина нашла 200 документов,
+    /// слияние дало 377 кандидатов — и выдача совпала с той, где текстового
+    /// поиска не было вовсе, до последнего идентификатора.
     static func diversifying(
         _ hits: [RetrievalHit], count: Int, lambda: Double, metric: DistanceMetric?
     ) -> (hits: [RetrievalHit], note: String?) {
@@ -1023,7 +1267,9 @@ public actor RetrievalPipeline {
 
         let total = withVectors.count
         let candidates = withVectors.enumerated().map { position, entry -> MaximalMarginalRelevance.Candidate in
-            let bounded = entry.element.distance.flatMap { metric?.similarity(forDistance: $0) }
+            // Сначала — оценка, если её кто-то уже поправил.
+            let bounded = entry.element.relevance
+                ?? entry.element.distance.flatMap { metric?.similarity(forDistance: $0) }
             // Without a bounded scale: first in the pool is 1, last is near 0.
             let byRank = total > 1 ? 1 - Double(position) / Double(total) : 1
             return MaximalMarginalRelevance.Candidate(
@@ -1038,13 +1284,38 @@ public actor RetrievalPipeline {
         let byID: [String: RetrievalHit] = Dictionary(
             hits.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }
         )
-        var result = order.compactMap { byID[$0] }
-        // Everything MMR did not look at, in the order it arrived.
-        result += hits.filter { position[$0.id] == nil && $0.embedding?.isEmpty != false }
-        return (
-            result,
-            String(localized: "λ \(String(format: "%.2f", lambda)), из \(hits.count) кандидатов оставлено \(result.count)")
-        )
+        let chosen = order.compactMap { byID[$0] }
+
+        // Кандидаты без вектора — по рангу среди **уцелевших**, а не среди
+        // всех, кто пришёл. MMR прореживает векторную половину (из двухсот
+        // остаётся десять), и считать место по выбывшим значит отправить
+        // текстовую половину в хвост: у первого текстового кандидата было
+        // десять векторных впереди, из которых MMR оставил одного.
+        var vectorless: [Int: [RetrievalHit]] = [:]
+        var survivorsSoFar = 0
+        for hit in hits {
+            if position[hit.id] != nil {
+                survivorsSoFar += 1
+                continue
+            }
+            guard hit.embedding?.isEmpty != false else { continue }
+            vectorless[survivorsSoFar, default: []].append(hit)
+        }
+
+        // Ключи `vectorless` лежат в 0…chosen.count — счётчик растёт только
+        // на выбранных, — поэтому цикл ниже разбирает их все, и «хвоста
+        // на всякий случай» здесь быть не может.
+        var result: [RetrievalHit] = vectorless[0] ?? []
+        for (index, hit) in chosen.enumerated() {
+            result.append(hit)
+            result += vectorless[index + 1] ?? []
+        }
+        let mixed = result.count - chosen.count
+        var note = String(localized: "λ \(String(format: "%.2f", lambda)), из \(hits.count) кандидатов оставлено \(result.count)")
+        if mixed > 0 {
+            note += String(localized: ", из них без вектора \(mixed.plainDigits) — расставлены по рангу слияния")
+        }
+        return (result, note)
     }
 
     // MARK: - Stage 6: the chunks that stood next to the match

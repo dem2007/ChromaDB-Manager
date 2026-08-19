@@ -308,6 +308,26 @@ final class ReextractionPlanTests: XCTestCase {
         XCTAssertEqual(forced.staleExtraction.map(\.relativePath), ["b.pdf"])
     }
 
+    /// Переизвлечение меняет **список работ**, а не всё, что план успел
+    /// заметить. Раньше поля переносились выборочно, и пометка о новом уровне
+    /// вложенности исчезала с карточки на первом же переизвлечении — уровень
+    /// в папке оставался, а сказать о нём было уже некому.
+    func testForcingKeepsWhatThePlanNoticed() {
+        var original = plan(stale: ["a.pdf"])
+        original = SyncPlan(
+            sourceID: original.sourceID, sourceName: original.sourceName, items: original.items,
+            newlyMissing: original.newlyMissing, pendingRemovals: original.pendingRemovals,
+            staleExtraction: original.staleExtraction,
+            tableRowsToEmbed: 42,
+            newFolderLevels: [NewFolderLevel(number: 3, folderCount: 7, examples: ["2025", "2026"])]
+        )
+
+        let forced = SourceSyncService.forcing(["a.pdf"], in: original)
+
+        XCTAssertEqual(forced.newFolderLevels.map(\.number), [3])
+        XCTAssertEqual(forced.tableRowsToEmbed, 42)
+    }
+
     func testAnEmptyRequestChangesNothing() {
         let original = plan(stale: ["a.pdf"])
         let forced = SourceSyncService.forcing([], in: original)
@@ -316,7 +336,7 @@ final class ReextractionPlanTests: XCTestCase {
     }
 }
 
-// MARK: - The rule end to end asks for this one by name)
+// MARK: - The rule end to end ( asks for this one by name)
 
 final class ExtractionCurrencyEndToEndTests: XCTestCase {
     private var root: URL!

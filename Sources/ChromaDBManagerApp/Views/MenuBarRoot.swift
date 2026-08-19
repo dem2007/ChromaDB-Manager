@@ -15,6 +15,7 @@ struct MenuBarRoot: View {
     var body: some View {
         MenuBarView(
             search: quickSearch,
+            mcp: app.mcp,
             openMainWindow: { request in
                 app.pendingRequest = request
                 delegate.showMainWindow()
@@ -50,6 +51,14 @@ struct MenuBarSupport: ViewModifier {
             delegate.openViewer = { openWindow(id: ChromaDBManagerApp.viewerWindowID) }
             delegate.openMain = { openWindow(id: ChromaDBManagerApp.mainWindowID) }
             delegate.startMenuBarSupport()
+            // Сокет MCP поднимается вместе с приложением, а не с окном
+            //: агент подключается к запущенному приложению, и
+            // закрытое окно — не повод рвать мост, если приложение осталось
+            // в строке меню. Это не сеть: файл сокета лежит в каталоге
+            // пользователя, и без зарегистрированного ключа ни один
+            // инструмент ничего не отдаёт. Повторный вызов безвреден —
+            // `start` выходит сам, если уже слушает.
+            app.mcp.start(app)
         }
     }
 }

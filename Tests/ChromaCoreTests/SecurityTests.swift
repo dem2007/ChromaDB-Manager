@@ -126,7 +126,7 @@ final class EmergencyRevocationTests: XCTestCase {
     }
 }
 
-/// «Ни один секрет не попадает в git, логи или отчёты» (ТЗ — as a
+/// «Ни один секрет не попадает в git, логи или отчёты» (ТЗ) — as a
 /// property of the code, not of anybody's discipline.
 final class SecretsStayOutOfSightTests: XCTestCase {
     func testAWholeClientKeyIsMaskedButThePrefixSurvives() {

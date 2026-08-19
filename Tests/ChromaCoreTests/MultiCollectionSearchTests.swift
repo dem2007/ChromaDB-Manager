@@ -4,12 +4,59 @@ import XCTest
 /// Поиск сразу по нескольким коллекциям.
 final class MultiCollectionSearchTests: XCTestCase {
     private func target(
-        _ name: String, model: String = "bge-m3", metric: DistanceMetric = .cosine, weight: Double = 1
+        _ name: String, model: String = "bge-m3", metric: DistanceMetric = .cosine, weight: Double = 1,
+        queryPrefix: String = ""
     ) -> MultiCollectionSearch.Target {
-        MultiCollectionSearch.Target(
+        var profile = SearchProfile(collectionName: name)
+        profile.queryPrefix = queryPrefix
+        return MultiCollectionSearch.Target(
             collectionID: "id-\(name)", collectionName: name, model: model, metric: metric,
-            profile: SearchProfile(collectionName: name), weight: weight
+            profile: profile, weight: weight
         )
+    }
+
+    // MARK: - Приставка к запросу
+
+    /// Здесь вектор передаётся в конвейер готовым, и свою приставку он
+    /// применить уже не может — значит применить её обязан этот поиск.
+    /// Иначе одна и та же настройка работала бы в поиске по одной коллекции
+    /// и молча не работала в поиске по нескольким.
+    func testThePrefixOfEachTargetReachesTheModel() async {
+        let calls = Calls()
+        let search = MultiCollectionSearch(
+            embed: { text, _ in calls.texts.append(text); return [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) }
+        )
+        _ = await search.run(query: "сервер", targets: [target("без"), target("с", queryPrefix: "search_query: ")])
+        XCTAssertEqual(calls.texts, ["сервер", "search_query: сервер"])
+    }
+
+    /// Одна модель, но разные приставки — это два разных запроса к ней.
+    /// Запас по одной лишь модели отдал бы второй цели чужой вектор.
+    func testTwoPrefixesOnOneModelAreTwoVectors() async {
+        let calls = Calls()
+        let search = MultiCollectionSearch(
+            embed: { text, _ in calls.texts.append(text); return [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) }
+        )
+        let answer = await search.run(
+            query: "сервер",
+            targets: [target("а", queryPrefix: "A: "), target("б", queryPrefix: "Б: ")]
+        )
+        XCTAssertEqual(answer.embeddingCalls, 2, "приставки разные: \(calls.texts)")
+    }
+
+    /// И экономия остаётся: одинаковая приставка на одной модели — один вызов.
+    func testTheSamePrefixOnOneModelIsStillOneCall() async {
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) }
+        )
+        let answer = await search.run(
+            query: "сервер",
+            targets: [target("а", queryPrefix: "A: "), target("б", queryPrefix: "A: ")]
+        )
+        XCTAssertEqual(answer.embeddingCalls, 1)
     }
 
     private func hit(_ id: String, distance: Double) -> RetrievalHit {
@@ -23,6 +70,7 @@ final class MultiCollectionSearchTests: XCTestCase {
     private final class Calls: @unchecked Sendable {
         var models: [String] = []
         var searched: [String] = []
+        var texts: [String] = []
     }
 
     /// Главное обещание: три коллекции на одной модели — один вектор запроса,

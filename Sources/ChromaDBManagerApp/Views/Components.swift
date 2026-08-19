@@ -276,6 +276,7 @@ struct AdvancedSection<Content: View>: View {
             Text(title)
                 .font(Theme.Font.control)
                 .foregroundStyle(Theme.Palette.secondaryText)
+                .togglesDisclosure($isExpanded)
         }
     }
 }
@@ -308,6 +309,7 @@ struct HowItWorks<Content: View>: View {
             Text("Как это работает")
                 .font(Theme.Font.control)
                 .foregroundStyle(Theme.Palette.primaryText)
+                .togglesDisclosure($isExpanded)
         }
         .padding(.horizontal, Theme.Padding.rowHorizontal)
         .padding(.vertical, Theme.Padding.rowVertical)
@@ -317,6 +319,57 @@ struct HowItWorks<Content: View>: View {
             RoundedRectangle(cornerRadius: Theme.Radius.row)
                 .strokeBorder(Theme.Palette.border, lineWidth: 1)
         )
+    }
+}
+
+extension View {
+    /// Весь заголовок раскрывашки — кнопка, а не одна стрелка.
+    ///
+    /// На macOS `DisclosureGroup` откликается только на треугольник слева:
+    /// подпись рядом с ним выглядит нажимаемой, но не нажимается. Промах
+    /// мимо цели в шесть точек — это не придирка, а обычное «ткнул и ничего
+    /// не произошло».
+    ///
+    /// `contentShape` нужен вместе с растяжкой по ширине: без него нажатие
+    /// ловил бы только сам текст, а пустое место справа от него — нет.
+    func togglesDisclosure(_ isExpanded: Binding<Bool>) -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.wrappedValue.toggle() }
+            }
+    }
+}
+
+/// Подпись, ширина которой не зависит от начертания.
+///
+/// Выделять выбранный пункт полужирным правильно, а менять из-за этого его
+/// размер — нет: полужирный текст шире обычного, и переключатель ёрзал при
+/// каждом нажатии, сдвигая заодно и соседние пункты. Место занимает
+/// **невидимый полужирный двойник**, а поверх него рисуется настоящая
+/// подпись — то есть ширина всегда одна, наибольшая, а меняется только вид.
+///
+/// Двойник скрыт от озвучивания: иначе VoiceOver прочитал бы подпись дважды.
+struct SteadyWeightLabel: View {
+    let title: String
+    let font: Font
+    let isEmphasised: Bool
+    let colour: Color
+
+    /// Начертание, по которому считается место. Не зависит от состояния —
+    /// в этом весь смысл.
+    static func sizingFont(_ font: Font) -> Font { font.weight(.semibold) }
+
+    var body: some View {
+        Text(title)
+            .font(Self.sizingFont(font))
+            .opacity(0)
+            .accessibilityHidden(true)
+            .overlay(
+                Text(title)
+                    .font(isEmphasised ? font.weight(.semibold) : font)
+                    .foregroundStyle(colour)
+            )
     }
 }
 
@@ -330,9 +383,12 @@ struct SegmentedSelector<Value: Hashable>: View {
         HStack(spacing: 2) {
             ForEach(options, id: \.value) { option in
                 let isSelected = option.value == selection
-                Text(option.title)
-                    .font(isSelected ? Theme.Font.caption.weight(.semibold) : Theme.Font.caption)
-                    .foregroundStyle(isSelected ? Theme.Palette.primaryText : Theme.Palette.secondaryText)
+                SteadyWeightLabel(
+                    title: option.title,
+                    font: Theme.Font.caption,
+                    isEmphasised: isSelected,
+                    colour: isSelected ? Theme.Palette.primaryText : Theme.Palette.secondaryText
+                )
                     .padding(.horizontal, 16)
                     .padding(.vertical, 5)
                     .background(
@@ -512,7 +568,7 @@ struct ConsoleView: View {
     }
 }
 
-/// The shared shell for anything log-shaped of the styling brief).
+/// The shared shell for anything log-shaped ( of the styling brief).
 struct LogBlock<Content: View>: View {
     var caption: String?
     var minHeight: CGFloat?
@@ -581,20 +637,50 @@ struct CapsuleButtonStyle: ButtonStyle {
     enum Kind { case primary, normal, secondary, danger }
 
     let kind: Kind
+    /// Цвет выбранного состояния — `nil` значит «не выбрана».
+    ///
+    /// Своим полем, а не `.tint`: этот стиль рисует и заливку, и цвет надписи
+    /// сам, поэтому `.tint` до него не доходит вовсе. Живой случай: кнопки
+    /// «релевантен / частично / нерелевантен» в стенде оценки красились
+    /// именно так — отметка ставилась, а кнопка не менялась ничем, и человек
+    /// жал её второй раз, снимая только что поставленную оценку.
+    var chosen: Color?
+    /// Держать ширину по выбранному состоянию, даже когда кнопка не выбрана
+    ///.
+    ///
+    /// Нужно кнопкам выбора: у выбранной начертание `.medium`, у прочих
+    /// `.regular`, и полужирная надпись шире — тройка «релевантен / частично
+    /// / нерелевантен» дёргалась при каждом нажатии. Место занимает невидимый
+    /// двойник надписи в выбранном начертании.
+    ///
+    /// Отдельным полем, а не всегда: обычная кнопка выбранной не бывает,
+    /// и расширять её ради состояния, в которое она не попадёт, незачем.
+    var reservesEmphasisWidth = false
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         let height = kind == .secondary ? Theme.Size.secondaryControl : Theme.Size.control
-        configuration.label
-            .font(.system(
-                size: kind == .secondary ? 12.5 : 13,
-                weight: kind == .primary || kind == .danger ? .medium : .regular
-            ))
+        let size: CGFloat = kind == .secondary ? 12.5 : 13
+        let emphasised = kind == .primary || kind == .danger || chosen != nil
+        let label = configuration.label
+            .font(.system(size: size, weight: emphasised ? .medium : .regular))
             .foregroundStyle(foreground)
+
+        return Group {
+            if reservesEmphasisWidth {
+                configuration.label
+                    .font(.system(size: size, weight: .medium))
+                    .opacity(0)
+                    .accessibilityHidden(true)
+                    .overlay(label)
+            } else {
+                label
+            }
+        }
             .padding(.horizontal, kind == .secondary ? 13 : (kind == .normal ? 14 : 16))
             .frame(height: height)
             .background(background)
-            .overlay(Capsule().strokeBorder(Theme.Palette.border, lineWidth: 1))
+            .overlay(Capsule().strokeBorder(chosen ?? Theme.Palette.border, lineWidth: 1))
             .clipShape(Capsule())
             .shadow(color: glow, radius: 8, y: 2)
             .opacity(configuration.isPressed ? 0.82 : 1)
@@ -602,6 +688,7 @@ struct CapsuleButtonStyle: ButtonStyle {
 
     private var foreground: Color {
         guard isEnabled else { return Theme.Palette.captionText }
+        if chosen != nil { return .white }
         switch kind {
         case .primary, .danger: return .white
         case .normal, .secondary: return Theme.Palette.primaryText
@@ -611,6 +698,8 @@ struct CapsuleButtonStyle: ButtonStyle {
     @ViewBuilder private var background: some View {
         if !isEnabled {
             Capsule().fill(Theme.Palette.selectionFill)
+        } else if let chosen {
+            Capsule().fill(chosen)
         } else {
             switch kind {
             case .primary:
@@ -631,6 +720,7 @@ struct CapsuleButtonStyle: ButtonStyle {
 
     private var glow: Color {
         guard isEnabled else { return .clear }
+        if let chosen { return chosen.opacity(0.35) }
         switch kind {
         case .primary: return Theme.Palette.accent.opacity(0.45)
         case .danger: return Theme.Palette.danger.opacity(0.4)
@@ -643,6 +733,10 @@ extension ButtonStyle where Self == CapsuleButtonStyle {
     /// Главная кнопка экрана — одна.
     static var chromaPrimary: CapsuleButtonStyle { CapsuleButtonStyle(kind: .primary) }
     static var chromaNormal: CapsuleButtonStyle { CapsuleButtonStyle(kind: .normal) }
+    /// Кнопка выбора: цвет — «выбрана», `nil` — «не выбрана».
+    static func chromaChoice(_ chosen: Color?) -> CapsuleButtonStyle {
+        CapsuleButtonStyle(kind: .normal, chosen: chosen, reservesEmphasisWidth: true)
+    }
     static var chromaSecondary: CapsuleButtonStyle { CapsuleButtonStyle(kind: .secondary) }
     /// Необратимое действие.
     static var chromaDanger: CapsuleButtonStyle { CapsuleButtonStyle(kind: .danger) }

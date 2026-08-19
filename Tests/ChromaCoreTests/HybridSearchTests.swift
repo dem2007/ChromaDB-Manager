@@ -91,6 +91,57 @@ final class TextRelevanceTests: XCTestCase {
         return DocumentRecord(id: id, document: text, metadata: metadata.isEmpty ? nil : metadata)
     }
 
+    /// Частое слово запроса не должно решать исход.
+    ///
+    /// Живой случай: «vCpu» находил нужное, а «ГЕОП аренда виртуальных
+    /// процессоров» по тому же документу — мусор. «ГЕОП» стоит почти в каждом
+    /// чанке этого файла, и без веса по редкости побеждал тот чанк, где
+    /// название платформы повторяется чаще всего.
+    func testACommonWordDoesNotOutweighTheRareOne() {
+        var records = (0..<12).map {
+            record("общий-\($0)", "ГЕОП. Услуги ГЕОП. Порядок оказания услуг ГЕОП участникам ГЕОП.")
+        }
+        records.append(record("нужный", "Аренда vCPU: виртуальных процессоров в ГЕОП, тарификация по vCPU."))
+
+        let terms = ["ГЕОП", "аренда", "виртуальных", "процессоров"]
+        let ranked = TextRelevance.ranked(records, terms: terms)
+
+        XCTAssertEqual(ranked.first?.record.id, "нужный", "порядок: \(ranked.map(\.record.id).prefix(3))")
+    }
+
+    /// Вес считается по редкости: слово из всех документов набора весит мало,
+    /// слово из одного — много.
+    func testTheWeightFollowsRarity() throws {
+        let records = (0..<10).map { record("д-\($0)", $0 == 0 ? "ГЕОП и vCPU" : "ГЕОП и услуги") }
+        let weights = TextRelevance.termWeights(["ГЕОП", "vCPU"], in: records)
+        let common = try XCTUnwrap(weights["ГЕОП"], "вес частого терма обязан быть посчитан")
+        let rare = try XCTUnwrap(weights["vCPU"], "вес редкого терма обязан быть посчитан")
+        XCTAssertLessThan(common, rare)
+    }
+
+    /// Терм, стоящий только в пути заголовков, редким не считается.
+    ///
+    /// Частота считается по тексту **и** заголовку, потому что вес умножает
+    /// и бонус за заголовок: иначе слово, которого нет ни в одном тексте,
+    /// получало бы максимальный вес и поднимало свой чанк ни за что.
+    func testAHeadingOnlyTermIsNotTreatedAsRare() throws {
+        let records = (0..<10).map {
+            record("д-\($0)", "Порядок оказания услуг", heading: "Раздел 3 › Тарификация")
+        }
+        let weights = TextRelevance.termWeights(["услуг", "Тарификация"], in: records)
+        let inText = try XCTUnwrap(weights["услуг"])
+        let inHeading = try XCTUnwrap(weights["Тарификация"])
+        XCTAssertEqual(inHeading, inText, accuracy: 1e-9, "оба слова есть у всех записей — веса равны")
+    }
+
+    /// Запрос из одного слова не трогается вовсе: общий множитель мест
+    /// не переставляет, а лишний проход по кандидатам — работа впустую.
+    func testASingleWordQueryIsNotWeighted() {
+        let records = [record("а", "vCPU"), record("б", "vCPU и ещё vCPU")]
+        XCTAssertTrue(TextRelevance.termWeights(["vCPU"], in: records).isEmpty)
+        XCTAssertEqual(TextRelevance.ranked(records, terms: ["vCPU"]).first?.record.id, "б")
+    }
+
     func testMoreOccurrencesRankHigher() {
         let ranked = TextRelevance.ranked(
             [record("один", "ORA-01555 упомянут один раз"),

@@ -3,7 +3,7 @@ import Foundation
 /// Types a metadata field may take.
 ///
 /// ChromaDB stores only scalars — string, int, float, bool (verified, see
-///. There is deliberately no "list" or "object" type: the
+///). There is deliberately no "list" or "object" type: the
 /// server would reject them. A date is an ISO-8601 string, optionally mirrored
 /// into a numeric unix-timestamp field so range filters work.
 public enum MetadataFieldType: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -199,17 +199,19 @@ public struct MetadataSchema: Codable, Hashable, Identifiable, Sendable {
     /// requires the schema builder to know them as auto fields, and a document
     /// typed by hand cannot be expected to carry an `extractor_id`.
     public static let sourceProvidedKeys: Set<String> = [
-        "source_id", "source_file", "chunk_index", "chunk_count",
+        "source_id", "source_file", "file_id", "chunk_index", "chunk_count",
         "chunk_estimated_tokens", "chunk_level", "parent_chunk_id", "content_hash",
         "file_ext", "file_mtime", "file_size", "file_name", "relative_path",
         "extractor_id", "extractor_version", "container_format", "structure_source",
-        "extraction_warnings", "page_number", "page_count", "heading_path", "has_tables",
+        "extraction_warnings", "page_number", "page_count", "heading_path", "has_tables", "tables_flat",
         "spine_index", "chapter_id", "slide_number", "ocr_used", "ocr_confidence_avg", "document_language", "document_identifier",
         "document_title", "document_author", "document_created",
         // Table sources. Here for the same reason as the rest — and for
         // one more: a spreadsheet column named «row_number» would otherwise
         // overwrite the field row-level synchronisation depends on.
         "sheet_name", "row_number", "row_key", "table_mode",
+        // Покрытие книги: сколько её листов вообще размечено.
+        "sheets_indexed", "sheets_total",
     ]
 
     public static func isTechnicalKey(_ key: String) -> Bool {
@@ -253,7 +255,7 @@ public struct MetadataSchema: Codable, Hashable, Identifiable, Sendable {
     /// has no schema yet. Auto fields stay out: they are technical
     /// and describing them would only make hand-typed documents harder to add.
     public static func drafted(collectionName: String, from source: DataSource) -> MetadataSchema {
-        let fields = source.customMetadata.keys.sorted()
+        var fields = source.customMetadata.keys.sorted()
             .filter { !$0.isEmpty && !isTechnicalKey($0) }
             .map { key in
                 MetadataField(
@@ -263,6 +265,24 @@ public struct MetadataSchema: Codable, Hashable, Identifiable, Sendable {
                     defaultValue: source.customMetadata[key] ?? ""
                 )
             }
+        // Поля из пути — такие же поля источника, только значение у каждого
+        // файла своё. Обязательными объявляются лишь те, у которых
+        // есть значение по умолчанию: остальные бывают не у всех файлов,
+        // и требовать их значило бы заранее записать часть папки в нарушители.
+        // Ключ, заданный и уровнем, и ручным полем, даёт в схеме два поля
+        // с одним именем: `field(for:)` вернёт первое, валидация проверит
+        // дважды, а человеку придётся убирать дубль руками.
+        var taken = Set(fields.map(\.trimmedKey))
+        for level in source.pathLevels where level.isNamed {
+            guard taken.insert(level.trimmedKey).inserted else { continue }
+            fields.append(MetadataField(
+                key: level.trimmedKey,
+                type: level.type,
+                isRequired: level.parsedFallback != nil,
+                defaultValue: level.fallbackValue,
+                note: String(localized: "значение берётся из названия папки")
+            ))
+        }
         return MetadataSchema(collectionName: collectionName, fields: fields, allowsExtraFields: true)
     }
 }

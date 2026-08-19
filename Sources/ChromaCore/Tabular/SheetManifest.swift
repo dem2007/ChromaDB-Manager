@@ -234,7 +234,8 @@ public enum TableSyncPlanner {
         layout: SheetLayout,
         manifest: SheetManifest,
         sourceID: UUID,
-        sourceFile: String
+        sourceFile: String,
+        coverage: SheetCoverage? = nil
     ) -> SheetSyncPlan {
         var plan = SheetSyncPlan()
         let signature = mapping.signature
@@ -264,7 +265,7 @@ public enum TableSyncPlanner {
             guard !row.isEmpty else { continue }
             guard let document = RowMapper.document(
                 for: row, mapping: mapping, layout: layout,
-                sourceID: sourceID, sourceFile: sourceFile
+                sourceID: sourceID, sourceFile: sourceFile, coverage: coverage
             ) else {
                 plan.empty.append(row.number)
                 continue

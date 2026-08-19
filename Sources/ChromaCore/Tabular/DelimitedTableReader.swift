@@ -126,7 +126,7 @@ public enum TextEncodingGuess: String, Codable, Hashable, Sendable, CaseIterable
 }
 
 /// How a delimited file is to be read — detected, and overridable by hand
-/// requires both).
+/// ( requires both).
 public struct DelimitedFormat: Codable, Hashable, Sendable {
     public var encoding: TextEncodingGuess
     public var delimiter: String

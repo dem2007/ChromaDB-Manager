@@ -64,15 +64,23 @@ public enum TextRelevance {
             .joined(separator: " ")
     }
 
-    public static func score(document: String?, headingPath: String?, terms: [String]) -> Double {
-        guard let document, !document.isEmpty, !terms.isEmpty else { return 0 }
+    /// Оценка записи по уже посчитанным вхождениям.
+    ///
+    /// Отдельной формы «посчитай по тексту и заголовку» больше нет: она
+    /// осталась без единого вызова, когда `ranked` перешёл на пакетный
+    /// подсчёт, и при этом строила `DocumentRecord` со словарём метаданных
+    /// на каждое обращение. Формула по-прежнему одна и покрыта тестами —
+    /// через `ranked`, которым её и пользуются.
+    /// - Parameter weights: вес терма по его редкости. Пусто — все
+    ///   термы равны, как было до появления взвешивания.
+    static func score(_ hit: Hits, terms: [String], weights: [String: Double]) -> Double {
+        guard let document = hit.record.document, !document.isEmpty, !terms.isEmpty else { return 0 }
         var score = 0.0
         for term in terms {
-            score += Double(occurrences(of: term, in: document))
-            if let headingPath, !headingPath.isEmpty,
-               headingPath.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
-                score += headingBonus
-            }
+            guard let found = hit.byTerm[term] else { continue }
+            let weight = weights[term] ?? 1
+            score += Double(found.occurrences) * weight
+            if found.inHeading { score += headingBonus * weight }
         }
         guard score > 0 else { return 0 }
         // Divided by the square root of the length, the way Lucene normalises
@@ -80,6 +88,90 @@ public enum TextRelevance {
         // more about that sentence than twice in a page. Without it the longest
         // chunk wins almost every query, purely for being long.
         return score / max(1, Double(document.count).squareRoot())
+    }
+
+    /// Вес терма по его редкости среди найденного.
+    ///
+    /// **Зачем.** Запрос «vCpu» находил нужное, а «ГЕОП аренда виртуальных
+    /// процессоров» по тому же файлу — мусор. Разбор: слово «ГЕОП» стоит
+    /// в этом документе почти на каждой странице, и без веса оно значило
+    /// ровно столько же, сколько «vCPU», который встречается десяток раз.
+    /// Формула складывала вхождения — и наверх выходил чанк, где чаще всего
+    /// повторяется название платформы, то есть любой чанк этого документа.
+    /// Одиночный редкий терм такой беды не знает: делить наверху нечего.
+    ///
+    /// **Как.** Обратная частота по тому набору, который вернул `$contains`:
+    /// это не вся коллекция, но именно тот отбор, внутри которого мы и
+    /// расставляем места. Терм, который есть у всех найденных, не отличает
+    /// их друг от друга — его вес близок к нулю; терм, который есть у
+    /// немногих, весит много.
+    ///
+    /// Запрос из одного слова не меняется вовсе: общий множитель мест
+    /// не переставляет.
+    public static func termWeights(
+        _ terms: [String], in records: [DocumentRecord]
+    ) -> [String: Double] {
+        weights(terms, hits: records.map { record in
+            Hits(record: record, byTerm: counts(of: terms, in: record))
+        })
+    }
+
+    /// Сколько раз каждый терм встретился в записи и стоит ли он в заголовке.
+    ///
+    /// Считается **один раз** на запись: и вес терма, и его вклад
+    /// в оценку опираются на одни и те же вхождения, а подстрочный поиск —
+    /// самая дорогая часть стадии. До этого набор кандидатов обходился
+    /// дважды: сперва ради частот, затем ради оценки.
+    struct Hits {
+        var record: DocumentRecord
+        var byTerm: [String: (occurrences: Int, inHeading: Bool)]
+
+        /// Есть ли терм в этой записи — хоть в тексте, хоть в заголовке.
+        func has(_ term: String) -> Bool {
+            guard let hit = byTerm[term] else { return false }
+            return hit.occurrences > 0 || hit.inHeading
+        }
+    }
+
+    static func counts(
+        of terms: [String], in record: DocumentRecord
+    ) -> [String: (occurrences: Int, inHeading: Bool)] {
+        var heading: String?
+        if case .string(let value)? = record.metadata?["heading_path"] { heading = value }
+        var result: [String: (occurrences: Int, inHeading: Bool)] = [:]
+        for term in terms where result[term] == nil {
+            let found = record.document.map { occurrences(of: term, in: $0) } ?? 0
+            let inHeading = heading.map {
+                !$0.isEmpty && $0.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+            } ?? false
+            result[term] = (found, inHeading)
+        }
+        return result
+    }
+
+    /// Вес по редкости — из уже посчитанных вхождений.
+    ///
+    /// Заголовок учитывается наравне с текстом: вес умножает и `headingBonus`,
+    /// а терм, стоящий только в пути заголовков, при подсчёте «в скольких
+    /// документах он есть» иначе выглядел бы не встречающимся нигде и получал
+    /// бы максимальный вес на пустом месте.
+    static func weights(_ terms: [String], hits: [Hits]) -> [String: Double] {
+        let total = Double(hits.count)
+        guard total > 0, terms.count > 1 else { return [:] }
+        var result: [String: Double] = [:]
+        for term in terms where result[term] == nil {
+            // Счётчиком, а не `filter{}.count`: промежуточный массив копий
+            // `Hits` — со словарём и записью документа в каждой — собирался
+            // бы по разу на терм запроса ровно в том пути, который эта же
+            // правка избавила от второго обхода.
+            var containing = 0.0
+            for hit in hits where hit.has(term) { containing += 1 }
+            // Классическая форма BM25: у терма, который есть у всех, вес
+            // стремится к нулю, но не становится отрицательным — иначе
+            // документ штрафовался бы за то, что он вообще найден.
+            result[term] = max(0.05, log(1 + (total - containing + 0.5) / (containing + 0.5)))
+        }
+        return result
     }
 
     /// Case- and diacritic-insensitive, counting overlaps as one each.
@@ -106,11 +198,13 @@ public enum TextRelevance {
     public static func ranked(
         _ records: [DocumentRecord], terms: [String]
     ) -> [(record: DocumentRecord, score: Double)] {
-        records
-            .map { record -> (record: DocumentRecord, score: Double) in
-                var heading: String?
-                if case .string(let value)? = record.metadata?["heading_path"] { heading = value }
-                return (record, score(document: record.document, headingPath: heading, terms: terms))
+        // Вхождения считаются один раз на запись и служат обоим: и весу
+        // терма по редкости, и самой оценке.
+        let hits = records.map { Hits(record: $0, byTerm: counts(of: terms, in: $0)) }
+        let weights = weights(terms, hits: hits)
+        return hits
+            .map { hit -> (record: DocumentRecord, score: Double) in
+                (hit.record, score(hit, terms: terms, weights: weights))
             }
             .filter { $0.score > 0 }
             .sorted { left, right in

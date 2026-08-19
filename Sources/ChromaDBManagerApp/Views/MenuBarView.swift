@@ -10,6 +10,9 @@ struct MenuBarView: View {
     @EnvironmentObject private var queueMirror: QueueMirror
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var search: QuickSearchViewModel
+    /// Состояние моста для агентов. Наблюдается напрямую: `AppEnvironment`
+    /// о его изменениях не рассказывает.
+    @ObservedObject var mcp: MCPService
     /// Открыть главное окно и, если надо, окно просмотра.
     let openMainWindow: (ExternalRequest?) -> Void
     let openViewerWindow: () -> Void
@@ -25,6 +28,8 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             status
+            Divider()
+            mcpStatus
             Divider()
             quickSearch
             Divider()
@@ -67,6 +72,45 @@ struct MenuBarView: View {
             }
             .toggleStyle(.switch).controlSize(.mini)
             .padding(.top, 2)
+        }
+    }
+
+    // MARK: - MCP
+
+    /// Работает ли мост для агентов — прямо здесь, в строке меню.
+    ///
+    /// Ради этого вопроса окно и оставляют закрытым: «приложение можно
+    /// закрыть, но агент должен ходить». Ответ на него был виден только на
+    /// экране «Клиенты», то есть в том самом окне, которого нет.
+    private var mcpStatus: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(mcp.isListening ? Theme.Palette.running : Theme.Palette.stopped)
+                .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+            Text(mcp.isListening
+                 ? String(localized: "MCP слушает")
+                 : String(localized: "MCP не запущен"))
+                .font(Theme.Font.caption)
+            if mcp.isListening {
+                // Сколько мостов открыто сейчас и сколько вызовов было за
+                // сеанс: «слушает» и «им пользуются» — разные факты.
+                Text(mcp.connections.isEmpty
+                     ? String(localized: "подключений нет")
+                     : String(localized: "подключений: \(mcp.connections.count.plainDigits)"))
+                    .font(Theme.Font.caption).foregroundStyle(.secondary)
+                if mcp.callCount > 0 {
+                    // Разделитель — отдельным видом, а не частью строки:
+                    // склеенный интерполяцией, он уезжал в каталог текстов
+                    // ключом «· %@», переводить который нечего.
+                    Text(verbatim: "·").font(Theme.Font.caption).foregroundStyle(.secondary)
+                    Text("вызовов: \(mcp.callCount.plainDigits)")
+                        .font(Theme.Font.caption).foregroundStyle(.secondary)
+                }
+            } else if let error = mcp.lastError {
+                Text(error).font(Theme.Font.caption).foregroundStyle(.orange)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+            Spacer()
         }
     }
 

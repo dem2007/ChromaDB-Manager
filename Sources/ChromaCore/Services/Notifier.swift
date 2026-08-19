@@ -110,7 +110,7 @@ public final class Notifier: ObservableObject {
     /// Идентификатор есть и у процесса `xctest`, а `UNUserNotificationCenter`
     /// у него всё равно падает с `bundleProxyForCurrentProcess is nil` — то
     /// есть проверка отвечала на соседний вопрос, а не на свой (тот же
-    /// класс дефекта, что и. Пока приложение запускали только
+    /// класс дефекта, что и). Пока приложение запускали только
     /// как `.app`, разница не проявлялась; как только слой экранов стал
     /// тестируемым, первый же тест уронил процесс.
     public nonisolated static var isSupported: Bool {

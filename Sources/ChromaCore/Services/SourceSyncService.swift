@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import UniformTypeIdentifiers
 
 // MARK: - Plan
 
@@ -142,6 +143,9 @@ public struct SyncPlan {
     /// Rows a table source would send to the model. Counted during the
     /// plan, because the price of a sheet cannot be guessed from its file size.
     public let tableRowsToEmbed: Int
+    /// Уровни вложенности глубже названных. Как и устаревший
+    /// экстрактор — сообщаются, но работы не создают: имя уровню даёт человек.
+    public let newFolderLevels: [NewFolderLevel]
 
     public init(
         sourceID: UUID,
@@ -151,7 +155,8 @@ public struct SyncPlan {
         pendingRemovals: [PendingRemoval],
         massDisappearance: MassDisappearance? = nil,
         staleExtraction: [StaleExtraction] = [],
-        tableRowsToEmbed: Int = 0
+        tableRowsToEmbed: Int = 0,
+        newFolderLevels: [NewFolderLevel] = []
     ) {
         self.sourceID = sourceID
         self.sourceName = sourceName
@@ -161,6 +166,7 @@ public struct SyncPlan {
         self.massDisappearance = massDisappearance
         self.staleExtraction = staleExtraction
         self.tableRowsToEmbed = tableRowsToEmbed
+        self.newFolderLevels = newFolderLevels
     }
 
     public func count(of kind: (SyncItemKind) -> Bool) -> Int {
@@ -207,15 +213,60 @@ public struct SyncPlan {
         writeItems.reduce(0) { $0 + ($1.textLength ?? Int($1.size)) }
     }
 
-    /// whether a manual run of this size should show itself and wait for a
-    /// confirmation first.
+    /// whether a manual run should show itself and wait for a confirmation
+    /// first — по любой из причин, перечисленных в `confirmationReasons`.
     ///
-    /// Read the threshold exactly as the UI states it — «показывать план, если
-    /// файлов больше N» — so 0 means every run that writes anything stops to be
-    /// looked at. It used to be special-cased as «выключено», which made the
-    /// setting say one thing and do the opposite.
+    /// Причин две: файлов больше порога и строк из таблиц больше пяти тысяч
+    ///. Раньше здесь считалась только первая, а вторую проверяла
+    /// модель экрана отдельным условием — и объяснение на экране разошлось
+    /// с тем, что на самом деле сработало.
+    ///
+    /// Порог файлов читается ровно так, как написано в настройке —
+    /// «показывать план, если файлов больше N», — поэтому 0 означает
+    /// «останавливаться на всём, что пишет». Когда-то ноль был особым
+    /// случаем «выключено», и настройка говорила одно, а делала другое.
     public func needsConfirmation(threshold: Int) -> Bool {
-        writeItems.count > max(0, threshold)
+        !confirmationReasons(threshold: threshold).isEmpty
+    }
+
+    /// Почему план остановился и ждёт человека.
+    ///
+    /// Причин две, и они независимы: много файлов и много строк из таблиц.
+    /// Раньше про причину знали ворота, а баннер на экране рассказывал
+    /// **всегда про первую** — и на плане из сорока двух файлов при пороге сто
+    /// писал «42 — больше порога 100». Утверждение неверное, и человеку
+    /// приходилось искать, чему верить: числу или порогу.
+    ///
+    /// Поэтому причина считается здесь, рядом с самими воротами, и текст
+    /// берётся у неё. Возвращается список: обе причины могут сработать разом,
+    /// и умалчивать о второй — та же беда меньшего размера.
+    public func confirmationReasons(threshold: Int) -> [ConfirmationReason] {
+        var reasons: [ConfirmationReason] = []
+        if writeItems.count > max(0, threshold) {
+            reasons.append(.manyFiles(files: writeItems.count, threshold: max(0, threshold)))
+        }
+        if tableRowsToEmbed > TableRunEstimate.warningThreshold {
+            reasons.append(.manyTableRows(rows: tableRowsToEmbed, threshold: TableRunEstimate.warningThreshold))
+        }
+        return reasons
+    }
+
+    /// Что именно велело остановиться, словами.
+    public enum ConfirmationReason: Equatable, Sendable {
+        /// Файлов к записи больше, чем разрешает настройка «показывать план».
+        case manyFiles(files: Int, threshold: Int)
+        /// Строк из таблиц столько, что каждая станет обращением к модели.
+        case manyTableRows(rows: Int, threshold: Int)
+
+        /// Одно предложение: что случилось и что с этим делать.
+        public var sentence: String {
+            switch self {
+            case .manyFiles(let files, let threshold):
+                return String(localized: "Файлов к записи \(files.plainDigits) — больше, чем \(threshold.plainDigits), после которых приложение показывает план. Снимите отметки с тех, что трогать не нужно.")
+            case .manyTableRows(let rows, let threshold):
+                return String(localized: "Строк из таблиц \(rows.plainDigits) — каждая станет отдельным обращением к модели, а предупреждение включается после \(threshold.plainDigits). Это надолго: проверьте, те ли это файлы.")
+            }
+        }
     }
 }
 
@@ -329,6 +380,9 @@ public struct SyncSummary {
     /// Collections whose stored chunking recipe differs from the one this run
     /// writes with: their contents are now mixed. Never resolved by the
     /// app itself — re-indexing or cloning is the user's call.
+    /// Чанков, дорезанных под контекст модели. Ноль почти всегда;
+    /// не ноль — повод уменьшить размер чанка у источника.
+    public var chunksSplitToFit: Int = 0
     public var heterogeneousCollections: [String] = []
     /// Files whose text an older version of the extractor produced. Reported,
     /// never queued: forbids an app update from starting hours of local
@@ -341,6 +395,8 @@ public struct SyncSummary {
     public var tableWarnings: [String] = []
     /// Исчезнувшие строки таблиц, ждущие решения.
     public var tableRowsNeedingDecision: Int = 0
+    /// Уровни вложенности глубже названных.
+    public var newFolderLevels: [NewFolderLevel] = []
 
     public var wroteNothing: Bool { added == 0 && updated == 0 }
 
@@ -361,6 +417,12 @@ public struct SyncSummary {
         return String(localized: "файлов, извлечённых прежней версией экстрактора: \(staleExtraction.count) (\(versions.joined(separator: ", "))) — переизвлечение запускается вручную")
     }
 
+    public var newFolderLevelsLine: String? {
+        guard let deepest = newFolderLevels.first else { return nil }
+        let names = deepest.examples.joined(separator: ", ")
+        return String(localized: "появился уровень вложенности \(deepest.number) (\(deepest.folderCount) папок: \(names)) — поле не задано, названия папок в базу не попадают")
+    }
+
     public var heterogeneityLine: String? {
         guard !heterogeneousCollections.isEmpty else { return nil }
         return String(localized: "параметры чанкинга разошлись с записанными в коллекциях: \(heterogeneousCollections.joined(separator: ", ")) — содержимое стало неоднородным, нужна переиндексация или клонирование")
@@ -373,7 +435,8 @@ public struct SyncSummary {
 
     public var line: String {
         let base = String(localized: "добавлено \(added), обновлено \(updated), без изменений \(unchanged); чанков записано \(chunksWritten), удалено \(chunksDeleted)")
-        return [base, recoveryLine, heterogeneityLine, staleExtractionLine].compactMap { $0 }.joined(separator: "; ")
+        return [base, recoveryLine, heterogeneityLine, staleExtractionLine, newFolderLevelsLine]
+            .compactMap { $0 }.joined(separator: "; ")
     }
 }
 
@@ -796,7 +859,7 @@ public actor SourceSyncService {
     /// find a file's chunks again by `source_file`.
     public static let autoMetadataKeys = [
         DocumentOrigin.metadataKey,
-        "source_id", "source_file", "chunk_index", "content_hash",
+        "source_id", "source_file", "file_id", "chunk_index", "content_hash",
         "file_ext", "file_mtime", "file_size",
     ]
 
@@ -844,12 +907,20 @@ public actor SourceSyncService {
                 routeMetadata: item.routeMetadata
             )
         }
+        // Переносится **всё**, кроме того, что этот вызов меняет намеренно.
+        // Раньше поля перечислялись выборочно, и каждое новое поле плана
+        // молча терялось при переизвлечении: так исчезала пометка о новом
+        // уровне вложенности — уровень в папке оставался, а строка с карточки
+        // пропадала.
         return SyncPlan(
             sourceID: plan.sourceID, sourceName: plan.sourceName, items: items,
             newlyMissing: plan.newlyMissing, pendingRemovals: plan.pendingRemovals,
+            massDisappearance: plan.massDisappearance,
             // The list is kept as it was: a run that re-extracts part of it
             // should still report what is left.
-            staleExtraction: plan.staleExtraction.filter { !paths.contains($0.relativePath) }
+            staleExtraction: plan.staleExtraction.filter { !paths.contains($0.relativePath) },
+            tableRowsToEmbed: plan.tableRowsToEmbed,
+            newFolderLevels: plan.newFolderLevels
         )
     }
 
@@ -865,6 +936,38 @@ public actor SourceSyncService {
     /// базу до запуска синхронизации, и манифест обязан догнать её сразу —
     /// прерванный на этом месте запуск не должен искать чанки по старому имени.
     public func save(manifest: SourceManifest) { manifests.save(manifest) }
+
+    /// Снять находки диагностики с файлов источника.
+    ///
+    /// Одним обращением к актору, а не «прочитать снаружи, поправить,
+    /// сохранить»: те два шага чередуются с чужими обращениями к манифесту —
+    /// например, с записью соседнего решения по диагностике, — и тот, кто
+    /// сохранит последним, затирает работу другого.
+    ///
+    /// Чего это **не** снимает: прогон синхронизации читает манифест в начале
+    /// и сохраняет в конце, а между ними у него десятки `await`, на которых
+    /// актор впускает других. Находка, снятая человеком посреди прогона,
+    /// вернётся на экран вместе с итоговой записью прогона. Это цена
+    /// реентерабельности актора, и лечится она не здесь, а тем, что прогон
+    /// перестанет держать манифест через `await`.
+    ///
+    /// - Parameter paths: пути, находки о которых снимаются. `nil` — снять
+    ///   все находки этого источника (красная кнопка «очистить»).
+    /// - Returns: сколько находок снято.
+    @discardableResult
+    public func forgetProblems(_ paths: Set<String>?, sourceID: UUID) -> Int {
+        var manifest = manifests.load(sourceID: sourceID)
+        let before = manifest.problems.count
+        if let paths {
+            manifest.problems.removeAll { paths.contains($0.relativePath) }
+        } else {
+            manifest.problems.removeAll()
+        }
+        let removed = before - manifest.problems.count
+        guard removed > 0 else { return 0 }
+        manifests.save(manifest)
+        return removed
+    }
 
     // MARK: - Scanning
 
@@ -912,6 +1015,22 @@ public actor SourceSyncService {
         return files.sorted { $0.path < $1.path }
     }
 
+    /// Уровни вложенности папки источника — тем же обходом и теми же
+    /// правилами, что и синхронизация.
+    ///
+    /// Именно теми же: редактор, показывающий уровни по одному списку файлов,
+    /// и прогон, работающий по другому, рано или поздно разойдутся в том,
+    /// сколько в папке уровней, — и правым в этом споре будет прогон, а
+    /// объясняться придётся человеку.
+    public func folderLevels(source: DataSource) throws -> FolderLevels {
+        let files = try scanFiles(source: source)
+        let excluded = Set(source.excludedPaths)
+        let paths = files
+            .map { Self.relative($0, to: source.url) }
+            .filter { !excluded.contains($0) }
+        return FolderLevels.of(paths: paths)
+    }
+
     // MARK: - Plan
 
     /// Compares the folder with the manifest. Reads only the files that might
@@ -932,6 +1051,9 @@ public actor SourceSyncService {
         let manifest = manifests.load(sourceID: source.id)
         let signature = source.chunking.signature
         let extractionSignature = source.extractionSignature
+        // Только для выбора экстрактора: пароль сюда не нужен, а он стоит
+        // похода в Keychain на каждый файл.
+        let stampOptions = Self.extractionOptions(for: source)
         var items: [SyncPlanItem] = []
         var staleExtraction: [StaleExtraction] = []
         var seenPaths: Set<String> = []
@@ -1083,7 +1205,10 @@ public actor SourceSyncService {
             }()
             let sizeMatches = entry?.size == size
             let timeMatches = entry.map { abs($0.modifiedAt.timeIntervalSince(modified)) < 1 } ?? false
-            let currentExtractor = Self.stamp(of: file, registry: registry)
+            let currentExtractor = Self.stamp(
+                of: file, storedID: entry?.extractorID ?? "",
+                registry: registry, options: stampOptions
+            )
 
             // Hashing the bytes is worth it only when the cheap signal already
             // says something moved: it answers «re-saved, or actually edited?»
@@ -1213,6 +1338,17 @@ public actor SourceSyncService {
                 "Источник «\(source.name)»: файлов, извлечённых прежней версией экстрактора: \(staleExtraction.count). Автоматически ничего не пересчитывается — операция «переизвлечь и переэмбедить» запускается вручную.")
         }
 
+        // Уровень глубже названных. Считается по тем же путям, что
+        // уже собраны для плана, — отдельного обхода папки это не стоит.
+        // Сообщается и только: имя уровню даёт человек, а `level_4`,
+        // придуманный приложением, — мусор в метаданных всей коллекции.
+        let newLevels = FolderLevels.of(paths: Array(seenPaths))
+            .unnamed(beyond: source.pathLevels.count)
+        if let deepest = newLevels.first {
+            log(.info, "Источники",
+                "Источник «\(source.name)»: появился уровень вложенности \(deepest.number) (\(deepest.folderCount) папок) — поле для него не задано, названия папок в базу не попадают.")
+        }
+
         return SyncPlan(
             sourceID: source.id,
             sourceName: source.name,
@@ -1221,7 +1357,8 @@ public actor SourceSyncService {
             pendingRemovals: pending,
             massDisappearance: disappearance,
             staleExtraction: staleExtraction,
-            tableRowsToEmbed: tableRowsToEmbed
+            tableRowsToEmbed: tableRowsToEmbed,
+            newFolderLevels: newLevels
         )
     }
 
@@ -1232,7 +1369,14 @@ public actor SourceSyncService {
     /// Static on purpose: auto fields and the source's own key-values are the
     /// same for every file, so the answer is known before the first byte is read
     /// and a mismatch can stop the run instead of surfacing halfway through.
-    public func coverage(source: DataSource, schema: MetadataSchema) -> SourceSchemaCoverage {
+    /// - Parameter levels: уровни папки, если их уже посчитали. Нужны
+    ///   ради одного вопроса: поле уровня попадёт **каждому** чанку или только
+    ///   тем файлам, что лежат достаточно глубоко. Без ответа поле обещанным
+    ///   не считается — обещание, которое конвейер держит через раз, хуже
+    ///   честного «не закрыто».
+    public func coverage(
+        source: DataSource, schema: MetadataSchema, levels: FolderLevels? = nil
+    ) -> SourceSchemaCoverage {
         var provided = Set(Self.autoMetadataKeys)
         provided.formUnion(["file_name", "chunk_count", "chunk_estimated_tokens", "chunk_level"])
         // Written for every chunk of every file. `page_number`,
@@ -1241,8 +1385,8 @@ public actor SourceSyncService {
         // promise the pipeline can only sometimes keep.
         provided.formUnion(["extractor_id", "extractor_version", "container_format", "structure_source"])
         if source.chunking.strategy.producesLevels { provided.insert("parent_chunk_id") }
-        if source.mapping != .folderToCollection { provided.insert("relative_path") }
         provided.formUnion(source.customMetadata.keys.filter { !$0.isEmpty })
+        provided.formUnion(Self.guaranteedLevelKeys(of: source, levels: levels))
 
         let uncovered = schema.fields
             .filter { $0.isRequired && !$0.trimmedKey.isEmpty }
@@ -1255,8 +1399,9 @@ public actor SourceSyncService {
         for (key, value) in source.customMetadata where !key.isEmpty {
             probe[key] = .inferred(from: value)
         }
-        let problems = validator.validate(probe, against: schema).violations
+        var problems = validator.validate(probe, against: schema).violations
             .filter { $0.kind == .wrongType }
+        problems.append(contentsOf: Self.levelTypeProblems(of: source, schema: schema))
 
         return SourceSchemaCoverage(
             collectionName: schema.collectionName,
@@ -1264,6 +1409,208 @@ public actor SourceSyncService {
             uncoveredRequiredFields: uncovered,
             typeProblems: problems
         )
+    }
+
+    /// Поля уровней, которые получит **каждый** чанк источника.
+    ///
+    /// Уровень со значением по умолчанию гарантирован всегда: файлу, который
+    /// до уровня не достаёт, запишется это значение. Уровень без него —
+    /// только когда посчитанное дерево говорит, что выше уровня файлов нет;
+    /// не посчитали — значит не знаем, и обещать нечего.
+    static func guaranteedLevelKeys(of source: DataSource, levels: FolderLevels?) -> Set<String> {
+        var result: Set<String> = []
+        for (index, level) in source.pathLevels.prefix(PathLevel.maximumLevels).enumerated() {
+            guard level.isNamed else { continue }
+            if level.parsedFallback != nil {
+                result.insert(level.trimmedKey)
+                continue
+            }
+            guard let known = levels?.levels.first(where: { $0.number == index + 1 }) else { continue }
+            // Имя папки, не приводящееся к типу, — дырка в том же обещании:
+            // такому файлу поле не запишется.
+            if known.filesAbove == 0, known.namesNotMatching(level).isEmpty, !known.namesTruncated {
+                result.insert(level.trimmedKey)
+            }
+        }
+        return result
+    }
+
+    /// Уровень объявлен строкой, а схема ждёт от этого поля число: значения
+    /// разойдутся с договором коллекции на каждом файле, и сказать об этом
+    /// надо в редакторе, а не на сотом документе.
+    static func levelTypeProblems(of source: DataSource, schema: MetadataSchema) -> [SchemaViolation] {
+        source.pathLevels.compactMap { level in
+            guard level.isNamed, let field = schema.field(for: level.trimmedKey) else { return nil }
+            guard field.type != level.type else { return nil }
+            return SchemaViolation(
+                field: level.trimmedKey,
+                kind: .wrongType,
+                message: String(localized: "Уровень пути «\(level.trimmedKey)» объявлен как \(level.type.title), а схема коллекции ждёт \(field.type.title).")
+            )
+        }
+    }
+
+    // MARK: - Обновление метаданных без пересчёта векторов
+
+    /// Что дало обновление полей у уже проиндексированных файлов.
+    public struct MetadataRefreshReport: Sendable {
+        public var filesUpdated = 0
+        public var chunksUpdated = 0
+        public var keysRemoved: [String] = []
+        public var failures: [(file: String, reason: String)] = []
+
+        public var isEmpty: Bool { filesUpdated == 0 && failures.isEmpty }
+    }
+
+    /// Файлы, у которых поля в базе записаны прежними настройками.
+    ///
+    /// Пустая подпись — запись прежней сборки: чем она записана, неизвестно.
+    /// Такие файлы попадают в список только когда источник **пользуется**
+    /// полями из пути: иначе обновление предлагалось бы каждому источнику
+    /// после первого же обновления приложения, а менять там нечего.
+    public func filesWithOutdatedMetadata(in manifest: SourceManifest, source: DataSource) -> [String] {
+        let current = source.metadataSignature
+        return manifest.entries.values
+            .filter { entry in
+                if entry.metadataSignature.isEmpty {
+                    return !source.pathLevels.filter(\.isNamed).isEmpty
+                }
+                return entry.metadataSignature != current
+            }
+            .map(\.relativePath)
+            .sorted()
+    }
+
+    public func filesWithOutdatedMetadata(source: DataSource) -> [String] {
+        filesWithOutdatedMetadata(in: manifests.load(sourceID: source.id), source: source)
+    }
+
+    /// Переписывает поля уже проиндексированных чанков — и только их.
+    ///
+    /// Ни одного обращения к модели: текст файлов не менялся, изменились
+    /// подписи к нему. Поэтому же операция отдельная, а не «переиндексируйте
+    /// источник»: у папки на пять тысяч документов это разница между минутой
+    /// и половиной суток.
+    ///
+    /// Ключи, которые источник больше не пишет, убираются явно: `update`
+    /// у ChromaDB метаданные **сливает**, и поле, выброшенное из настроек,
+    /// осталось бы в базе навсегда.
+    ///
+    /// - Parameter backup: доказательство, что копия сделана. Значение,
+    ///   которое нельзя получить иначе как у `BackupService`: это перезапись
+    ///   документов, которые никто не ломал (правила 8.7).
+    @discardableResult
+    public func refreshMetadata(
+        source: DataSource,
+        chroma: any SyncDatabase,
+        backup: BackupEvidence,
+        paths: Set<String>? = nil,
+        progress: @Sendable (SyncProgress) -> Void = { _ in }
+    ) async throws -> MetadataRefreshReport {
+        // Тот же замок, что у синхронизации, и по той же причине: обе операции
+        // читают манифест целиком, ждут на `await` и сохраняют свою копию.
+        // Прогон, начавшийся посередине обновления полей, потерял бы записи
+        // о только что проиндексированных файлах — вместе с их `chunkIDs`,
+        // то есть и с возможностью убрать их прежние чанки.
+        guard !running.contains(source.id) else { throw SyncError.alreadyRunning(source.name) }
+        running.insert(source.id)
+        defer { running.remove(source.id) }
+
+        var manifest = manifests.load(sourceID: source.id)
+        let outdated = Set(filesWithOutdatedMetadata(in: manifest, source: source))
+        let wanted = paths.map { outdated.intersection($0) } ?? outdated
+        var report = MetadataRefreshReport()
+        guard !wanted.isEmpty else { return report }
+
+        log(.info, "Источники",
+            "Источник «\(source.name)»: обновляем поля у \(wanted.count.plainDigits) файлов без пересчёта векторов. \(backup.describedAs)")
+
+        let signature = source.metadataSignature
+        let currentKeys = source.writtenMetadataKeys
+        var collectionIDs: [String: String] = [:]
+        var removedKeys: Set<String> = []
+        var done = 0
+
+        for relativePath in wanted.sorted() {
+            // Отмена спрашивается у себя, а не ожидается от клиента базы:
+            // «Остановить» на пяти тысячах файлов должно останавливать, даже
+            // когда каждый вызов возвращается мгновенно и бросить ему нечего.
+            do {
+                try Task.checkCancellation()
+            } catch {
+                manifests.save(manifest)
+                throw CancellationError()
+            }
+            guard let entry = manifest.entries[relativePath] else { continue }
+            done += 1
+            progress(SyncProgress(
+                stage: String(localized: "Обновление полей"),
+                processedFiles: done, totalFiles: wanted.count, currentFile: relativePath
+            ))
+            guard !entry.chunkIDs.isEmpty else {
+                // Записи без списка чанков остались от сборок до A6.2: искать
+                // их в базе по фильтру ради полей — дороже, чем честно сказать.
+                report.failures.append((file: relativePath, reason: String(localized: "у файла не записаны идентификаторы чанков — обновите его обычной синхронизацией")))
+                continue
+            }
+            guard let route = router.route(relativePath: relativePath, source: source).route else {
+                report.failures.append((file: relativePath, reason: String(localized: "файл не размещается нынешним правилом маппинга")))
+                continue
+            }
+
+            var fields = route.extraMetadata
+            for (key, value) in source.customMetadata where !key.isEmpty {
+                fields[key] = .inferred(from: value)
+            }
+            // Убирается то, что писалось прежними настройками и не пишется
+            // сейчас. Плюс поля, которых у этого файла не оказалось: уровень
+            // мог перестать доставать до него.
+            var removed = MetadataSignature(entry.metadataSignature).writtenKeys
+            removed.formUnion(currentKeys)
+            removed.subtract(fields.keys)
+            // `relative_path` новым чанкам больше не пишется, но из
+            // старых не выковыривается: по нему могли быть построены
+            // сохранённые фильтры и внешние запросы. Обновление полей — не
+            // повод ломать их у половины файлов.
+            removed.remove("relative_path")
+            removedKeys.formUnion(removed)
+
+            do {
+                let collectionID: String
+                if let known = collectionIDs[entry.collectionName] {
+                    collectionID = known
+                } else {
+                    collectionID = try await chroma.resolveID(of: entry.collectionName)
+                    collectionIDs[entry.collectionName] = collectionID
+                }
+                try await chroma.updateDocuments(
+                    collectionID: collectionID,
+                    updates: entry.chunkIDs.map {
+                        DocumentUpdate(id: $0, metadata: fields, removedMetadataKeys: removed.sorted())
+                    }
+                )
+                var updated = entry
+                updated.metadataSignature = signature
+                manifest.entries[relativePath] = updated
+                report.filesUpdated += 1
+                report.chunksUpdated += entry.chunkIDs.count
+                // Манифест пишется по ходу, а не в конце: прерванная операция
+                // должна оставить сделанное сделанным, иначе повтор пойдёт
+                // по второму кругу через всю папку.
+                if report.filesUpdated % 50 == 0 { manifests.save(manifest) }
+            } catch is CancellationError {
+                manifests.save(manifest)
+                throw CancellationError()
+            } catch {
+                report.failures.append((file: relativePath, reason: Self.reason(for: error)))
+            }
+        }
+
+        manifests.save(manifest)
+        report.keysRemoved = removedKeys.sorted()
+        log(report.failures.isEmpty ? .success : .warning, "Источники",
+            "Источник «\(source.name)»: поля обновлены у \(report.filesUpdated.plainDigits) файлов (\(report.chunksUpdated.plainDigits) чанков), не вышло у \(report.failures.count.plainDigits); векторы не пересчитывались")
+        return report
     }
 
     // MARK: - Recovery
@@ -1474,6 +1821,11 @@ public actor SourceSyncService {
         progress(SyncProgress(stage: String(localized: "Сравнение с манифестом")))
 
         var plan: SyncPlan
+        // Уровни вложенности считает только наш план: у git- и
+        // веб-источника его готовит своя служба, и её пустой список — это
+        // «не считали», а не «уровней нет». Флаг живёт рядом с планом и
+        // меняется вместе с ним: план ниже бывает пересчитан нашим кодом.
+        var countsFolderLevels = preparedPlan == nil
         if let preparedPlan {
             plan = preparedPlan
         } else {
@@ -1494,6 +1846,7 @@ public actor SourceSyncService {
             plan = try await self.plan(
                 source: source, embeddingModel: embeddingModel, allowMassRemovals: true
             )
+            countsFolderLevels = true
         }
         if let reextraction {
             log(.info, "Источники",
@@ -1561,7 +1914,8 @@ public actor SourceSyncService {
                 embeddingModel: embeddingModel, dimension: nil,
                 recoveredFiles: recovery.finished.count,
                 reindexedAfterFailure: recovery.toReindex.count,
-                staleExtraction: plan.staleExtraction
+                staleExtraction: plan.staleExtraction,
+                newFolderLevels: plan.newFolderLevels
             )
             // The skipped files belong in this line too. Without them a run that
             // read nothing because every file was refused looked identical to a
@@ -1577,6 +1931,13 @@ public actor SourceSyncService {
             // Even a run that wrote nothing has learned which files it cannot
             // read; that is exactly what the diagnostics screen is for.
             manifest.problems = Self.plannedProblems(of: plan)
+            // Уровень, появившийся в папке, переживает перезапуск приложения:
+            // он замечен прогоном, а решать по нему человеку — может быть,
+            // завтра. Пометка обновляется только когда план считали
+            // здесь: у git- и веб-источника план готовит своя служба, уровней
+            // не считает вовсе, и присвоение пустого списка стирало бы то,
+            // что заметил предыдущий прогон.
+            if countsFolderLevels { manifest.newFolderLevels = plan.newFolderLevels }
             manifests.save(manifest)
             return summary
         }
@@ -1659,6 +2020,15 @@ public actor SourceSyncService {
         var chunksDeleted = 0
         var marked: [String] = []
         var substituted: [(file: String, reason: String)] = []
+        /// Сколько чанков пришлось дорезать под контекст модели.
+        var chunksSplitToFit = 0
+        // Сколько знаков модель читает **на самом деле**.
+        // Мерится пробой и не совпадает с контекстом в токенах: живой случай —
+        // контекст 8192 токена при пределе 2937 знаков. Меряется лениво и
+        // один раз: проба стоит семи вызовов модели, и обычный прогон, где
+        // длинных чанков нет, не платит за неё ничего.
+        var measuredInputLimit: Int?
+        var inputLimitMeasured = false
         var skipped: [(file: String, reason: String)] = plan.items.compactMap { item in
             guard let reason = item.kind.detail, !item.kind.writesDocuments else { return nil }
             return (item.relativePath, reason)
@@ -1830,7 +2200,7 @@ public actor SourceSyncService {
             if let swap = Self.substitution(for: source.chunking, document: extracted) {
                 substituted.append((item.relativePath, swap.note))
             }
-            let chunks = try await Self.plannedChunks(
+            var chunks = try await Self.plannedChunks(
                 of: extracted,
                 fileExtension: item.url.pathExtension,
                 pipeline: pipeline,
@@ -1862,15 +2232,41 @@ public actor SourceSyncService {
             // refuses to split, can still produce a chunk past the model's
             // context. The file is left as it was and named in the report
             // rather than indexed with its tail cut off.
-            if let oversized = chunks.first(where: {
+            // Чанк длиннее контекста модели дорезается по предложениям
+            //, а не отменяет индексацию всего файла. Правило A7.3
+            // про обрезанный хвост в силе — хвост просто становится
+            // следующим чанком, и об этом говорится вслух.
+            //
+            // Дорезается и по замеренному пределу в знаках, не только по
+            // контексту в токенах: раньше чанк, влезавший в токены,
+            // но не влезавший в предел, уводил **весь файл** в пропущенные
+            // и обрывал прогон.
+            if !inputLimitMeasured,
+               chunks.contains(where: { $0.text.count >= EmbeddingInputProbe.suspiciousCharacters }) {
+                measuredInputLimit = await binding.measuredInputLimit(of: embeddingModel, embeddings: embeddings)
+                // Отметка ставится только по удаче: сорвавшаяся проба
+                // не должна выключать дорезку до конца прогона.
+                // Повторный вызов ничего не стоит — служба помнит и то,
+                // что предела не нашлось.
+                inputLimitMeasured = measuredInputLimit != nil
+            }
+            let fitted = OversizeChunks.fitted(
+                chunks, contextLength: contextLength, characterLimit: measuredInputLimit
+            )
+            if fitted.split > 0 {
+                chunks = fitted.chunks
+                chunksSplitToFit += fitted.split
+                log(.warning, "Источники",
+                    "Файл \(item.relativePath): чанков, не влезавших в контекст модели, дорезано по предложениям: \(fitted.split.plainDigits). Уменьшите размер чанка, если это повторяется.")
+            }
+            // Пустой чанк дорезкой не лечится: его нечем делить, и отправлять
+            // его модели незачем.
+            if let empty = chunks.first(where: {
                 ContextBudget.check($0.text, contextLength: contextLength).blocksSending
             }) {
-                let verdict = ContextBudget.check(oversized.text, contextLength: contextLength)
-                let tokens = TokenEstimator.estimatedTokens(oversized.text)
-                let reason = String(localized: "чанк \(oversized.index + 1) длиннее контекста модели (≈\(tokens) токенов): \(verdict.message ?? "")")
+                let verdict = ContextBudget.check(empty.text, contextLength: contextLength)
+                let reason = String(localized: "чанк \(empty.index + 1) не отправляется модели: \(verdict.message ?? "")")
                 skipped.append((item.relativePath, reason))
-                // «Повторить» after the chunk size has been changed — the reason
-                // says what to change, the action is what to do afterwards.
                 runProblems.append(FileProblem(relativePath: item.relativePath, reason: reason, remedy: .retry))
                 continue
             }
@@ -1893,6 +2289,7 @@ public actor SourceSyncService {
                 extractorID: extracted.extractorID,
                 extractorVersion: extracted.extractorVersion,
                 extractionSignature: source.extractionSignature,
+                metadataSignature: source.metadataSignature,
                 modifiedAt: item.modifiedAt,
                 size: item.size,
                 chunkingSignature: signature,
@@ -1902,21 +2299,52 @@ public actor SourceSyncService {
             // The intent reaches the disk **before** the database is touched.
             // Everything below can be interrupted; only a record written first
             // makes the interruption recoverable.
-            try journal.begin(record, sourceID: source.id)
+            // Один файл больше не уводит за собой весь прогон.
+            //
+            // Так уходил файл, чанк которого не влезал в то, что модель
+            // читает на самом деле: ошибка поднималась из записи наружу,
+            // прогон обрывался на этом файле, и остальные сотни не
+            // разбирались вовсе. Теперь непрошедшее называется в отчёте,
+            // а разбор идёт дальше.
+            let writtenBeforeFile = chunksWritten
+            do {
+                try journal.begin(record, sourceID: source.id)
 
-            let baseMetadata = metadata(
-                for: item, text: text, hash: hash, source: source,
-                embeddingModel: embeddingModel, totalChunks: chunks.count,
-                attention: attentionNote[collectionName], extracted: extracted
-            )
-            let schema = schemas[collectionName]
-            // Where each chunk landed in the document, found once per file.
-            let placements = ChunkLocator.placements(of: chunks, in: extracted)
+                let baseMetadata = metadata(
+                    for: item, text: text, hash: hash, source: source,
+                    embeddingModel: embeddingModel, totalChunks: chunks.count,
+                    attention: attentionNote[collectionName], extracted: extracted
+                )
+                let schema = schemas[collectionName]
+                // Where each chunk landed in the document, found once per file.
+                let placements = ChunkLocator.placements(of: chunks, in: extracted)
 
-            var batch: [TextChunk] = []
-            for chunk in chunks {
-                batch.append(chunk)
-                if batch.count == batchSize {
+                var batch: [TextChunk] = []
+                for chunk in chunks {
+                    batch.append(chunk)
+                    if batch.count == batchSize {
+                        try await flush(
+                            batch, relativePath: item.relativePath, baseMetadata: baseMetadata,
+                            placements: placements,
+                            contextPrefixEnabled: source.chunking.contextPrefix,
+                            enrichment: enrichment,
+                            schema: schema, collectionID: collectionID, model: embeddingModel,
+                            dimension: dimension, chroma: chroma, embeddings: embeddings,
+                            binding: binding
+                        )
+                        chunksWritten += batch.count
+                        batch.removeAll()
+                        progress(SyncProgress(
+                            stage: String(localized: "Эмбеддинг"),
+                            processedFiles: index, totalFiles: writeItems.count,
+                            chunksWritten: chunksWritten, currentFile: item.relativePath
+                        ))
+                        // The batch is written and the journal is consistent: the
+                        // safe moment to let a more important task have the model.
+                        await yield?()
+                    }
+                }
+                if !batch.isEmpty {
                     try await flush(
                         batch, relativePath: item.relativePath, baseMetadata: baseMetadata,
                         placements: placements,
@@ -1927,52 +2355,46 @@ public actor SourceSyncService {
                         binding: binding
                     )
                     chunksWritten += batch.count
-                    batch.removeAll()
-                    progress(SyncProgress(
-                        stage: String(localized: "Эмбеддинг"),
-                        processedFiles: index, totalFiles: writeItems.count,
-                        chunksWritten: chunksWritten, currentFile: item.relativePath
-                    ))
-                    // The batch is written and the journal is consistent: the
-                    // safe moment to let a more important task have the model.
-                    await yield?()
                 }
+
+                try journal.advance(sourceID: source.id, relativePath: item.relativePath, to: .upserted)
+
+                // Only now the old tail goes — by explicit ids, never by a `where`
+                // condition. A file that got shorter leaves chunks nothing refers
+                // to any more, and a filter could take more than it should if two
+                // sources ever agreed on the same metadata.
+                let tail = record.tailIDs
+                if !tail.isEmpty {
+                    try await chroma.deleteDocuments(collectionID: collectionID, ids: tail)
+                    chunksDeleted += tail.count
+                }
+                try journal.advance(sourceID: source.id, relativePath: item.relativePath, to: .cleaned)
+
+                if case .new = item.kind { added += 1 } else { updated += 1 }
+                if attentionNote[collectionName] != nil { marked.append(item.relativePath) }
+
+                manifest.record(record.manifestEntry())
+                // Written per file, and never before the database confirmed the
+                // write: an interrupted sync keeps everything it managed to do, and
+                // the next run picks up where it stopped.
+                manifests.save(manifest)
+                try journal.finish(sourceID: source.id, relativePath: item.relativePath)
+            } catch let error as SyncError {
+                guard case .longerThanModelReads = error else { throw error }
+                let reason = Self.reason(for: error)
+                // Записанное этим файлом снимается: манифест о нём не
+                // узнал, и оставленные чанки стали бы сиротами, на которые
+                // никто не ссылается и которых никто не перезапишет.
+                try? await chroma.deleteDocuments(collectionID: collectionID, ids: record.newIDs)
+                try? journal.finish(sourceID: source.id, relativePath: item.relativePath)
+                chunksWritten = writtenBeforeFile
+                skipped.append((item.relativePath, reason))
+                runProblems.append(FileProblem(
+                    relativePath: item.relativePath, reason: reason, remedy: .retry
+                ))
+                log(.warning, "Источники", "Файл \(item.relativePath) пропущен: \(reason)")
+                continue
             }
-            if !batch.isEmpty {
-                try await flush(
-                    batch, relativePath: item.relativePath, baseMetadata: baseMetadata,
-                    placements: placements,
-                    contextPrefixEnabled: source.chunking.contextPrefix,
-                    enrichment: enrichment,
-                    schema: schema, collectionID: collectionID, model: embeddingModel,
-                    dimension: dimension, chroma: chroma, embeddings: embeddings,
-                    binding: binding
-                )
-                chunksWritten += batch.count
-            }
-
-            try journal.advance(sourceID: source.id, relativePath: item.relativePath, to: .upserted)
-
-            // Only now the old tail goes — by explicit ids, never by a `where`
-            // condition. A file that got shorter leaves chunks nothing refers
-            // to any more, and a filter could take more than it should if two
-            // sources ever agreed on the same metadata.
-            let tail = record.tailIDs
-            if !tail.isEmpty {
-                try await chroma.deleteDocuments(collectionID: collectionID, ids: tail)
-                chunksDeleted += tail.count
-            }
-            try journal.advance(sourceID: source.id, relativePath: item.relativePath, to: .cleaned)
-
-            if case .new = item.kind { added += 1 } else { updated += 1 }
-            if attentionNote[collectionName] != nil { marked.append(item.relativePath) }
-
-            manifest.record(record.manifestEntry())
-            // Written per file, and never before the database confirmed the
-            // write: an interrupted sync keeps everything it managed to do, and
-            // the next run picks up where it stopped.
-            manifests.save(manifest)
-            try journal.finish(sourceID: source.id, relativePath: item.relativePath)
         }
 
         progress(SyncProgress(
@@ -1984,6 +2406,7 @@ public actor SourceSyncService {
         // Replaced wholesale rather than merged: a file that read cleanly this
         // time is not still broken because it was broken last week.
         manifest.problems = runProblems
+        if countsFolderLevels { manifest.newFolderLevels = plan.newFolderLevels }
         manifests.save(manifest)
 
         let summary = SyncSummary(
@@ -1995,11 +2418,13 @@ public actor SourceSyncService {
             substituted: substituted,
             recoveredFiles: recovery.finished.count,
             reindexedAfterFailure: recovery.toReindex.count,
+            chunksSplitToFit: chunksSplitToFit,
             heterogeneousCollections: heterogeneous,
             staleExtraction: plan.staleExtraction,
             tableWarnings: tableWarnings,
             tableRowsNeedingDecision: tableManifests.pendingRemovals(sourceID: source.id)
-                .reduce(0) { $0 + $1.rows.count }
+                .reduce(0) { $0 + $1.rows.count },
+            newFolderLevels: plan.newFolderLevels
         )
         log(.success, "Источники", "Источник «\(source.name)» → \(plan.targetCollections.joined(separator: ", ")): \(summary.line), за \(String(format: "%.1f", summary.duration)) с")
         for item in skipped {
@@ -2170,12 +2595,21 @@ public actor SourceSyncService {
             id = resolved
         }
 
-        let filter = DocumentFilter(conditions: [
-            MetadataCondition(field: "source_id", op: .equals, value: sourceID.uuidString),
-            MetadataCondition(field: "source_file", op: .equals, value: relativePath),
-        ])
         do {
-            return try await chroma.deleteDocuments(collectionID: id, filter: filter)
+            // Формы записи пути перебираются по очереди: чанки, лежащие
+            // в базе с прежних сборок, записаны так, как путь отдала файловая
+            // система, а спрашиваем мы теперь каноничной формой. Не найти их
+            // здесь — значит оставить в коллекции чанки удалённого файла.
+            var deleted = 0
+            for variant in FilePathKey.variants(relativePath) {
+                let filter = DocumentFilter(conditions: [
+                    MetadataCondition(field: "source_id", op: .equals, value: sourceID.uuidString),
+                    MetadataCondition(field: "source_file", op: .equals, value: variant),
+                ])
+                deleted = try await chroma.deleteDocuments(collectionID: id, filter: filter)
+                if deleted > 0 { break }
+            }
+            return deleted
         } catch {
             // Older or stricter servers might refuse the filter; the ids we
             // remembered still let us clean up.
@@ -2440,6 +2874,11 @@ public actor SourceSyncService {
             DocumentOrigin.metadataKey: DocumentOrigin.source.value,
             "source_id": .string(source.id.uuidString),
             "source_file": .string(item.relativePath),
+            // Отпечаток файла — то, чем агент просит документ целиком.
+            // Путь для этого плох: его перепечатывают в другой форме записи,
+            // теряют верхние папки, ломают кодировкой. Шестнадцать
+            // шестнадцатеричных знаков так не испортишь.
+            "file_id": .string(Self.fileFingerprint(item.relativePath)),
             "content_hash": .string(hash),
             "chunk_count": .int(totalChunks),
             "_cdbm_source_name": .string(source.name),
@@ -2472,6 +2911,13 @@ public actor SourceSyncService {
         }
         if !extracted.warnings.isEmpty {
             metadata["extraction_warnings"] = .string(extracted.warnings.map(\.text).joined(separator: "; "))
+            // Отдельным полем, а не только словами в оговорке: по
+            // нему выдача агенту приписывает предупреждение, а проверка
+            // коллекции находит файлы, где числам верить нельзя. Разбирать
+            // ради этого русскую фразу — способ однажды её не узнать.
+            if extracted.warnings.contains(where: { if case .tablesNotAssembled = $0 { return true } else { return false } }) {
+                metadata["tables_flat"] = .bool(true)
+            }
         }
         if let pageCount = extracted.pageCount {
             metadata["page_count"] = .int(pageCount)
@@ -2507,10 +2953,22 @@ public actor SourceSyncService {
 
     /// `id = <sha256(relative_path) первые 16 hex>-<chunk_index>`, fixed by the
     /// spec: re-indexing a file replaces its chunks instead of duplicating them.
+    ///
+    /// Хеш берётся от каноничной формы пути: sha256 считает байты, и
+    /// одно и то же имя, записанное разложенным и слитным, дало бы файлу два
+    /// разных отпечатка — то есть два набора чанков вместо замены прежних.
     public static func documentID(relativePath: String, chunkIndex: Int) -> String {
-        let digest = SHA256.hash(data: Data(relativePath.utf8))
-        let hash = digest.compactMap { String(format: "%02x", $0) }.joined().prefix(16)
-        return "\(hash)-\(chunkIndex)"
+        "\(fileFingerprint(relativePath))-\(chunkIndex)"
+    }
+
+    /// Отпечаток файла — то, чем его чанки отличаются от чужих.
+    ///
+    /// Шестнадцать шестнадцатеричных знаков: их нельзя перепечатать «в другой
+    /// форме», потерять верхние папки или испортить кодировкой, и потому
+    /// именно он отдаётся агенту как способ спросить файл целиком.
+    public static func fileFingerprint(_ relativePath: String) -> String {
+        let digest = SHA256.hash(data: Data(FilePathKey.canonical(relativePath).utf8))
+        return String(digest.compactMap { String(format: "%02x", $0) }.joined().prefix(16))
     }
 
     /// SHA-256 of the extracted text.
@@ -2709,19 +3167,75 @@ public actor SourceSyncService {
 
     /// Which extractor would read this file today, without reading it —
     /// compares versions on files it deliberately does not open.
-    static func stamp(of url: URL, registry: ExtractorRegistry) -> ExtractorStamp {
-        guard let type = ExtractorRegistry.type(of: url),
-              let extractor = registry.all.first(where: { $0.canHandle(type) }) else {
+    ///
+    /// `storedID` — тот, что записан у файла в манифесте: сравнивать надо
+    /// с его же экстрактором, а не с первым подходящим.
+    static func stamp(
+        of url: URL, storedID: String = "", registry: ExtractorRegistry,
+        options: ExtractionOptions = ExtractionOptions()
+    ) -> ExtractorStamp {
+        guard let type = ExtractorRegistry.type(of: url) else {
             return ExtractorStamp(id: "", version: 0)
         }
-        return ExtractorStamp(id: extractor.id, version: extractor.version)
+        return registry.currentStamp(for: type, storedID: storedID, options: options)
     }
 
+    /// Файлы, чей текст в базе получен прежней версией того же экстрактора
+    /// — по манифесту, без обхода папки и без чтения файлов.
+    ///
+    /// Это тот же список, что собирает план, но доступный **до** него: смена
+    /// версии приходит с обновлением приложения, то есть с его перезапуском,
+    /// а список плана жил только в памяти экрана и после перезапуска исчезал.
+    /// Человек видел карточку без единого слова о том, что 4522 файла в базе
+    /// прочитаны позапрошлой читалкой.
+    ///
+    /// Тип берётся по расширению записи, а не с диска: это ответ на вопрос
+    /// «чем читали и чем читают», а не «что сейчас лежит по этому пути», и
+    /// четыре с половиной тысячи обращений к файловой системе ради него платить
+    /// незачем. Штамп на расширение считается один раз.
+    public func staleExtractions(in manifest: SourceManifest, source: DataSource) -> [StaleExtraction] {
+        let options = Self.extractionOptions(for: source)
+        var stamps: [String: ExtractorStamp] = [:]
+        var result: [StaleExtraction] = []
+        for entry in manifest.entries.values {
+            let stored = entry.extractorStamp
+            guard !stored.isUnknown else { continue }
+            let ext = (entry.relativePath as NSString).pathExtension.lowercased()
+            let key = "\(ext)|\(stored.id)"
+            let current: ExtractorStamp
+            if let cached = stamps[key] {
+                current = cached
+            } else {
+                current = UTType(filenameExtension: ext)
+                    .map { registry.currentStamp(for: $0, storedID: stored.id, options: options) }
+                    ?? ExtractorStamp(id: "", version: 0)
+                stamps[key] = current
+            }
+            guard SyncDecisionRules.isStale(stored: stored, current: current) else { continue }
+            result.append(StaleExtraction(
+                relativePath: entry.relativePath,
+                collectionName: entry.collectionName,
+                previous: stored,
+                current: current
+            ))
+        }
+        return result.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    /// Путь файла внутри источника — в единой форме записи.
+    ///
+    /// Файловая система macOS отдаёт имена разложенными: «й» приходит двумя
+    /// знаками. Для Swift это та же строка, а для ChromaDB, JSON и sha256 —
+    /// другие байты, и путь, попавший в базу в таком виде, не находился ни
+    /// фильтром человека, ни `get_file` агента. Форма выбирается здесь, в
+    /// одном месте, — дальше по коду путь идёт уже слитным.
     public static func relative(_ url: URL, to root: URL) -> String {
         let rootPath = root.standardizedFileURL.path
         let filePath = url.standardizedFileURL.path
-        guard filePath.hasPrefix(rootPath) else { return url.lastPathComponent }
-        return String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard filePath.hasPrefix(rootPath) else { return FilePathKey.canonical(url.lastPathComponent) }
+        return FilePathKey.canonical(
+            String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        )
     }
 }
 

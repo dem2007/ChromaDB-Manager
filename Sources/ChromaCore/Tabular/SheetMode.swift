@@ -87,7 +87,11 @@ public enum SheetModeDetector {
 
         let width = filled.prefix(sampleSize).map { $0.lastColumn + 1 }.max() ?? 0
         let body = Array(filled.dropFirst().prefix(sampleSize))
-        let titles = headerTitles(header, width: width)
+        // Повторы получают номера так же, как при явном выборе строки.
+        // Иначе один и тот же лист ведёт себя по-разному: роли и свои названия
+        // — словари по имени колонки, и две колонки «Стоимость» делят одну
+        // роль на двоих. Пометить одну текстом, а вторую метаданными нельзя.
+        let titles = TableProfileMatcher.uniqued(headerTitles(header, width: width))
         // Columns that are empty everywhere — the narrow spacer column real
         // spreadsheets are full of. They are not columns of the table, and
         // judging the header row by them rejected perfectly ordinary files.

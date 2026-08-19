@@ -11,6 +11,15 @@ final class SourcesViewModel: ObservableObject {
     @Published var draftIsNew = false
     @Published var draftMetadataRows: [MetadataRow] = []
     @Published var draftSeparators = ""
+    /// Уровни вложенности папки, которую сейчас настраивают.
+    ///
+    /// Считаются один раз при открытии редактора: называть уровни вслепую —
+    /// это гадать, сколько их и что в них лежит, а ответ занимает секунду.
+    @Published var draftFolderLevels: FolderLevels?
+    @Published var draftLevelsScanning = false
+    /// Папку прочитать не удалось (диск отключён, путь исчез): тогда уровни
+    /// не показываются, но и настраивать их вручную никто не мешает.
+    @Published var draftLevelsProblem: String?
 
     // Running state
     /// Источники, которые сейчас синхронизируются или ждут своей очереди
@@ -66,6 +75,31 @@ final class SourcesViewModel: ObservableObject {
     /// а здесь — что диск тот самый. Ответ «да» стоит восьми тысяч
     /// документов, и спрашивать о нём тем же способом нельзя.
     @Published var massRemoval: MassRemovalPrompt?
+    /// Ход массового решения об исчезнувших файлах и строках.
+    ///
+    /// Файлы разбираются по одному, и каждый — это обращение к базе. На
+    /// девяноста файлах разбор шёл пятнадцать секунд, и всё это время экран
+    /// выглядел так, будто нажатие потеряли: кнопки живы, список цел, ничего
+    /// не двигается. Правило 2 — молча ничего не происходит.
+    @Published var resolveProgress: ResolveProgress?
+
+    struct ResolveProgress: Equatable {
+        var done: Int
+        var total: Int
+        /// Что именно разбирается — файлы или листы таблиц.
+        var subject: Subject
+
+        enum Subject: Equatable { case files, sheets }
+
+        var text: String {
+            switch subject {
+            case .files:
+                return String(localized: "Разбираем файлы: \(done.plainDigits) из \(total.plainDigits)")
+            case .sheets:
+                return String(localized: "Разбираем листы: \(done.plainDigits) из \(total.plainDigits)")
+            }
+        }
+    }
 
     struct MassRemovalPrompt: Identifiable {
         var id: UUID { source.id }
@@ -108,11 +142,16 @@ final class SourcesViewModel: ObservableObject {
     /// last plan or run of a source and shown until something is done about it —
     /// the app never puts them in a queue by itself.
     @Published var staleExtraction: [UUID: [StaleExtraction]] = [:]
+    /// Уровни вложенности, которым никто не давал имени. Читаются
+    /// из манифеста вместе с остальным: замечает прогон, решает человек.
+    @Published var newFolderLevels: [UUID: [NewFolderLevel]] = [:]
+    /// Файлы, чьи поля в базе записаны прежними настройками источника
+    ///. Лечится переписыванием метаданных, а не пересчётом векторов.
+    @Published var outdatedMetadata: [UUID: Int] = [:]
     /// the diagnostics screen. Files the last run could not read, and
     /// files it read with something to say about them.
     @Published var problems: [UUID: [FileProblem]] = [:]
     @Published var warnedFiles: [UUID: [ManifestEntry]] = [:]
-    @Published var showingDiagnostics = false
     /// set when the pending run would send a lot of rows to the model.
     /// The sample-run offer is shown only while this is set.
     @Published var tableEstimates: [UUID: TableRunEstimate] = [:]
@@ -354,6 +393,10 @@ final class SourcesViewModel: ObservableObject {
     func beginEditing(_ source: DataSource, isNew: Bool = false) {
         draft = source
         draftIsNew = isNew
+        draftFolderLevels = nil
+        draftLevelsProblem = nil
+        draftLevelsScanning = false
+        alignDraftLevels()
         draftMetadataRows = source.customMetadata.keys.sorted().map {
             MetadataRow(key: $0, value: source.customMetadata[$0] ?? "")
         }
@@ -363,8 +406,103 @@ final class SourcesViewModel: ObservableObject {
             .joined(separator: " | ")
     }
 
+    /// Считает уровни папки для редактора.
+    ///
+    /// Отдельной задачей и не блокируя лист: у папки с сотней тысяч файлов
+    /// обход занимает секунды, и это не повод не показывать остальные
+    /// настройки. Пока считается — так и написано.
+    func scanDraftLevels(_ app: AppEnvironment) {
+        guard let source = draft, !source.isWeb else {
+            draftFolderLevels = nil
+            return
+        }
+        draftFolderLevels = nil
+        draftLevelsProblem = nil
+        draftLevelsScanning = true
+        let syncService = app.syncService
+        Task { [weak self] in
+            do {
+                let levels = try await syncService.folderLevels(source: source)
+                await MainActor.run {
+                    guard let self, self.draft?.id == source.id else { return }
+                    self.draftFolderLevels = levels
+                    self.draftLevelsScanning = false
+                    self.alignDraftLevels()
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.draft?.id == source.id else { return }
+                    self.draftLevelsProblem = app.describe(error)
+                    self.draftLevelsScanning = false
+                }
+            }
+        }
+    }
+
+    /// Строк уровней в редакторе столько, сколько их в папке, — но не больше
+    /// предела и не меньше уже названных: уровень, названный когда-то, не
+    /// должен исчезнуть из виду оттого, что папку временно опустошили.
+    func alignDraftLevels() {
+        guard var source = draft, !source.isWeb else { return }
+        // Названные уровни держат длину списка сами: поле, названное когда-то,
+        // уже есть в базе. Безымянный хвост длину не держит — это пустые
+        // строки на экране и ничего больше.
+        let named = source.pathLevels.lastIndex(where: \.isNamed).map { $0 + 1 } ?? 0
+        let wanted = min(max(draftFolderLevels?.depth ?? 0, named), PathLevel.maximumLevels)
+        guard source.pathLevels.count != wanted else { return }
+        if source.pathLevels.count < wanted {
+            source.pathLevels.append(contentsOf: (source.pathLevels.count..<wanted).map { _ in PathLevel() })
+        } else {
+            // Обрезаются только **безымянные** хвостовые уровни: названный
+            // уровень — это поле в базе, и молча его выбрасывать нельзя.
+            while source.pathLevels.count > wanted, source.pathLevels.last?.isNamed == false {
+                source.pathLevels.removeLast()
+            }
+        }
+        draft = source
+    }
+
+    /// Что мешает сохранить поля из пути. `nil` — всё в порядке.
+    var pathLevelProblem: String? {
+        guard let levels = draft?.pathLevels else { return nil }
+        for (index, level) in levels.enumerated() {
+            if let problem = PathLevel.keyProblem(level.key) {
+                return String(localized: "Уровень \(index + 1): \(problem)")
+            }
+            if level.isNamed, level.defaultIsBroken {
+                return String(localized: "Уровень \(index + 1): значение «\(level.fallbackValue)» не разбирается как \(level.type.title).")
+            }
+        }
+        let named = levels.filter(\.isNamed).map(\.trimmedKey)
+        if let duplicate = Self.firstDuplicate(in: named) {
+            return String(localized: "Поле «\(duplicate)» задано двум уровням сразу.")
+        }
+        let manual = Set(draftMetadataRows.map { $0.key.trimmingCharacters(in: .whitespaces) })
+        if let clash = named.first(where: manual.contains) {
+            return String(localized: "Поле «\(clash)» задано и уровнем пути, и метаданными источника — значение уровня было бы затёрто.")
+        }
+        return nil
+    }
+
+    private static func firstDuplicate(in keys: [String]) -> String? {
+        var seen: Set<String> = []
+        for key in keys {
+            if seen.contains(key) { return key }
+            seen.insert(key)
+        }
+        return nil
+    }
+
     func saveDraft(_ app: AppEnvironment) {
         guard var source = draft else { return }
+        // Хвостовые безымянные уровни в настройках не хранятся: они ничего
+        // не пишут, а подпись метаданных от них меняться не должна.
+        while source.pathLevels.last?.isNamed == false { source.pathLevels.removeLast() }
+        source.pathLevels = source.pathLevels.map {
+            var level = $0
+            level.key = level.trimmedKey
+            return level
+        }
         source.collectionName = CollectionNaming.sanitize(source.collectionName)
         // У веб-источника «путь» — это его адрес: он показывается в списке,
         // в логе и в сводке, и расходиться с настройкой ему нельзя.
@@ -408,7 +546,6 @@ final class SourcesViewModel: ObservableObject {
     /// so the next run tries it again by itself. Everything that did read stays
     /// read — the manifest is what makes that cheap.
     func retry(_ source: DataSource, app: AppEnvironment) {
-        showingDiagnostics = false
         sync(source, app: app)
     }
 
@@ -433,7 +570,9 @@ final class SourcesViewModel: ObservableObject {
         updated.excludedPaths.append(relativePath)
         app.settings.upsert(source: updated)
         app.log.record(.warning, "Источники", "Источник «\(source.name)»: файл \(relativePath) исключён из индексации (документы в базе не тронуты)")
-        problems[source.id]?.removeAll { $0.relativePath == relativePath }
+        // И из манифеста тоже: список на экране пережил бы перезапуск, а
+        // исключённый файл в нём — это находка, о которой уже всё решено.
+        forget([relativePath], in: source.id, app: app)
         infoMessage = String(localized: "\(relativePath) больше не читается. Уже записанные чанки остались в базе — если файл там есть, следующий запуск предложит решить, что с ними делать.")
     }
 
@@ -444,6 +583,72 @@ final class SourcesViewModel: ObservableObject {
         updated.excludedPaths.removeAll { $0 == relativePath }
         app.settings.upsert(source: updated)
         app.log.record(.info, "Источники", "Источник «\(source.name)»: файл \(relativePath) снова индексируется")
+    }
+
+    // MARK: - Массовые решения по диагностике
+
+    /// Исключить из индексации сразу несколько файлов одного источника.
+    ///
+    /// Настройка источника пишется **один раз** на весь набор: `upsert` внутри
+    /// цикла сохранял бы конфигурацию по разу на файл, и на двух сотнях файлов
+    /// это двести записей одного и того же файла настроек.
+    /// - Returns: сколько файлов действительно исключено. Сообщение об итоге
+    ///   пишет вызывающий: на нескольких источниках подряд каждая своя строка
+    ///   затирала предыдущую, и на экране оставалось число последнего
+    /// источника вместо общего.
+    @discardableResult
+    func exclude(_ paths: [String], in source: DataSource, app: AppEnvironment) -> Int {
+        let fresh = paths.filter { !source.excludedPaths.contains($0) }
+        guard !fresh.isEmpty else { return 0 }
+        var updated = source
+        updated.excludedPaths.append(contentsOf: fresh)
+        app.settings.upsert(source: updated)
+        app.log.record(.warning, "Источники", "Источник «\(source.name)»: исключено из индексации файлов — \(fresh.count.plainDigits) (документы в базе не тронуты)")
+        forget(fresh, in: source.id, app: app)
+        return fresh.count
+    }
+
+    /// Итог массового исключения — одной строкой на всё, что выбрано.
+    func reportExcluded(_ count: Int) {
+        guard count > 0 else { return }
+        infoMessage = String(localized: "Файлов исключено: \(count.plainDigits). Уже записанные чанки остались в базе — если файлы там есть, следующий запуск предложит решить, что с ними делать.")
+    }
+
+    /// Итог «убрать из списка»: находки сняты, файлы не тронуты.
+    func reportForgotten(_ count: Int) {
+        guard count > 0 else { return }
+        infoMessage = String(localized: "Находок убрано из списка: \(count.plainDigits). Файлы остались в источниках — следующий запуск скажет о них снова, если они снова не прочитаются.")
+    }
+
+    /// Убрать находки из списка, ничего больше не меняя.
+    ///
+    /// И из экрана, и из манифеста: манифест — это то, что переживает
+    /// перезапуск, и убранное только с экрана вернулось бы завтра само.
+    /// Файл при этом остаётся в источнике: следующий прогон прочитает его
+    /// снова и, если он снова не прочтётся, снова об этом скажет. Это честно —
+    /// «очистить напоминание» не значит «починить файл».
+    func forget(_ paths: [String], in sourceID: UUID, app: AppEnvironment) {
+        let set = Set(paths)
+        problems[sourceID]?.removeAll { set.contains($0.relativePath) }
+        if problems[sourceID]?.isEmpty == true { problems[sourceID] = nil }
+        // Правка манифеста — одним обращением к актору: читать его здесь,
+        // а сохранять следующим вызовом значило бы дать идущему прогону
+        // вклиниться между этими двумя шагами.
+        Task { await app.syncService.forgetProblems(set, sourceID: sourceID) }
+    }
+
+    /// Красная кнопка «очистить всё»: находки уходят из всех источников разом.
+    func forgetAllProblems(_ app: AppEnvironment) {
+        let counted = problemCount
+        let ids = Array(problems.keys)
+        problems = [:]
+        app.log.record(.warning, "Источники", "Диагностика очищена вручную: снято находок — \(counted.plainDigits)")
+        infoMessage = String(localized: "Диагностика очищена: снято находок — \(counted.plainDigits). Файлы остались в источниках, и следующий запуск скажет о них снова, если они снова не прочитаются.")
+        Task {
+            for id in ids {
+                await app.syncService.forgetProblems(nil, sourceID: id)
+            }
+        }
     }
 
     func promptForPassword(_ problem: FileProblem, source: DataSource) {
@@ -512,6 +717,9 @@ final class SourcesViewModel: ObservableObject {
             var tableRemovals: [UUID: [PendingRowRemoval]] = [:]
             var git: [UUID: GitSyncService.Status] = [:]
             var blocked: [UUID: String] = [:]
+            var stale: [UUID: [StaleExtraction]] = [:]
+            var newLevels: [UUID: [NewFolderLevel]] = [:]
+            var outdated: [UUID: Int] = [:]
             for source in sources {
                 // Спросить git — это два быстрых вызова и ноль записей в базу;
                 // зато экран сразу знает про ветку и про то, что её сменили.
@@ -524,6 +732,17 @@ final class SourcesViewModel: ObservableObject {
                     updatedAt: manifest.updatedAt
                 )
                 if !manifest.pendingRemovals.isEmpty { pending[source.id] = manifest.pendingRemovals }
+                // смена версии экстрактора приходит с обновлением
+                // приложения, то есть с его перезапуском. Считать её только
+                // в плане значило молчать до тех пор, пока человек не нажмёт
+                // «План» — а нажимать его незачем, когда на карточке ничего
+                // не написано. Манифест уже прочитан, файлы для этого
+                // ответа открывать не нужно.
+                let staleFiles = await app.syncService.staleExtractions(in: manifest, source: source)
+                if !staleFiles.isEmpty { stale[source.id] = staleFiles }
+                if !manifest.newFolderLevels.isEmpty { newLevels[source.id] = manifest.newFolderLevels }
+                let outdatedFiles = await app.syncService.filesWithOutdatedMetadata(in: manifest, source: source)
+                if !outdatedFiles.isEmpty { outdated[source.id] = outdatedFiles.count }
                 // Чтение манифеста таблиц — синхронное и с диска, а `Task`
                 // модели экрана наследует главный актор: без ухода в сторону
                 // двадцать источников читались главным потоком.
@@ -577,6 +796,9 @@ final class SourcesViewModel: ObservableObject {
                     self.pendingRowRemovals[source.id] = tableRemovals[source.id]
                     self.gitStatus[source.id] = git[source.id]
                     self.recoveryBlocks[source.id] = blocked[source.id]
+                    self.staleExtraction[source.id] = stale[source.id]
+                    self.newFolderLevels[source.id] = newLevels[source.id]
+                    self.outdatedMetadata[source.id] = outdated[source.id]
                     self.manifestsRead.insert(source.id)
                 }
             }
@@ -645,7 +867,7 @@ final class SourcesViewModel: ObservableObject {
             } catch {
                 await MainActor.run { self?.errorMessage = app.describe(error) }
             }
-            await MainActor.run { self?.busySourceIDs.remove(source.id) }
+            await MainActor.run { _ = self?.busySourceIDs.remove(source.id) }
             self?.refreshManifests(app)
         }
     }
@@ -736,8 +958,12 @@ final class SourcesViewModel: ObservableObject {
         // learn that **before** it starts. Rule 4 of Приложение 5 in its most
         // literal form — and the file-count threshold does not cover it: one
         // workbook is one file and fifty thousand calls.
+        // Правило одно и живёт в `SyncPlan.confirmationReasons`:
+        // и «много файлов», и «много строк из таблиц» проверяются там.
+        // Второе выражение того же правила здесь разъехалось бы с первым
+        // при любой правке порога.
         let bigTable = (planned?.tableRowsToEmbed ?? 0) > TableRunEstimate.warningThreshold
-        if let plan = planned, plan.needsConfirmation(threshold: threshold) || bigTable {
+        if let plan = planned, plan.needsConfirmation(threshold: threshold) {
             let metrics = await app.metrics.current()
             let benchmarks = await app.benchmarks.all()
             await MainActor.run {
@@ -746,6 +972,10 @@ final class SourcesViewModel: ObservableObject {
                 lastPlanBenchmarks = benchmarks
                 excludedPaths[source.id] = []
                 pendingConfirmations.insert(source.id)
+                // Причина — одна на баннер экрана и на баннер карточки плана
+                //: два своих текста разошлись бы, и один из них уже
+                // говорил неправду.
+                var lines = plan.confirmationReasons(threshold: threshold).map(\.sentence)
                 if bigTable {
                     let estimate = TableRunEstimate(
                         embeddings: plan.tableRowsToEmbed, metadataWrites: 0,
@@ -754,11 +984,11 @@ final class SourcesViewModel: ObservableObject {
                         basis: basis(model, metrics: metrics, benchmarks: benchmarks)
                     )
                     tableEstimates[source.id] = estimate
-                    infoMessage = String(localized: "Строк из таблиц к обработке: \(plan.tableRowsToEmbed) — это \(plan.tableRowsToEmbed) обращений к модели. \(estimate.line). Можно сначала попробовать на выборке.")
+                    lines.append(String(localized: "\(estimate.line). Можно сначала попробовать на выборке."))
                 } else {
                     tableEstimates[source.id] = nil
-                    infoMessage = String(localized: "Затронет файлов: \(plan.writeItems.count) — больше порога \(threshold). Проверьте план и подтвердите запуск.")
                 }
+                infoMessage = lines.joined(separator: " ")
             }
             return
         }
@@ -1156,27 +1386,122 @@ final class SourcesViewModel: ObservableObject {
         }
     }
 
+    /// Переписывает поля уже проиндексированных чанков.
+    ///
+    /// Отдельной операцией и без модели: текст файлов не менялся — менялись
+    /// подписи к нему. У папки на пять тысяч документов это разница между
+    /// минутой и половиной суток пересчёта.
+    func refreshMetadata(_ source: DataSource, app: AppEnvironment) {
+        guard !isBusy(source.id) else { return }
+        errorMessage = nil
+        infoMessage = nil
+        beginOperation()
+        busySourceIDs.insert(source.id)
+        let syncService = app.syncService
+        tasks[source.id] = Task { [weak self] in
+            do {
+                // Копия — **до** очереди, а не внутри неё.
+                //
+                // Копия идёт отдельной задачей группы «вся база целиком», а та
+                // начинается только на пустой очереди. Заказанная изнутри
+                // работающей задачи, она ждала бы её конца, а та — своей копии:
+                // «Обновление полей» вставало намертво и держало очередь.
+                // Так же устроено «Переизвлечь и переэмбедить»: сперва копия,
+                // потом работа.
+                let backup = try await Self.makeBackup(
+                    for: source, app: app,
+                    note: "перед обновлением полей источника \(source.name)"
+                )
+                // Подключение берётся после копии: сервер за это время гасили
+                // и поднимали, и прежнее подключение уже не то.
+                let ticket = await MainActor.run {
+                    QueueTicket(
+                        title: String(localized: "Обновление полей источника «\(source.name)»"),
+                        priority: .interactive,
+                        group: .database,
+                        connectionID: app.connectionID
+                    )
+                }
+                let report = try await app.queue.run(ticket) { _ -> SourceSyncService.MetadataRefreshReport in
+                    guard let client = await MainActor.run(body: { app.client }) else {
+                        throw SyncError.recoveryFailed(file: source.name, reason: String(localized: "нет подключения к базе"))
+                    }
+                    return try await syncService.refreshMetadata(source: source, chroma: client, backup: backup)
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    if report.isEmpty {
+                        self.infoMessage = "Обновлять нечего: поля всех файлов уже записаны нынешними настройками."
+                    } else {
+                        let failed = report.failures.isEmpty
+                            ? ""
+                            : " Не вышло у \(report.failures.count.plainDigits) файлов — они в журнале."
+                        self.infoMessage = "Поля обновлены: файлов \(report.filesUpdated.plainDigits), чанков \(report.chunksUpdated.plainDigits). Векторы не пересчитывались. Бэкап: \(backup.describedAs).\(failed)"
+                    }
+                    for failure in report.failures {
+                        app.log.record(.warning, "Источники", "Поля не обновлены у \(failure.file): \(failure.reason)")
+                    }
+                }
+            } catch is CancellationError {
+                app.log.record(.warning, "Источники", "Обновление полей «\(source.name)» отменено")
+            } catch {
+                await MainActor.run { self?.errorMessage = app.describe(error) }
+                app.report(error, category: "Источники")
+            }
+            await MainActor.run {
+                self?.endOperation()
+                self?.busySourceIDs.remove(source.id)
+                self?.tasks[source.id] = nil
+                self?.refreshManifests(app)
+            }
+        }
+    }
+
     /// Local database: stop the server, copy the folder, start it again.
     /// External server: export the affected collections to JSON.
     ///
     /// Copying SQLite files under a running server produces a backup that
     /// restores into a corrupt database, which is why the server goes down —
     /// the same reasoning as re-embedding, and the same code path.
-    private static func makeBackup(for source: DataSource, app: AppEnvironment) async throws -> BackupEvidence {
-        let note = "перед переизвлечением источника \(source.name)"
+    private static func makeBackup(
+        for source: DataSource, app: AppEnvironment, note: String? = nil
+    ) async throws -> BackupEvidence {
+        let note = note ?? "перед переизвлечением источника \(source.name)"
         switch app.settings.configuration.mode {
         case .localDatabase:
             let path = app.localDatabaseURL
-            app.log.record(.info, "Источники", "Останавливаем локальный сервер, чтобы скопировать папку базы")
-            await app.disconnect()
-            do {
-                let evidence = try app.backupService.backupLocalDatabase(at: path, note: note)
-                await app.connect()
-                return evidence
-            } catch {
-                // The server comes back whether the copy worked or not.
-                await app.connect()
-                throw error
+            // Копия папки требует погасить сервер, а вместе с ним снимаются
+            // все задачи подключения. Поэтому копирование идёт
+            // отдельной задачей, которая ждёт пустой очереди и никого
+            // не пускает, пока не кончится: два «Переизвлечь и переэмбедить»
+            // подряд раньше означали, что бэкап второго убивал работу первого.
+            // Заголовок называет дело, ради которого копия снимается
+            //. «Резервная копия базы» четырьмя строками подряд — это
+            // очередь, в которой не видно ни одной заказанной операции:
+            // человек нажал «переизвлечь» у четырёх источников, а в очереди
+            // одни копии, и понять, куда делись переизвлечения, нельзя.
+            let ticket = QueueTicket(
+                title: String(localized: "Резервная копия базы — \(note)"),
+                priority: .interactive,
+                group: .exclusive,
+                connectionID: nil
+            )
+            return try await app.queue.run(ticket) { _ in
+                await MainActor.run {
+                    app.log.record(.info, "Источники", "Останавливаем локальный сервер, чтобы скопировать папку базы")
+                }
+                // Тот же сервер вернётся через несколько секунд: задачи,
+                // которые ещё не начались, эту остановку переживают.
+                await app.disconnect(reason: .serverRestart)
+                do {
+                    let evidence = try await MainActor.run { try app.backupService.backupLocalDatabase(at: path, note: note) }
+                    await app.connect()
+                    return evidence
+                } catch {
+                    // The server comes back whether the copy worked or not.
+                    await app.connect()
+                    throw error
+                }
             }
 
         case .server:
@@ -1311,40 +1636,7 @@ final class SourcesViewModel: ObservableObject {
 
     // MARK: - Pending removals
 
-    func resolve(
-        _ removal: PendingRemoval,
-        decision: SourceSyncService.RemovalDecision,
-        source: DataSource,
-        app: AppEnvironment
-    ) {
-        Task { [weak self] in
-            do {
-                let deleted = try await app.syncService.resolve(
-                    removal: removal,
-                    decision: decision,
-                    source: source,
-                    chroma: app.client
-                )
-                await MainActor.run {
-                    switch decision {
-                    case .deleteChunks:
-                        self?.infoMessage = "Файл \(removal.relativePath): удалено документов — \(deleted)."
-                    case .keepInDatabase:
-                        self?.infoMessage = "Файл \(removal.relativePath): документы оставлены в базе."
-                    case .postpone:
-                        break
-                    }
-                    self?.lastSummary = nil
-                }
-            } catch {
-                await MainActor.run { self?.errorMessage = app.describe(error) }
-                app.report(error, category: "Источники")
-            }
-            self?.refreshManifests(app)
-        }
-    }
-
-    /// То же решение сразу о нескольких файлах.
+    /// Решение о нескольких файлах сразу.
     ///
     /// Список исчезнувших файлов бывает в десятки строк — на живой базе их
     /// было шестьдесят шесть, — и по каждой приходилось нажимать отдельно.
@@ -1358,10 +1650,15 @@ final class SourcesViewModel: ObservableObject {
         app: AppEnvironment
     ) {
         guard !removals.isEmpty else { return }
+        // Второе нажатие поверх идущего разбора запрещено: те же файлы
+        // разбирались бы дважды, и второй проход отчитался бы отказами
+        // о работе, которую сделал первый.
+        guard resolveProgress == nil else { return }
+        resolveProgress = ResolveProgress(done: 0, total: removals.count, subject: .files)
         Task { [weak self] in
             var deleted = 0
             var failed = 0
-            for removal in removals {
+            for (index, removal) in removals.enumerated() {
                 do {
                     deleted += try await app.syncService.resolve(
                         removal: removal, decision: decision, source: source, chroma: app.client
@@ -1371,9 +1668,11 @@ final class SourcesViewModel: ObservableObject {
                     app.report(error, category: "Источники")
                     await MainActor.run { self?.errorMessage = app.describe(error) }
                 }
+                await MainActor.run { self?.resolveProgress?.done = index + 1 }
             }
             let handled = removals.count - failed
             await MainActor.run {
+                self?.resolveProgress = nil
                 switch decision {
                 case .deleteChunks:
                     self?.infoMessage = String(localized: "Файлов разобрано: \(handled.plainDigits), удалено документов — \(deleted.plainDigits).")
@@ -1401,10 +1700,14 @@ final class SourcesViewModel: ObservableObject {
         app: AppEnvironment
     ) {
         guard !removals.isEmpty else { return }
+        guard resolveProgress == nil else { return }
+        // Лист — это тысячи строк и столько же удалений в базе: ход разбора
+        // здесь нужен не меньше, чем на файлах.
+        resolveProgress = ResolveProgress(done: 0, total: removals.count, subject: .sheets)
         Task { [weak self] in
             var deleted = 0
             var failed = 0
-            for removal in removals {
+            for (index, removal) in removals.enumerated() {
                 do {
                     deleted += try await app.syncService.resolve(
                         rowRemoval: removal, decision: decision, source: source, chroma: app.client
@@ -1414,9 +1717,11 @@ final class SourcesViewModel: ObservableObject {
                     app.report(error, category: "Таблицы")
                     await MainActor.run { self?.errorMessage = app.describe(error) }
                 }
+                await MainActor.run { self?.resolveProgress?.done = index + 1 }
             }
             let handled = removals.count - failed
             await MainActor.run {
+                self?.resolveProgress = nil
                 switch decision {
                 case .deleteChunks:
                     self?.infoMessage = String(localized: "Листов разобрано: \(handled.plainDigits), удалено строк из базы — \(deleted.plainDigits).")
@@ -1437,7 +1742,11 @@ final class SourcesViewModel: ObservableObject {
     func coverage(for source: DataSource, app: AppEnvironment) async -> SourceSchemaCoverage? {
         let name = CollectionNaming.sanitize(source.collectionName)
         guard let schema = app.schemaStore.schema(for: name), !schema.isEmpty else { return nil }
-        return await app.syncService.coverage(source: source, schema: schema)
+        // Уровни передаются посчитанными: по ним видно, попадёт ли
+        // поле каждому чанку или только файлам, лежащим достаточно глубоко.
+        return await app.syncService.coverage(
+            source: source, schema: schema, levels: draftFolderLevels
+        )
     }
 
     func draftSchemaFromSource(_ source: DataSource, app: AppEnvironment) {

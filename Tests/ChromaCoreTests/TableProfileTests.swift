@@ -201,14 +201,35 @@ final class TableProfileTests: XCTestCase {
         XCTAssertFalse(reason.isEmpty)
     }
 
-    /// Duplicate titles would make two columns fight over one key; the user has
-    /// to fix the sheet or point at another row.
-    func testDuplicateTitlesAreRefusedWithTheirNames() {
+    /// Повтор в шапке — не отказ, а различимые имена.
+    ///
+    /// Раньше такая строка не читалась вовсе: выбрать её заголовком было
+    /// нельзя, при том что шапка в два этажа — обычное дело, и «Стоимость»
+    /// стоит под каждым годом. Первая колонка сохраняет имя из файла:
+    /// человек смотрит в свой файл рядом.
+    func testDuplicateTitlesGetNumbersInsteadOfARefusal() {
         let sheet = rows([[.text("Цена"), .text("Название"), .text("Цена")]])
-        guard case .needsDecision(let reason) = TableProfileMatcher.headers(in: sheet, headerRow: 1) else {
-            return XCTFail("повторяющиеся заголовки должны требовать решения")
+        guard case .headers(let titles) = TableProfileMatcher.headers(in: sheet, headerRow: 1) else {
+            return XCTFail("строку с повторами человек выбрал сам — читать её надо")
         }
-        XCTAssertTrue(reason.contains("Цена"), reason)
+        XCTAssertEqual(titles, ["Цена", "Название", "Цена (2)"])
+    }
+
+    /// Имя с номером, уже занятое в самой шапке, не присваивается второй раз.
+    func testANumberedNameThatIsAlreadyTakenGoesFurther() {
+        XCTAssertEqual(
+            TableProfileMatcher.uniqued(["Цена", "Цена (2)", "Цена"]),
+            ["Цена", "Цена (2)", "Цена (3)"]
+        )
+    }
+
+    /// Три одинаковых — три разных имени, и порядок сохраняется: колонка
+    /// читается по своему месту в файле.
+    func testThreeSameTitlesBecomeThree() {
+        XCTAssertEqual(
+            TableProfileMatcher.uniqued(["Год", "Год", "Год"]),
+            ["Год", "Год (2)", "Год (3)"]
+        )
     }
 
     // MARK: - Storage

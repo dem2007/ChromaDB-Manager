@@ -34,6 +34,12 @@ struct MenuBarSettingsCard: View {
                      : String(localized: "Недоступно без значка в строке меню: приложение без окна и без значка нельзя было бы ни открыть, ни закрыть."))
                     .font(Theme.Font.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                // Главное, ради чего это включают: агент продолжает работать
+                // с базой при закрытом окне. Состояние моста видно
+                // в самом окошке строки меню — там же, где поиск.
+                Text("MCP-сервер при этом остаётся поднятым: агент работает с базой, пока приложение живёт в строке меню. Его состояние видно в окошке значка.")
+                    .font(Theme.Font.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Divider().padding(.vertical, 2)
 

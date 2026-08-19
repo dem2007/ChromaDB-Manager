@@ -62,6 +62,14 @@ enum TableGeometry {
     /// Соседние по высоте знаки, расходящиеся меньше чем на столько от роста
     /// знака, — одна строка.
     static let lineTolerance = 0.45
+    /// Знак ниже этой доли от роста строки — знак препинания, а не буква
+    ///. Точка занимает пятую часть роста цифры, запятая — треть;
+    /// самая низкая буква, «о» строчная, — больше половины.
+    static let lowGlyphRatio = 0.6
+    /// Насколько базовая линия такого знака может отходить от базовой линии
+    /// строки — в ростах знака. Замер на живой странице: у точки расхождение
+    /// 0.13 пункта при росте 5.4, у запятой — 1.28 (она свисает ниже).
+    static let lowGlyphBaseline = 0.4
     /// Колонок больше этого — это не таблица, а разлетевшийся текст.
     static let maximumColumns = 24
     /// Строк таблицы меньше этого — не таблица, а две строки с отступом.
@@ -89,17 +97,18 @@ enum TableGeometry {
     static func lines(from words: [Word], height: Double, separated: Bool = false) -> [Line] {
         guard height > 0, !words.isEmpty else { return [] }
 
-        var byLine: [[Word]] = []
+        var grouped: [[Word]] = []
         var previousY: Double?
         for word in words.sorted(by: { $0.box.midY > $1.box.midY }) {
             let y = Double(word.box.midY)
-            if let previousY, abs(previousY - y) <= height * lineTolerance, !byLine.isEmpty {
-                byLine[byLine.count - 1].append(word)
+            if let previousY, abs(previousY - y) <= height * lineTolerance, !grouped.isEmpty {
+                grouped[grouped.count - 1].append(word)
             } else {
-                byLine.append([word])
+                grouped.append([word])
             }
             previousY = y
         }
+        let byLine = returningPunctuation(grouped, height: height)
 
         let gap = max(minimumColumnGap, height * columnGapRatio)
         let space = max(0.8, height * wordGapRatio)
@@ -135,6 +144,56 @@ enum TableGeometry {
         return result
     }
 
+    /// Возвращает знаки препинания в их строку.
+    ///
+    /// **Что было.** Строки собираются по середине рамки знака, а у точки она
+    /// лежит на три пункта ниже, чем у стоящей рядом цифры: рамка точки —
+    /// один пункт от базовой линии, рамка цифры — семь. При допуске в 2,4
+    /// пункта точка не дотягивалась до своей строки и уходила в соседнюю.
+    /// Замер на смете заказчика: «31 585 738,00» приходило как
+    /// «31 585 738 00», номер позиции «11.1» — как «11 1», а строка таблицы
+    /// рассыпалась на три и утягивала за собой всю страницу в плоский текст.
+    ///
+    /// **Почему пост-обработкой.** Разбиение остальных знаков не трогается
+    /// вовсе: цепочка по середине рамки работает для букв и цифр, и менять
+    /// её ради точки значило бы чинить одно, ломая другое (проверено —
+    /// сборка обычных таблиц разъезжалась).
+    ///
+    /// Правда — в базовой линии: у цифры и у точки она общая до сотых долей.
+    /// Поэтому низкий знак переносится в ту строку, чья базовая линия к нему
+    /// ближе, — и только если она ближе, чем у строки, где он оказался.
+    static func returningPunctuation(_ lines: [[Word]], height: Double) -> [[Word]] {
+        guard lines.count > 1, height > 0 else { return lines }
+
+        func isLow(_ word: Word) -> Bool { Double(word.box.height) < height * lowGlyphRatio }
+        /// Базовая линия строки — по её высоким знакам. Низкие в расчёт не
+        /// идут: у запятой низ рамки под строкой, и она сдвинула бы отсчёт.
+        func baseline(_ line: [Word]) -> Double? {
+            let tall = line.filter { !isLow($0) }.map { Double($0.box.minY) }.sorted()
+            return tall.isEmpty ? nil : tall[tall.count / 2]
+        }
+
+        let baselines = lines.map(baseline)
+        var result = lines.map { $0.filter { !isLow($0) } }
+
+        for (index, line) in lines.enumerated() {
+            for word in line where isLow(word) {
+                let low = Double(word.box.minY)
+                var best = index
+                var distance = baselines[index].map { abs(low - $0) } ?? .greatestFiniteMagnitude
+                for (candidate, value) in baselines.enumerated() {
+                    guard let value, abs(low - value) < distance else { continue }
+                    distance = abs(low - value)
+                    best = candidate
+                }
+                // Слишком далеко от любой базовой линии — знак остаётся там,
+                // где был: выдумывать ему строку хуже, чем оставить как есть.
+                result[distance <= height * lowGlyphBaseline ? best : index].append(word)
+            }
+        }
+        return result.filter { !$0.isEmpty }
+    }
+
     // MARK: - Строки в таблицу
 
     /// Страница, собранная по координатам. `nil` — таблиц на ней нет,
@@ -145,11 +204,21 @@ enum TableGeometry {
     /// отступ, и номер страницы в углу. Признак — **повторяемость отступа**:
     /// три и более строки подряд, у которых ячейки начинаются на одних и тех же
     /// отступах. Без этого условия таблицей объявлялись три страницы из четырёх.
-    static func text(of lines: [Line]) -> String? {
-        guard !lines.isEmpty else { return nil }
+    static func text(of lines: [Line]) -> String? { assess(lines).text }
+
+    /// То же, но со вторым ответом: **была ли на странице таблица**, которую
+    /// собрать не удалось.
+    ///
+    /// Разница важна для того, кто потом читает текст. «Таблиц нет» и
+    /// «таблица есть, но осталась сеткой чисел без названий колонок» — это
+    /// для агента, считающего смету, совершенно разные страницы, а в тексте
+    /// они выглядят одинаково. Живой случай: из семи страниц собрались три,
+    /// остальные ушли плоским текстом, и по ним посчитали смету.
+    static func assess(_ lines: [Line]) -> (text: String?, unassembledTable: Bool) {
+        guard !lines.isEmpty else { return (nil, false) }
         let tolerance = max(minimumColumnGap, (lines.first?.height ?? 10) * columnGapRatio)
         let columns = supportedColumns(in: lines, tolerance: tolerance)
-        guard columns.count >= 2 else { return nil }
+        guard columns.count >= 2 else { return (nil, false) }
 
         func columnIndexes(of line: Line) -> Set<Int> {
             Set(line.cells.compactMap { cell in
@@ -160,6 +229,8 @@ enum TableGeometry {
         var blocks: [String] = []
         var table: [Line] = []
         var found = 0
+        /// Строки, стоявшие по колонкам, но в таблицу не сложившиеся.
+        var refused = 0
 
         func flush() {
             defer { table = [] }
@@ -167,6 +238,7 @@ enum TableGeometry {
             guard let width = grid.first?.count, width > 1, width <= maximumColumns,
                   looksLikeTable(grid)
             else {
+                if table.count >= minimumRows { refused += table.count }
                 blocks.append(contentsOf: table.map(\.text).filter { !$0.isEmpty })
                 return
             }
@@ -185,9 +257,15 @@ enum TableGeometry {
         }
         flush()
 
-        guard found >= minimumRows, Double(found) / Double(lines.count) >= tableShare else { return nil }
+        // Страница не сложилась в таблицу. Но если табличные строки на ней
+        // были — а их набралось на целую таблицу, — молчать об этом нельзя:
+        // текст уйдёт к агенту сеткой чисел без названий колонок.
+        guard found >= minimumRows, Double(found) / Double(lines.count) >= tableShare else {
+            return (nil, refused + found >= minimumRows)
+        }
         let text = blocks.joined(separator: "\n\n")
-        return text.isEmpty ? nil : text
+        // Часть страницы собралась, часть — нет: та часть тоже уйдёт плоской.
+        return (text.isEmpty ? nil : text, refused >= minimumRows)
     }
 
     /// Отступы, на которых начинаются ячейки **нескольких** строк.
@@ -284,9 +362,41 @@ enum TableGeometry {
 
     /// Рост знака, по которому считаются все пороги: медиана, а не среднее —
     /// одна крупная надпись не должна двигать порог для всей страницы.
+    ///
+    /// Считается **по буквам и цифрам**, а не по всем знакам подряд.
+    /// Рамка точки — пятая часть рамки буквы, и страница, где точек больше,
+    /// чем букв, отдавала медиану в четыре раза меньше настоящего кегля.
+    /// Живой случай: оглавление на 90 строк, каждая с отточием до номера
+    /// страницы, — 5209 точек против 803 букв, медиана 1,2 пункта при кегле
+    /// 11. От этого рассыпалось всё сразу: допуск строки становился меньше
+    /// полупункта, и «Содержание» приходило как «С о е жание д р» — буквы
+    /// одного слова оказывались в разных строках и разных колонках, а
+    /// страница уходила в базу markdown-таблицей из слогов.
+    ///
+    /// Буквы отбираются **по самому знаку**, а не по его росту. Отбор
+    /// «выше такой-то доли от верхнего процентиля» разбирался и отвергнут:
+    /// на странице со смешанным кеглем — титуле, слайде, первой полосе —
+    /// крупный набор поднимает процентиль, и порог отсекает уже основной
+    /// текст. Проба на 100 знаках: 30 заголовочных ростом 12 пунктов и
+    /// 70 текстовых ростом 5 давали медиану 12 вместо 5, то есть вдвое
+    /// завышенные пороги для всей страницы. Признак «это буква» от
+    /// распределения кеглей не зависит вовсе.
+    ///
+    /// Замер на корпусе заказчика (120 файлов): собранных таблиц 265 против
+    /// 263 у отбора по процентилю, рассыпавшихся страниц 3 и 3 — то есть
+    /// правило не хуже там, где оба работают, и не ломается там, где то
+    /// другое ломается.
     static func medianHeight(of words: [Word]) -> Double {
-        let heights = words.map { Double($0.box.height) }.sorted()
-        guard !heights.isEmpty else { return 0 }
-        return heights[heights.count / 2]
+        let letters = words
+            .filter { $0.text.contains { $0.isLetter || $0.isNumber } }
+            .map { Double($0.box.height) }
+            .sorted()
+        guard !letters.isEmpty else {
+            // Страница без единой буквы: чертёж, ведомость из одних знаков
+            // препинания. Мерить нечем, кроме того, что есть.
+            let heights = words.map { Double($0.box.height) }.sorted()
+            return heights.isEmpty ? 0 : heights[heights.count / 2]
+        }
+        return letters[letters.count / 2]
     }
 }

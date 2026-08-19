@@ -174,6 +174,14 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
     public var ruleTemplate: String
     /// Whether unmatched files fall back to `collectionName` instead of being skipped.
     public var ruleUsesFallbackCollection: Bool
+    /// Уровни вложенности папок, ставшие полями метаданных.
+    ///
+    /// Отдельно от режима маппинга, а не пятым его вариантом: режим отвечает
+    /// на вопрос «в какую коллекцию», уровни — «что известно о файле из его
+    /// места в дереве». Это разные вопросы, и связывать их значило бы
+    /// запретить «первый уровень — коллекция, второй и третий — поля».
+    /// Пустой список — поведение ровно прежнее.
+    public var pathLevels: [PathLevel]
     public var embeddingModel: String?
     /// Metric for collections this source creates. Immutable once a collection
     /// exists, so changing it here only affects collections made afterwards.
@@ -279,6 +287,7 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         rulePattern: String = "",
         ruleTemplate: String = "$1",
         ruleUsesFallbackCollection: Bool = false,
+        pathLevels: [PathLevel] = [],
         embeddingModel: String? = nil,
         metric: DistanceMetric = .cosine,
         chunking: ChunkingConfiguration = ChunkingConfiguration(),
@@ -310,6 +319,7 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         self.rulePattern = rulePattern
         self.ruleTemplate = ruleTemplate
         self.ruleUsesFallbackCollection = ruleUsesFallbackCollection
+        self.pathLevels = pathLevels
         self.embeddingModel = embeddingModel
         self.metric = metric
         self.chunking = chunking
@@ -346,6 +356,28 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
             + "/iwork:\(iWorkExportEnabled ? 1 : 0)"
     }
 
+    /// Что попадает в метаданные чанка помимо текста и того, чем его прочитали:
+    /// режим маппинга, поля из пути, ручные поля источника.
+    ///
+    /// Отдельно от `extractionSignature` по одной причине, зато важной: смена
+    /// этих полей **не меняет текст**, а значит и векторы. Переписать их можно
+    /// обновлением метаданных, без единого обращения к модели, — и сигнатура
+    /// нужна ровно затем, чтобы приложение знало, у каких файлов в базе поля
+    /// от прежних настроек, и предложило их обновить вместо часов пересчёта.
+    public var metadataSignature: String { MetadataSignature.of(self).text }
+
+    /// Ключи, которые этот источник пишет в метаданные чанка сверх
+    /// автоматических: поля из пути и ручные поля.
+    ///
+    /// `relative_path` отсюда ушёл вместе с самим полем: оно слово
+    /// в слово повторяло `source_file`, который пишется всегда и всеми
+    /// режимами.
+    public var writtenMetadataKeys: Set<String> {
+        var keys = Set(pathLevels.filter(\.isNamed).map(\.trimmedKey))
+        keys.formUnion(customMetadata.keys.filter { !$0.isEmpty })
+        return keys
+    }
+
     /// Tolerant decoding: a source registered by an earlier build has none of
     /// the 2C fields, and must not disappear because of that.
     public init(from decoder: Decoder) throws {
@@ -365,6 +397,9 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         rulePattern = try container.decodeIfPresent(String.self, forKey: .rulePattern) ?? ""
         ruleTemplate = try container.decodeIfPresent(String.self, forKey: .ruleTemplate) ?? "$1"
         ruleUsesFallbackCollection = try container.decodeIfPresent(Bool.self, forKey: .ruleUsesFallbackCollection) ?? false
+        // Источник прежней сборки уровней не знает — и это «их нет»,
+        // а не «файл не читается».
+        pathLevels = ((try? container.decodeIfPresent([PathLevel].self, forKey: .pathLevels)) ?? nil) ?? []
         embeddingModel = try container.decodeIfPresent(String.self, forKey: .embeddingModel)
         metric = ((try? container.decodeIfPresent(DistanceMetric.self, forKey: .metric)) ?? nil) ?? .cosine
         chunking = ((try? container.decodeIfPresent(ChunkingConfiguration.self, forKey: .chunking)) ?? nil) ?? ChunkingConfiguration()

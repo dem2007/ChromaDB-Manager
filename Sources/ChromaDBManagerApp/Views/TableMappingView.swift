@@ -9,6 +9,10 @@ struct TableMappingSheet: View {
     let source: DataSource
     var onClose: () -> Void
 
+    /// Показывать ли предпросмотр целиком. Сбрасывается при смене
+    /// листа: решение «покажи все двести» принимается про конкретный лист.
+    @State private var showsAllColumns = false
+
     var body: some View {
         SheetShell(
             title: String(localized: "Таблица: сопоставление колонок"),
@@ -221,60 +225,102 @@ struct TableMappingSheet: View {
                 let titles = (0..<width).map { $0 < mapping.columns.count ? mapping.columns[$0] : "" }
                 let roles = titles.map { mapping.role(of: $0) }
 
-                ScrollView(.horizontal) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        // Буквы колонок — как в самой таблице.
-                        //
-                        // Они не строка файла, а его разметка, и потому стоят
-                        // отдельно и всегда: строка заголовков может быть
-                        // десятой, всё что выше приглушено, и опереться при
-                        // разметке становится не на что. «Колонка E» — то, чем
-                        // человек называет колонку, глядя в свой же файл
-                        // рядом, и это единственное имя, которое не зависит
-                        // ни от выбранной строки заголовков, ни от
-                        // переименований.
-                        // `LazyHStack`, а не `HStack`: на листе в 210 колонок
-                        // обычный стек строит все 210 ячеек каждой из 21
-                        // строки сразу — 4 400 текстов с рамкой и фоном,
-                        // и экран отвечает с задержкой в секунды. Ленивый
-                        // строит те, что видны; ширина ячейки задана числом,
-                        // поэтому ему есть от чего считать.
-                        LazyHStack(spacing: 0) {
-                            Color.clear.frame(width: numberGutterWidth, height: 1)
-                            ForEach(0..<width, id: \.self) { column in
-                                Text(XLSXReader.columnName(column))
-                                    .font(Theme.Font.micro)
-                                    .foregroundStyle(Theme.Palette.captionText)
-                                    .frame(width: 130, alignment: .center)
-                                    .padding(.horizontal, 6)
-                            }
+                // Сетка собирается **колонками**, а не строками.
+                //
+                // Так ленивость наконец работает. Раньше ленивый стек лежал
+                // внутри вертикального: тому нужен полный размер каждой
+                // строки, и стек был обязан построить все свои ячейки —
+                // на листе в 114 колонок это 2 400 текстов с фоном и рамкой,
+                // и собирались они заново при каждом нажатии на номер строки
+                // и каждом знаке в поле «Своё название». Замер на рабочей
+                // книге: ядро отдаёт все 14 листов за 0,04 с, а экран не
+                // отвечал минуту.
+                //
+                // Колонка целиком — один элемент ленивого стека, и строится
+                // только то, что видно: двадцать одна ячейка вместо всех.
+                let shown = showsAllColumns ? width : min(width, Self.columnsShownAtOnce)
+                // Строки считаются один раз на сетку, а не в каждой колонке:
+                // `previewRows` строит словарь и массив, и в ленивом стеке
+                // из ста колонок это сто одинаковых построений на каждую
+                // перерисовку — то есть на каждый знак в поле «Своё название».
+                let previewRows = preview.previewRows
+                HStack(alignment: .top, spacing: 0) {
+                    // Номера строк — вне прокрутки: по ним назначают строку
+                    // заголовков, а уезжали они вместе с содержимым, и на
+                    // широком листе целиться становилось не во что.
+                    VStack(alignment: .leading, spacing: rowSpacing) {
+                        Color.clear.frame(width: numberGutterWidth, height: Self.rowHeight)
+                        ForEach(previewRows, id: \.number) { row in
+                            numberCell(
+                                row.number,
+                                isHeader: row.number == mapping.headerRow,
+                                sheet: preview.sheet.name
+                            )
                         }
+                    }
 
-                        ForEach(preview.previewRows, id: \.number) { row in
-                            let isHeader = row.number == mapping.headerRow
-                            let isAbove = mapping.headerRow.map { row.number < $0 } ?? false
-                            LazyHStack(spacing: 0) {
-                                numberCell(row.number, isHeader: isHeader, sheet: preview.sheet.name)
-                                ForEach(0..<width, id: \.self) { column in
-                                    // В строке заголовков показывается выбранное
-                                    // человеком имя: переименование должно быть
-                                    // видно там же, где на него смотрят.
-                                    let text = isHeader && !titles[column].isEmpty
-                                        ? mapping.title(of: titles[column])
-                                        : row.value(at: column).displayText
-                                    cell(text, role: roles[column], isHeader: isHeader, isAbove: isAbove)
+                    ScrollView(.horizontal) {
+                        LazyHStack(alignment: .top, spacing: 0) {
+                            ForEach(0..<shown, id: \.self) { column in
+                                VStack(alignment: .leading, spacing: rowSpacing) {
+                                    // Буквы колонок — как в самой таблице.
+                                    //
+                                    // Они не строка файла, а его разметка, и потому
+                                    // стоят отдельно и всегда: строка заголовков
+                                    // может быть десятой, всё что выше приглушено,
+                                    // и опереться при разметке становится не на что.
+                                    // «Колонка E» — то, чем человек называет колонку,
+                                    // глядя в свой же файл рядом, и это единственное
+                                    // имя, которое не зависит ни от выбранной строки
+                                    // заголовков, ни от переименований.
+                                    Text(XLSXReader.columnName(column))
+                                        .font(Theme.Font.micro)
+                                        .foregroundStyle(Theme.Palette.captionText)
+                                        .frame(width: 130 + 12, height: Self.rowHeight)
+                                    ForEach(previewRows, id: \.number) { row in
+                                        let isHeader = row.number == mapping.headerRow
+                                        let isAbove = mapping.headerRow.map { row.number < $0 } ?? false
+                                        // В строке заголовков показывается выбранное
+                                        // человеком имя: переименование должно быть
+                                        // видно там же, где на него смотрят.
+                                        let text = isHeader && !titles[column].isEmpty
+                                            ? mapping.title(of: titles[column])
+                                            : row.value(at: column).displayText
+                                        cell(text, role: roles[column], isHeader: isHeader, isAbove: isAbove)
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                if width > shown {
+                    HStack(spacing: 8) {
+                        Text("Показаны первые \(shown.plainDigits) колонок из \(width.plainDigits).")
+                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        Button(String(localized: "Показать все")) { showsAllColumns = true }
+                            .font(Theme.Font.micro).buttonStyle(.link)
+                        Spacer()
+                    }
+                }
             }
+            // Решение «показать все» принимается про конкретный лист: на
+            // соседнем оно значит другое число колонок и другую задержку.
+            .onChange(of: model.selectedSheet) { _, _ in showsAllColumns = false }
         }
     }
 
     /// Ширина колонки с номерами строк — она же отступ под буквами колонок,
     /// чтобы буква стояла над своей колонкой, а не съезжала на соседнюю.
     private var numberGutterWidth: CGFloat { 30 + 4 * 2 }
+    /// Высота строки задана числом, а не содержимым: номера строк стоят вне
+    /// прокрутки, и совпасть с ячейками они могут только по общей мерке.
+    private static let rowHeight: CGFloat = 22
+    private var rowSpacing: CGFloat { 2 }
+    /// Столько колонок показывается сразу. Лист в тысячу колонок бывает
+    /// (сводная выгрузка по дням), и строить его целиком незачем: разметку
+    /// делают по первым, а «показать все» — рядом, одной кнопкой.
+    private static let columnsShownAtOnce = 60
 
     /// Номер строки — он же кнопка «читать заголовки отсюда».
     private func numberCell(_ number: Int, isHeader: Bool, sheet: String) -> some View {
@@ -284,8 +330,8 @@ struct TableMappingSheet: View {
             Text("\(number)")
                 .font(Theme.Font.micro)
                 .foregroundStyle(isHeader ? Color.accentColor : Theme.Palette.captionText)
-                .frame(width: 30, alignment: .trailing)
-                .padding(.horizontal, 4).padding(.vertical, 3)
+                .frame(width: 30, height: Self.rowHeight, alignment: .trailing)
+                .padding(.horizontal, 4)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -302,10 +348,12 @@ struct TableMappingSheet: View {
             // Строки выше заголовка приглушены: они остаются на виду, потому
             // что по ним и выбирают строку заголовка, но записями не станут.
             .foregroundStyle(isAbove ? Theme.Palette.captionText : .primary)
-            .frame(width: 130, alignment: .leading)
-            .padding(.horizontal, 6).padding(.vertical, 3)
+            .frame(width: 130, height: Self.rowHeight, alignment: .leading)
+            .padding(.horizontal, 6)
             .background(isAbove ? Color.clear : colour(for: role).opacity(isHeader ? 0.28 : 0.12))
-            .overlay(Rectangle().strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+            // `border`, а не `overlay` с фигурой: рамка та же, а представлений
+            // на ячейку вдвое меньше — на сетке в две тысячи ячеек это заметно.
+            .border(Color(nsColor: .separatorColor), width: 0.5)
     }
 
     private func colour(for role: ColumnRole) -> Color {
@@ -325,6 +373,19 @@ struct TableMappingSheet: View {
         ) {
             let binding = model.binding(for: preview.sheet.name)
             VStack(alignment: .leading, spacing: 6) {
+                // Заголовки из файла — в поля «Своё название».
+                // Править имя приходится ровно тогда, когда оно почти годится,
+                // и набирать его заново ради одной правки — работа на ровном
+                // месте: оно уже написано в соседней колонке.
+                HStack(spacing: 8) {
+                    Button(String(localized: "Заполнить названия из файла")) {
+                        model.fillTitlesFromFile(for: preview.sheet.name)
+                    }
+                    .buttonStyle(.chromaNormal)
+                    .help(String(localized: "Перенести заголовки из файла в поля «Своё название», чтобы их править. Уже заданные названия не трогаются."))
+                    Spacer()
+                }
+
                 HStack(spacing: 8) {
                     Text("Колонка в файле").frame(width: 190, alignment: .leading)
                     Text("Своё название").frame(width: 170, alignment: .leading)
@@ -521,11 +582,15 @@ struct TableMappingSheet: View {
             subtitle: "Применяется к файлам с тем же набором колонок. Файл с другим набором не индексируется наполовину — он попадёт в «требуют решения»."
         ) {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    TextField("Название профиля", text: $model.profileName)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 260)
-                    Spacer()
+                TextField("Название профиля", text: $model.profileName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 260)
+
+                // Кнопки — строкой под полем, а не рядом с ним: вчетвером
+                // в одном ряду с текстовым полем они не помещались, и надписи
+                // обрезались до «Экспорт профи…». Кнопка, которую нельзя
+                // прочитать, ничем не лучше кнопки без подписи.
+                HStack(spacing: 8) {
                     Button("Экспорт профилей…") { model.exportProfiles(app, source: source) }
                         .disabled(model.allProfiles.isEmpty)
                     Button("Импорт профилей…") { model.importProfiles(app, source: source) }
@@ -534,7 +599,13 @@ struct TableMappingSheet: View {
                         .disabled(model.sheets.isEmpty)
                     Button("Сохранить профиль") { model.save(app, source: source) }
                         .keyboardShortcut(.defaultAction)
+                    Spacer(minLength: 0)
                 }
+                .fixedSize(horizontal: true, vertical: false)
+                // Пустая строка после действий: дальше идут настройки профиля,
+                // и без зазора кнопка «Сохранить профиль» читается как часть
+                // строки «Хранить профиль».
+                .padding(.bottom, 8)
 
                 // Где хранить профиль. Выбор человека, а не умолчание
                 // приложения: одинаковые книги приходят в разные папки, и

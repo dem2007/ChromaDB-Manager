@@ -120,6 +120,15 @@ struct InspectorTabs: View {
                         .font(Theme.Font.body).padding(.leading, 16)
                 }
 
+                // ручная проверка — переименованная папка оставляет
+                // в базе чанки под прежним путём, и убрать их можно только
+                // по решению человека.
+                Toggle(String(localized: "Проверить, что файлы источников на месте"), isOn: $model.checksFilesOnDisk)
+                    .font(Theme.Font.control)
+                Text("Обходит папки источников этой коллекции и показывает чанки файлов, которых на диске больше нет, — обычно это переименованная или переехавшая папка. Удаляются они только выбором и кнопкой. Папку, которую не удалось прочитать (отключённый диск), проверка пропускает: «не знаем» честнее, чем «файлов нет».")
+                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 progressLine
 
                 // Пустое состояние — внутри карточки, к которой относится:
@@ -171,6 +180,7 @@ struct InspectorTabs: View {
                             .font(Theme.Font.micro).buttonStyle(.link)
                     }
                 }
+                selectionBar(report)
                 ForEach(report.categoriesWithFindings) { category in
                     categoryRow(category, report: report)
                     if category != report.categoriesWithFindings.last { Divider() }
@@ -180,6 +190,17 @@ struct InspectorTabs: View {
                 // лежало в подвале окна, за две карточки от списка.
                 HStack(spacing: 8) {
                     let selected = model.selectedDocumentIDs()
+                    // Уборка путей не про выделенное: она идёт по всей
+                    // коллекции, потому и стоит отдельно от кнопок,
+                    // работающих с отмеченными находками.
+                    if model.hasLegacyPaths {
+                        Button(String(localized: "Привести пути к единой форме")) {
+                            model.repairFilePaths(collection: collection, app: app)
+                        }
+                        .buttonStyle(.chromaNormal)
+                        .disabled(model.isRunning)
+                        .help(String(localized: "Перепишет поля source_file, file_id и file_name у всей коллекции. Текст не меняется, векторы не пересчитываются."))
+                    }
                     if !selected.isEmpty {
                         Button(String(localized: "Пометить как проверенное")) {
                             model.acknowledgeSelectedPairs(collection: collection)
@@ -205,6 +226,34 @@ struct InspectorTabs: View {
         }
     }
 
+    /// Что выбрано во всём отчёте и как выбрать всё разом.
+    ///
+    /// Кнопки решения стоят под списком, а счёт — здесь, над ним: удаляют
+    /// документы, а отмечают находки, и это разные числа. У «дублей по
+    /// тексту» одна находка — это пара документов.
+    @ViewBuilder
+    private func selectionBar(_ report: InspectionReport) -> some View {
+        let selectable = model.selectable()
+        if !selectable.isEmpty {
+            let chosen = model.selectedFindings.intersection(selectable.map(\.id)).count
+            HStack(spacing: 10) {
+                Button(model.isEverythingSelected()
+                       ? String(localized: "Снять выбор")
+                       : String(localized: "Выбрать все замечания")) {
+                    if model.toggleSelection() {
+                        model.expanded.formUnion(report.categoriesWithFindings)
+                    }
+                }
+                .buttonStyle(.link).font(Theme.Font.micro)
+                if chosen > 0 {
+                    Text("выбрано \(chosen.plainDigits) из \(selectable.count.plainDigits) · документов \(model.selectedDocumentIDs().count.plainDigits)")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                }
+                Spacer()
+            }
+        }
+    }
+
     private func categoryRow(_ category: InspectionCategory, report: InspectionReport) -> some View {
         let findings = report.findings(in: category)
         return VStack(alignment: .leading, spacing: 6) {
@@ -226,6 +275,24 @@ struct InspectorTabs: View {
                     }
                 }
                 .buttonStyle(.plain)
+                // Выбор всего разряда одним нажатием. Триста находок
+                // по одному флажку не отмечают — их отмечают разрядом:
+                // «дубли по тексту» решают одним решением на все двести
+                // тринадцать.
+                if !model.selectable(in: category).isEmpty {
+                    let chosen = model.isEverythingSelected(in: category)
+                    Button(chosen
+                           ? String(localized: "снять выбор")
+                           : String(localized: "выбрать все")) {
+                        // Разряд, который выбрали, тут же раскрывается:
+                        // выбор, которого не видно, ничем не отличается
+                        // от невыбранного.
+                        if model.toggleSelection(in: category) {
+                            model.expanded.insert(category)
+                        }
+                    }
+                    .buttonStyle(.link).font(Theme.Font.micro)
+                }
                 Spacer()
             }
             Text(category.explanation).font(Theme.Font.caption)

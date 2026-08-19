@@ -23,6 +23,13 @@ final class EnvironmentViewModel: ObservableObject {
     @Published var acknowledgeSkippingBackup = false
     @Published var lastBackup: BackupRecord?
     @Published var backups: [BackupRecord] = []
+    /// Копия, о которой спрошено «точно удалить».
+    ///
+    /// Удаление копии необратимо и стоит ровно один щелчок по значку корзины,
+    /// стоящему в ряду с «Восстановить». Промах по соседней кнопке уносил
+    /// последнюю копию базы на пять гигабайт, и узнать об этом можно было
+    /// только по исчезнувшей строке.
+    @Published var pendingBackupDeletion: BackupRecord?
     /// Whether the installed CLI has the vacuum command. Probed once.
     @Published var maintenanceAvailable = false
     @Published var lastMaintenance: MaintenanceService.Result?
@@ -201,7 +208,7 @@ final class EnvironmentViewModel: ObservableObject {
             // 2. The database must be closed before its files are copied.
             if app.processManager.isRunning || app.connection.isConnected {
                 await MainActor.run { self.appendConsole("Останавливаем сервер перед обновлением…") }
-                await app.disconnect()
+                await app.disconnect(reason: .serverRestart)
             }
 
             // 3. Backup.
@@ -304,38 +311,62 @@ final class EnvironmentViewModel: ObservableObject {
     }
 
     /// Backup → stop → vacuum → start → verify, in that order.
+    ///
+    /// Целиком — **задачей общей очереди** в группе `exclusive`.
+    /// Сжатие копирует базу и гасит сервер, а гашение снимает все задачи
+    /// подключения: ровно та беда, что разобрана в для бэкапа. До этой
+    /// правки сжатие шло мимо очереди, и нажатое во время индексации
+    /// обрывало её молча — а само оно нигде, кроме этого экрана, не значилось,
+    /// так что «почему всё встало» ответа не имело.
     func runMaintenance(_ app: AppEnvironment) {
         guard let target = backupTarget(app) else { return }
         run(app, title: String(localized: "Обслуживание базы")) { [weak self] in
-            await MainActor.run { self?.appendConsole("Резервная копия перед обслуживанием…") }
-            let record = try app.backupService.backup(databaseAt: target, note: "перед обслуживанием базы")
-            await MainActor.run {
-                self?.lastBackup = record
-                self?.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
-            }
-
-            let collectionsBefore = await app.collectionSnapshots().count
-            await MainActor.run { self?.appendConsole("Останавливаем сервер…") }
-            await app.disconnect()
-
-            let result = try await app.maintenance.vacuum(databaseAt: target)
-            await MainActor.run {
-                self?.lastMaintenance = result
-                self?.appendConsole(result.summary)
-            }
-
-            await app.connect()
-            // The check that matters: the database opens and still has
-            // everything it had before.
-            let collectionsAfter = await app.collectionSnapshots().count
-            await MainActor.run {
-                if collectionsAfter == collectionsBefore {
-                    self?.appendConsole("Проверка после обслуживания: коллекций \(collectionsAfter), как и было.")
-                    self?.infoMessage = result.summary
-                } else {
-                    self?.errorMessage = String(localized: "После обслуживания число коллекций изменилось: было \(collectionsBefore), стало \(collectionsAfter). Резервная копия \(record.name) на месте.")
+            let ticket = QueueTicket(
+                title: String(localized: "Сжатие базы"),
+                priority: .interactive,
+                group: .exclusive,
+                connectionID: nil
+            )
+            try await app.queue.run(ticket) { _ in
+                await MainActor.run { self?.appendConsole("Резервная копия перед обслуживанием…") }
+                let record = try app.backupService.backup(databaseAt: target, note: "перед обслуживанием базы")
+                await MainActor.run {
+                    self?.lastBackup = record
+                    self?.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
                 }
-                self?.refreshBackups(app)
+
+                let collectionsBefore = await app.collectionSnapshots().count
+                await MainActor.run { self?.appendConsole("Останавливаем сервер…") }
+                await app.disconnect(reason: .serverRestart)
+
+                let result: MaintenanceService.Result
+                do {
+                    result = try await app.maintenance.vacuum(databaseAt: target)
+                } catch {
+                    // Сервер поднимается, чем бы сжатие ни кончилось: оставить
+                    // базу погашенной значило бы к неудачной операции добавить
+                    // неработающее приложение.
+                    await app.connect()
+                    throw error
+                }
+                await MainActor.run {
+                    self?.lastMaintenance = result
+                    self?.appendConsole(result.summary)
+                }
+
+                await app.connect()
+                // The check that matters: the database opens and still has
+                // everything it had before.
+                let collectionsAfter = await app.collectionSnapshots().count
+                await MainActor.run {
+                    if collectionsAfter == collectionsBefore {
+                        self?.appendConsole("Проверка после обслуживания: коллекций \(collectionsAfter), как и было.")
+                        self?.infoMessage = result.summary
+                    } else {
+                        self?.errorMessage = String(localized: "После обслуживания число коллекций изменилось: было \(collectionsBefore), стало \(collectionsAfter). Резервная копия \(record.name) на месте.")
+                    }
+                    self?.refreshBackups(app)
+                }
             }
         }
     }
@@ -393,15 +424,28 @@ final class EnvironmentViewModel: ObservableObject {
             return
         }
         run(app, title: String(localized: "Восстановление резервной копии")) { [weak self] in
-            await app.disconnect()
-            try app.backupService.restore(backup, to: destination)
-            await MainActor.run {
-                self?.appendConsole("Копия \(backup.name) восстановлена в \(destination.path)")
-                self?.verificationFailed = false
-                self?.infoMessage = String(localized: "Резервная копия восстановлена.")
-                self?.refreshBackups(app)
+            // Через общую очередь и в одиночку: восстановление гасит
+            // сервер и подменяет файлы базы под всеми, кто с ней работает.
+            let ticket = QueueTicket(
+                title: String(localized: "Восстановление копии базы"),
+                priority: .interactive, group: .exclusive, connectionID: nil
+            )
+            try await app.queue.run(ticket) { _ in
+                await app.disconnect(reason: .serverRestart)
+                do {
+                    try app.backupService.restore(backup, to: destination)
+                } catch {
+                    await app.connect()
+                    throw error
+                }
+                await MainActor.run {
+                    self?.appendConsole("Копия \(backup.name) восстановлена в \(destination.path)")
+                    self?.verificationFailed = false
+                    self?.infoMessage = String(localized: "Резервная копия восстановлена.")
+                    self?.refreshBackups(app)
+                }
+                await app.connect()
             }
-            await app.connect()
         }
     }
 
@@ -411,21 +455,46 @@ final class EnvironmentViewModel: ObservableObject {
             return
         }
         run(app, title: String(localized: "Резервное копирование")) { [weak self] in
-            // A copy of a live SQLite database is a corrupt copy.
-            await app.disconnect()
-            let record = try app.backupService.backup(databaseAt: target, note: "по запросу пользователя")
-            await MainActor.run {
-                self?.lastBackup = record
-                self?.infoMessage = String(localized: "Создана копия \(record.name) (\(record.sizeText)).")
-                self?.refreshBackups(app)
+            // Той же дорогой, что и копия перед переизвлечением (
+            //): гашение сервера снимает все задачи подключения, поэтому
+            // копирование ждёт пустой очереди и никого не пускает, пока идёт.
+            let ticket = QueueTicket(
+                title: String(localized: "Резервная копия базы"),
+                priority: .interactive, group: .exclusive, connectionID: nil
+            )
+            try await app.queue.run(ticket) { _ in
+                // A copy of a live SQLite database is a corrupt copy.
+                await app.disconnect(reason: .serverRestart)
+                let record: BackupRecord
+                do {
+                    record = try app.backupService.backup(databaseAt: target, note: "по запросу пользователя")
+                } catch {
+                    await app.connect()
+                    throw error
+                }
+                await MainActor.run {
+                    self?.lastBackup = record
+                    self?.infoMessage = String(localized: "Создана копия \(record.name) (\(record.sizeText)).")
+                    self?.refreshBackups(app)
+                }
+                await app.connect()
             }
-            await app.connect()
         }
     }
 
+    /// Спрашивает, точно ли удалять копию. Сама не удаляет ничего.
+    func askToDelete(_ backup: BackupRecord) {
+        pendingBackupDeletion = backup
+    }
+
     func delete(_ backup: BackupRecord, app: AppEnvironment) {
+        pendingBackupDeletion = nil
         do {
             try app.backupService.delete(backup)
+            // Не молча: строка исчезла бы и без сообщения, а «что именно
+            // я сейчас удалил» — это ровно то, что человек перепроверяет.
+            infoMessage = String(localized: "Копия \(backup.name) удалена (освобождено \(backup.sizeText)).")
+            app.log.record(.warning, "Копии", "Резервная копия \(backup.name) удалена вручную (\(backup.sizeText))")
             refreshBackups(app)
         } catch {
             errorMessage = app.describe(error)

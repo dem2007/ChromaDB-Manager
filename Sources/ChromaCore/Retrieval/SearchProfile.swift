@@ -173,8 +173,47 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     public var textWeight: Double
     /// `rrf_k` — the constant that flattens the curve near the top.
     public var fusionK: Double
+    // MARK: - Stage 1: длина кандидата
+
+    /// Отбрасывать кандидатов короче этого числа знаков. 0 — не отбрасывать.
+    ///
+    /// Выключено по умолчанию: короткий чанк изредка и есть ответ — артикул,
+    /// код ошибки, номер постановления, — и жёсткая отсечка их теряет.
+    public var minimumCharacters: Int
+    /// Штраф за длину: `схожесть × min(1, длина / цель)^степень`.
+    public var lengthPenaltyEnabled: Bool
+    /// Длина, начиная с которой штрафа нет вовсе, в знаках.
+    public var lengthTarget: Int
+    /// Степень: 0.5 — мягко (чанк в 30 знаков теряет две трети оценки),
+    /// 1.0 — вдвое жёстче.
+    public var lengthPenaltyPower: Double
+
     /// Whether the query is looked for whole or word by word.
     ///
+    /// Приставка к тексту запроса **перед тем, как считать вектор**.
+    ///
+    /// Модели семейства Qwen3-Embedding и nomic обучены на несимметричной
+    /// паре: документ идёт в модель как есть, а запрос — с инструкцией
+    /// впереди. Без неё вектор запроса и вектор документа лежат в слегка
+    /// разных областях, и близость меряется не совсем та.
+    ///
+    /// Замер на живой `text-embedding-qwen3-embedding-4b` и коллекции
+    /// `base_adaptive`: приставка
+    /// `"Instruct: Given a web search query, retrieve relevant passages that
+    /// answer the query\nQuery: "` меняет выдачу сильно — из десяти мест
+    /// совпадает от нуля до трёх. На запросе «импортозамещение программного
+    /// обеспечения» без приставки в тройке таблица ЕСИА и модель угроз,
+    /// с приставкой — приказ о стратегии и «цели создания импортозамещённой
+    /// ИТ-инфраструктуры ЦОД».
+    ///
+    /// Приставка живёт **в профиле**, а не в привязке коллекции, именно
+    /// затем, чтобы стенд мог сравнить её с пустой на одной и той же базе:
+    /// это одно отличие варианта, и пересчитывать ради него ничего не нужно.
+    ///
+    /// Текстовой половины поиска приставка не касается: там ищутся слова
+    /// запроса, а не его вектор.
+    public var queryPrefix: String
+
     /// Whole by default. Word-by-word needs `$or` inside `where_document`, and
     /// 3 says that must be verified against the installed server rather than
     /// assumed.
@@ -265,6 +304,11 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         textWeight: Double = 1,
         fusionK: Double = ReciprocalRankFusion.defaultK,
         splitQueryIntoWords: Bool = false,
+        minimumCharacters: Int = 0,
+        lengthPenaltyEnabled: Bool = false,
+        lengthTarget: Int = 300,
+        lengthPenaltyPower: Double = 0.5,
+        queryPrefix: String = "",
         searchLevel: ChunkLevelScope = .children,
         collapseByParent: Bool = true,
         promotion: ParentPromotion = .parent,
@@ -290,6 +334,11 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         self.textWeight = textWeight
         self.fusionK = fusionK
         self.splitQueryIntoWords = splitQueryIntoWords
+        self.minimumCharacters = minimumCharacters
+        self.lengthPenaltyEnabled = lengthPenaltyEnabled
+        self.lengthTarget = lengthTarget
+        self.lengthPenaltyPower = lengthPenaltyPower
+        self.queryPrefix = queryPrefix
         self.searchLevel = searchLevel
         self.collapseByParent = collapseByParent
         self.promotion = promotion
@@ -348,6 +397,8 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         case candidateMultiplier, minimumCandidates
         case vectorSearchEnabled, textSearchEnabled, vectorWeight, textWeight
         case fusionK, splitQueryIntoWords
+        case minimumCharacters, lengthPenaltyEnabled, lengthTarget, lengthPenaltyPower
+        case queryPrefix
         case searchLevel, collapseByParent, promotion
         case diversityEnabled, diversityLambda
         case rerankEnabled, rerankModel, rerankMode, rerankPrompt, rerankInstruction
@@ -373,6 +424,13 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         textWeight = try container.decodeIfPresent(Double.self, forKey: .textWeight) ?? 1
         fusionK = try container.decodeIfPresent(Double.self, forKey: .fusionK) ?? ReciprocalRankFusion.defaultK
         splitQueryIntoWords = try container.decodeIfPresent(Bool.self, forKey: .splitQueryIntoWords) ?? false
+        // Профили, записанные до, читаются как «длина не учитывается»:
+        // молча поменять ранжирование у сохранённого профиля нельзя.
+        minimumCharacters = try container.decodeIfPresent(Int.self, forKey: .minimumCharacters) ?? 0
+        lengthPenaltyEnabled = try container.decodeIfPresent(Bool.self, forKey: .lengthPenaltyEnabled) ?? false
+        lengthTarget = try container.decodeIfPresent(Int.self, forKey: .lengthTarget) ?? 300
+        lengthPenaltyPower = try container.decodeIfPresent(Double.self, forKey: .lengthPenaltyPower) ?? 0.5
+        queryPrefix = try container.decodeIfPresent(String.self, forKey: .queryPrefix) ?? ""
 
         searchLevel = try container.decodeIfPresent(ChunkLevelScope.self, forKey: .searchLevel) ?? .children
         collapseByParent = try container.decodeIfPresent(Bool.self, forKey: .collapseByParent) ?? true
@@ -421,6 +479,18 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         return stages
     }
 
+    /// Текст, который уходит **в модель** за вектором запроса.
+    ///
+    /// Одно место на всё приложение, и это важнее, чем кажется: живой поиск
+    /// считает вектор внутри конвейера, а стенд — заранее, снаружи, и кладёт
+    /// его в общий на прогон запас. Разойдись эти два места — стенд сравнивал
+    /// бы приставку саму с собой: вариант «с приставкой» брал бы из запаса
+    /// вектор, посчитанный без неё, и показывал бы ту же выдачу. Ровно этот
+    /// класс поломок ловился в, и, и повторять его не стоит.
+    public func embeddedQuery(_ text: String) -> String {
+        queryPrefix.isEmpty ? text : queryPrefix + text
+    }
+
     /// How many candidates stage 1 asks the collection for.
     ///
     /// With nothing downstream to discard this is `n_results` and no more. That
@@ -436,7 +506,22 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         // choose between.
         // Fusion needs a pool too: two lists of exactly `n` merge into
         // something shorter than `n` only by accident.
-        guard stages.contains(.collapse) || stages.contains(.diversity) || stages.contains(.fusion) else {
+        //
+        // Пометки в этот список **не** входят, хотя стадия пометок тоже
+        // работает с пулом. Закреплённый документ, не попавший
+        // в кандидаты, добирается отдельным запросом по самой пометке —
+        // это точнее и дешевле, чем поднимать пул всем поискам подряд:
+        // помеченных документов единицы, а пул платят все.
+        // Переранжирование и длина — тоже работа с пулом.
+        //
+        // Rerank без пула переставляет те же `n_results`, которые и так
+        // вернула база: нужный чанк, стоявший у вектора на сто тридцать
+        // третьем месте, до чат-модели не доезжает никогда. То же у отсечки
+        // и штрафа за длину: они отбрасывают и двигают, а брать взамен
+        // отброшенного нечего, если пул равен выдаче.
+        let discardsByLength = minimumCharacters > 0 || lengthPenaltyEnabled
+        guard stages.contains(.collapse) || stages.contains(.diversity)
+                || stages.contains(.fusion) || stages.contains(.rerank) || discardsByLength else {
             return requested
         }
         return max(requested, max(minimumCandidates, requested * max(1, candidateMultiplier)))

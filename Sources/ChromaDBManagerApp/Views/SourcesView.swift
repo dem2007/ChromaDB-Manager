@@ -10,6 +10,8 @@ struct SourcesSection: View {
     @ObservedObject var model: SourcesViewModel
     @ObservedObject var embeddings: EmbeddingsViewModel
     @ObservedObject var autoSync: AutoSyncCoordinator
+    /// Перейти на вкладку «Диагностика».
+    var openDiagnostics: () -> Void = {}
 
     /// Какие исчезнувшие файлы отмечены для общего решения.
     /// Ключ — источник и путь: пути в разных источниках совпадают.
@@ -88,9 +90,6 @@ struct SourcesSection: View {
             set: { if !$0 { model.cancelDraft() } }
         )) {
             SourceEditorSheet(model: model, embeddings: embeddings)
-        }
-        .sheet(isPresented: $model.showingDiagnostics) {
-            DiagnosticsSheet(model: model)
         }
         .sheet(isPresented: Binding(
             get: { model.tableMappingSource != nil },
@@ -173,7 +172,10 @@ struct SourcesSection: View {
                         }
                     }
                     Spacer()
-                    Button(String(localized: "Открыть диагностику")) { model.showingDiagnostics = true }
+                    // Соседняя вкладка, а не лист поверх экрана: там та же
+                    // диагностика, и лист прятал её вместе с массовыми
+                    // действиями, ради которых на неё и заходят.
+                    Button(String(localized: "Открыть диагностику")) { openDiagnostics() }
                         .buttonStyle(.chromaNormal)
                 }
             }
@@ -413,6 +415,44 @@ struct SourcesSection: View {
                     .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // поля источника изменились, а в базе лежат прежние.
+            // Не переиндексация: текст не менялся, менялись подписи к нему —
+            // значит и модель звать незачем.
+            if let count = model.outdatedMetadata[source.id], count > 0 {
+                HStack(spacing: 8) {
+                    Circle().fill(Theme.Palette.attention)
+                        .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+                    Text("поля в базе записаны прежними настройками: \(count.plainDigits) файлов")
+                        .font(Theme.Font.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(String(localized: "Обновить поля")) { model.refreshMetadata(source, app: app) }
+                        .buttonStyle(.chromaSecondary)
+                        .disabled(model.isBusy(source.id) || !app.connection.isConnected)
+                    Spacer()
+                }
+                Text("Переписываются только метаданные чанков: векторы не пересчитываются, модель не вызывается. Сначала делается бэкап.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // в папке появилась ещё одна ступень, и её смысл в базу
+            // не попадает. Приложение не выдумывает ей имя и не делает работы
+            // — говорит и ждёт, как и в
+            if let level = (model.newFolderLevels[source.id] ?? []).first {
+                HStack(spacing: 8) {
+                    Circle().fill(Theme.Palette.attention)
+                        .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+                    Text("появился уровень вложенности \(level.number.plainDigits): \(level.folderCount.plainDigits) папок (\(level.examples.joined(separator: ", ")))")
+                        .font(Theme.Font.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(String(localized: "Назвать уровень…")) { model.beginEditing(source) }
+                        .buttonStyle(.chromaSecondary)
+                        .disabled(model.isBusy(source.id))
+                    Spacer()
+                }
+                Text("Пока поле не задано, названия этих папок в метаданные не пишутся. Уже проиндексированные файлы при этом не трогаются.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             // an exclusion the user cannot see is a file that silently
             // stopped being indexed (rule 2 Приложения 5).
             ForEach(source.excludedPaths, id: \.self) { path in
@@ -628,9 +668,17 @@ struct SourcesSection: View {
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 if isPending {
+                    // Текст — у самой причины. Прежде баннер всегда
+                    // рассказывал про порог файлов, даже когда остановили
+                    // ворота строк из таблиц: на плане из сорока двух файлов
+                    // при пороге сто он писал «42 — больше порога 100».
+                    let reasons = plan.confirmationReasons(
+                        threshold: settings.configuration.syncPreviewThresholdFiles
+                    )
                     MessageBanner(
                         kind: .warning,
-                        text: "Затронет файлов: \(plan.writeItems.count) — больше порога \(settings.configuration.syncPreviewThresholdFiles). Снимите отметки с файлов, которые не нужно трогать, и подтвердите запуск."
+                        text: (reasons.map(\.sentence)
+                               + [String(localized: "Подтвердите запуск.")]).joined(separator: " ")
                     )
                 }
 
@@ -851,6 +899,18 @@ struct SourcesSection: View {
                 subtitle: "Файлы и строки таблиц исчезли из источника. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет."
             ) {
                 VStack(alignment: .leading, spacing: 14) {
+                    // Разбор идёт файл за файлом и на девяноста файлах длится
+                    // секунды. Без этой строки экран выглядел так, будто
+                    // нажатие потеряли.
+                    if let progress = model.resolveProgress {
+                        HStack(spacing: 8) {
+                            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+                                .frame(width: 160)
+                            Text(progress.text)
+                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                            Spacer()
+                        }
+                    }
                     ForEach(pairs, id: \.0.id) { source, removals in
                         decisionGroup(source: source, removals: removals)
                     }
@@ -891,11 +951,12 @@ struct SourcesSection: View {
                         model.resolveRows([removal], decision: .keepInDatabase, source: source, app: app)
                     }
                     .buttonStyle(.chromaNormal)
+                    .disabled(model.resolveProgress != nil)
                     Button(String(localized: "Удалить из базы")) {
                         model.resolveRows([removal], decision: .deleteChunks, source: source, app: app)
                     }
                     .buttonStyle(.chromaDanger)
-                    .disabled(!app.connection.isConnected)
+                    .disabled(!app.connection.isConnected || model.resolveProgress != nil)
                 }
             }
         }
@@ -929,12 +990,13 @@ struct SourcesSection: View {
                         selectedRemovals.subtract(chosen.map { key(source, $0) })
                     }
                     .buttonStyle(.chromaNormal)
+                    .disabled(model.resolveProgress != nil)
                     Button(String(localized: "Удалить из базы")) {
                         model.resolve(chosen, decision: .deleteChunks, source: source, app: app)
                         selectedRemovals.subtract(chosen.map { key(source, $0) })
                     }
                     .buttonStyle(.chromaDanger)
-                    .disabled(!app.connection.isConnected)
+                    .disabled(!app.connection.isConnected || model.resolveProgress != nil)
                 }
             }
             // Строк столько же, сколько исчезло файлов, а исчезнуть может
@@ -969,11 +1031,12 @@ struct SourcesSection: View {
                         model.resolve([removal], decision: .keepInDatabase, source: source, app: app)
                     }
                     .buttonStyle(.chromaNormal)
+                    .disabled(model.resolveProgress != nil)
                     Button(String(localized: "Удалить из базы")) {
                         model.resolve([removal], decision: .deleteChunks, source: source, app: app)
                     }
                     .buttonStyle(.chromaDanger)
-                    .disabled(!app.connection.isConnected)
+                    .disabled(!app.connection.isConnected || model.resolveProgress != nil)
                 }
             }
             if removals.count > removalLimit {
@@ -1042,6 +1105,7 @@ struct SourceEditorSheet: View {
                     if model.draft?.isGit == true { gitBasics }
                     basics
                     mapping
+                    pathLevels
                 }
                 chunking
                 triggers
@@ -1049,7 +1113,7 @@ struct SourceEditorSheet: View {
                 schemaHookup
             }
         } actions: {
-            if let problem = ruleProblem {
+            if let problem = ruleProblem ?? model.pathLevelProblem {
                 Text(problem)
                     .font(Theme.Font.caption)
                     .foregroundStyle(Theme.Palette.danger)
@@ -1063,13 +1127,17 @@ struct SourceEditorSheet: View {
                    : String(localized: "Сохранить")) { model.saveDraft(app) }
                 .buttonStyle(.chromaPrimary)
                 .keyboardShortcut(.defaultAction)
-                .disabled(ruleProblem != nil)
+                .disabled(ruleProblem != nil || model.pathLevelProblem != nil)
         }
         .task(id: model.draft?.id) {
+            model.scanDraftLevels(app)
             await refreshCoverage()
             showExtendedGeneration = model.draft?.chunking.generation.usesExtendedBlockValues ?? false
         }
         .task(id: model.draft?.chunking.chatModel) { await refreshStructuredOutputSupport() }
+        // Поля из пути — такая же часть договора с коллекцией, как ручные:
+        // изменили уровень — карточка схемы обязана ответить сразу.
+        .task(id: model.draft?.metadataSignature) { await refreshCoverage() }
     }
 
     /// Probes the chosen chat model once. Only for LLM-based chunking: no other
@@ -1523,6 +1591,126 @@ struct SourceEditorSheet: View {
                         .strokeBorder(Theme.Palette.border, lineWidth: 1)
                 )
             }
+            }
+        }
+    }
+
+    /// Уровни вложенности как поля метаданных.
+    ///
+    /// Отдельным блоком, а не пятым режимом маппинга: режим отвечает на вопрос
+    /// «в какую коллекцию», уровни — «что известно о файле из его места
+    /// в дереве». Пустой блок ничего не меняет, и источник ведёт себя ровно
+    /// как прежде.
+    @ViewBuilder
+    private var pathLevels: some View {
+        SectionCard(
+            title: String(localized: "Поля из пути"),
+            subtitle: String(localized: "Названия папок становятся полями каждого чанка — по ним потом фильтруют выдачу."),
+            help: String(localized: "Уровень — это папка на своей глубине: первый уровень внутри папки источника, второй внутри него и так далее. Имя поля пишется латиницей: по нему фильтруют запросы и ходят внешние клиенты. Значение берётся с папки как есть — хоть кириллицей, хоть с пробелами. Уровень без имени не пишется никуда. Изменение полей не пересчитывает векторы: их можно обновить отдельной операцией.")
+        ) {
+            VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
+                if model.draftLevelsScanning {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Считаем уровни папки…").font(Theme.Font.caption)
+                            .foregroundStyle(Theme.Palette.captionText)
+                    }
+                } else if let problem = model.draftLevelsProblem {
+                    Text("Папку прочитать не удалось: \(problem)")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let levels = model.draftFolderLevels, levels.isEmpty,
+                          draft.wrappedValue.pathLevels.isEmpty {
+                    Text("Внутри папки нет подпапок с подходящими файлами — полям из пути неоткуда взяться.")
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ForEach(Array(draft.pathLevels.enumerated()), id: \.element.id) { index, level in
+                    pathLevelRow(index: index, level: level)
+                }
+
+                if let levels = model.draftFolderLevels, levels.deeperThanLimit {
+                    Text("В папке есть пути глубже \(PathLevel.maximumLevels.plainDigits) уровней — их названия полями не станут.")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !draft.wrappedValue.pathLevels.filter(\.isNamed).isEmpty {
+                    pathLevelPreview
+                }
+            }
+        }
+    }
+
+    /// Одна строка уровня: что в нём лежит, как назвать и что писать файлам,
+    /// которые до него не достают.
+    @ViewBuilder
+    private func pathLevelRow(index: Int, level: Binding<PathLevel>) -> some View {
+        let known = model.draftFolderLevels?.levels.first { $0.number == index + 1 }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Text("Уровень \((index + 1).plainDigits)")
+                    .font(Theme.Font.control)
+                    .frame(width: 90, alignment: .leading)
+                TextField(String(localized: "имя поля (латиницей)"), text: level.key)
+                    .textFieldStyle(.roundedBorder)
+                    .font(Theme.Font.mono)
+                    .frame(maxWidth: 200)
+                Picker("", selection: level.type) {
+                    ForEach(MetadataFieldType.allCases) { type in
+                        Text(type.title).tag(type)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 150)
+                TextField(String(localized: "если папки нет"), text: level.fallbackValue)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 160)
+                Spacer(minLength: 0)
+            }
+            if let known {
+                Text("\(known.folderCount.plainDigits) папок: \(known.examples.joined(separator: ", "))\(known.folderCount > known.examples.count ? "…" : "")")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+            if let problem = PathLevel.keyProblem(level.wrappedValue.key) {
+                Text(problem)
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if level.wrappedValue.isNamed, let known {
+                // Две вещи, о которых честнее сказать до прогона: сколько файлов
+                // останутся без поля и сколько папок не приводятся к типу.
+                if known.filesAbove > 0 {
+                    Text("\(known.filesAbove.plainDigits) файлов лежат выше этого уровня\(level.wrappedValue.fallbackValue.isEmpty ? " — у них поля не будет" : " — им запишется «\(level.wrappedValue.fallbackValue)»").")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                let mismatched = known.namesNotMatching(level.wrappedValue)
+                if !mismatched.isEmpty {
+                    Text("Не разбираются как \(level.wrappedValue.type.title): \(mismatched.prefix(3).joined(separator: ", "))\(mismatched.count > 3 ? "…" : "") — \(mismatched.count.plainDigits) из \(known.names.count.plainDigits). Таким файлам поле не запишется.")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Предпросмотр на настоящих путях: показать результат на выдуманном
+    /// `folder/file.txt` значит показать не то.
+    @ViewBuilder
+    private var pathLevelPreview: some View {
+        let source = draft.wrappedValue
+        let samples = model.draftFolderLevels?.samplePaths ?? []
+        if !samples.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Так это запишется:").font(Theme.Font.micro)
+                    .foregroundStyle(Theme.Palette.captionText)
+                ForEach(samples, id: \.self) { path in
+                    let fields = CollectionRouter.levelFields(for: path, levels: source.pathLevels)
+                    Text("\(path) → \(fields.isEmpty ? String(localized: "полей нет") : fields.keys.sorted().map { "\($0)=\(fields[$0]?.displayString ?? "")" }.joined(separator: ", "))")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -2245,6 +2433,7 @@ struct SourceEditorSheet: View {
             .padding(.top, 4)
         } label: {
             Text("Расширенные параметры").font(Theme.Font.caption)
+                .togglesDisclosure($showExtendedGeneration)
         }
     }
 

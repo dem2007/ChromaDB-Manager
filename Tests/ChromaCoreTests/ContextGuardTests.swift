@@ -79,7 +79,7 @@ final class ContextGuardTests: XCTestCase {
     }
 
     /// Для эмбеддингов берётся потолок, для порождающих вызовов — загруженный
-    /// контекст. Это разные числа и разные измерения против.
+    /// контекст. Это разные числа и разные измерения ( против).
     func testTheTwoContextNumbersAreNotTheSameThing() {
         let model = LMStudioModel(
             id: "м", kind: .chat, contextLength: 40_960, loadedContextLength: 8_192
