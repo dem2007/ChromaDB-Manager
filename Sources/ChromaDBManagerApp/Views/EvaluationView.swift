@@ -17,6 +17,8 @@ struct EvaluationView: View {
     /// «Просмотр доступен и из результатов стенда оценки — при разметке
     /// результатов посмотреть исходник особенно нужно».
     @StateObject private var viewer = DocumentViewerViewModel()
+    /// Раскрыт ли промпт оценки — по той же причине, что и таймауты.
+    @State private var showingJudgePrompt = false
 
     var body: some View {
         ScrollView {
@@ -251,7 +253,7 @@ struct EvaluationView: View {
         }
         .frame(maxWidth: 460, alignment: .leading)
 
-        DisclosureGroup("Промпт оценки") {
+        DisclosureGroup(isExpanded: $showingJudgePrompt) {
             VStack(alignment: .leading, spacing: 6) {
                 TextEditor(text: Binding(
                     get: { app.settings.configuration.modelJudgePrompt.text },
@@ -274,6 +276,8 @@ struct EvaluationView: View {
                 }
             }
             .padding(.top, 6)
+        } label: {
+            Text("Промпт оценки").togglesDisclosure($showingJudgePrompt)
         }
         .font(Theme.Font.body)
 
@@ -485,9 +489,8 @@ struct EvaluationView: View {
             ForEach([1, 3, 5, 10, 20], id: \.self) { k in
                 let chosen = model.ks(app).contains(k)
                 Button("@\(k)") { toggleK(k) }
-                    .buttonStyle(.chromaNormal)
+                    .buttonStyle(.chromaChoice(chosen ? Theme.Palette.accent : nil))
                     .controlSize(.small)
-                    .tint(chosen ? Color.accentColor : nil)
             }
             Spacer()
         }
@@ -933,33 +936,71 @@ struct EvaluationView: View {
                 // результатов — это двести карточек с текстом и тремя кнопками
                 // каждая, и обычный стек строит их все до первого показа
                 // экрана. Ленивый строит только видимое.
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(run.queries) { query in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(query.text).font(Theme.Font.body).bold()
-                            // Варианты — колонками рядом: различие видно
-                            // только тогда, когда выдачи стоят друг напротив друга.
-                            ScrollView(.horizontal) {
-                                HStack(alignment: .top, spacing: 12) {
-                                    ForEach(run.variants) { variant in
-                                        resultColumn(run: run, query: query, variant: variant)
-                                    }
-                                }
+                // Одна горизонтальная прокрутка на всю карточку, а не своя
+                // у каждого запроса. Вложенных прокруток было столько
+                // же, сколько запросов, и колёсико трекпада металось между
+                // ними: страница дёргалась туда-сюда, а колонки соседних
+                // запросов стояли на разных сдвигах.
+                ScrollView(.horizontal) {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(run.queries) { query in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(query.text).font(Theme.Font.body).bold()
+                                // Варианты — колонками рядом: различие
+                                // видно только тогда, когда выдачи стоят друг
+                                // напротив друга.
+                                comparisonGrid(run: run, query: query)
                             }
+                            Divider()
                         }
-                        Divider()
                     }
                 }
             }
         }
     }
 
-    /// Выдача одного варианта на один запрос — колонка отчёта.
-    private func resultColumn(
-        run: EvaluationRun, query: EvaluationQuery, variant: EvaluationVariant
-    ) -> some View {
-        let result = run.result(query: query.id, variant: variant.id)
-        return VStack(alignment: .leading, spacing: 4) {
+    /// Ширина колонки варианта. Одна на весь экран: колонки стоят рядом,
+    /// и разной ширины у них быть не может.
+    private static let columnWidth: CGFloat = 340
+
+    /// Выдачи вариантов **сеткой**, а не стопкой колонок.
+    ///
+    /// Сравнивают по строкам: «что у всех на четвёртом месте». В стопке
+    /// независимых колонок четвёртая строка одного варианта стоит напротив
+    /// шестой у соседнего — текст у результатов разной высоты, и колонки
+    /// разъезжаются тем сильнее, чем ниже смотришь. `Grid` выравнивает
+    /// ячейки одной строки по самой высокой, и номера снова стоят друг
+    /// напротив друга.
+    private func comparisonGrid(run: EvaluationRun, query: EvaluationQuery) -> some View {
+        let results = run.variants.map { run.result(query: query.id, variant: $0.id) }
+        let rows = results.map { $0?.hits.count ?? 0 }.max() ?? 0
+        return Grid(alignment: .topLeading, horizontalSpacing: 12, verticalSpacing: 6) {
+            GridRow {
+                ForEach(Array(run.variants.enumerated()), id: \.element.id) { index, variant in
+                    columnHeader(variant: variant, result: results[index])
+                }
+            }
+            ForEach(0..<rows, id: \.self) { position in
+                GridRow {
+                    ForEach(Array(run.variants.enumerated()), id: \.element.id) { index, variant in
+                        if let hits = results[index]?.hits, position < hits.count {
+                            let hit = hits[position]
+                            resultRow(queryID: query.id, variantID: variant.id, hit: hit)
+                                .frame(width: Self.columnWidth, alignment: .topLeading)
+                        } else {
+                            // Пустая ячейка держит колонку: без неё соседние
+                            // съезжают влево и сравнивать снова нечего.
+                            Color.clear.frame(width: Self.columnWidth, height: 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Шапка колонки: чей это вариант и чем кончился его поиск.
+    private func columnHeader(variant: EvaluationVariant, result: EvaluationResult?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
             Text(variant.name).font(Theme.Font.caption).bold()
             if let failure = result?.failure {
                 Text(failure).font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
@@ -973,9 +1014,6 @@ struct EvaluationView: View {
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                ForEach(result.hits) { hit in
-                    resultRow(queryID: query.id, variantID: variant.id, hit: hit)
-                }
                 if result.hits.isEmpty {
                     Text("ничего не найдено").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                 }
@@ -983,7 +1021,7 @@ struct EvaluationView: View {
                 Text("не выполнялся").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
             }
         }
-        .frame(width: 340, alignment: .leading)
+        .frame(width: Self.columnWidth, alignment: .leading)
     }
 
     /// Один результат с тремя кнопками — разметка прямо в отчёте.
@@ -993,18 +1031,24 @@ struct EvaluationView: View {
     private func resultRow(queryID: UUID, variantID: UUID, hit: EvaluationHit) -> some View {
         let grade = model.grade(queryID: queryID, variantID: variantID, hit: hit)
         return VStack(alignment: .leading, spacing: 3) {
+            // Место под три строки — всегда, даже если текст короче.
+            // Плавающая высота строки — это и есть «скачет при прокрутке»:
+            // ленивый список оценивает высоту ещё не построенных кусков, и
+            // каждая построенная строка сдвигает всё, что ниже.
             Text("\(hit.position). \(Self.preview(hit))")
                 .font(Theme.Font.caption)
-                .lineLimit(3)
+                .lineLimit(3, reservesSpace: true)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 4) {
                 ForEach(RelevanceGrade.allCases) { candidate in
                     Button(candidate.title) {
                         model.mark(queryID: queryID, variantID: variantID, hit: hit, grade: candidate, app: app)
                     }
-                    .buttonStyle(.chromaNormal)
+                    // Цвет — самому стилю, а не через `.tint`:
+                    // капсульный стиль рисует заливку сам, и `.tint` до него
+                    // не доходил — отметка ставилась, кнопка не менялась.
+                    .buttonStyle(.chromaChoice(grade == candidate ? Self.tint(candidate) : nil))
                     .controlSize(.small)
-                    .tint(grade == candidate ? Self.tint(candidate) : nil)
                     // Названия оценок не сокращаются никогда: «релеван…» и
                     // «нерелева…» отличаются четырьмя буквами в начале,
                     // и промахнуться на них — обычное дело.

@@ -5,7 +5,11 @@ import ChromaCore
 
 struct ChromaDBManagerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var app = AppEnvironment()
+    // Общий экземпляр, а не новый на каждое построение сцены:
+    // автозамыкание `@StateObject` SwiftUI зовёт по многу раз, отбрасывая
+    // лишние объекты уже после того, как их `init` открыл кеш и прочитал
+    // журнал задач.
+    @StateObject private var app = AppEnvironment.shared
     @StateObject private var quickSearch = QuickSearchViewModel()
 
     var body: some Scene {

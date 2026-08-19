@@ -187,7 +187,7 @@ final class QueryHistoryTests: XCTestCase {
     }
 
     /// Dates are written one way and must be read the same way — a mismatch
-    /// fails silently and answers «истории нет» (the shape of.
+    /// fails silently and answers «истории нет» — the shape the bug took.
     func testDatesSurviveTheRoundTrip() {
         let moment = Date(timeIntervalSince1970: 1_780_000_000)
         store().record(entry("когда-то", at: moment))

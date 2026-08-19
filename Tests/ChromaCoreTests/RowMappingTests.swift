@@ -190,6 +190,62 @@ final class RowMetadataTests: XCTestCase {
         XCTAssertEqual(row.value(at: 1).displayText, "15 %")
     }
 
+    /// единица идёт рядом с числом отдельным полем.
+    ///
+    /// оставлял её тексту документа — и это работало, только пока
+    /// колонка помечена как текст. У колонки с процентами, помеченной
+    /// метаданными, «4 %» не оставалось нигде, и число 4 было неотличимо
+    /// от рублей и штук.
+    func testAUnitIsWrittenBesideTheNumber() throws {
+        let row = SheetRow(number: 5, cells: [
+            0: .text("A-1"),
+            1: .measured(0.04, .percent),
+            4: .text("инфляция"),
+        ])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["цена"], .int(4), "число остаётся числом — по нему фильтруют")
+        XCTAssertEqual(document.metadata["цена_unit"], .string("%"))
+    }
+
+    /// У числа без оформления единицы нет — и поля тоже: пустое «неизвестно»
+    /// в каждой строке ничем не лучше его отсутствия.
+    func testAPlainNumberGetsNoUnitField() throws {
+        let row = SheetRow(number: 5, cells: [0: .text("A-1"), 1: .number(42), 4: .text("шт")])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertNil(document.metadata["цена_unit"])
+    }
+
+    /// Валюта пишется той же подписью, что видна в книге, — хоть она и стоит
+    /// перед числом.
+    func testACurrencyPrefixBecomesTheUnitToo() throws {
+        let row = SheetRow(number: 5, cells: [
+            0: .text("A-1"),
+            1: .measured(120, NumberUnit(prefix: "$", suffix: "")),
+            4: .text("цена"),
+        ])
+        let document = try XCTUnwrap(document(row))
+        XCTAssertEqual(document.metadata["цена_unit"], .string("$"))
+    }
+
+    /// Колонка, которую в файле так и назвали, важнее нашего поля: её значение
+    /// перезаписывать нельзя.
+    func testARealColumnWinsOverTheUnitField() throws {
+        let columns = ["Цена", "Цена_unit"]
+        let row = SheetRow(number: 5, cells: [0: .measured(0.15, .percent), 1: .text("рубли")])
+        let document = try XCTUnwrap(RowMapper.document(
+            for: row,
+            mapping: TableMapping(
+                sheetName: "Каталог", columns: columns,
+                roles: ["Цена": .metadata, "Цена_unit": .text]
+            ),
+            layout: SheetLayout(headerRow: 1, columns: columns),
+            sourceID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            sourceFile: "прайс.xlsx"
+        ))
+        XCTAssertEqual(document.metadata["цена"], .int(15))
+        XCTAssertNil(document.metadata["цена_unit"], "колонка помечена текстом — поле занимать нечем")
+    }
+
     func testACurrencyKeepsItsNumberInMetadata() throws {
         let row = SheetRow(number: 5, cells: [
             0: .text("A-1"),

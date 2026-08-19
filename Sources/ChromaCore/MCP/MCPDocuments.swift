@@ -286,6 +286,12 @@ public enum MCPDocumentRendering {
             budget -= shownText.count + metadataLine.count
 
             var object: [String: JSONValue] = ["id": .string(payload.id)]
+            // Отпечаток файла отдельным полем, а не только среди трёх десятков
+            // метаданных: им агент просит документ целиком, и увидеть
+            // его он должен сразу, а не вычитывать из общей строки.
+            if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
+                object["fileId"] = .string(fileID)
+            }
             // Из какой коллекции результат. Без этого агент, искавший
             // по трём, не сможет ни дочитать документ, ни сказать человеку,
             // откуда он это взял.
@@ -310,6 +316,12 @@ public enum MCPDocumentRendering {
             var header = payload.role == .context
                 ? String(localized: "— контекст, id «\(payload.id)»")
                 : String(localized: "\((index + 1).plainDigits). id «\(payload.id)»")
+            // То же, что и в структурированном ответе, и по той же причине:
+            // модель читает текст, а в строке метаданных отпечаток теряется
+            // среди трёх десятков полей.
+            if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
+                header += String(localized: ", файл целиком — get_file с file_id \(fileID)")
+            }
             if let distance = payload.distance {
                 let value = String(format: "%.4f", distance)
                 header += metric.map { String(localized: ", расстояние \(value) (\($0))") }
@@ -330,6 +342,36 @@ public enum MCPDocumentRendering {
                 }
             }
             lines.append(body)
+        }
+
+        // Таблица в этом фрагменте осталась плоским текстом: колонки
+        // не разделены, и по числам оттуда нельзя сказать, где цена, а где
+        // итог. Живой случай: агент посчитал по такой странице смету и
+        // выдал одну позицию двумя, каждую с полной ценой.
+        if payloads.contains(where: { document in
+            if case .bool(true)? = document.metadata?["tables_flat"] { return true }
+            return false
+        }) {
+            notes.append(String(
+                localized: "Внимание: в части этих фрагментов таблица осталась плоским текстом — колонки в ней не разделены. Числа оттуда нельзя раскладывать по колонкам и складывать; сверься с исходным файлом."
+            ))
+        }
+
+        // Книга попала в базу не целиком: у строки записано, сколько
+        // листов размечено из скольких. Живой случай — из четырнадцати листов
+        // сметы размечены пять, и лист с ценами в базу не попал вовсе;
+        // агент, считавший по остальным, об этом не знал.
+        let partial = payloads.compactMap { document -> (Int, Int)? in
+            guard case .int(let indexed)? = document.metadata?["sheets_indexed"],
+                  case .int(let total)? = document.metadata?["sheets_total"],
+                  indexed < total
+            else { return nil }
+            return (indexed, total)
+        }
+        if let (indexed, total) = partial.first {
+            notes.append(String(
+                localized: "Внимание: книга проиндексирована не целиком — размечено листов \(indexed.plainDigits) из \(total.plainDigits). Строк с неразмеченных листов в базе нет, и считать по этой выдаче итоги нельзя."
+            ))
         }
 
         if payloads.contains(where: { ($0.text?.count ?? 0) > limits.documentCharacters }) {

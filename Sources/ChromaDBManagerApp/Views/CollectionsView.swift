@@ -1008,9 +1008,37 @@ struct CollectionsView: View {
             VStack(alignment: .leading, spacing: 10) {
                 profileBar(collection)
 
+                // Enter выполняет запрос. Поле многострочное —
+                // оно растёт под длинный запрос, — и Return у него уходит
+                // не туда, куда ждёшь: нажатие пропадало впустую, ни выдачи,
+                // ни переноса строки.
+                //
+                // Замерено пробником на этой системе:
+                // • Return у поля с `axis: .vertical` доходит до `onSubmit`
+                //   и строку **не** переносит;
+                // • Shift+Return — тоже `onSubmit`, тоже без переноса;
+                // • перенос строки даёт Option+Return, и только он;
+                // • `onKeyPress` при этом Return видит и может забрать себе.
+                //
+                // Поэтому обработчика два. Какой из них сработает, зависит от
+                // того, успело ли поле забрать нажатие; запрос от этого не
+                // должен зависеть, а два запуска разом отсекает `runQuery`:
+                // он выходит, пока предыдущий не кончился.
                 TextField(String(localized: "Текст запроса"), text: $model.queryText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(2...5)
+                    .onKeyPress(phases: .down) { press in
+                        guard press.key == .return,
+                              press.modifiers.isDisjoint(with: [.option]) else { return .ignored }
+                        guard !model.isQuerying, collection.isBound else { return .ignored }
+                        Task { await model.runQuery(app) }
+                        return .handled
+                    }
+                    .onSubmit {
+                        guard !model.isQuerying, collection.isBound else { return }
+                        Task { await model.runQuery(app) }
+                    }
+                    .help(String(localized: "Enter — выполнить запрос, Option+Enter — перенос строки."))
 
                 alsoSearchInRow(collection)
 
@@ -1030,7 +1058,10 @@ struct CollectionsView: View {
                         model.showHistory.toggle()
                         if model.showHistory { model.reloadHistory(app) }
                     }
-                    .buttonStyle(.chromaNormal)
+                    // Открытая история видна по самой кнопке, а не
+                    // только по панели под ней: так же показан «Журнал
+                    // пересчётов» в логах, и разнобоя тут быть не должно.
+                    .buttonStyle(model.showHistory ? .chromaPrimary : .chromaNormal)
                     if model.isQuerying { ProgressView().controlSize(.small) }
                     Button(String(localized: "Выполнить")) {
                         Task { await model.runQuery(app) }
@@ -1281,6 +1312,13 @@ struct CollectionsView: View {
             if !model.smartSearchEnabled {
                 Text(String(localized: "Конвейер выключен: запрос идёт как обычный векторный поиск этапа 2. Иерархия, соседи, разнообразие и переранжирование не применяются."))
                     .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+            } else if model.lastRetrieval?.unchangedByProfile == true {
+                // Прямо здесь, а не в свёрнутой панели диагностики:
+                // человек, у которого галочка не меняет выдачу, ищет причину
+                // у переключателя, а не в разделе «как получен результат».
+                Text(String(localized: "Этот профиль не изменил выдачу: свёртка и подъём к разделу доступны только коллекции с двумя уровнями чанков, пометок в выдаче нет, а остальные стадии выключены. Разницу с обычным поиском дадут «Текстовый поиск» (точные слова запроса), «Разнообразие» или «Соседние чанки» — они включаются в «Настроить…»."))
+                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1296,6 +1334,7 @@ struct CollectionsView: View {
                     rerankModels: embeddingsModel.rerankModels.map(\.id),
                     rerankingTypedIDs: embeddingsModel.rerankingTypedIDs,
                     isHierarchical: model.selected?.looksHierarchical ?? false,
+                    metric: model.selected?.space,
                     onCancel: {
                         model.showProfileEditor = false
                         model.profileDraft = nil
@@ -1355,6 +1394,7 @@ struct CollectionsView: View {
                 Text(String(localized: "Как получен этот результат")).font(Theme.Font.caption).bold()
                 Text(diagnostics.summary).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
             }
+            .togglesDisclosure($model.showDiagnostics)
         }
         .padding(10)
         .background(Color(nsColor: .textBackgroundColor))

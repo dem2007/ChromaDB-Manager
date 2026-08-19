@@ -116,8 +116,15 @@ public struct MultiCollectionSearch: Sendable {
             return Answer(hits: [], collections: [], embeddingCalls: 0, seconds: 0)
         }
 
-        // Вектор на модель, а не на коллекцию.
-        var vectors: [String: [Double]] = [:]
+        // Вектор на «модель + текст, уходящий в модель», а не на коллекцию
+        //. Одной модели мало: приставка к запросу живёт в профиле,
+        // и у двух целей на одной модели она может быть разной — общий
+        // вектор дал бы одной из них выдачу по чужому запросу.
+        struct VectorKey: Hashable {
+            let model: String
+            let text: String
+        }
+        var vectors: [VectorKey: [Double]] = [:]
         var calls = 0
         var reports: [CollectionReport] = []
         var lists: [(target: Target, hits: [RetrievalHit])] = []
@@ -125,12 +132,18 @@ public struct MultiCollectionSearch: Sendable {
         for target in targets {
             let collectionStarted = Date()
             do {
+                // Тот же текст, что считает живой поиск внутри конвейера
+                //: здесь вектор передаётся готовым, и конвейер свою
+                // приставку применить уже не сможет — значит применить её
+                // обязаны мы.
+                let asked = target.profile.embeddedQuery(query)
+                let key = VectorKey(model: target.model, text: asked)
                 let vector: [Double]
-                if let known = vectors[target.model] {
+                if let known = vectors[key] {
                     vector = known
                 } else {
-                    vector = try await embed(query, target.model)
-                    vectors[target.model] = vector
+                    vector = try await embed(asked, target.model)
+                    vectors[key] = vector
                     calls += 1
                 }
                 let outcome = try await search(target, query, vector)

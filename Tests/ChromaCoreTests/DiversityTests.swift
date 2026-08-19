@@ -154,8 +154,16 @@ final class DiversityStageTests: XCTestCase {
         XCTAssertEqual(result.note, "векторов кандидатов нет — переупорядочивать нечем")
     }
 
-    /// A result whose embedding did not come back must not vanish.
-    func testACandidateWithoutAVectorKeepsItsPlaceAtTheEnd() {
+    /// A result whose embedding did not come back must not vanish — и не
+    /// уезжает в хвост.
+    ///
+    /// Раньше этот тест требовал ровно обратного: «остаётся последним».
+    /// Требование выглядело безобидным, пока не выяснилось, чем оно
+    /// оборачивается: текстовая половина гибридного поиска приходит **вся**
+    /// без векторов, и усечение до `n_results` выбрасывало её целиком —
+    /// при включённом разнообразии текстовый поиск не влиял на выдачу вовсе.
+    /// Теперь место считается по числу уцелевших кандидатов перед ним.
+    func testACandidateWithoutAVectorKeepsItsPlaceInTheRanking() {
         let hits = [
             hit("a", distance: 0.10, vector: [1, 0]),
             hit("b", distance: 0.11, vector: [0.99, 0.01]),
@@ -164,7 +172,10 @@ final class DiversityStageTests: XCTestCase {
         ]
         let result = RetrievalPipeline.diversifying(hits, count: 4, lambda: 0.5, metric: .cosine)
         XCTAssertEqual(Set(result.hits.map(\.id)).count, 4, "ни один результат не должен потеряться")
-        XCTAssertEqual(result.hits.last?.id, "нет вектора")
+        XCTAssertEqual(
+            result.hits.map(\.id).firstIndex(of: "нет вектора"), 2,
+            "перед ним стояли двое уцелевших — там ему и место: \(result.hits.map(\.id))"
+        )
     }
 
     func testOnACosineCollectionRelevanceComesFromTheDistance() {

@@ -33,6 +33,10 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
     public var extractorID: String
     public var extractorVersion: Int
     public var extractionSignature: String
+    /// Поля метаданных, с которыми пишется файл — здесь по той же
+    /// причине, что и остальные подписи: доигранный после сбоя прогон обязан
+    /// записать в манифест то же, что записал бы прерванный.
+    public var metadataSignature: String
     public var modifiedAt: Date
     public var size: Int64
     public var chunkingSignature: String
@@ -55,6 +59,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
         extractorID: String = "",
         extractorVersion: Int = 0,
         extractionSignature: String = "",
+        metadataSignature: String = "",
         modifiedAt: Date,
         size: Int64,
         chunkingSignature: String,
@@ -72,6 +77,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
         self.extractorID = extractorID
         self.extractorVersion = extractorVersion
         self.extractionSignature = extractionSignature
+        self.metadataSignature = metadataSignature
         self.modifiedAt = modifiedAt
         self.size = size
         self.chunkingSignature = chunkingSignature
@@ -98,6 +104,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
         extractorID = try container.decodeIfPresent(String.self, forKey: .extractorID) ?? ""
         extractorVersion = try container.decodeIfPresent(Int.self, forKey: .extractorVersion) ?? 0
         extractionSignature = try container.decodeIfPresent(String.self, forKey: .extractionSignature) ?? ""
+        metadataSignature = try container.decodeIfPresent(String.self, forKey: .metadataSignature) ?? ""
         modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
         size = try container.decode(Int64.self, forKey: .size)
         chunkingSignature = try container.decodeIfPresent(String.self, forKey: .chunkingSignature) ?? ""
@@ -129,6 +136,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
             extractorID: extractorID,
             extractorVersion: extractorVersion,
             extractionSignature: extractionSignature,
+            metadataSignature: metadataSignature,
             warnings: warnings
         )
     }

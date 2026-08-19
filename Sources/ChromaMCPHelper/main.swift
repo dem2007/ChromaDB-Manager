@@ -49,19 +49,38 @@ let queue = DispatchQueue(label: "chromadb.mcp.helper")
 final class PendingReplies: @unchecked Sendable {
     private let lock = NSCondition()
     private var count = 0
+    /// Чьи запросы ещё ждут ответа. Раньше считались только штуки —
+    /// этого хватало, чтобы не выйти раньше времени, но не хватало, чтобы
+    /// ответить за приложение, когда связь с ним оборвалась посреди вызова.
+    private var awaiting: [JSONRPCID] = []
 
-    func sent() {
-        lock.lock(); count += 1; lock.unlock()
+    func sent(_ id: JSONRPCID?) {
+        lock.lock()
+        count += 1
+        if let id { awaiting.append(id) }
+        lock.unlock()
     }
 
     /// Ответ узнаётся по наличию `id`: уведомления ответа не требуют.
     func received(_ data: Data) {
         guard let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: data),
-              incoming.id != nil else { return }
+              let id = incoming.id else { return }
         lock.lock()
         if count > 0 { count -= 1 }
+        awaiting.removeAll { $0 == id }
         lock.broadcast()
         lock.unlock()
+    }
+
+    /// Забирает всех, кто ещё ждёт: им придётся ответить самим.
+    func drainAwaiting() -> [JSONRPCID] {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = awaiting
+        awaiting.removeAll()
+        count = 0
+        lock.broadcast()
+        return taken
     }
 
     /// Ждёт ответов не дольше отведённого срока: клиент мог и уйти, а висеть
@@ -91,7 +110,13 @@ final class AppLink: @unchecked Sendable {
         defer { lock.unlock() }
         if channel == nil { channel = openChannel() }
         guard let channel else { return false }
-        channel.send(message)
+        // Неудачная отправка — тоже повод ответить агенту. Канал
+        // считается живым, пока о его смерти не сообщили, и сообщение,
+        // ушедшее в уже закрытое соединение, раньше пропадало без следа.
+        channel.send(message) { error in
+            log("сообщение не ушло: \(error.localizedDescription)")
+            answerForTheApp()
+        }
         return true
     }
 
@@ -109,6 +134,11 @@ final class AppLink: @unchecked Sendable {
                 self?.lock.lock()
                 self?.channel = nil
                 self?.lock.unlock()
+                // Но тем, кто ждёт ответа **сейчас**, приложение уже
+                // не ответит: их запросы ушли в закрывшийся канал.
+                // Без этого агент ждал своего таймаута, а человек видел
+                // «модель зависла» вместо «приложение закрыли».
+                answerForTheApp()
             }
             // `connect` уже поднял и дождался связи: файл сокета остаётся
             // на диске после закрытия приложения, и «файл есть» не значит
@@ -137,6 +167,23 @@ final class AppLink: @unchecked Sendable {
 }
 
 let link = AppLink()
+
+/// Отвечает за приложение всем, чьи запросы остались без ответа.
+///
+/// Ошибкой выполнения, а не молчанием: агент обязан узнать, что вызов
+/// не состоялся, — иначе он ждёт таймаута, а человек читает это как
+/// «зависла модель».
+func answerForTheApp() {
+    let waiting = pending.drainAwaiting()
+    guard !waiting.isEmpty else { return }
+    log("связь оборвалась, отвечаем за приложение: запросов \(waiting.count)")
+    for id in waiting {
+        output.write(.failure(id: id, JSONRPCError(
+            code: JSONRPCError.internalError,
+            message: MCPConnector.ConnectError.appNotRunning.localizedDescription
+        )))
+    }
+}
 
 /// Отказ, когда приложение не запущено.
 ///
@@ -185,7 +232,7 @@ while true {
         // Разбираем ровно настолько, чтобы знать идентификатор: он нужен,
         // если ответить придётся нам самим. Содержимое — дело приложения.
         let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
-        if incoming?.id != nil { pending.sent() }
+        if incoming?.id != nil { pending.sent(incoming?.id) }
         if !link.send(message) { refuse(incoming) }
     }
 }

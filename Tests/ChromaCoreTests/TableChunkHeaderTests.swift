@@ -79,7 +79,7 @@ final class TableChunkHeaderTests: XCTestCase {
     }
 }
 
-/// Две таблицы, записанные вплотную, не путают шапки (разбор кода.
+/// Две таблицы, записанные вплотную, не путают шапки (разбор кода).
 extension TableChunkHeaderTests {
     func testTwoTablesInARowKeepTheirOwnHeaders() {
         let text = """

@@ -30,6 +30,13 @@ public struct ManifestEntry: Codable, Hashable {
     /// Extraction options this file was written under. Empty for an
     /// entry from before they existed — unknown, and therefore not a mismatch.
     public var extractionSignature: String
+    /// Поля метаданных, с которыми записаны чанки этого файла: режим маппинга,
+    /// поля из пути, ручные поля источника. Пустая — запись прежней
+    /// сборки: «неизвестно», а не «другие».
+    ///
+    /// Хранится отдельно от `extractionSignature`, потому что её расхождение
+    /// лечится не переизвлечением, а переписыванием метаданных — без модели.
+    public var metadataSignature: String
     /// Set when the file is gone from disk but the user chose to keep its chunks,
     /// so it is not reported as "needs a decision" again on every sync.
     public var isOrphaned: Bool
@@ -56,6 +63,7 @@ public struct ManifestEntry: Codable, Hashable {
         extractorID: String = "",
         extractorVersion: Int = 0,
         extractionSignature: String = "",
+        metadataSignature: String = "",
         isOrphaned: Bool = false,
         warnings: [String] = []
     ) {
@@ -65,6 +73,7 @@ public struct ManifestEntry: Codable, Hashable {
         self.extractorID = extractorID
         self.extractorVersion = extractorVersion
         self.extractionSignature = extractionSignature
+        self.metadataSignature = metadataSignature
         self.modifiedAt = modifiedAt
         self.size = size
         self.embeddedAt = embeddedAt
@@ -84,6 +93,7 @@ public struct ManifestEntry: Codable, Hashable {
         extractorID = try container.decodeIfPresent(String.self, forKey: .extractorID) ?? ""
         extractorVersion = try container.decodeIfPresent(Int.self, forKey: .extractorVersion) ?? 0
         extractionSignature = try container.decodeIfPresent(String.self, forKey: .extractionSignature) ?? ""
+        metadataSignature = try container.decodeIfPresent(String.self, forKey: .metadataSignature) ?? ""
         modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
         size = try container.decode(Int64.self, forKey: .size)
         embeddedAt = try container.decodeIfPresent(Date.self, forKey: .embeddedAt) ?? Date()
@@ -148,6 +158,10 @@ public struct SourceManifest: Codable {
     /// trying. Replaced wholesale by each run that reached the end: a
     /// problem that is no longer reported is a problem that is gone.
     public var problems: [FileProblem]
+    /// Уровни вложенности глубже названных, замеченные последним прогоном
+    ///. Здесь по той же причине, что и `problems`: замечает прогон,
+    /// а решает человек — может быть, через неделю и после перезапуска.
+    public var newFolderLevels: [NewFolderLevel]
 
     public init(
         sourceID: UUID,
@@ -155,7 +169,8 @@ public struct SourceManifest: Codable {
         updatedAt: Date? = nil,
         entries: [String: ManifestEntry] = [:],
         pendingRemovals: [PendingRemoval] = [],
-        problems: [FileProblem] = []
+        problems: [FileProblem] = [],
+        newFolderLevels: [NewFolderLevel] = []
     ) {
         self.sourceID = sourceID
         self.version = version
@@ -163,6 +178,7 @@ public struct SourceManifest: Codable {
         self.entries = entries
         self.pendingRemovals = pendingRemovals
         self.problems = problems
+        self.newFolderLevels = newFolderLevels
     }
 
     /// A manifest written before versions existed reads as version 1 — it is
@@ -172,9 +188,22 @@ public struct SourceManifest: Codable {
         sourceID = try container.decode(UUID.self, forKey: .sourceID)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
-        entries = try container.decodeIfPresent([String: ManifestEntry].self, forKey: .entries) ?? [:]
-        pendingRemovals = try container.decodeIfPresent([PendingRemoval].self, forKey: .pendingRemovals) ?? []
-        problems = try container.decodeIfPresent([FileProblem].self, forKey: .problems) ?? []
+        // Пути приводятся к единой форме записи прямо при чтении.
+        // Манифесты прежних сборок хранят их так, как отдала файловая
+        // система, — «й» двумя знаками. Сам Swift разницы не видит, а вот
+        // sha256, из которого собираются идентификаторы чанков, видит: файл
+        // получил бы второй набор чанков вместо замены прежних.
+        let stored = try container.decodeIfPresent([String: ManifestEntry].self, forKey: .entries) ?? [:]
+        entries = stored.reduce(into: [:]) { result, pair in
+            var entry = pair.value
+            entry.relativePath = FilePathKey.canonical(entry.relativePath)
+            result[FilePathKey.canonical(pair.key)] = entry
+        }
+        pendingRemovals = (try container.decodeIfPresent([PendingRemoval].self, forKey: .pendingRemovals) ?? [])
+            .map { var item = $0; item.relativePath = FilePathKey.canonical(item.relativePath); return item }
+        problems = (try container.decodeIfPresent([FileProblem].self, forKey: .problems) ?? [])
+            .map { var item = $0; item.relativePath = FilePathKey.canonical(item.relativePath); return item }
+        newFolderLevels = try container.decodeIfPresent([NewFolderLevel].self, forKey: .newFolderLevels) ?? []
     }
 
     /// Indexed files that were read, but not cleanly.

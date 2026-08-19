@@ -250,9 +250,25 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
 - Registering folders: an extension mask, recursive traversal, a per-source embedding model,
   key-value metadata of your own.
 - Four mapping modes: folder → one collection; first-level subfolders → separate collections;
-  one collection plus `relative_path` in the metadata; a manual rule (a regex over the path →
+  one collection plus the file path in the metadata; a manual rule (a regex over the path →
   a collection name). Files that matched no rule are not silently skipped — they are listed in
   the report.
+- **Fields from the path: folder names become chunk metadata.** `Системы/2025/Система
+  1/устав.docx` yields `year = 2025` and `system = Система 1`, and results are filtered by
+  those instead of splitting one set of vectors across twenty collections. Levels are named
+  with the tree in view: each row says how many folders sit at that level and what they are
+  called, with a preview over the source's real paths below. The field name is written in
+  Latin letters (queries filter by it and external clients use it); the value is taken from
+  the folder as written. Works with any mapping mode, up to eight levels.
+  - **Nothing is invented.** A file above a level takes the default value, and without one it
+    gets no field at all. A folder that does not parse as the field's type ("архив" in a
+    numeric `year`) yields no value — and the editor says so before the run, not after.
+  - **A new level in the folder is an offer, not work.** When another step appears, the app
+    reports how many folders are there and what they are called, then waits: a person names
+    the level. The note survives a restart.
+  - **Changing the fields does not recompute vectors.** The text did not change, only the
+    labels on it: "Update the fields" rewrites chunk metadata without a single call to the
+    model, after a backup. A field dropped from the settings is removed from the database.
 - Seven chunking strategies: Fixed-size, Recursive, Document-based (Markdown headings, HTML
   tags, function and class boundaries), Hierarchical (parent and child chunks in one
   collection, linked by `parent_chunk_id`), Semantic (a cut where the meaning changes),
@@ -294,9 +310,10 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
   it does not; what happens with uncovered fields is a per-source setting (do not run, or index
   with an "needs attention" mark). If there is no schema, a draft can be generated from the
   source's own fields.
-- Automatic fields on every chunk: `source_id`, `source_file`, `chunk_index`, `content_hash`,
-  `file_ext`, `file_mtime`, `file_size` (plus `file_name`, `chunk_count` and `relative_path`
-  in the path-aware modes).
+- Automatic fields on every chunk: `source_id`, `source_file`, `file_id`, `chunk_index`,
+  `content_hash`, `file_ext`, `file_mtime`, `file_size` (plus `file_name` and `chunk_count`).
+  `file_id` is the file's fingerprint — sixteen characters an agent uses to ask for the whole
+  document instead of a path.
 
 ![Sources](docs/screenshots/sources.png)
 
@@ -342,7 +359,10 @@ embeddings through a local [LM Studio](https://lmstudio.ai/).
   looked is a claim, not an omission.
 - **A new extractor version is an offer, not work.** Updating the app does not start hours of
   recomputation on its own: files extracted by the previous version are listed on the source's
-  card with a button, and nothing happens until it is pressed.
+  card with a button, and nothing happens until it is pressed. The list is computed from the
+  manifest when the screen opens — before any sync, and it survives the restart that an update
+  arrives with. A scan read by recognition is compared against its own extractor rather than
+  against whichever one would claim the file first.
 
 **Web sources: a page, a list of addresses, a site crawl**
 - Three kinds of source: **a single page**, **a list of addresses** and **a crawl** from a
@@ -720,6 +740,7 @@ is a private `chroma run` managed by the app; embeddings are computed by the app
 the server, which is why every collection has a model and a dimension bound to it.
 
 More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+How to measure search quality without fooling yourself — [docs/EVALUATION.md](docs/EVALUATION.md).
 How to report a vulnerability — [SECURITY.md](SECURITY.md).
 
 ---

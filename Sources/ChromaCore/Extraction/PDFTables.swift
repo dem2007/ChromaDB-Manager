@@ -26,11 +26,16 @@ enum PDFPageTables {
 
     /// Страница, собранная по координатам. `nil` — таблиц на ней нет,
     /// и тогда всё остаётся как было: текст PDFKit и сшивка абзацев.
-    static func page(_ page: PDFPage) -> String? {
-        guard let words = words(of: page) else { return nil }
+    static func page(_ page: PDFPage) -> String? { assess(page).text }
+
+    /// То же, но со вторым ответом: была ли на странице таблица, которую
+    /// собрать не удалось. Такая страница уходит к агенту сеткой
+    /// чисел без названий колонок, и об этом он должен знать.
+    static func assess(_ page: PDFPage) -> (text: String?, unassembledTable: Bool) {
+        guard let words = words(of: page) else { return (nil, false) }
         let height = TableGeometry.medianHeight(of: words)
-        guard height > 0 else { return nil }
-        return TableGeometry.text(of: TableGeometry.lines(from: words, height: height))
+        guard height > 0 else { return (nil, false) }
+        return TableGeometry.assess(TableGeometry.lines(from: words, height: height))
     }
 
     /// Знаки страницы с их рамками. Каждый знак — отдельный кусок: в слова

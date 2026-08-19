@@ -380,16 +380,16 @@ struct OverviewView: View {
                 id: "backup",
                 text: String(localized: "Последняя резервная копия — \(backup.createdAt.formatted(date: .abbreviated, time: .shortened)), \(backup.sizeText)"),
                 isUrgent: false,
-                action: String(localized: "Копии"),
-                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Копии"))) }
+                action: String(localized: "Резервные копии"),
+                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии"))) }
             ))
         } else {
             found.append(Decision(
                 id: "no-backup",
                 text: String(localized: "Резервных копий базы нет"),
                 isUrgent: false,
-                action: String(localized: "Копии"),
-                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Копии"))) }
+                action: String(localized: "Резервные копии"),
+                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии"))) }
             ))
         }
         return found

@@ -107,6 +107,17 @@ public enum LMStudioError: LocalizedError {
     /// в базу не попал.
     case embeddingCountMismatch(sent: Int, received: Int)
 
+    /// LM Studio ответила от другой модели, чем просили.
+    ///
+    /// Замерено на живой LM Studio 0.3.x: `/v1/embeddings` **не загружает**
+    /// модель по имени из запроса. Если названной модели среди загруженных
+    /// нет, ответ приходит от той, что загружена, — и в поле `model` стоит
+    /// её имя, а не запрошенное. На заведомо несуществующее имя тоже: ошибки
+    /// не будет. Просили `bge-m3-mlx` — получили
+    /// `text-embedding-qwen3-embedding-0.6b`, и узнать об этом можно было
+    /// только по этому полю.
+    case modelSubstituted(requested: String, returned: String)
+
     public var errorDescription: String? {
         switch self {
         case .badURL(let value):
@@ -125,6 +136,8 @@ public enum LMStudioError: LocalizedError {
             return "Ответ модели «\(model)» оборван по лимиту токенов (finish_reason: length) — это неполный результат, а не короткий."
         case .embeddingCountMismatch(let sent, let received):
             return "LM Studio вернула \(received) векторов на \(sent) текстов. Сопоставить их с текстами нельзя, поэтому операция остановлена: молча записанная часть означала бы пропавшие документы."
+        case .modelSubstituted(let requested, let returned):
+            return "Запрошена модель «\(requested)», а ответила «\(returned)». Операция остановлена: векторы двух моделей несопоставимы, и записанные молча они превратили бы коллекцию в смесь, которую уже не разделить. Загрузите нужную модель в LM Studio или выберите ту, что уже загружена."
         }
     }
 
@@ -369,7 +382,48 @@ public actor LMStudioClient {
         guard items.count == sent else {
             throw LMStudioError.embeddingCountMismatch(sent: sent, received: items.count)
         }
+
+        // Кто на самом деле ответил. Проверка здесь, вместе со сверкой
+        // количества: оба вопроса — «то ли мы получили, что просили», и оба
+        // должны действовать на все пути сразу, включая выключенный кэш.
+        if let returned = payload.model, substituted(requested: model, returned: returned) {
+            throw LMStudioError.modelSubstituted(requested: model, returned: returned)
+        }
         return items.map(\.embedding)
+    }
+
+    /// Ответила ли LM Studio от **другой** модели, чем просили.
+    ///
+    /// Сравнение нестрогое, и это осознанно. Живые замеры показали три вида
+    /// расхождений, ни одно из которых не является подменой:
+    ///
+    /// * регистр — на `TEXT-EMBEDDING-QWEN3-EMBEDDING-4B` приходит
+    ///   `text-embedding-qwen3-embedding-4b`;
+    /// * издатель в начале — `google/gemma-4-e2b` против `gemma-4-e2b`;
+    /// * квантование в конце — `qwen3.8-27b-mlx@4bit` против `qwen3.8-27b-mlx`;
+    /// * сокращённое имя — на `qwen3-embedding-4b` приходит полное
+    ///   `text-embedding-qwen3-embedding-4b`, то есть имя **разрешено**,
+    ///   а не подменено.
+    ///
+    /// Поэтому совпадением считается не только равенство, но и вхождение
+    /// одного имени в другое. Плата за мягкость — модель, чьё имя является
+    /// началом имени другой (`qwen3-4b` и `qwen3-4b-thinking`), подмены
+    /// не покажет. Для эмбеддинговых моделей такой пары в живом списке нет,
+    /// а ложная остановка индексации стоила бы дороже: она ломает работу
+    /// там, где всё в порядке.
+    static func substituted(requested: String, returned: String) -> Bool {
+        let asked = canonicalModelID(requested)
+        let answered = canonicalModelID(returned)
+        guard !asked.isEmpty, !answered.isEmpty else { return false }
+        guard asked != answered else { return false }
+        return !asked.contains(answered) && !answered.contains(asked)
+    }
+
+    /// Имя модели без издателя и квантования, в нижнем регистре.
+    static func canonicalModelID(_ id: String) -> String {
+        let withoutPublisher = id.split(separator: "/").last.map(String.init) ?? id
+        let withoutQuantisation = withoutPublisher.split(separator: "@").first.map(String.init) ?? withoutPublisher
+        return withoutQuantisation.trimmingCharacters(in: .whitespaces).lowercased()
     }
 
     public func embed(text: String, model: String) async throws -> [Double] {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Asking Numbers to export a `.numbers` file as `.xlsx` (by the
-/// mechanism of.
+/// mechanism of).
 public protocol NumbersExporting: Sendable {
     func exportWorkbook(from url: URL, to destination: URL, timeout: TimeInterval) async throws
 }

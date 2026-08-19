@@ -166,7 +166,7 @@ final class CollectionsViewModel: ObservableObject {
     /// asked, and is not part of reading one.
     @Published var showDiagnostics = false
 
-    // Поиск по нескольким коллекциям; ядро —, MCP —
+    // Поиск по нескольким коллекциям: экран, ядро и MCP
     /// Коллекции, которые ищутся **вместе с открытой**. Пусто — обычный поиск
     /// по одной, тот же, что и был.
     @Published var alsoSearchIn: Set<String> = []
@@ -1156,6 +1156,10 @@ final class CollectionsViewModel: ObservableObject {
                     previous: document.metadata
                 )
             ])
+            // «В этой коллекции есть закреплённые» кешируется на коллекцию,
+            // и ответ только что изменился. Без сброса первое же
+            // закрепление не подействовало бы до перезапуска приложения.
+            await app.collectionShapes.forgetMarks(collectionID: collection.id)
             statusMessage = marks.isEmpty
                 ? String(localized: "Пометки с документа \(document.id) сняты.")
                 : String(localized: "Документ \(document.id): \(marks.summaryLine).")
@@ -1386,6 +1390,12 @@ final class CollectionsViewModel: ObservableObject {
     // MARK: - Query
 
     func runQuery(_ app: AppEnvironment) async {
+        // Второй запуск поверх идущего — не поиск, а гонка: оба пишут
+        // в `hits`, `lastRetrieval` и `searchReports`, и на экране остаётся
+        // выдача того, кто пришёл вторым, с отчётом того, кто пришёл первым.
+        // Enter обрабатывается двумя путями сразу, да и по кнопке
+        // «Выполнить» можно щёлкнуть дважды.
+        guard !isQuerying else { return }
         // Подключение проверяется, а клиент здесь не нужен: конвейер
         // собирает его сам. Связка осталась от прежней редакции.
         guard app.client != nil, let collection = selected else { return }

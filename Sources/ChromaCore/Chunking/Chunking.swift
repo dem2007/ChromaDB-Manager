@@ -9,7 +9,7 @@ public enum ChunkStrategy: String, Codable, CaseIterable, Identifiable, Sendable
     case adaptive
     case llmBased
     // Late chunking is absent by design: it needs token-level embeddings, which
-    // the OpenAI-compatible API of LM Studio does not expose (see DECISIONS).
+    // the OpenAI-compatible API of LM Studio does not expose.
 
     public var id: String { rawValue }
 

@@ -161,17 +161,6 @@ final class ReembeddingViewModel: ObservableObject {
         self.request = nil
         confirmationText = ""
 
-        let ticket = QueueTicket(
-            title: String(localized: "Пересчёт коллекции «\(request.collection.name)»"),
-            priority: .manual,
-            group: .lmStudio,
-            connectionID: app.connectionID,
-            resumable: ResumableRequest(
-                kind: .reembedding,
-                subject: request.collection.name,
-                title: String(localized: "Пересчёт коллекции «\(request.collection.name)»")
-            )
-        )
         task = Task { [weak self] in
             // Одна ссылка на всю задачу вместо «weak self» в каждом вложенном
             // замыкании: перезахват внешней переменной из параллельно
@@ -182,6 +171,21 @@ final class ReembeddingViewModel: ObservableObject {
                 // called without the evidence it returns.
                 let backup = try await self.makeBackup(request, app: app)
                 guard let client = app.client else { throw ChromaError.notConfigured }
+                // Тикет собирается **после** копии: она гасит сервер и
+                // поднимает заново, и подключение, взятое до неё, к моменту
+                // постановки в очередь уже не существует. С мёртвым
+                // номером задача не снималась бы при настоящем отключении.
+                let ticket = QueueTicket(
+                    title: String(localized: "Пересчёт коллекции «\(request.collection.name)»"),
+                    priority: .manual,
+                    group: .lmStudio,
+                    connectionID: app.connectionID,
+                    resumable: ResumableRequest(
+                        kind: .reembedding,
+                        subject: request.collection.name,
+                        title: String(localized: "Пересчёт коллекции «\(request.collection.name)»")
+                    )
+                )
 
                 let lmStudio = try app.makeLMStudioClient()
                 let result = try await app.queue.run(ticket) { context in
@@ -262,19 +266,35 @@ final class ReembeddingViewModel: ObservableObject {
             // Copying SQLite files under a running server produces a backup that
             // restores into a corrupt database, so the server goes down first.
             let path = app.localDatabaseURL
-            app.log.record(.info, "Re-embedding", "Останавливаем локальный сервер, чтобы скопировать папку базы")
-            await app.disconnect()
-            do {
-                let evidence = try app.backupService.backupLocalDatabase(
-                    at: path,
-                    note: "перед re-embedding коллекции \(request.collection.name) → \(request.targetModel)"
-                )
-                await app.connect()
-                return evidence
-            } catch {
-                // The server must come back whether the copy worked or not.
-                await app.connect()
-                throw error
+            // Отдельной задачей очереди, которая ждёт пустой очереди и никого
+            // не пускает: гашение сервера снимает все задачи
+            // подключения, и бэкап, начатый посреди чужой работы, эту работу
+            // обрывал.
+            let ticket = QueueTicket(
+                title: String(localized: "Резервная копия базы"),
+                priority: .interactive,
+                group: .exclusive,
+                connectionID: nil
+            )
+            return try await app.queue.run(ticket) { _ in
+                await MainActor.run {
+                    app.log.record(.info, "Re-embedding", "Останавливаем локальный сервер, чтобы скопировать папку базы")
+                }
+                await app.disconnect(reason: .serverRestart)
+                do {
+                    let evidence = try await MainActor.run {
+                        try app.backupService.backupLocalDatabase(
+                            at: path,
+                            note: "перед re-embedding коллекции \(request.collection.name) → \(request.targetModel)"
+                        )
+                    }
+                    await app.connect()
+                    return evidence
+                } catch {
+                    // The server must come back whether the copy worked or not.
+                    await app.connect()
+                    throw error
+                }
             }
 
         case .server:

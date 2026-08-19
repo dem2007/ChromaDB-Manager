@@ -10,6 +10,8 @@ final class EmbeddingsViewModel: ObservableObject {
     @Published var isChecking = false
     @Published var connectionMessage: String?
     @Published var errorMessage: String?
+    /// Итог пробы после ручной смены вида модели.
+    @Published var overrideWarning: String?
     /// what the cache holds and how often it saved a call to the model.
     @Published var cacheStatistics: EmbeddingCache.Statistics?
     @Published var isClearingCache = false
@@ -223,6 +225,40 @@ final class EmbeddingsViewModel: ObservableObject {
             models[index].kindIsInferred = true
         }
         app.log.record(.info, "LM Studio", "Тип модели \(model.id) вручную изменён на «\(kind.title)»")
+        overrideWarning = nil
+        guard kind == .embedding else { return }
+        Task { await verifyEmbeddingOverride(model, app: app) }
+    }
+
+    /// Пометка «считать эмбеддинговой» меняет наш список, но не мнение
+    /// LM Studio.
+    ///
+    /// Живой случай: `bge-m3-mlx` числится у LM Studio как `llm` (arch
+    /// xlm-roberta), на `/v1/embeddings` она её не подаёт и молча отвечает
+    /// от загруженной модели. Пометка при этом ставится, модель появляется
+    /// в списках выбора — и узнать о подмене можно было бы только по чужим
+    /// векторам в коллекции. Поэтому пометка проверяется сразу одним
+    /// вызовом, пока человек ещё смотрит на экран.
+    ///
+    /// Проба идёт **мимо кэша**: сохранённый вектор ответил бы за модель,
+    /// которую сейчас никто не спрашивал.
+    private func verifyEmbeddingOverride(_ model: LMStudioModel, app: AppEnvironment) async {
+        guard let client = try? app.makeLMStudioClient() else { return }
+        do {
+            _ = try await client.embedIgnoringCache(texts: ["проверка"], model: model.id)
+        } catch let error as LMStudioError {
+            switch error {
+            case .modelSubstituted, .modelNotEmbedding:
+                overrideWarning = error.errorDescription
+                app.log.record(.warning, "LM Studio", "Проба пометки «эмбеддинговая» у \(model.id): \(error.errorDescription ?? "")")
+            default:
+                // LM Studio выключена или занята — это не про пометку, и
+                // говорить об этом здесь значило бы обвинить не то.
+                break
+            }
+        } catch {
+            return
+        }
     }
 
     func selectDefaultModel(_ model: LMStudioModel, app: AppEnvironment) {
@@ -285,6 +321,12 @@ final class EmbeddingsViewModel: ObservableObject {
     // MARK: - Перезагрузка модели с бо́льшим контекстом
 
     @Published private(set) var loadingModel: String?
+    /// Перезагрузка стоит в очереди и ещё не начата.
+    ///
+    /// Разница видна человеку: «загружается» — это минуты, «ждёт очереди» —
+    /// это «сначала доработает то, что идёт». Без этой строки кнопка,
+    /// нажатая во время индексации, выглядела бы сломанной.
+    @Published private(set) var loadWaitsInQueue = false
 
     /// Есть ли чем перезагружать. Кнопка без `lms` — обещание, которого
     /// приложение не выполнит.
@@ -326,12 +368,37 @@ final class EmbeddingsViewModel: ObservableObject {
             .info, "Модели",
             "Перезагрузка модели «\(model)» с контекстом \(to.plainDigits) вместо \(from.plainDigits)"
         )
+        // Через очередь, в группе локальной модели. Раньше
+        // перезагрузка шла мимо неё — «это работа LM Studio, а не
+        // приложения», — и выдёргивала модель из-под собственного же замера
+        // скорости: в журнале это «LM Studio вернула ошибку 400: Model was
+        // unloaded while the request was still in queue» и потерянные минуты
+        // измерения. Очередь держит группу последовательной, поэтому
+        // перезагрузка теперь дожидается конца того, что приложение уже
+        // начало. Чужие пользователи LM Studio ею по-прежнему не защищены —
+        // на то и спрашивается подтверждение.
+        let ticket = QueueTicket(
+            title: String(localized: "Перезагрузка модели «\(model)»"),
+            priority: .interactive,
+            group: .lmStudio,
+            connectionID: app.connectionID
+        )
         Task {
-            defer { loadingModel = nil }
+            defer {
+                loadingModel = nil
+                loadWaitsInQueue = false
+            }
+            loadWaitsInQueue = await app.queue.isRunning(group: .lmStudio)
             do {
                 // Именно `reload`, а не `load`: `lms load` ставит рядом ещё
                 // одну копию модели, а не заменяет загруженную.
-                let result = try await loader.reload(model: model, contextLength: to)
+                // `loader` копией в список захвата: читать изменяемое
+                // свойство главного актора из задачи очереди — это гонка,
+                // и в Swift 6 ошибка. Структура Sendable, копия ничего не стоит.
+                let result = try await app.queue.run(ticket) { [weak self, loader] _ in
+                    await MainActor.run { [weak self] in self?.loadWaitsInQueue = false }
+                    return try await loader.reload(model: model, contextLength: to)
+                }
                 app.log.record(
                     .success, "Модели",
                     "Модель «\(model)» загружена с контекстом \(to.plainDigits)"

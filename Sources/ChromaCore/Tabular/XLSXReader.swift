@@ -79,6 +79,17 @@ public struct NumberUnit: Hashable, Sendable {
 
     public static let percent = NumberUnit(scale: 100, suffix: "%")
 
+    /// Подпись единицы одной строкой — то, что уходит в метаданные рядом
+    /// с числом. `nil` — подписи нет, и писать нечего.
+    ///
+    /// Из двух возможных берётся та, что есть: у процентов и килограммов
+    /// подпись стоит после числа, у долларов — перед, а поле метаданных
+    /// отвечает на один вопрос: «в чём измерено».
+    public var label: String? {
+        let text = suffix.isEmpty ? prefix : suffix
+        return text.isEmpty ? nil : text
+    }
+
     /// Число так, как его видно в книге.
     public func displayed(_ value: Double) -> Double {
         guard scale != 1 else { return value }

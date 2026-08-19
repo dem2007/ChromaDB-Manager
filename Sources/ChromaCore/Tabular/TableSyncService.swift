@@ -137,11 +137,22 @@ public struct TableSyncReport: Sendable {
     public var duplicates: [(sheetName: String, groups: [DuplicateRowGroup])] = []
     /// Sheets whose mapping changed: a re-index, offered rather than performed.
     public var sheetsNeedingReindex: [String] = []
+    /// Листы книги, которые не размечены ни одним профилем.
+    ///
+    /// Раньше они пропускались молча, и это стоило дорого: у книги на
+    /// четырнадцать листов размечены были пять, в базу попали 73 строки из
+    /// полутора тысяч, а лист с ценами не попал вовсе. Ни человек, ни агент
+    /// об этом не знали — выдача выглядела полной.
+    public var sheetsWithoutMapping: [String] = []
 
     public var rowsWritten: Int { rowsAdded + rowsReembedded + rowsMetadataOnly }
 
     public var line: String {
-        String(localized: "листов \(sheetsIndexed.count), строк добавлено \(rowsAdded), переэмбедено \(rowsReembedded), метаданные \(rowsMetadataOnly), без изменений \(rowsUnchanged)")
+        var text = String(localized: "листов \(sheetsIndexed.count), строк добавлено \(rowsAdded), переэмбедено \(rowsReembedded), метаданные \(rowsMetadataOnly), без изменений \(rowsUnchanged)")
+        if !sheetsWithoutMapping.isEmpty {
+            text += String(localized: "; листов без разметки \(sheetsWithoutMapping.count) — их строки в базу не попали: \(sheetsWithoutMapping.prefix(5).joined(separator: ", "))")
+        }
+        return text
     }
 }
 
@@ -310,17 +321,34 @@ public actor TableSyncService {
         sheets: [(sheet: SheetInfo, rows: [SheetRow])],
         manifest: TableFileManifest,
         context: Context
-    ) -> (plans: [(sheet: String, mapping: TableMapping, plan: SheetSyncPlan)], problems: [SheetProblem], warnings: [String]) {
+    ) -> (
+        plans: [(sheet: String, mapping: TableMapping, plan: SheetSyncPlan)],
+        problems: [SheetProblem],
+        warnings: [String],
+        coverage: SheetCoverage
+    ) {
         var plans: [(String, TableMapping, SheetSyncPlan)] = []
         var problems: [SheetProblem] = []
         /// Листы, разобранные назначенным профилем с оговорками.
         var looseMatches: [String] = []
 
-        for (index, entry) in sheets.enumerated() {
-            let (shape, match) = TableSyncService.claim(
+        // Первым проходом — сколько листов книги вообще размечено.
+        // Знать это надо **до** записи первой же строки: покрытие уходит
+        // в метаданные каждой строки, и посчитать его после было бы поздно.
+        // Разметка спрашивается здесь один раз и переиспользуется ниже.
+        let claims = sheets.enumerated().map { index, entry in
+            TableSyncService.claim(
                 sheet: entry.sheet, rows: entry.rows, index: index,
                 profiles: context.profiles, assigned: context.assignedProfile
             )
+        }
+        let coverage = SheetCoverage(
+            indexed: claims.filter { $0.match.mapping != nil }.count,
+            total: sheets.count
+        )
+
+        for (index, entry) in sheets.enumerated() {
+            let (shape, match) = claims[index]
 
             let mapping: TableMapping
             switch match {
@@ -381,12 +409,13 @@ public actor TableSyncService {
                 layout: layout,
                 manifest: manifest.sheets[entry.sheet.name] ?? SheetManifest(sheetName: entry.sheet.name),
                 sourceID: context.sourceID,
-                sourceFile: context.relativePath
+                sourceFile: context.relativePath,
+                coverage: coverage
             )
             if let limit = context.rowLimit { sheetPlan = sheetPlan.limitedToFirstRows(limit) }
             plans.append((entry.sheet.name, mapping, sheetPlan))
         }
-        return (plans, problems, looseMatches)
+        return (plans, problems, looseMatches, coverage)
     }
 
     // MARK: - Writing
@@ -407,7 +436,7 @@ public actor TableSyncService {
         var report = TableSyncReport()
         report.relativePath = context.relativePath
 
-        let (plans, problems, looseMatches) = plan(sheets: sheets, manifest: manifest, context: context)
+        let (plans, problems, looseMatches, coverage) = plan(sheets: sheets, manifest: manifest, context: context)
         report.problems = problems
         report.sheetsSkipped = problems.map(\.sheetName)
         report.warnings.append(contentsOf: looseMatches)
@@ -425,7 +454,7 @@ public actor TableSyncService {
                   claimed.mapping.mode == .document else { continue }
             let written = try await writeRendered(
                 entry: entry, mapping: claimed.mapping, layout: claimed.layout, manifest: &manifest,
-                context: context, chroma: chroma, embeddings: embeddings
+                context: context, chroma: chroma, embeddings: embeddings, coverage: coverage
             )
             report.sheetsIndexed.append(entry.sheet.name)
             report.rowsAdded += written.added
@@ -556,6 +585,20 @@ public actor TableSyncService {
                 log(.warning, "Таблицы",
                     "Лист «\(sheetName)» файла \(context.relativePath): \(rows.plainDigits) строк дают тот же документ, что строка выше, и записаны не были — \(examples)\(tail)")
             }
+        }
+
+        // Листы, до которых разметка не дотянулась. Считаются в конце
+        // и по остатку, а не по ходу: лист мог обработаться как документ,
+        // попасть в план строк или отложиться с проблемой — «не размечен»
+        // означает, что не случилось ничего из этого.
+        let touched = Set(report.sheetsIndexed)
+            .union(plans.map(\.sheet))
+            .union(report.sheetsSkipped)
+            .union(report.sheetsNeedingReindex)
+        report.sheetsWithoutMapping = sheets.map(\.sheet.name).filter { !touched.contains($0) }
+        if !report.sheetsWithoutMapping.isEmpty {
+            log(.warning, "Таблицы",
+                "Файл \(context.relativePath): листов без разметки \(report.sheetsWithoutMapping.count.plainDigits) из \(sheets.count.plainDigits) — их строки в базу не попали: \(report.sheetsWithoutMapping.joined(separator: ", "))")
         }
 
         manifest.collectionName = context.collectionName
@@ -739,7 +782,8 @@ extension TableSyncService {
         manifest: inout TableFileManifest,
         context: Context,
         chroma: any SyncDatabase,
-        embeddings: EmbeddingProvider
+        embeddings: EmbeddingProvider,
+        coverage: SheetCoverage? = nil
     ) async throws -> (added: Int, reembedded: Int, unchanged: Int) {
         // This file's header row: the one repeated in every chunk must be the
         // one this file actually has.
@@ -772,6 +816,12 @@ extension TableSyncService {
                 "chunk_estimated_tokens": .int(chunk.estimatedTokens),
             ]
             if let note = chunk.note { metadata["extraction_warnings"] = .string(note) }
+            // Книга в базе не целиком — это верно и для листа,
+            // разобранного документом, а не строками.
+            if let coverage, coverage.isPartial {
+                metadata["sheets_indexed"] = .int(coverage.indexed)
+                metadata["sheets_total"] = .int(coverage.total)
+            }
 
             let document = TableRowDocument(id: id, text: chunk.text, metadata: metadata, rowKey: nil)
             let identity = TableRowRecord.identity(rowKey: "chunk-\(chunk.index)", rowNumber: chunk.index)

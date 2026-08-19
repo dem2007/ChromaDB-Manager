@@ -1,7 +1,7 @@
 import Foundation
 
 /// Operators ChromaDB accepts inside a `where` clause. Verified against
-/// chroma 1.4.4, and.
+/// chroma 1.4.4 (and).
 public enum FilterOperator: String, CaseIterable, Identifiable, Codable, Sendable {
     case equals = "$eq"
     case notEquals = "$ne"

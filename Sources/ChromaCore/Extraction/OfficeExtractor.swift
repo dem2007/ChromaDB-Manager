@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 ///
 /// **On the main actor**, as requires: the importers behind `.html` and
 /// `.officeOpenXML` are built on WebKit and are documented as needing the main
-/// thread. Measured on this macOS they also work off it (see DECISIONS,
+/// thread. Measured on this macOS they also work off it,
 /// but «worked once» is not a promise.
 ///
 /// Цена этого — **не** «несколько миллисекунд на файл», как здесь было

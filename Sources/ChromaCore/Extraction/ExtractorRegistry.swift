@@ -75,6 +75,32 @@ public struct ExtractorRegistry: Sendable {
         return extractors.first { $0.canHandle(type) && $0.isAvailable(for: options) }
     }
 
+    /// Штамп, с которым сравнивает запись манифеста.
+    ///
+    /// Не «первый подходящий экстрактор», а **тот же**, что читал файл в прошлый
+    /// раз, — если он и сегодня взялся бы за этот файл. У PDF, прочитанного
+    /// распознаванием, первым кандидатом всегда стоит `pdfkit`: идентификаторы
+    /// не совпадали, правило объявляло сравнение невозможным и молчало
+    /// о таком файле навсегда, сколько бы версий ни сменил сам `vision-ocr`.
+    /// Замер на рабочих манифестах: 84 файла, которым предложение переизвлечь
+    /// не показалось бы никогда.
+    ///
+    /// Доступность важна: с выключённым распознаванием `vision-ocr` кандидатом
+    /// не является, штамп возвращается чужой — и молчание снова оказывается
+    /// правильным ответом, потому что переизвлекать этот скан сегодня нечем.
+    ///
+    /// - Parameter storedID: идентификатор экстрактора из манифеста; пустой —
+    ///   запись старой сборки, для которой ответ всё равно будет «неизвестен».
+    public func currentStamp(
+        for type: UTType, storedID: String, options: ExtractionOptions = ExtractionOptions()
+    ) -> ExtractorStamp {
+        let candidates = extractors.filter { $0.canHandle(type) && $0.isAvailable(for: options) }
+        guard let extractor = candidates.first(where: { $0.id == storedID }) ?? candidates.first else {
+            return ExtractorStamp(id: "", version: 0)
+        }
+        return ExtractorStamp(id: extractor.id, version: extractor.version)
+    }
+
     /// Runs the first matching extractor, then the next one on a failure that
     /// another extractor could plausibly recover from.
     ///

@@ -97,6 +97,14 @@ final class AppEnvironment: ObservableObject {
     /// свои — там просмотр показывается листом поверх экрана.
     let documentViewer = DocumentViewerViewModel()
 
+    /// MCP-сервер (этап 7). Здесь, а не у главного окна.
+    ///
+    /// Он жил объектом состояния `RootView` и умирал вместе с ним: человек
+    /// закрывал окно, приложение оставалось в строке меню — и агент терял
+    /// мост, хотя приложение работало. «Оставаться в строке меню» значит
+    /// именно это: окна нет, а обращаться к базе можно.
+    let mcp = MCPService()
+
     /// Сводка последней синхронизации — её показывает значок в строке меню
     ///. Здесь, а не в модели экрана источников: строка меню живёт и
     /// тогда, когда этот экран не открывали ни разу.
@@ -193,6 +201,19 @@ final class AppEnvironment: ObservableObject {
             }
         }
     }
+
+    /// Единственный экземпляр на процесс.
+    ///
+    /// SwiftUI вызывает автозамыкание `@StateObject` при каждом пересоздании
+    /// структуры сцены и лишние экземпляры отбрасывает — но их `init` успевает
+    /// сделать работу: открыть кеш эмбеддингов (тот же файл SQLite), создать
+    /// свою очередь задач и прочитать журнал незавершённых. В журнале за день
+    /// это видно прямо: предупреждение «с прошлого запуска остались
+    /// незавершённые задачи» встретилось 91 раз при десяти запусках
+    /// приложения — по 3–26 раз за сессию.
+    ///
+    /// Инициализатор остаётся доступным: тесты собирают своё окружение.
+    static let shared = AppEnvironment()
 
     init() {
         // Retention has to be known before the first line is written, so the
@@ -484,7 +505,10 @@ final class AppEnvironment: ObservableObject {
             pendingEndpoint = nil
             self.client = client
             self.endpoint = endpoint
-            self.connectionID = UUID()
+            let connectionID = UUID()
+            self.connectionID = connectionID
+            // Ждавшие возвращения сервера получают новое подключение.
+            await queue.resumeTasks(connectionID: connectionID)
             // A different connection may be a different database entirely, and
             // an id that means one thing there means another here.
             Task { await collectionShapes.reset() }
@@ -511,14 +535,35 @@ final class AppEnvironment: ObservableObject {
             connection = .failed(error.localizedDescription)
             lastError = describe(error)
             log.record(.error, "Подключение", describe(error))
+            // Подняться не вышло — ждать возвращения сервера больше некому.
+            await queue.dropDetachedTasks()
         }
     }
 
-    func disconnect() async {
+    /// Зачем гасится сервер.
+    ///
+    /// Разница не косметическая: от неё зависит судьба очереди. Копия базы,
+    /// сжатие и восстановление гасят **тот же** сервер и поднимают его через
+    /// несколько секунд — задачам, которые ещё не начались, ждать не мешает
+    /// ничто. Смена подключения, выход и стирание данных — другое дело: база
+    /// будет другая или её не будет вовсе.
+    enum DisconnectReason {
+        /// Сервер вернётся на то же место.
+        case serverRestart
+        /// Этого подключения больше не будет.
+        case leaving
+    }
+
+    func disconnect(reason: DisconnectReason = .leaving) async {
         // the tasks of this connection hold a client that is about to be
         // released — they go before it does.
         if let connectionID {
-            await queue.cancelTasks(connectionID: connectionID)
+            switch reason {
+            case .leaving:
+                await queue.cancelTasks(connectionID: connectionID)
+            case .serverRestart:
+                _ = await queue.pauseTasks(connectionID: connectionID)
+            }
         }
         connectionID = nil
         client = nil
@@ -674,9 +719,30 @@ final class AppEnvironment: ObservableObject {
     }
 
     func report(_ error: Error, category: String) {
+        // Отмена — не сбой. Задача снята кнопкой «Остановить», окно
+        // закрыто, экран сменился — сломаться тут нечему, а красная плашка
+        // и ERROR в журнале говорят человеку обратное. В журнале след
+        // остаётся, но своим уровнем: при запуске приложения так набегали
+        // две «ошибки» подряд, ни одна из которых ничего не значила.
+        guard !Self.isCancellation(error) else {
+            log.record(.debug, category, String(localized: "операция отменена"))
+            return
+        }
         let text = describe(error)
         lastError = text
         log.record(.error, category, text)
+    }
+
+    /// Отменённая операция — своя и чужая.
+    ///
+    /// `CancellationError` бросает наш код; `URLError.cancelled` и
+    /// `NSUserCancelledError` приходят от системы, когда вместе с задачей
+    /// отменяется её сетевой запрос, — и это та же самая отмена.
+    nonisolated static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let url = error as? URLError, url.code == .cancelled { return true }
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError
     }
 
     /// the outcome of a background operation, offered to Notification

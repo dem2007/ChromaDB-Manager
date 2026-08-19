@@ -22,6 +22,9 @@ struct EmbeddingsView: View {
                 if let message = model.connectionMessage {
                     MessageBanner(kind: .success, text: message) { model.connectionMessage = nil }
                 }
+                if let warning = model.overrideWarning {
+                    MessageBanner(kind: .warning, text: warning) { model.overrideWarning = nil }
+                }
 
                 // Экран «Модели» отвечает на один вопрос: чем считаются
                 // векторы. Источники уехали на свой экран — раньше на одном
@@ -247,9 +250,21 @@ struct EmbeddingsView: View {
                                     if model.loadingModel == item.id {
                                         HStack(spacing: 5) {
                                             ProgressView().controlSize(.small)
-                                            Text("загружается…").font(Theme.Font.micro)
+                                            // Очередь держит группу локальной
+                                            // модели последовательной:
+                                            // перезагрузка ждёт конца того, что
+                                            // уже идёт, — и молчать об этом
+                                            // значит показывать зависшую
+                                            // кнопку.
+                                            Text(model.loadWaitsInQueue
+                                                 ? String(localized: "ждёт очереди…")
+                                                 : String(localized: "загружается…"))
+                                                .font(Theme.Font.micro)
                                                 .foregroundStyle(Theme.Palette.captionText)
                                         }
+                                        .help(model.loadWaitsInQueue
+                                              ? String(localized: "Локальная модель сейчас занята другой работой приложения. Перезагрузка начнётся, когда та закончится.")
+                                              : String(localized: "LM Studio перезагружает модель"))
                                     } else if let range = model.reloadableContext(item) {
                                         Button(String(localized: "Загрузить с \(range.to.plainDigits)")) {
                                             model.requestLoad(item)

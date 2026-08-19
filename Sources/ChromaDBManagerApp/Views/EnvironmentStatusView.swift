@@ -498,7 +498,7 @@ struct EnvironmentStatusView: View {
     private var backupsCard: some View {
         SectionCard(
             title: String(localized: "Резервные копии"),
-            subtitle: String(localized: "Копия снимается при остановленном сервере — копировать файлы работающей SQLite нельзя.")
+            subtitle: String(localized: "Копия снимается при остановленном сервере — копировать файлы работающей SQLite нельзя. Поэтому копирование и восстановление идут общей очередью и ждут, пока она освободится.")
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
@@ -548,17 +548,44 @@ struct EnvironmentStatusView: View {
                             Button(String(localized: "Восстановить")) { model.restore(backup, app: app) }
                                 .buttonStyle(.chromaNormal)
                                 .disabled(model.isBusy || backup.isIncomplete)
+                            // Спрашивает, а не удаляет: копия уходит навсегда,
+                            // и кнопка стоит вплотную к «Восстановить».
                             Button(role: .destructive) {
-                                model.delete(backup, app: app)
+                                model.askToDelete(backup)
                             } label: {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .help(String(localized: "Удалить копию \(backup.name)"))
                         }
                         .padding(.vertical, 2)
                     }
                 }
             }
+        }
+        // Вопрос задаётся о **той самой** копии: имя, дата и размер в тексте,
+        // потому что строки в списке различаются только ими.
+        //
+        // Через `presenting:`, а не чтением поля внутри кнопки: SwiftUI
+        // закрывает диалог, сбрасывая `isPresented`, и сеттер этого биндинга
+        // обнуляет `pendingBackupDeletion`. Действие, которое прочитало бы
+        // поле у модели, рисковало увидеть уже `nil` — то есть тихо не
+        // удалить ничего. Здесь копия приезжает в замыкание значением.
+        .confirmationDialog(
+            String(localized: "Точно удалить копию?"),
+            isPresented: Binding(
+                get: { model.pendingBackupDeletion != nil },
+                set: { if !$0 { model.pendingBackupDeletion = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: model.pendingBackupDeletion
+        ) { backup in
+            Button(String(localized: "Удалить копию"), role: .destructive) {
+                model.delete(backup, app: app)
+            }
+            Button(String(localized: "Отмена"), role: .cancel) { model.pendingBackupDeletion = nil }
+        } message: { backup in
+            Text(String(localized: "\(backup.name) — \(backup.createdAt.formatted(date: .abbreviated, time: .shortened)), \(backup.sizeText). Копия удаляется с диска навсегда; восстановить базу из неё будет нельзя."))
         }
     }
 
@@ -572,7 +599,7 @@ struct EnvironmentStatusView: View {
                     .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                     .fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(String(localized: "Порядок: резервная копия → остановка сервера → сжатие → запуск → проверка. Времени занимает примерно как копирование базы (сейчас \(ByteCountFormatter.string(fromByteCount: model.databaseSize(app), countStyle: .file)))."))
+                    Text(String(localized: "Порядок: резервная копия → остановка сервера → сжатие → запуск → проверка. Времени занимает примерно как копирование базы (сейчас \(ByteCountFormatter.string(fromByteCount: model.databaseSize(app), countStyle: .file))). Идёт общей очередью задач: если что-то индексируется, сжатие дождётся конца, а не оборвёт работу."))
                         .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack {

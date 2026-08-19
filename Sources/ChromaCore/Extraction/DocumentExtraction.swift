@@ -90,6 +90,12 @@ public enum ExtractionWarning: Hashable, Sendable {
     case structureIsHeuristic
     case noStructure
     case tablesFlattened
+    /// Таблица на странице была, но собрать её не удалось.
+    ///
+    /// Не то же, что `tablesFlattened`: там строки и колонки на месте,
+    /// теряется оформление. Здесь теряются сами колонки — текст уходит
+    /// сеткой чисел, где не отличить цену от итога.
+    case tablesNotAssembled(pages: Int)
     case commentsSkipped
     case ocrUsed(averageConfidence: Double)
     case speakerNotesUnavailable
@@ -107,6 +113,8 @@ public enum ExtractionWarning: Hashable, Sendable {
             // объединения, цвета. Говорить про приложение то, чего оно
             // не делает, нельзя даже в оговорке.
             return String(localized: "таблицы записаны текстом: строки и колонки сохранены, оформление — нет")
+        case .tablesNotAssembled(let pages):
+            return String(localized: "на \(pages.plainDigits) страницах таблица осталась плоским текстом: колонки в ней не разделены, и на числа оттуда опираться нельзя")
         case .commentsSkipped:
             // Для `.docx` эта оговорка больше не ставится: там сноски
             // и комментарии извлекаются, а правки принимаются, и говорить

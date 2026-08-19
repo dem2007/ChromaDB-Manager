@@ -19,6 +19,10 @@ struct ClientsView: View {
     /// Разрез экрана: «Ключи», «MCP», «Журнал».
     var tab: Int = 0
 
+    /// Расшифровка «умного поиска» — она одна на экран: карточек ключей
+    /// много, но открытых поповеров одновременно не бывает.
+    @State private var showingSmartSearchHelp = false
+
     var body: some View {
         // Reader ради одного: «Настроить подключение агента» открывает блок
         // ниже по странице, и без прокрутки к нему кнопка выглядела так,
@@ -118,9 +122,21 @@ struct ClientsView: View {
         }
     }
 
+    /// Время обращения — с датой, когда оно не сегодняшнее.
+    ///
+    /// Одно время без даты читается как «только что»: восемь строк подряд
+    /// с «15:25» и «17:32» выглядят получасом работы, а на деле это три дня.
+    /// Именно из-за этого «ещё не подключался» рядом с полным журналом
+    /// казалось противоречием, хотя противоречия не было.
+    private func journalTime(_ date: Date) -> String {
+        Calendar.current.isDateInToday(date)
+            ? date.formatted(date: .omitted, time: .standard)
+            : date.formatted(date: .abbreviated, time: .shortened)
+    }
+
     private func journalRow(_ entry: AuditEntry) -> some View {
         HStack(spacing: 8) {
-            Text(entry.date.formatted(date: .omitted, time: .standard))
+            Text(journalTime(entry.date))
                 .font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
             Text(entry.client).font(Theme.Font.caption)
                 .foregroundStyle(Theme.Palette.captionText)
@@ -483,11 +499,19 @@ struct ClientsView: View {
             }
         }
 
-        HStack(spacing: 16) {
+        // Сеткой, а не одной строкой: полей шесть, и в ряд они
+        // не помещаются — SwiftUI в таком случае отбирает ширину у подписей,
+        // и они рассыпаются по букве в строке. Сетка переносит поля целыми
+        // ячейками, сколько бы ни было места.
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 150), spacing: 16, alignment: .leading)],
+            alignment: .leading, spacing: 10
+        ) {
             limitField(
                 title: String(localized: "Документов в сутки"),
                 value: permissions.maxDocumentsPerDay,
-                placeholder: String(localized: "без лимита")
+                defaultValue: nil,
+                help: String(localized: "Сколько документов этот ключ может записать за сутки. Считаются только записи: чтение квоту не расходует и не останавливается, когда она исчерпана. Запрос, который её превысил бы, отклоняется целиком, а в ответе сказано, сколько уже записано сегодня. Пусто — предела нет.")
             )
             limitField(
                 title: String(localized: "Размер документа, КБ"),
@@ -495,14 +519,16 @@ struct ClientsView: View {
                     get: { permissions.wrappedValue.maxDocumentBytes.map { $0 / 1024 } },
                     set: { permissions.wrappedValue.maxDocumentBytes = $0.map { $0 * 1024 } }
                 ),
-                placeholder: String(localized: "без лимита")
+                defaultValue: nil,
+                help: String(localized: "Предел на **один** записываемый документ. Если в запросе окажется документ крупнее, отклоняется весь запрос, а в ответе названы фактический и разрешённый размеры. Пусто — предела нет.")
             )
             // Потолок выдачи агенту: всё, что вернул MCP, попадает
             // в контекст модели целиком.
             limitField(
                 title: String(localized: "Результатов в MCP"),
                 value: permissions.maxSearchResults,
-                placeholder: String(localized: "по умолчанию 10")
+                defaultValue: 10,
+                help: String(localized: "Сколько результатов агент получит на один поиск. Просьба о большем не отклоняется: отдаётся потолок, и в ответе сказано, что запрос урезан, — иначе агент решит, что в коллекции больше ничего нет. Пусто — десять.")
             )
             // Символьные потолки — рядом с ним, потому что упирается агент
             // обычно в них: счётчик результатов подняли, а ответ всё
@@ -510,12 +536,14 @@ struct ClientsView: View {
             limitField(
                 title: String(localized: "Символов в документе"),
                 value: permissions.maxDocumentCharacters,
-                placeholder: String(localized: "по умолчанию 4000")
+                defaultValue: 4000,
+                help: String(localized: "Сколько знаков текста одного найденного документа попадёт в ответ. Остальное обрезается — дочитать документ агент может вызовом get_documents по его id. Всё, что отдано, уходит в контекст модели целиком, поэтому предел здесь стоит не ради базы, а ради него. Пусто — четыре тысячи.")
             )
             limitField(
                 title: String(localized: "Символов в ответе"),
                 value: permissions.maxResponseCharacters,
-                placeholder: String(localized: "по умолчанию 24000")
+                defaultValue: 24000,
+                help: String(localized: "Общий бюджет одного ответа: тексты и метаданные всех результатов вместе. Когда бюджет исчерпан, список обрывается, и в ответе сказано, сколько результатов показано из скольких. Первый результат отдаётся всегда, даже если занимает весь бюджет: ответ без единого результата хуже. Пусто — двадцать четыре тысячи.")
             )
             // сколько коллекций агент обыскивает одним вызовом. Десять
             // коллекций — это десять поисков на один вызов, и упереться в это
@@ -523,12 +551,21 @@ struct ClientsView: View {
             limitField(
                 title: String(localized: "Коллекций в поиске"),
                 value: permissions.maxSearchCollections,
-                placeholder: String(localized: "по умолчанию 5")
+                defaultValue: 5,
+                help: String(localized: "Сколько коллекций агент обыщет одним вызовом: десять коллекций — это десять поисков за раз. Лишние не отбрасываются молча — в ответе сказано, сколько из запрошенных обыскано и что остальные можно взять следующим вызовом. Пусто — пять.")
             )
             // Умный поиск решается отдельно от коллекции: человек у экрана
             // видит выдачу и правит запрос, а агент — нет.
             VStack(alignment: .leading, spacing: 2) {
-                Text(String(localized: "Умный поиск в MCP")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                HStack(spacing: 4) {
+                    Text(String(localized: "Умный поиск в MCP")).font(Theme.Font.caption)
+                        .foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: true, vertical: false)
+                    HelpButton(
+                        text: String(localized: "Переписывать ли запрос агента и переранжировать ли выдачу перед ответом. «Как у коллекции» — по её собственной настройке. Решается отдельно от коллекции потому, что случаи разные: человек у экрана видит выдачу и правит запрос сам, а агент — нет."),
+                        isPresented: $showingSmartSearchHelp
+                    )
+                }
                 Picker("", selection: Binding(
                     get: { permissions.wrappedValue.smartSearch },
                     set: { permissions.wrappedValue.smartSearch = $0 }
@@ -540,19 +577,27 @@ struct ClientsView: View {
                 .labelsHidden()
                 .fixedSize()
             }
-            if let used = model.usageToday[client.id], used > 0 {
-                Text(String(localized: "сегодня записано: \(used.plainDigits)"))
-                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            }
-            Spacer()
+        }
+        if let used = model.usageToday[client.id], used > 0 {
+            Text(String(localized: "сегодня записано: \(used.plainDigits)"))
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
         }
 
         // Rate, not just volume: a loop in a client agent spends a daily quota
         // in a minute, and the daily limit does nothing about it.
         HStack(spacing: 16) {
-            countField(String(localized: "Запросов в минуту"), permissions.requestsPerMinute)
-            countField(String(localized: "Всплеск"), permissions.burst)
-            countField(String(localized: "Записей в минуту"), permissions.writesPerMinute)
+            countField(
+                String(localized: "Запросов в минуту"), permissions.requestsPerMinute,
+                help: String(localized: "Сколько обращений ключ может сделать за минуту — считаются и чтения, и записи. Устроено как ведро с жетонами: жетоны копятся ровным темпом, тратятся по запросу, и когда их нет, ответом будет отказ. Нужно поверх суточной квоты: цикл в агенте съедает её за минуту, и предела в сутках против этого мало.")
+            )
+            countField(
+                String(localized: "Всплеск"), permissions.burst,
+                help: String(localized: "Размер того самого ведра: сколько запросов подряд можно сделать сверх ровного темпа. Агент, который проснулся и задал десять вопросов разом, пройдёт; тот, что стучит без остановки, упрётся в темп.")
+            )
+            countField(
+                String(localized: "Записей в минуту"), permissions.writesPerMinute,
+                help: String(localized: "Отдельный счёт для записывающих вызовов, поверх общего: записи стоят дороже чтений и меняют базу. Всплеск у них свой — половина общего.")
+            )
             if let throttled = model.throttledToday[client.id], throttled > 0 {
                 Text(String(localized: "отклонено по частоте: \(throttled.plainDigits)"))
                     .font(Theme.Font.micro).foregroundStyle(.orange)
@@ -613,21 +658,81 @@ struct ClientsView: View {
         }
     }
 
-    private func countField(_ title: String, _ value: Binding<Int>) -> some View {
+    private func countField(_ title: String, _ value: Binding<Int>, help: String) -> some View {
+        CountField(title: title, value: value, help: help)
+    }
+
+    private func limitField(
+        title: String, value: Binding<Int?>, defaultValue: Int?, help: String
+    ) -> some View {
+        LimitField(title: title, value: value, defaultValue: defaultValue, help: help)
+    }
+}
+
+/// Поле предела: подпись, знак «?» с расшифровкой и само поле.
+///
+/// Отдельным видом, а не функцией: поповеру нужен свой `@State`, а он бывает
+/// только у вида.
+///
+/// Подпись стоит **над** полем: слева она занимала ширину наравне с полем
+/// ввода, и когда таких пар в ряду шесть, SwiftUI сжимал подписи до предела —
+/// «Документов в сутки» превращалось в столбик по букве в строке. `fixedSize`
+/// держит подпись целой: строка ужимается чем угодно, только не ею.
+private struct CountField: View {
+    let title: String
+    @Binding var value: Int
+    let help: String
+
+    @State private var showingHelp = false
+
+    var body: some View {
         HStack(spacing: 6) {
+            // Подпись не ужимается: три пары в ряд помещаются, но
+            // в узком окне SwiftUI начал бы отбирать ширину у неё же.
             Text(title).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            TextField("", value: value, format: .number.grouping(.never))
+                .fixedSize(horizontal: true, vertical: false)
+            HelpButton(text: help, isPresented: $showingHelp)
+            TextField("", value: $value, format: .number.grouping(.never))
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 70)
         }
     }
+}
 
-    private func limitField(title: String, value: Binding<Int?>, placeholder: String) -> some View {
-        HStack(spacing: 6) {
-            Text(title).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            TextField(placeholder, value: value, format: .number.grouping(.never))
+private struct LimitField: View {
+    let title: String
+    @Binding var value: Int?
+    /// Значение, которое действует при пустом поле. `nil` — предела нет.
+    ///
+    /// Числом, а не готовой строкой: подсказка «по умолчанию 24000»
+    /// в поле шириной 120 не помещалась и обрезалась **с конца** — то есть
+    /// ровно на числе, ради которого её и читают. Осталось «по умолчанию 2».
+    /// Теперь подпись строит само поле, и длинную фразу туда не вписать даже
+    /// по ошибке: в поле стоит само число, а «пусто — столько-то» сказано
+    /// в расшифровке под знаком вопроса.
+    let defaultValue: Int?
+    /// Что этот предел делает на самом деле. Числа тут похожи друг на друга,
+    /// а действуют по-разному: один отклоняет запись целиком, другой молча
+    /// обрезает текст в ответе агенту — и по названию поля это не видно.
+    let help: String
+
+    @State private var showingHelp = false
+
+    private var placeholder: String {
+        guard let defaultValue else { return String(localized: "без лимита") }
+        return defaultValue.formatted(.number.grouping(.never))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(title).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: true, vertical: false)
+                HelpButton(text: help, isPresented: $showingHelp)
+            }
+            TextField(placeholder, value: $value, format: .number.grouping(.never))
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 90)
+                .frame(width: 120)
         }
     }
 }

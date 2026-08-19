@@ -39,6 +39,12 @@ final class InspectorViewModel: ObservableObject {
 
     /// Дорогая проверка — отдельной галочкой, выключенной.
     @Published var checksNearDuplicates = false
+    /// Проверять, что файлы источников ещё на месте.
+    ///
+    /// Выключено по умолчанию и включается руками: это обход папок всех
+    /// источников коллекции, а на отключённом диске «файла нет» значит совсем
+    /// не то, что после переименования папки.
+    @Published var checksFilesOnDisk = false
     @Published var sampleSize = 5000
     @Published var nearDuplicateSampleSize = 1000
 
@@ -116,12 +122,11 @@ final class InspectorViewModel: ObservableObject {
             checksNearDuplicates: checksNearDuplicates,
             nearDuplicateSampleSize: nearDuplicateSampleSize
         )
-        let context = CollectionInspector.Context(
-            collection: collection,
-            knownSourceIDs: Set(app.settings.configuration.dataSources.map(\.id.uuidString)),
-            schema: app.schemaStore.schema(for: collection.name),
-            acknowledgedPairs: store.acknowledgedPairs(for: collection.name)
-        )
+        let knownSourceIDs = Set(app.settings.configuration.dataSources.map(\.id.uuidString))
+        let schema = app.schemaStore.schema(for: collection.name)
+        let acknowledged = store.acknowledgedPairs(for: collection.name)
+        let sources = app.settings.configuration.dataSources
+        let wantsFileCheck = checksFilesOnDisk
         let previous = store.reports(for: collection.name).first
 
         task = Task { [weak self] in
@@ -133,6 +138,54 @@ final class InspectorViewModel: ObservableObject {
             // переживает задачу, — снова слабо, но уже от константы.
             guard let self else { return }
             do {
+                // Спрашивается только если попросили: это обход папок всех
+                // источников коллекции. Папка, которую прочитать
+                // не удалось, в набор не попадает вовсе — «не знаем» честнее,
+                // чем «файлов нет».
+                var filesOnDisk: [String: Set<String>]?
+                if wantsFileCheck {
+                    var collected: [String: Set<String>] = [:]
+                    for source in sources where !source.isWeb {
+                        // Только источники, которые пишут **в эту** коллекцию:
+                        // обходить папки всех двадцати ради проверки одной
+                        // коллекции — это минуты ожидания вместо секунд.
+                        //
+                        // Спрашивается и манифест, и настройка источника.
+                        // Одного манифеста мало: перенос настроек несёт
+                        // источники, но не манифесты (SettingsTransfer), — на
+                        // второй машине с общей базой манифест пуст, а чанки
+                        // в коллекции есть, и молчать про них значит выключить
+                        // проверку ровно там, где она нужнее всего.
+                        //
+                        // Сначала имя из настроек, и только потом манифест:
+                        // манифест — это чтение и разбор JSON, который у папки
+                        // на тысячи файлов весит мегабайты, а у самого частого
+                        // режима («папка → одна коллекция») ответ виден
+                        // из настройки бесплатно.
+                        let named = CollectionNaming.sanitize(source.collectionName)
+                        if named != collection.name {
+                            let manifest = await app.syncService.manifest(for: source.id)
+                            guard manifest.collections.contains(collection.name) else { continue }
+                        }
+                        guard let files = try? await app.syncService.scanFiles(source: source) else { continue }
+                        let paths = Set(files.map { SourceSyncService.relative($0, to: source.url) })
+                        // Пустая папка — это «не знаем», а не «файлы удалены»:
+                        // так выглядит и вынесенная на время папка, и суженная
+                        // маска расширений. Объявлять из-за неё исчезнувшей всю
+                        // коллекцию нельзя (то же правило, что у порога
+                        // массовой пропажи в).
+                        guard !paths.isEmpty else { continue }
+                        collected[source.id.uuidString] = paths
+                    }
+                    filesOnDisk = collected
+                }
+                let context = CollectionInspector.Context(
+                    collection: collection,
+                    knownSourceIDs: knownSourceIDs,
+                    schema: schema,
+                    acknowledgedPairs: acknowledged,
+                    filesOnDisk: filesOnDisk
+                )
                 // инспектор читает базу и никого не заставляет считать
                 // векторы — поэтому группа `database`, а не `lmStudio`.
                 let produced = try await app.queue.run(QueueTicket(
@@ -359,6 +412,45 @@ final class InspectorViewModel: ObservableObject {
         if expanded.contains(category) { expanded.remove(category) } else { expanded.insert(category) }
     }
 
+    /// Находки, которые вообще можно выбрать.
+    ///
+    /// У части находок документов нет — это замечания «про коллекцию»,
+    /// а не про записи; удалять и помечать в них нечего, и флажка у них
+    /// в списке тоже нет. Кнопка «выбрать все» обязана считать так же,
+    /// иначе она обещала бы то, чего не сделает.
+    func selectable(in category: InspectionCategory? = nil) -> [InspectionFinding] {
+        guard let report else { return [] }
+        return report.findings.filter { finding in
+            !finding.documentIDs.isEmpty && (category == nil || finding.category == category)
+        }
+    }
+
+    /// Выбрано ли **всё** в этом разряде (или во всём отчёте).
+    ///
+    /// «Всё», а не «хоть что-то»: иначе кнопка предлагала бы снять выбор
+    /// сразу после первого флажка, и выбрать разряд целиком было бы нечем
+    /// (та же ошибка, что чинил на экране диагностики).
+    func isEverythingSelected(in category: InspectionCategory? = nil) -> Bool {
+        let all = selectable(in: category)
+        return !all.isEmpty && all.allSatisfy { selectedFindings.contains($0.id) }
+    }
+
+    /// Переключает разряд целиком: выбранное снимает, невыбранное добавляет.
+    /// Возвращает, выбран ли разряд после нажатия, — экрану это нужно, чтобы
+    /// раскрыть список: выбор, которого не видно, бесполезен.
+    @discardableResult
+    func toggleSelection(in category: InspectionCategory? = nil) -> Bool {
+        let all = selectable(in: category)
+        guard !all.isEmpty else { return false }
+        let ids = all.map(\.id)
+        if isEverythingSelected(in: category) {
+            selectedFindings.subtract(ids)
+            return false
+        }
+        selectedFindings.formUnion(ids)
+        return true
+    }
+
     func toggleSelection(_ finding: InspectionFinding) {
         if selectedFindings.contains(finding.id) {
             selectedFindings.remove(finding.id)
@@ -427,6 +519,76 @@ final class InspectorViewModel: ObservableObject {
             }
         }
     }
+
+    /// Есть ли что чинить уборкой путей.
+    var hasLegacyPaths: Bool {
+        report?.findings.contains { $0.category == .legacyFilePaths } ?? false
+    }
+
+    /// Привести пути к единой форме и проставить отпечатки.
+    ///
+    /// По всей коллекции, а не по выделенному: инспектор смотрит выборку,
+    /// а чинить половину коллекции — значит оставить ту же беду на второй
+    /// половине и не сказать об этом. Меняются только метаданные: текст
+    /// не трогается, векторы не пересчитываются.
+    func repairFilePaths(collection: ChromaCollection, app: AppEnvironment) {
+        guard let client = app.client else { return }
+        isRunning = true
+        task = Task { [weak self] in
+            do {
+                var offset = 0
+                var chunks = 0
+                var files: Set<String> = []
+                while true {
+                    try Task.checkCancellation()
+                    let page = try await client.getDocuments(
+                        collectionID: collection.id, limit: Self.repairPageSize, offset: offset
+                    )
+                    guard !page.isEmpty else { break }
+                    offset += page.count
+
+                    let updates = FilePathRepair.updates(for: page)
+                    if !updates.isEmpty {
+                        try await client.updateDocuments(collectionID: collection.id, updates: updates)
+                        chunks += updates.count
+                        for record in page where FilePathRepair.needsRepair(record.metadata) {
+                            if let path = FilePathRepair.filePath(record.metadata) {
+                                files.insert(FilePathKey.canonical(path))
+                            }
+                        }
+                    }
+                    await MainActor.run {
+                        self?.statusMessage = String(localized: "Просмотрено чанков: \(offset.plainDigits), переписано: \(chunks.plainDigits)")
+                    }
+                    if page.count < Self.repairPageSize { break }
+                }
+
+                let updated = chunks
+                let fileCount = files.count
+                await MainActor.run {
+                    guard let self else { return }
+                    // Отчёт составлялся до уборки — оставлять его значит
+                    // показывать находки, которых больше нет.
+                    self.report = nil
+                    self.selectedFindings = []
+                    self.isRunning = false
+                    self.statusMessage = updated == 0
+                        ? String(localized: "Пути уже в единой форме — переписывать нечего.")
+                        : String(localized: "Пути приведены к единой форме: файлов \(fileCount.plainDigits), чанков \(updated.plainDigits). Векторы не пересчитывались. Прогоните инспектор заново.")
+                    app.log.record(.success, "Коллекции",
+                                   "Коллекция «\(collection.name)»: пути приведены к единой форме у \(updated.plainDigits) чанков (\(fileCount.plainDigits) файлов), векторы не пересчитывались")
+                }
+            } catch {
+                await MainActor.run {
+                    self?.errorMessage = app.describe(error)
+                    self?.isRunning = false
+                }
+            }
+        }
+    }
+
+    /// Сколько чанков читается за раз при уборке путей.
+    private static let repairPageSize = 500
 
     /// «Это не дубли» — пара больше не всплывает.
     func acknowledgeSelectedPairs(collection: ChromaCollection) {

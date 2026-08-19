@@ -26,6 +26,21 @@ public enum FileRemedy: String, Codable, Sendable, CaseIterable {
         case .exclude: return String(localized: "Исключить из источника")
         }
     }
+
+    /// Название **разряда находок**, а не действия над ними.
+    ///
+    /// На вкладке диагностики по нему выбирают разом всё одного рода:
+    /// «выбрать все сканы» — это про то, чем файлы похожи, а «Включить
+    /// распознавание» — про то, что с ними делать, и одним словом эти две
+    /// вещи называть нельзя.
+    public var groupTitle: String {
+        switch self {
+        case .enableOCR: return String(localized: "Сканы без текста")
+        case .password: return String(localized: "Под паролем")
+        case .retry: return String(localized: "Сбой чтения")
+        case .exclude: return String(localized: "Читать нечем")
+        }
+    }
 }
 
 /// One file that needs a decision, with the reason it needs one.

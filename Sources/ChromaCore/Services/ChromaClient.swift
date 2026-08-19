@@ -132,7 +132,7 @@ public enum ChromaError: LocalizedError {
         case .readOnly:
             return String(localized: "Снимите режим «только чтение» в профиле подключения, если правки действительно нужны.")
         case .dimensionMismatch:
-            return String(localized: "Выберите модель с той же размерностью или клонируйте коллекцию под новую модель (этап 2).")
+            return String(localized: "Выберите модель с той же размерностью или склонируйте коллекцию под новую на экране «Пересчёт».")
         case .unreachable:
             return String(localized: "Проверьте, запущен ли сервер, и правильность host/port.")
         case .tenantNotFound, .databaseNotFound:
@@ -579,7 +579,7 @@ public actor ChromaClient {
     ///
     /// `where` and `where_document` are independent parameters and go together
     /// with the vector — that combination is the whole point of «найди похожее,
-    /// но только там, где встречается слово X» (verified in.
+    /// но только там, где встречается слово X» — проверено на живом сервере.
     public func query(
         collectionID: String,
         embedding: [Double],

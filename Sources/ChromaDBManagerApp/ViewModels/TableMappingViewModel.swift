@@ -452,12 +452,54 @@ final class TableMappingViewModel: ObservableObject {
         // теперь оказался таблицей — и стоять «документом» ему незачем.
         // Обратно — никогда: «документ» человек мог выбрать сам.
         var note = String(localized: "Заголовки прочитаны из строки \(number): \(shape.columns.joined(separator: ", ")).")
+        // Повторы в шапке — обычное дело у таблиц в два этажа: «Стоимость»
+        // стоит под каждым годом. Имена им дописаны, и сказать об этом надо
+        // сразу: в базу они уйдут именно такими.
+        // Спрашивается у самой шапки, а не у вида полученных имён: заголовок
+        // «Стоимость (руб.)» из файла оканчивается скобкой и без всякого
+        // переименования, и проверка «на вид похоже на номер» врала бы.
+        if let row = entry.rows.first(where: { $0.number == number }) {
+            let width = entry.rows.map { $0.lastColumn + 1 }.max() ?? 0
+            let original = SheetModeDetector.headerTitles(row, width: width)
+            let duplicated = Set(Dictionary(grouping: original, by: { $0 }).filter { $0.value.count > 1 }.keys)
+            if !duplicated.isEmpty {
+                note += " " + String(localized: "Названия повторялись — к ним дописаны номера: \(duplicated.sorted().joined(separator: ", ")). Своё название колонке можно задать ниже.")
+            }
+        }
         if mapping.mode == .document, shape.mode == .dataTable {
             mapping.mode = .dataTable
             note += " " + String(localized: "Под ними однородные строки — режим переключён на «Таблица данных».")
         }
         drafts[sheetName] = mapping
         infoMessage = note
+    }
+
+    /// Переписывает заголовки из файла в поля «Своё название».
+    ///
+    /// Пустое поле и так значит «как в файле», и до сих пор это считалось
+    /// достаточным. Но править имя приходится ровно тогда, когда оно
+    /// **почти** годится: «Продолжи-тельность (мес)» с переносом посреди
+    /// слова, «Столбец 3», заголовок на полстроки. Переписывать его руками
+    /// в поле — это набирать заново то, что уже написано рядом.
+    ///
+    /// Заполняются только пустые поля: у тех, что человек уже правил,
+    /// значение важнее нашего удобства. Заголовок, равный букве колонки,
+    /// пропускается — «A» в качестве имени не лучше пустого поля.
+    func fillTitlesFromFile(for sheetName: String) {
+        guard var mapping = drafts[sheetName] else { return }
+        var filled = 0
+        for (index, column) in mapping.columns.enumerated() {
+            let own = (mapping.titles[column] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard own.isEmpty, column != XLSXReader.columnName(index) else { continue }
+            mapping.titles[column] = column
+            filled += 1
+        }
+        guard filled > 0 else {
+            infoMessage = String(localized: "Заполнять нечего: у всех колонок уже есть свои названия или заголовков в файле нет.")
+            return
+        }
+        drafts[sheetName] = mapping
+        infoMessage = String(localized: "Названия перенесены из файла: \(filled.plainDigits). Теперь их можно править — в базу уйдут они.")
     }
 
     /// Размечать по буквам колонок: заголовков на листе нет.

@@ -56,8 +56,21 @@ public final class MCPChannel: @unchecked Sendable {
         return failure == nil && !lock.withLock { finished }
     }
 
-    public func send(_ message: Data) {
-        connection.send(content: LineFraming.frame(message), completion: .contentProcessed { _ in })
+    /// - Parameter onFailure: отправить не удалось.
+    ///
+    /// Ошибка отправки **не** игнорируется. Канал считается живым
+    /// до тех пор, пока о его смерти не сообщил `stateUpdateHandler`, а между
+    /// «приложение закрылось» и этим сообщением проходит время: сообщение,
+    /// ушедшее в эту щель, пропадало молча. Для моста это значит, что агент
+    /// не получал ни ответа, ни отказа и ждал своего таймаута.
+    public func send(_ message: Data, onFailure: (@Sendable (Error) -> Void)? = nil) {
+        connection.send(
+            content: LineFraming.frame(message),
+            completion: .contentProcessed { error in
+                guard let error else { return }
+                onFailure?(error)
+            }
+        )
     }
 
     public func close() {
@@ -130,15 +143,27 @@ public final class MCPListener: @unchecked Sendable {
 
     public enum ListenError: LocalizedError {
         case notReady
+        /// По этому адресу уже кто-то отвечает — другая копия приложения.
+        case alreadyRunning
 
         public var errorDescription: String? {
-            String(localized: "Не удалось открыть сокет MCP — агенты не смогут подключиться.")
+            switch self {
+            case .notReady:
+                return String(localized: "Не удалось открыть сокет MCP — агенты не смогут подключиться.")
+            case .alreadyRunning:
+                return String(localized: "Сокет MCP уже занят другой копией приложения — эта копия агентов не обслуживает. Закройте лишнюю копию и перезапустите приложение.")
+            }
         }
     }
 
     public init(path: String = AppPaths.mcpSocketFile.path) {
         self.path = path
     }
+
+    /// Сколько ждать ответа при проверке «жив ли сокет». Местное соединение
+    /// устанавливается за миллисекунды; две секунды здесь означали бы, что
+    /// запуск после падения приложения каждый раз замирает на них.
+    static let aliveProbeTimeout: TimeInterval = 0.3
 
     /// Поднимает слушателя и **дожидается готовности**.
     ///
@@ -154,6 +179,13 @@ public final class MCPListener: @unchecked Sendable {
         // Файл сокета переживает падение процесса, и оставшийся от прошлого
         // запуска намертво занял бы адрес. Удаляется именно сокет: если по
         // этому пути лежит что-то другое, это не наш файл и трогать его нельзя.
+        //
+        // И только **мёртвый**. Раньше удалялся любой: вторая копия
+        // приложения — запущенная из сборки при открытой из Xcode или просто
+        // вторым щелчком — молча забирала адрес себе, и мосты агентов
+        // оставались подключёнными к первой, а новые уходили ко второй.
+        // Кто из двух отвечает на вызов, зависело от того, когда его подняли.
+        if isSocketAlive() { throw ListenError.alreadyRunning }
         removeStaleSocket()
 
         let listener = try NWListener(using: listenerParameters(path: path))
@@ -207,6 +239,22 @@ public final class MCPListener: @unchecked Sendable {
         removeStaleSocket()
     }
 
+    /// Отвечает ли кто-нибудь по этому адресу прямо сейчас.
+    ///
+    /// Проверяется подключением, а не существованием файла: файл остаётся
+    /// на диске после падения процесса, и «файл есть» не значит «есть кому
+    /// отвечать» — ровно та же причина, по которой мост дожидается
+    /// готовности канала, а не наличия файла.
+    private func isSocketAlive() -> Bool {
+        var status = stat()
+        guard lstat(path, &status) == 0, (status.st_mode & S_IFMT) == S_IFSOCK else { return false }
+        guard let channel = try? MCPConnector.connect(
+            path: path, queue: queue, timeout: Self.aliveProbeTimeout
+        ) else { return false }
+        channel.close()
+        return true
+    }
+
     private func removeStaleSocket() {
         var status = stat()
         guard lstat(path, &status) == 0, (status.st_mode & S_IFMT) == S_IFSOCK else { return }
@@ -248,9 +296,14 @@ public enum MCPConnector {
     /// после закрытия приложения. Поэтому связь ещё и дожидается — иначе
     /// сообщение уходит в мёртвый канал и агент ждёт ответа, которого не будет
     /// (найдено живой сверкой с DoD этапа 7).
+    /// - Parameter timeout: сколько ждать готовности канала. Мосту нужен
+    ///   запас на занятое приложение; проверке «жив ли сокет» — нет: местное
+    ///   соединение либо устанавливается сразу, либо не устанавливается
+    /// вовсе, и лишнее ожидание удлиняет запуск после падения.
     public static func connect(
         path: String = AppPaths.mcpSocketFile.path,
-        queue: DispatchQueue
+        queue: DispatchQueue,
+        timeout: TimeInterval = connectTimeout
     ) throws -> MCPChannel {
         var status = stat()
         guard lstat(path, &status) == 0, (status.st_mode & S_IFMT) == S_IFSOCK else {
@@ -259,7 +312,7 @@ public enum MCPConnector {
         let connection = NWConnection(to: .unix(path: path), using: clientParameters())
         let channel = MCPChannel(connection: connection, queue: queue)
         channel.start()
-        guard channel.waitUntilReady(timeout: connectTimeout) else {
+        guard channel.waitUntilReady(timeout: timeout) else {
             channel.close()
             throw ConnectError.appNotRunning
         }
