@@ -225,12 +225,11 @@ struct StatisticsSection: View {
         }
     }
 
-    /// «0,00 с» — число, которое молчит: у быстрых стратегий время на файл
-    /// меньше сотой секунды, и округление превращало его в ноль.
+    /// Правило «округление, дающее ноль, заменяется словами» живёт одним
+    /// местом на приложение — `SecondsText` (правило 6).
+    /// Здесь остаётся только приписка «на файл».
     private static func perFile(_ seconds: Double) -> String {
-        seconds < 0.01
-            ? String(localized: "меньше 0,01 с на файл")
-            : String(format: String(localized: "%.2f с на файл"), seconds)
+        String(localized: "\(SecondsText.line(seconds, decimals: 2)) на файл")
     }
 
     private func cell(

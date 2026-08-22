@@ -296,13 +296,27 @@ final class MCPService: ObservableObject {
     private weak var app: AppEnvironment?
 
     /// Подсказка модели: что это за сервер и в каком порядке им пользоваться.
+    /// Подсказка модели при рукопожатии.
+    ///
+    /// Здесь же и главное правило выбора инструмента: агент, которому
+    /// его не сказали, на вопрос «во всех ли документах это есть» зовёт поиск
+    /// по смыслу и получает три файла из тринадцати. Текст короткий нарочно:
+    /// он попадает в контекст **каждой** сессии.
     private static let instructions = """
     Это база документов ChromaDB, доступная через ChromaDB Manager. \
     Начинай с list_collections, чтобы узнать доступные коллекции, затем \
     describe_collection, чтобы понять, по каким полям метаданных можно \
     фильтровать. Запросы к поиску пиши текстом — векторы считает приложение \
-    моделью, привязанной к коллекции. Коллекции вне списка доступа не видны, \
-    создавать и удалять коллекции нельзя.
+    моделью, привязанной к коллекции. \
+    Инструмент выбирай по вопросу. «Что здесь про это сказано» — search. \
+    «Покажи все места, где это есть», «во всех ли документах это описано» — \
+    collect_mentions: поиск по смыслу полного охвата не даёт, замер на живой \
+    базе — куски трёх файлов из тринадцати при любом числе результатов. \
+    Документ целиком — get_file, только он держит порядок кусков. \
+    Если в выдаче строки таблиц, их колонки — это поля фильтра; проси в \
+    «fields» только нужные, иначе строка приносит все свои колонки и ответ \
+    обрывается по объёму. \
+    Коллекции вне списка доступа не видны, создавать и удалять коллекции нельзя.
     """
 }
 
@@ -382,14 +396,23 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         let schema = await MainActor.run { app?.schemaStore.schema(for: name) }
         // Примеры значений берутся из настоящих документов: без них модель
         // строит фильтр наугад и получает пустую выдачу, не понимая причины.
-        let sample = try await client.getDocuments(collectionID: collection.id, limit: 50)
-        let fields = Self.fields(schema: schema, sample: sample)
+        //
+        // Выборка — **с нескольких мест коллекции**, а не первые полсотни
+        // подряд. Строки таблиц лежат там, куда их положила
+        // синхронизация, и в начало не попадают: на живой коллекции из 5765
+        // чанков 1290 строк таблиц, а в первых пятидесяти документах не
+        // оказалось ни одной. Колонки с ценами — «стоимость_тыс_руб»,
+        // «итого», «2026» — агенту не показывались вовсе, и фильтр по ним
+        // он составить не мог.
+        let sample = try await MCPFieldSummary.spreadSample(client: client, collection: collection)
+        let described = MCPFieldSummary.fields(schema: schema, sample: sample)
 
         return MCPCollectionDescription(
             summary: summary,
-            fields: fields,
+            fields: described.shown,
             hasSchema: schema != nil,
-            allowsExtraFields: schema?.allowsExtraFields ?? true
+            allowsExtraFields: schema?.allowsExtraFields ?? true,
+            otherFields: described.hidden
         )
     }
 
@@ -850,14 +873,67 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         return lines.isEmpty ? nil : lines.joined(separator: " ")
     }
 
+}
+
+/// Поля коллекции для `describe_collection` — счёт по выборке документов
+///.
+///
+/// Отдельным типом, а не методом соединения: расчёт чистый — зависит только от
+/// схемы и выборки, — и проверяется тестом без сети, LM Studio и ChromaDB.
+/// Пока он жил в приватном классе, проверить его было нечем, и обе беды
+/// (выборка подряд и молчаливая обрезка полей) нашлись только на живых данных.
+enum MCPFieldSummary {
     /// Сколько полей уходит агенту.
     ///
     /// Не ограничение ради ограничения: у коллекции с богатыми метаданными
     /// полей бывают десятки, и все они попадут в контекст модели целиком.
     static let fieldLimit = 30
 
+    /// Выборка документов **с разных мест коллекции**.
+    ///
+    /// Пять окон вместо одного: столько же документов, но увиденное перестаёт
+    /// зависеть от того, что синхронизация положила первым. Меньше окон не
+    /// даёт разброса, больше — платится запросами ради всё той же полусотни.
+    static func spreadSample(
+        client: ChromaClient, collection: ChromaCollection, total: Int = 50, windows: Int = 5
+    ) async throws -> [DocumentRecord] {
+        let count = collection.documentCount ?? 0
+        let perWindow = max(1, total / windows)
+        guard count > total else {
+            return try await client.getDocuments(collectionID: collection.id, limit: total)
+        }
+        var records: [DocumentRecord] = []
+        var seen = Set<String>()
+        // Строки таблиц спрашиваются **отдельно и первым делом**.
+        // Разброса по коллекции для них мало: на живой базе с 14% строк
+        // таблиц пять окон по пятьдесят документов не поймали ни одной, а
+        // именно их колонки — «стоимость_тыс_руб», «итого» — и есть то, ради
+        // чего агент приходит к таблицам. Условие «есть номер строки» стоит
+        // 39–61 мс и находит их в любой коллекции, где они вообще есть.
+        var tableRows = DocumentFilter()
+        tableRows.conditions = [MetadataCondition(field: "row_number", op: .greaterOrEqual, value: "0")]
+        if let rows = try? await client.getDocuments(
+            collectionID: collection.id, limit: max(1, perWindow), filter: tableRows
+        ) {
+            for record in rows where seen.insert(record.id).inserted { records.append(record) }
+        }
+        for window in 0..<windows {
+            // Последнее окно упирается в конец коллекции, а не выходит за него.
+            let offset = min(count - perWindow, window * (count / windows))
+            let batch = try await client.getDocuments(
+                collectionID: collection.id, limit: perWindow, offset: max(0, offset)
+            )
+            for record in batch where seen.insert(record.id).inserted {
+                records.append(record)
+            }
+        }
+        return records
+    }
+
     /// Поля по схеме, а если схемы нет — по тому, что реально записано.
-    static func fields(schema: MetadataSchema?, sample: [DocumentRecord]) -> [MCPFieldDescription] {
+    static func fields(
+        schema: MetadataSchema?, sample: [DocumentRecord]
+    ) -> (shown: [MCPFieldDescription], hidden: [String]) {
         var examples: [String: [String]] = [:]
         var types: [String: String] = [:]
         for record in sample {
@@ -883,7 +959,7 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         }
 
         if let schema, !schema.isEmpty {
-            return schema.fields
+            let bySchema = schema.fields
                 .filter { !$0.trimmedKey.isEmpty }
                 .map { field in
                     MCPFieldDescription(
@@ -894,20 +970,28 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                         examples: examples[field.trimmedKey] ?? []
                     )
                 }
+            // Поля, встреченные в документах, но не объявленные в схеме, —
+            // тоже именами: схема бывает неполной, а фильтровать по ним можно.
+            let declared = Set(bySchema.map(\.key))
+            let extra = examples.keys
+                .filter { !$0.hasPrefix("_cdbm") && !declared.contains($0) }
+                .sorted()
+            return (bySchema, extra)
         }
 
         // Служебные поля приложения агенту не нужны: фильтровать по ним он
         // не станет, а место в контексте они займут.
-        return examples.keys
-            .filter { !$0.hasPrefix("_cdbm") }
-            .sorted()
-            .prefix(fieldLimit)
-            .map { key in
-                MCPFieldDescription(
-                    key: key, type: types[key] ?? "string", isRequired: false, note: nil,
-                    examples: examples[key] ?? []
-                )
-            }
+        let visible = examples.keys.filter { !$0.hasPrefix("_cdbm") }.sorted()
+        let described = visible.prefix(fieldLimit).map { key in
+            MCPFieldDescription(
+                key: key, type: types[key] ?? "string", isRequired: false, note: nil,
+                examples: examples[key] ?? []
+            )
+        }
+        // Отрезанные поля называются именами: имя стоит десяток знаков,
+        // примеры — сотни, и режется ради контекста модели именно второе.
+        // Без имени агент не составит фильтр вовсе.
+        return (Array(described), Array(visible.dropFirst(fieldLimit)))
     }
 
     static func typeName(_ value: MetadataValue) -> String {

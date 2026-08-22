@@ -301,6 +301,18 @@ struct SourcesSection: View {
                     if model.isBusy(source.id) {
                         Button(String(localized: "Остановить")) { model.cancel(sourceID: source.id) }
                             .buttonStyle(.chromaSecondary)
+                    } else if model.pendingConfirmations.contains(source.id) {
+                        // Ворота J2 остановили запуск и ждут подтверждения.
+                        // Кнопка называет это здесь, у самого источника: план
+                        // с баннером «Подтвердите запуск» лежит **выше**
+                        // списка, и человек, нажавший «Синхронизировать» внизу
+                        // длинного экрана, не видит ни его, ни причины —
+                        // нажатие выглядит потерянным.
+                        Button(String(localized: "Подтвердить запуск")) {
+                            model.runPlannedSync(source, app: app)
+                        }
+                        .buttonStyle(.chromaNormal)
+                        .disabled(!app.connection.isConnected)
                     } else {
                         Button(String(localized: "Синхронизировать")) { model.sync(source, app: app) }
                             .buttonStyle(.chromaNormal)
@@ -332,6 +344,22 @@ struct SourcesSection: View {
                 .font(Theme.Font.micro)
                 .foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
+
+                // Почему запуск остановлен — здесь же, а не только в плане
+                // наверху. Причина берётся у самого плана, как и
+                // баннер: два своих текста разошлись бы при первой правке
+                // порога.
+                if model.pendingConfirmations.contains(source.id),
+                   let plan = model.plans[source.id] {
+                    let reasons = plan.confirmationReasons(
+                        threshold: settings.configuration.syncPreviewThresholdFiles
+                    )
+                    Text((reasons.map(\.sentence) + [String(localized: "Запуск ждёт подтверждения.")])
+                        .joined(separator: " "))
+                        .font(Theme.Font.caption)
+                        .foregroundStyle(Theme.Palette.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 // Строка итога — то, чем источник закончил прошлый раз.
                 Text(model.syncStatus(of: source.id).line)
@@ -829,7 +857,7 @@ struct SourcesSection: View {
         SectionCard(title: "Результат синхронизации «\(summary.sourceName)»") {
             VStack(alignment: .leading, spacing: 6) {
                 Text(summary.line).font(Theme.Font.body)
-                Text("модель: \(summary.embeddingModel)\(summary.dimension.map { " · размерность \($0)" } ?? "") · время \(String(format: "%.1f", summary.duration)) с")
+                Text("модель: \(summary.embeddingModel)\(summary.dimension.map { " · размерность \($0)" } ?? "") · время \(SecondsText.line(summary.duration))")
                     .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                 if !summary.collections.isEmpty {
                     Text("коллекции: \(summary.collections.joined(separator: ", "))")

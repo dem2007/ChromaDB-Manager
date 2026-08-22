@@ -12,6 +12,10 @@ struct TableMappingSheet: View {
     /// Показывать ли предпросмотр целиком. Сбрасывается при смене
     /// листа: решение «покажи все двести» принимается про конкретный лист.
     @State private var showsAllColumns = false
+    /// Спрашивать ли подтверждение переиндексации: операция удаляет
+    /// строки из коллекции, и правило 3 приложения 5 требует сначала сказать,
+    /// сколько именно.
+    @State private var confirmsReindex = false
 
     var body: some View {
         SheetShell(
@@ -35,6 +39,7 @@ struct TableMappingSheet: View {
                 if let preview = model.preview { sheetCard(preview) }
                 if let preview = model.preview { rolesCard(preview) }
                 documentCard
+                reindexCard
                 profileCard
             }
         } actions: {
@@ -503,6 +508,54 @@ struct TableMappingSheet: View {
     }
 
     // MARK: - What one row becomes
+
+    /// переиндексация листа отдельной операцией.
+    ///
+    /// Отдельной, потому что смена разметки — это другой рецепт для **каждой**
+    /// строки листа: приложение такое само не пересчитывает, а прежде и вовсе
+    /// говорило «переиндексируйте вручную», не давая способа.
+    @ViewBuilder
+    private var reindexCard: some View {
+        if let state = model.reindexState() {
+            SectionCard(
+                title: "Переиндексация листа",
+                subtitle: state.changed
+                    ? String(localized: "Разметка изменилась с той, которой лист записан. Пока лист не переиндексирован, в коллекции лежат строки, собранные прежним рецептом.")
+                    : String(localized: "Лист записан нынешней разметкой. Переиндексация нужна только после её изменения.")
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Строк листа в коллекции: \(state.rows.plainDigits)")
+                        .font(Theme.Font.caption)
+                    Text(app.settings.configuration.trashEnabled
+                        ? String(localized: "Строки уйдут в корзину, потом будут удалены из коллекции, а лист забыт в манифесте. Запишутся они заново обычной синхронизацией источника — до неё лист в коллекции пуст.")
+                        : String(localized: "Корзина выключена: строки будут удалены из коллекции без копии. Запишутся они заново обычной синхронизацией источника — до неё лист в коллекции пуст."))
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Переиндексировать лист…") { confirmsReindex = true }
+                            .disabled(model.isBusy)
+                        if model.isBusy { ProgressView().controlSize(.small) }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .confirmationDialog(
+                model.selectedSheet.map { String(localized: "Переиндексировать лист «\($0)»?") }
+                    ?? String(localized: "Переиндексировать лист?"),
+                isPresented: $confirmsReindex,
+                titleVisibility: .visible
+            ) {
+                Button(String(localized: "Очистить лист и забыть его"), role: .destructive) {
+                    Task { await model.reindexSheet(app, source: source) }
+                }
+                Button(String(localized: "Отмена"), role: .cancel) {}
+            } message: {
+                Text(app.settings.configuration.trashEnabled
+                    ? String(localized: "Будет удалено строк: \(state.rows.plainDigits). Копии лягут в корзину, и оттуда их можно вернуть. Заново лист запишется при следующей синхронизации источника — за это придётся заплатить эмбеддингами.")
+                    : String(localized: "Будет удалено строк: \(state.rows.plainDigits). Корзина выключена — копий не останется. Заново лист запишется при следующей синхронизации источника — за это придётся заплатить эмбеддингами."))
+            }
+        }
+    }
 
     private var documentCard: some View {
         SectionCard(

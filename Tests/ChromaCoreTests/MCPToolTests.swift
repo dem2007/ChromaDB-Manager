@@ -146,6 +146,9 @@ final class MCPToolTests: XCTestCase {
         if tool.name == MCPToolCatalogue.getFile.name {
             object["file"] = .string("папка/файл.md")
         }
+        if tool.name == MCPToolCatalogue.collectMentions.name {
+            object["contains"] = .string("приемк")
+        }
         return .object(object)
     }
 
@@ -641,6 +644,384 @@ final class MCPToolTests: XCTestCase {
             rendered.documents.first?["text"]?.stringValue?.count,
             MCPOutputLimits.defaultDocumentCharacters
         )
+    }
+
+    // MARK: - Собери по теме
+
+    /// Куски раскладываются по файлам, частые файлы идут первыми, и с каждого
+    /// показывается один образец, а не все совпадения.
+    func testMentionsGroupChunksByFileAndShowOneSampleEach() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 3), ("б.docx", 1), ("в.docx", 5)])
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object(["collection": .string("заметки"), "contains": .string("приемк")]),
+            key: key
+        ).get()
+
+        guard case .array(let files)? = result["structuredContent"]?["files"] else {
+            return XCTFail("файлов нет вовсе")
+        }
+        XCTAssertEqual(files.count, 3)
+        XCTAssertEqual(files.first?["file"], .string("в.docx"))
+        XCTAssertEqual(files.first?["hits"], .int(5))
+        XCTAssertEqual(result["structuredContent"]?["totalMatches"], .int(9))
+        XCTAssertEqual(result["structuredContent"]?["totalFiles"], .int(3))
+        // По образцу с файла, а не по совпадению с куска.
+        guard case .array(let documents)? = result["structuredContent"]?["documents"] else {
+            return XCTFail("образцов нет вовсе")
+        }
+        XCTAssertEqual(documents.count, 3)
+    }
+
+    /// Обход коллекции один, а не по одному на страницу: инструмент просит
+    /// у базы всё сразу и листает уже разложенное по файлам.
+    func testMentionsScanTheCollectionOnceAndPageOverFiles() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 1), ("б.docx", 1), ("в.docx", 1)])
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object([
+                "collection": .string("заметки"), "contains": .string("приемк"),
+                "limit": .int(2), "offset": .int(0),
+            ]),
+            key: key
+        ).get()
+
+        XCTAssertEqual(backend.received.documents?.limit, MCPToolService.mentionsScanLimit)
+        XCTAssertEqual(backend.received.documents?.offset, 0)
+        guard case .array(let files)? = result["structuredContent"]?["files"] else {
+            return XCTFail("файлов нет вовсе")
+        }
+        XCTAssertEqual(files.count, 2)
+        XCTAssertEqual(result["structuredContent"]?["hasMore"], .bool(true))
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("offset 2"), text)
+    }
+
+    /// Вторая страница продолжает первую, а не начинает её заново.
+    func testMentionsPagingDoesNotRepeatFiles() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 3), ("б.docx", 2), ("в.docx", 1)])
+        let service = await service(clients: [client()], backend: backend)
+        func page(_ offset: Int) async throws -> [String] {
+            let result = try await call(
+                service, "collect_mentions",
+                .object([
+                    "collection": .string("заметки"), "contains": .string("приемк"),
+                    "limit": .int(2), "offset": .int(offset),
+                ]),
+                key: key
+            ).get()
+            guard case .array(let files)? = result["structuredContent"]?["files"] else { return [] }
+            return files.compactMap { $0["file"]?.stringValue }
+        }
+        let first = try await page(0)
+        let second = try await page(2)
+        XCTAssertEqual(first, ["а.docx", "б.docx"])
+        XCTAssertEqual(second, ["в.docx"])
+        XCTAssertTrue(Set(first).isDisjoint(with: Set(second)))
+    }
+
+    /// Больше трёх образцов с файла не отдаётся, сколько ни проси.
+    func testMentionsNeverShowMoreThanThreeSamplesPerFile() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 10)])
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object([
+                "collection": .string("заметки"), "contains": .string("приемк"),
+                "per_file": .int(9),
+            ]),
+            key: key
+        ).get()
+        guard case .array(let documents)? = result["structuredContent"]?["documents"] else {
+            return XCTFail("образцов нет вовсе")
+        }
+        XCTAssertEqual(documents.count, MCPToolService.mentionsMaximumPerFile)
+    }
+
+    /// Пустой ответ говорит, почему пусто: сравнение буквальное, а синонимы —
+    /// это другой инструмент.
+    func testMentionsSayWhyNothingMatched() async throws {
+        var backend = Backend()
+        backend.hits = []
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object(["collection": .string("заметки"), "contains": .string("экранная форма")]),
+            key: key
+        ).get()
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("буквальное"), text)
+        XCTAssertTrue(text.contains("search"), text)
+        XCTAssertEqual(result["structuredContent"]?["totalFiles"], .int(0))
+    }
+
+    func testMentionsWithoutAWordAreRefusedBeforeTheDatabaseIsTouched() async {
+        let backend = Backend()
+        let service = await service(clients: [client()], backend: backend)
+        let result = await call(
+            service, "collect_mentions", .object(["collection": .string("заметки")]), key: key
+        )
+        guard case .failure(let error) = result else { return XCTFail("вызов без слова принят") }
+        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        XCTAssertNil(backend.received.documents)
+    }
+
+    /// Просьбу об образцах урезали — об этом сказано вслух, иначе агент решит,
+    /// что больше в файле ничего нет (правило 3 приложения 5).
+    func testMentionsSayWhenPerFileWasCutDown() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 9)])
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object([
+                "collection": .string("заметки"), "contains": .string("приемк"),
+                "per_file": .int(9),
+            ]),
+            key: key
+        ).get()
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("Запрошено образцов с файла: 9"), text)
+    }
+
+    /// Перечень файлов занимает место в ответе наравне с текстами: сотня
+    /// длинных путей не должна выносить ответ за отведённый объём.
+    func testMentionsListingStaysInsideTheAnswerBudget() async throws {
+        var backend = Backend()
+        // Длинные **пути**, а не идентификаторы: в живой базе путь занимает
+        // полторы-две сотни знаков, и сотня таких путей — это перечень
+        // размером с весь ответ.
+        let longPath = String(repeating: "п", count: 400)
+        backend.hits = (1...100).map { number in
+            MCPDocumentPayload(
+                id: "d\(number)",
+                text: "приемка работ",
+                metadata: ["source_file": .string("\(longPath)-\(number).docx")]
+            )
+        }
+        let service = await service(
+            clients: [client(maxResults: 100)], backend: backend
+        )
+        let result = try await call(
+            service, "collect_mentions",
+            .object([
+                "collection": .string("заметки"), "contains": .string("приемк"),
+                "limit": .int(100),
+            ]),
+            key: key
+        ).get()
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        // Первая строка — заголовок ответа, перечень идёт следом до пустой.
+        let listing = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .dropFirst()
+            .prefix { !$0.isEmpty }
+            .joined(separator: "\n")
+        // Перечню отведена половина ответа: иначе сотня путей вытеснит из него
+        // сами образцы, ради которых вызов и делался.
+        XCTAssertLessThanOrEqual(listing.count, MCPOutputLimits.defaultResponseCharacters / 2)
+        // Допуск — на заголовки документов (id и подсказка про get_file):
+        // их render в бюджет не считает, и это его давнее правило, общее для
+        // всех инструментов. Без правки перечня ответ выходил за 35 000.
+        XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters + 2000)
+        XCTAssertTrue(text.contains("Перечень урезан"), String(text.prefix(400)))
+    }
+
+    /// Проекция полей доходит и до образцов «собери по теме».
+    func testMentionsHonourRequestedFields() async throws {
+        var backend = Backend()
+        backend.hits = Self.mentions([("а.docx", 1)])
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "collect_mentions",
+            .object([
+                "collection": .string("заметки"), "contains": .string("приемк"),
+                "fields": .array([.string("source_file")]),
+            ]),
+            key: key
+        ).get()
+        guard case .array(let documents)? = result["structuredContent"]?["documents"],
+              case .object(let metadata)? = documents.first?["metadata"]
+        else { return XCTFail("образца с метаданными нет") }
+        XCTAssertEqual(Set(metadata.keys), ["source_file"])
+    }
+
+    /// Число «contains» — это ошибка типа, а не «не сказано, что искать».
+    func testMentionsRefuseANonStringWord() async {
+        let backend = Backend()
+        let service = await service(clients: [client()], backend: backend)
+        let result = await call(
+            service, "collect_mentions",
+            .object(["collection": .string("заметки"), "contains": .int(5)]),
+            key: key
+        )
+        guard case .failure(let error) = result else { return XCTFail("число принято как слово") }
+        XCTAssertTrue(error.message.contains("строкой"), error.message)
+        XCTAssertNil(backend.received.documents)
+    }
+
+    /// Куски нескольких файлов: по `count` штук с каждого, в порядке чанков.
+    private static func mentions(_ files: [(String, Int)]) -> [MCPDocumentPayload] {
+        var payloads: [MCPDocumentPayload] = []
+        for (path, count) in files {
+            for index in 0..<count {
+                payloads.append(MCPDocumentPayload(
+                    id: "\(path)-\(index)",
+                    text: "приемка работ, кусок \(index)",
+                    metadata: [
+                        "source_file": .string(path),
+                        "file_id": .string(String(path.prefix(1))),
+                        "chunk_index": .int(index),
+                    ]
+                ))
+            }
+        }
+        return payloads
+    }
+
+    // MARK: - Проекция метаданных
+
+    /// Строка таблицы тащит в ответ все свои колонки. Агент, назвавший нужные,
+    /// получает их — и только их.
+    func testOnlyTheRequestedFieldsComeBack() {
+        let row: ChromaMetadata = [
+            "товар": .string("сервер"),
+            "цена_руб": .int(120_000),
+            "совокупные_трудозатраты_чел_мес": .double(3.5),
+            "руководитель_проекта_по_иб": .string("Иванов"),
+        ]
+        let rendered = MCPDocumentRendering.render(
+            [MCPDocumentPayload(id: "r1", text: "строка", metadata: row, distance: 0.1)],
+            limits: MCPOutputLimits(),
+            fields: ["товар", "цена_руб"]
+        )
+        guard case .object(let metadata)? = rendered.documents.first?["metadata"] else {
+            return XCTFail("метаданных нет вовсе")
+        }
+        XCTAssertEqual(Set(metadata.keys), ["товар", "цена_руб"])
+        // Не только в структурированном ответе: модель читает строку.
+        XCTAssertFalse(rendered.lines.joined().contains("руководитель_проекта_по_иб"))
+    }
+
+    /// Ради чего это сделано: те же строки, тот же бюджет — но помещается
+    /// их больше, потому что место занимали колонки, а не текст.
+    func testProjectionLetsMoreRowsFitTheSameBudget() {
+        var row: ChromaMetadata = ["цена_руб": .int(120_000)]
+        for number in 1...40 { row["колонка_\(number)"] = .string(String(repeating: "з", count: 40)) }
+        let payloads = (1...40).map { number in
+            MCPDocumentPayload(
+                id: "r\(number)", text: "строка таблицы", metadata: row, distance: 0.1
+            )
+        }
+        let whole = MCPDocumentRendering.render(payloads, limits: MCPOutputLimits())
+        let projected = MCPDocumentRendering.render(
+            payloads, limits: MCPOutputLimits(), fields: ["цена_руб"]
+        )
+        XCTAssertGreaterThan(projected.shown, whole.shown)
+    }
+
+    /// Проекция — забота выдачи, а не базы: предупреждение о плоской таблице
+    /// и отпечаток файла читаются из полных метаданных и переживают отбор.
+    func testProjectionKeepsWarningsAndTheFileFingerprint() {
+        let metadata: ChromaMetadata = [
+            "цена_руб": .int(500),
+            "file_id": .string("7b0d604937a1c2e4"),
+            "tables_flat": .bool(true),
+        ]
+        let rendered = MCPDocumentRendering.render(
+            [MCPDocumentPayload(id: "r1", text: "строка", metadata: metadata, distance: 0.1)],
+            limits: MCPOutputLimits(),
+            fields: ["цена_руб"]
+        )
+        XCTAssertEqual(rendered.documents.first?["fileId"], .string("7b0d604937a1c2e4"))
+        XCTAssertTrue(rendered.notes.contains { $0.contains("плоским текстом") })
+        guard case .object(let visible)? = rendered.documents.first?["metadata"] else {
+            return XCTFail("метаданных нет вовсе")
+        }
+        XCTAssertEqual(Set(visible.keys), ["цена_руб"])
+    }
+
+    /// Опечатка в имени колонки иначе выглядит как «в базе про это пусто» —
+    /// то есть как ответ, а не как промах.
+    func testAFieldNobodyHasIsNamedOutLoud() {
+        let rendered = MCPDocumentRendering.render(
+            [MCPDocumentPayload(id: "r1", text: "строка", metadata: ["цена_руб": .int(1)], distance: 0.1)],
+            limits: MCPOutputLimits(),
+            fields: ["цена_руб", "стоимость_руб"]
+        )
+        XCTAssertTrue(
+            rendered.notes.contains { $0.contains("стоимость_руб") && !$0.contains("цена_руб") },
+            rendered.notes.joined(separator: " | ")
+        )
+    }
+
+    /// Не задано — прежнее поведение: возвращаются все поля.
+    func testWithoutFieldsEverythingIsStillReturned() {
+        let metadata: ChromaMetadata = ["а": .int(1), "б": .int(2)]
+        for fields in [nil, []] as [[String]?] {
+            let rendered = MCPDocumentRendering.render(
+                [MCPDocumentPayload(id: "r1", text: "т", metadata: metadata, distance: 0.1)],
+                limits: MCPOutputLimits(), fields: fields
+            )
+            guard case .object(let visible)? = rendered.documents.first?["metadata"] else {
+                return XCTFail("метаданных нет вовсе")
+            }
+            XCTAssertEqual(Set(visible.keys), ["а", "б"])
+        }
+    }
+
+    /// Ничего не нашлось — виноват запрос, а не имена полей. Пометка о полях
+    /// в пустой выдаче уводит агента переименовывать то, что названо верно.
+    func testAnEmptyResultDoesNotBlameTheRequestedFields() async throws {
+        var backend = Backend()
+        backend.hits = []
+        let service = await service(clients: [client()], backend: backend)
+        let result = try await call(
+            service, "search",
+            .object([
+                "collection": .string("заметки"),
+                "query": .string("аренда"),
+                "fields": .array([.string("цена_руб")]),
+            ]),
+            key: key
+        ).get()
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("ничего не найдено"), text)
+        XCTAssertFalse(text.contains("Запрошенных полей нет"), text)
+    }
+
+    func testFieldsOfTheWrongShapeAreRefusedBeforeTheDatabaseIsTouched() async {
+        let backend = Backend()
+        let service = await service(clients: [client()], backend: backend)
+        for wrong in [JSONValue.string("цена"), .array([.string("")])] {
+            let result = await call(
+                service, "search",
+                .object([
+                    "collection": .string("заметки"),
+                    "query": .string("аренда"),
+                    "fields": wrong,
+                ]),
+                key: key
+            )
+            guard case .failure(let error) = result else {
+                return XCTFail("принято как список полей: \(wrong)")
+            }
+            XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        }
+        XCTAssertNil(backend.received.search)
+    }
+
+    /// Повтор поля — не ошибка, но и не повод показывать его дважды.
+    func testRepeatedFieldNamesAreCollapsed() throws {
+        let parsed = try MCPToolService.metadataFields(
+            .object(["fields": .array([.string("цена"), .string("цена"), .string(" цена ")])])
+        ).get()
+        XCTAssertEqual(parsed, ["цена"])
     }
 
     /// Векторы не возвращаются никогда — в выдаче для них нет даже места.
@@ -1369,7 +1750,18 @@ final class MCPPermissionMatrixTests: XCTestCase {
 
     private static let readTools: Set<String> = [
         "list_collections", "describe_collection", "search", "get_documents", "get_file",
+        "collect_mentions",
     ]
+
+    /// Какими вызовами базы оборачиваются разрешённые инструменты.
+    ///
+    /// Своего метода у `collect_mentions` нет намеренно: он обходит коллекцию
+    /// тем же `get_documents`, только один раз вместо страницы за страницей.
+    private static func backendCalls(for tools: Set<String>) -> Set<String> {
+        var names = tools
+        if names.remove("collect_mentions") != nil { names.insert("get_documents") }
+        return names
+    }
 
     private func arguments(_ name: String) -> JSONValue {
         var object: [String: JSONValue] = ["collection": .string("заметки")]
@@ -1377,6 +1769,7 @@ final class MCPPermissionMatrixTests: XCTestCase {
         if name == "add_documents" { object["documents"] = .array([.object(["text": .string("текст")])]) }
         if name == "delete_documents" { object["ids"] = .array([.string("d1")]) }
         if name == "get_file" { object["file"] = .string("папка/файл.md") }
+        if name == "collect_mentions" { object["contains"] = .string("приемк") }
         return .object(object)
     }
 
@@ -1436,7 +1829,7 @@ final class MCPPermissionMatrixTests: XCTestCase {
                 )
             }
             XCTAssertEqual(
-                backend.touched.names, role.allowed,
+                backend.touched.names, Self.backendCalls(for: role.allowed),
                 "\(role.title): до базы дошло не то, что разрешено"
             )
         }

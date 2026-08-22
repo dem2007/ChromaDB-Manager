@@ -6,7 +6,7 @@ import Foundation
 /// one knows which files were indexed, this one knows which **rows** were, and
 /// mixing them would make the file-level manifest grow by a line per row of
 /// every spreadsheet.
-public final class TableManifestStore {
+public final class TableManifestStore: @unchecked Sendable {
     private let directory: URL
     private let log: LogHandler
     private let queue = DispatchQueue(label: "app.chromadbmanager.tablemanifests")

@@ -440,3 +440,57 @@ final class SheetSyncScaleTests: XCTestCase {
         XCTAssertTrue(second.disappeared.isEmpty)
     }
 }
+
+/// забыть лист, чтобы записать его заново.
+final class SheetReindexTests: XCTestCase {
+    /// Забытый лист отдаёт свои документы вызывающему и перестаёт помнить
+    /// о них сам: удаляет их не манифест, а тот, кто получил список.
+    func testForgettingASheetReturnsItsDocumentsAndClearsIt() {
+        var manifest = TableFileManifest(relativePath: "фэо.xlsx", collectionName: "база")
+        manifest.sheets["Трудозатраты"] = SheetManifest(
+            sheetName: "Трудозатраты",
+            mappingSignature: "старая",
+            rows: [
+                "row\u{0}2": TableRowRecord(documentID: "d1", rowNumber: 2, rowKey: nil, textHash: "a", metadataHash: "b"),
+                "row\u{0}3": TableRowRecord(documentID: "d2", rowNumber: 3, rowKey: nil, textHash: "c", metadataHash: "d"),
+            ]
+        )
+        manifest.sheets["Расходы"] = SheetManifest(
+            sheetName: "Расходы", mappingSignature: "своя",
+            rows: ["row\u{0}2": TableRowRecord(documentID: "e1", rowNumber: 2, rowKey: nil, textHash: "e", metadataHash: "f")]
+        )
+        manifest.profilesSignature = "профили"
+
+        let forgotten = manifest.forgetSheet("Трудозатраты")
+
+        XCTAssertEqual(forgotten.sorted(), ["d1", "d2"])
+        XCTAssertNil(manifest.sheets["Трудозатраты"], "лист остался в манифесте — следующий прогон снова упрётся в смену разметки")
+        XCTAssertEqual(manifest.sheets["Расходы"]?.rowCount, 1, "забыт не тот лист")
+    }
+
+    /// Подпись профилей сбрасывается: иначе план объявит файл неизменившимся
+    /// и не откроет его вовсе — переиндексация пройдёт вхолостую.
+    func testForgettingASheetMakesThePlanOpenTheFileAgain() {
+        var manifest = TableFileManifest(
+            relativePath: "фэо.xlsx", collectionName: "база", profilesSignature: "профили"
+        )
+        manifest.sheets["Лист"] = SheetManifest(
+            sheetName: "Лист", mappingSignature: "старая",
+            rows: ["row\u{0}2": TableRowRecord(documentID: "d1", rowNumber: 2, rowKey: nil, textHash: "a", metadataHash: "b")]
+        )
+        _ = manifest.forgetSheet("Лист")
+        XCTAssertTrue(manifest.profilesSignature.isEmpty)
+    }
+
+    /// Лист, которого в манифесте нет, ничего не портит и ничего не отдаёт.
+    func testForgettingAnUnknownSheetChangesNothing() {
+        var manifest = TableFileManifest(
+            relativePath: "фэо.xlsx", collectionName: "база", profilesSignature: "профили"
+        )
+        manifest.sheets["Лист"] = SheetManifest(sheetName: "Лист", mappingSignature: "своя")
+        let before = manifest
+        XCTAssertTrue(manifest.forgetSheet("Другой").isEmpty)
+        XCTAssertEqual(manifest, before)
+    }
+}
+

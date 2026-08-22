@@ -289,8 +289,8 @@ struct DiagnosticsSection: View {
     /// Живой случай: выбрано 1542 из 2285, среди них уже все восемь сканов —
     /// и нажатие «Сканы без текста (8)» не меняло ровно ничего. Со стороны
     /// это выглядит сломанной кнопкой, и первым делом жмут её ещё раз.
-    /// Теперь состояние видно по самой кнопке: «✓» и заливка означают, что
-    /// разряд выбран целиком, а нажатие его снимает.
+    /// Теперь состояние видно по самой кнопке: заливка означает, что разряд
+    /// выбран целиком, а нажатие его снимает.
     @ViewBuilder
     private func kindBar(_ all: [(source: DataSource, problem: FileProblem)]) -> some View {
         let byKind = Dictionary(grouping: all, by: { $0.problem.remedy })
@@ -302,9 +302,13 @@ struct DiagnosticsSection: View {
                     if let group = byKind[remedy] {
                         let keys = group.map { key($0.source.id, $0.problem.relativePath) }
                         let chosen = keys.allSatisfy { selected.contains($0) }
-                        Button(chosen
-                               ? "✓ \(remedy.groupTitle) (\(group.count.plainDigits))"
-                               : "\(remedy.groupTitle) (\(group.count.plainDigits))") {
+                        // Надпись одна на оба состояния, и стиль один: и «✓»
+                        // в тексте, и разные стили у выбранной и невыбранной
+                        // кнопки меняли её ширину, кегль и высоту разом —
+                        // ряд ёрзал при каждом нажатии. Выбранное
+                        // показывает заливка, место под полужирную надпись
+                        // капсула держит всегда.
+                        Button("\(remedy.groupTitle) (\(group.count.plainDigits))") {
                             if chosen {
                                 selected.subtract(keys)
                                 // Разряд сняли и больше ничего не отмечено —
@@ -321,7 +325,7 @@ struct DiagnosticsSection: View {
                                 onlyChosen = true
                             }
                         }
-                        .buttonStyle(chosen ? .chromaNormal : .chromaSecondary)
+                        .buttonStyle(.chromaChoice(chosen ? Theme.Palette.accent : nil))
                         .help(chosen
                               ? String(localized: "Весь разряд уже выбран — нажатие снимет выбор")
                               : String(localized: "Добавить к выбранному все находки этого разряда"))
