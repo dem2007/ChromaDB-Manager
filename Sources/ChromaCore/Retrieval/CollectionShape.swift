@@ -53,7 +53,7 @@ public actor CollectionShapeCache {
             )
             async let childrenProbe = database.anyDocument(
                 collectionID: collectionID,
-                matching: DocumentFilter(conditions: [ChunkLevelScope.children.condition!])
+                matching: DocumentFilter(conditions: [ChunkLevelScope.childLevelProbe])
             )
             let hasParents = try await parentsProbe
             let hasChildren = try await childrenProbe

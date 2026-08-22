@@ -930,6 +930,66 @@ public actor SourceSyncService {
 
     public func removeManifest(for sourceID: UUID) { manifests.remove(sourceID: sourceID) }
 
+    // MARK: - Переиндексация листа
+
+    /// Что переиндексация должна убрать из базы.
+    public struct SheetReindexTarget: Sendable {
+        /// Коллекция берётся из манифеста **файла**, а не из источника:
+        /// источник умеет раскладывать файлы по разным коллекциям (по
+        /// подпапке, по правилу из пути), и его `collectionName` — только
+        /// запасной вариант. Ошибиться здесь значит снести не то или не
+        /// снести ничего, забыв при этом лист.
+        public let collectionName: String
+        public let documentIDs: [String]
+    }
+
+    /// Переиндексация листа: забыть его строки, чтобы прогон написал их заново.
+    ///
+    /// Держит источник занятым на всё время операции — тем же замком, что и
+    /// прогон. Без этого автоматическая синхронизация, начавшаяся между
+    /// «спросили список» и «забыли лист», писала бы манифест поверх и оставила
+    /// бы в коллекции строки, о которых манифест уже не помнит.
+    ///
+    /// Удаление делает вызывающий: корзина и база живут в слое приложения,
+    /// а манифест — здесь. Порядок закреплён самим устройством метода: сначала
+    /// список, потом `removing`, и только после её успеха — забвение листа.
+    @discardableResult
+    public func reindexSheet(
+        source: DataSource,
+        relativePath: String,
+        sheetName: String,
+        removing: @Sendable (SheetReindexTarget) async throws -> Void
+    ) async throws -> Int {
+        guard !running.contains(source.id) else { throw SyncError.alreadyRunning(source.name) }
+        running.insert(source.id)
+        defer { running.remove(source.id) }
+
+        var files = tableManifests.load(sourceID: source.id)
+        guard let file = files[relativePath], let sheet = file.sheets[sheetName], sheet.rowCount > 0 else {
+            return 0
+        }
+        try await removing(SheetReindexTarget(
+            collectionName: file.collectionName, documentIDs: sheet.documentIDs
+        ))
+
+        var updated = file
+        let forgotten = updated.forgetSheet(sheetName)
+        files[relativePath] = updated
+        tableManifests.save(files, sourceID: source.id)
+        log(.warning, "Таблицы",
+            "Лист «\(sheetName)» файла \(relativePath): забыт для переиндексации — строк \(forgotten.count.plainDigits), они будут записаны заново при следующей синхронизации")
+        return forgotten.count
+    }
+
+    /// Что манифест помнит про листы файла — для экрана «Таблицы».
+    ///
+    /// Через службу, а не мимо неё: манифест принадлежит ей, и второй читатель
+    /// со своим экземпляром хранилища рано или поздно прочитает его в момент
+    /// записи.
+    public func indexedSheets(sourceID: UUID, relativePath: String) -> [String: SheetManifest] {
+        tableManifests.load(sourceID: sourceID)[relativePath]?.sheets ?? [:]
+    }
+
     /// Записать манифест, изменённый снаружи.
     ///
     /// Нужно ровно для переноса чанков при переименовании: он меняет
@@ -2119,7 +2179,7 @@ public actor SourceSyncService {
                     // которую никто не читает.
                     tableWarnings.append(contentsOf: report.warnings.map { "\(item.relativePath): \($0)" })
                     for sheetName in report.sheetsNeedingReindex {
-                        tableWarnings.append(String(localized: "\(item.relativePath) → \(sheetName): сопоставление изменилось — лист нужно переиндексировать вручную, сам он не пересчитывается"))
+                        tableWarnings.append(String(localized: "\(item.relativePath) → \(sheetName): сопоставление изменилось — сам лист не пересчитывается. Переиндексация листа есть на экране «Таблицы» отдельной кнопкой: строки уйдут в корзину, а запишутся заново следующей синхронизацией"))
                     }
                     // Повторы ключа — пропущенные строки, и место им там же,
                     // где пропущенным файлам. Молча их пропускать
@@ -2679,8 +2739,13 @@ public actor SourceSyncService {
            !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return title
         }
+        // Та же починка кодировки, что у `file_name`, и по той же
+        // причине, только цена ошибки здесь выше: этот заголовок уходит
+        // приставкой в **вектор** чанка. Без починки в вектор
+        // попадало бы «Рг°®в•е_ѓа®Ђ» — строка, не значащая ничего ни для
+        // одной модели.
         let name = URL(fileURLWithPath: relativePath).deletingPathExtension().lastPathComponent
-        return name.isEmpty ? nil : name
+        return name.isEmpty ? nil : FileNameEncoding.repaired(name)
     }
 
     private func flush(
@@ -2900,7 +2965,9 @@ public actor SourceSyncService {
             metadata["file_ext"] = .string(item.url.pathExtension.lowercased())
             metadata["file_mtime"] = .string(ISO8601DateFormatter().string(from: item.modifiedAt))
             metadata["file_size"] = .int(Int(item.size))
-            metadata["file_name"] = .string(item.url.lastPathComponent)
+            // Имя, а не путь: испорченную кодировку из чужого архива чиним
+            // здесь, а `source_file` оставляем как на диске.
+            metadata["file_name"] = .string(FileNameEncoding.repaired(item.url.lastPathComponent))
         }
         // ChromaDB metadata has no arrays: a flat string with a
         // separator, not a list.

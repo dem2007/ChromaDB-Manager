@@ -263,11 +263,7 @@ public final class ZIPContainerReader {
             }
 
             let rawName = data.subdata(in: nameStart..<(nameStart + nameLength))
-            // Bit 11 promises UTF-8. Without it the name is formally CP437; in
-            // practice UTF-8 still works, and a name that decodes as neither is
-            // skipped rather than crashing the whole archive.
-            let utf8 = (flags & 0x800) != 0
-            if let name = String(data: rawName, encoding: .utf8) ?? (utf8 ? nil : String(data: rawName, encoding: .isoLatin1)) {
+            if let name = entryName(rawName, declaresUTF8: (flags & 0x800) != 0) {
                 let normalised = try normalise(name)
                 entries.append(ZIPEntry(
                     path: normalised,
@@ -281,6 +277,23 @@ public final class ZIPContainerReader {
             cursor = nameStart + nameLength + extraLength + commentLength
         }
         return entries
+    }
+
+    /// Имя записи из байтов заголовка.
+    ///
+    /// Бит 11 обещает UTF-8. Без него имя формально в CP437, но русские
+    /// архиваторы кладут туда CP866 — и это единственный случай, когда байты
+    /// не разбираются как UTF-8. Прежде такое имя читалось как Latin-1 и
+    /// превращалось в «ЊбзЈв» вместо «Отчёт»: обе кодировки однобайтовые,
+    /// поэтому ошибка не всплывала нигде — имя просто приезжало неверным.
+    ///
+    /// Флаг выставлен, а UTF-8 не разбирается — запись пропускается, как и
+    /// раньше: угадывать вопреки объявленному незачем.
+    static func entryName(_ raw: Data, declaresUTF8: Bool) -> String? {
+        if let utf8 = String(data: raw, encoding: .utf8) { return utf8 }
+        guard !declaresUTF8 else { return nil }
+        return String(data: raw, encoding: FileNameEncoding.dosRussian)
+            ?? String(data: raw, encoding: .isoLatin1)
     }
 
     /// Zip-slip. The path is never written to disk here, but it *is*

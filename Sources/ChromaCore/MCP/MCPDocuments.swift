@@ -36,7 +36,9 @@ public struct MCPOutputLimits: Sendable, Hashable {
         responseCharacters: Int = defaultResponseCharacters,
         collections: Int = defaultCollections
     ) {
-        self.ceiling = max(1, ceiling)
+        // Ключу можно выписать меньше общего предела, но не больше: конвейер
+        // всё равно обрежет, и настройка обещала бы то, чего не бывает.
+        self.ceiling = min(RetrievalLimits.maximumResults, max(1, ceiling))
         self.documentCharacters = max(1, documentCharacters)
         self.responseCharacters = max(1, responseCharacters)
         self.collections = max(1, collections)
@@ -241,6 +243,36 @@ public enum MCPDocumentRendering {
     /// показывать вообще.
     static let minimumUsefulText = 200
 
+    /// Оставляет в метаданных только запрошенные поля.
+    ///
+    /// Проекция нужна не для красоты ответа, а для его объёма: строка таблицы
+    /// тащит в выдачу **все свои колонки**, и бюджет ответа уходит на те,
+    /// которые вопроса не касаются.
+    ///
+    /// **Замер на живой коллекции** (1290 строк таблиц, `MCPProjectionLiveTests`):
+    ///
+    /// | выборка | метаданных на строку | строк в ответ на 24 000 |
+    /// |---|---|---|
+    /// | сто самых широких строк | 1883 → **94** | 8 → **56** |
+    /// | сто строк вразброс | 419 → **87** | 49 → **100** |
+    ///
+    /// Обычная строка весит около 270 знаков метаданных, широкая — до 2848:
+    /// поэтому проекция и нужна, и поэтому её не включают по умолчанию.
+    ///
+    /// Отбор идёт **на выдаче, а не в запросе к базе**: предупреждения
+    /// (плоская таблица, неполная книга) и отпечаток файла читаются из полных
+    /// метаданных, и агент, попросивший одну колонку, не должен из-за этого
+    /// перестать узнавать, что таблица пришла плоской.
+    ///
+    /// Имена сравниваются буквально: `describe_collection` называет их точно,
+    /// а угаданное «почти то же самое» лучше назвать вслух, чем молча отдать
+    /// пустоту.
+    static func projected(_ metadata: ChromaMetadata?, to fields: Set<String>?) -> ChromaMetadata? {
+        guard let fields, !fields.isEmpty else { return metadata }
+        guard let metadata else { return nil }
+        return metadata.filter { fields.contains($0.key) }
+    }
+
     /// Метаданные одной строкой — в том виде, в каком их читает модель.
     static func metadataLine(_ metadata: ChromaMetadata?) -> String {
         guard let metadata, !metadata.isEmpty else { return "" }
@@ -252,19 +284,25 @@ public enum MCPDocumentRendering {
     public static func render(
         _ payloads: [MCPDocumentPayload],
         limits: MCPOutputLimits,
-        metric: String? = nil
+        metric: String? = nil,
+        fields: [String]? = nil
     ) -> Output {
         var documents: [JSONValue] = []
         var lines: [String] = []
         var notes: [String] = []
         var budget = limits.responseCharacters
+        // Множество собирается один раз на весь ответ: полей у документа
+        // бывает под две сотни, а искать каждое из них по списку — это работа
+        // на ровном месте.
+        let wanted: Set<String>? = fields.flatMap { $0.isEmpty ? nil : Set($0) }
 
         for (index, payload) in payloads.enumerated() {
             let full = payload.text ?? ""
             // Метаданные считаются вместе с текстом: у документа из настоящей
             // коллекции их набирается на полтора килобайта, и бюджет, который
             // их не видит, ограничивает ответ только на бумаге.
-            let metadataLine = Self.metadataLine(payload.metadata)
+            let visible = Self.projected(payload.metadata, to: wanted)
+            let metadataLine = Self.metadataLine(visible)
             let room = budget - metadataLine.count
 
             // Первый документ отдаётся всегда, даже если он один съедает весь
@@ -297,7 +335,7 @@ public enum MCPDocumentRendering {
             // откуда он это взял.
             if let collection = payload.collection { object["collection"] = .string(collection) }
             if payload.text != nil { object["text"] = .string(shownText) }
-            if let metadata = payload.metadata, !metadata.isEmpty {
+            if let metadata = visible, !metadata.isEmpty {
                 object["metadata"] = .object(metadata.mapValues(\.json))
             }
             if let distance = payload.distance { object["distance"] = .double(distance) }
@@ -342,6 +380,26 @@ public enum MCPDocumentRendering {
                 }
             }
             lines.append(body)
+        }
+
+        // Имя поля, которого нет ни у одного документа, называется вслух
+        //: агент берёт его из describe_collection, и опечатка иначе
+        // выглядит как «в базе про это пусто» — то есть как ответ, а не как
+        // промах.
+        // Пустая выдача сюда не попадает: сказать «полей нет ни у одного
+        // документа», когда документов нет вовсе, значит увести агента
+        // от настоящей причины — запроса или фильтра — к именам колонок.
+        if let fields, !fields.isEmpty, !payloads.isEmpty {
+            var present: Set<String> = []
+            for payload in payloads {
+                if let metadata = payload.metadata { present.formUnion(metadata.keys) }
+            }
+            let missing = fields.filter { !present.contains($0) }
+            if !missing.isEmpty {
+                notes.append(String(
+                    localized: "Запрошенных полей нет ни у одного документа в этой выдаче: \(missing.joined(separator: ", ")). Точные имена — describe_collection."
+                ))
+            }
         }
 
         // Таблица в этом фрагменте осталась плоским текстом: колонки

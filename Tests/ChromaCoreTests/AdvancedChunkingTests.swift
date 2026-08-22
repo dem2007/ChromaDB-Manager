@@ -146,6 +146,26 @@ final class HierarchicalChunkingTests: XCTestCase {
         )
     }
 
+    /// Сторож для условия поиска «по дочерним».
+    ///
+    /// Область «дочерние» выражена как «не родитель» — `chunk_level != 1`, —
+    /// и это точно ровно до тех пор, пока нарезчик пишет два уровня: 1
+    /// родителю, 0 ребёнку. Появится третий — «не 1» начнёт молча захватывать
+    /// крупные разделы, и выдача потяжелеет вдвое, ничего об этом не сказав.
+    /// Пусть об этом скажет тест, а не читатель комментария.
+    func testTheChunkerWritesOnlyTwoLevels() {
+        for levels in 1...2 {
+            var configuration = configuration
+            configuration.levels = levels
+            let chunks = HierarchicalChunker(configuration: configuration).chunks(from: text(8))
+            let written = Set(chunks.map(\.level))
+            XCTAssertTrue(
+                written.isSubset(of: [0, 1]),
+                "нарезчик написал уровни \(written.sorted()); условие «поиск по дочерним» (ChunkLevelScope.children) выражено как «не 1» и на третий уровень не рассчитано"
+            )
+        }
+    }
+
     func testProducesParentsWithChildrenPointingAtThem() {
         let chunks = HierarchicalChunker(configuration: configuration).chunks(from: text(8))
 

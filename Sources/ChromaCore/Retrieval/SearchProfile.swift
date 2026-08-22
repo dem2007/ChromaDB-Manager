@@ -100,11 +100,38 @@ public enum ChunkLevelScope: String, Codable, Sendable, CaseIterable, Identifiab
     /// is what makes the filter work.
     public var condition: MetadataCondition? {
         switch self {
-        case .children: return MetadataCondition(field: "chunk_level", op: .equals, value: "0")
+        // «Не родитель», а не «уровень равен нулю».
+        //
+        // Уровень пишет только иерархическая нарезка, а в той же коллекции
+        // живут куски без него — прежде всего **строки таблиц**: их делает
+        // разбор таблицы, а не нарезчик текста. Условие `$eq 0` выбрасывало
+        // их из поиска целиком: на живой коллекции `base_hierarch_george`
+        // это 1290 документов из 3459, то есть больше трети базы, и запрос
+        // про трудозатраты возвращал прозу вместо чисел.
+        //
+        // **Проверено на живом сервере** (chroma 1.4.4): `$ne` и `$nin`
+        // отвечают и на документы, у которых поля нет вовсе (2776 = 1486
+        // детей + 1290 строк), а `$eq`, `$in`, `$lt`, `$lte` — только на те,
+        // у кого поле есть (1486). Поэтому «не родитель» выражается через
+        // `$ne`, и другого способа спросить «поля нет» у базы не существует.
+        //
+        // Нарезчик пишет ровно два уровня — 1 родителю, 0 ребёнку
+        // (`StructuralChunkers`), — поэтому «не 1» и значит «ребёнок или
+        // кусок без уровня».
+        case .children: return MetadataCondition(field: "chunk_level", op: .notEquals, value: "1")
         case .parents: return MetadataCondition(field: "chunk_level", op: .greater, value: "0")
         case .all: return nil
         }
     }
+
+    /// Условие «настоящие дети есть» — для определения формы коллекции.
+    ///
+    /// Отдельно от `condition`: форму решает наличие **обоих** уровней, и
+    /// спрашивать про детей условием «не родитель» здесь нельзя — ему ответит
+    /// любая плоская коллекция, у которой уровня нет ни у кого.
+    public static let childLevelProbe = MetadataCondition(
+        field: "chunk_level", op: .equals, value: "0"
+    )
 }
 
 /// What a hierarchical search returns once it has found a child.
@@ -148,6 +175,20 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     /// The profile the collection uses when no other is chosen.
     public var isDefault: Bool
 
+    /// Ключи из файла, которых эта сборка не знает.
+    ///
+    /// Пусто у профиля, созданного в приложении, и непусто у профиля,
+    /// записанного сборкой поновее: настройка в файле есть, в поиск не
+    /// попадает и пропадёт при первом сохранении. Живой случай — прогон,
+    /// поставленный с порогом `textSearchMaxWords` на сборке, где порога
+    /// ещё не было: четыре варианта дали числа опорного до третьего знака,
+    /// и понять, почему, можно было только сравнив дату сборки с датой
+    /// правки.
+    ///
+    /// В файл **не** записывается: этого ключа нет в `CodingKeys`, а
+    /// значит синтезированный кодировщик его не видит.
+    public private(set) var unknownSettings: [String] = []
+
     // MARK: - Stage 1: candidates
 
     /// How large a pool to ask for, as a multiple of `n_results`.
@@ -169,6 +210,39 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     /// Off by default: it is the answer to «найди точный код ошибки», not to
     /// every query, and a second source changes the ranking of every result.
     public var textSearchEnabled: Bool
+    /// Спрашивать термы одним регулярным выражением, а не перебором
+    /// написаний (П6.1 ТЗ).
+    ///
+    /// **Новый профиль — с выражением, сохранённый — как записан**.
+    /// П6.1 требует сперва переключатель, и только после замера — умолчание;
+    /// замер сделан: на четырнадцати запросах выдачи совпали у тринадцати,
+    /// счёт по запросам 0:0, а стоило это 21.8 с против 83.0 с. Равные ответы
+    /// вчетверо дешевле — достаточное основание.
+    ///
+    /// Сохранённому профилю способ поиска выбрал человек, и менять его молча
+    /// нельзя: граница слова меняет состав кандидатов (у терма «рис» — 577
+    /// чанков из 758). Поэтому декодер читает отсутствие ключа как «false»,
+    /// а не как это умолчание.
+    public var textSearchUsesRegex: Bool
+    /// Порог длины запроса, за которым текстовая стадия не работает.
+    ///
+    /// `nil` — без порога, как было: стадия работает на любом запросе.
+    /// Число — «работает, пока в запросе не больше стольких слов».
+    ///
+    /// **Замер, из которого взялась настройка.** На 43 парах «запрос ×
+    /// коллекция» текстовая стадия делит запросы надвое и ведёт себя на
+    /// половинах противоположно. Аббревиатура без неё не находится вовсе:
+    /// «МВХ» 1.00 → 0.00, «СМЭВ» 1.00 → 0.00 — вектор на слове из трёх букв
+    /// бесполезен. Длинный вопрос она, наоборот, портит: на девяти трудных
+    /// вопросах 0.452 против 0.571 без неё, и 14 мест из 45 в верхушке
+    /// занимали результаты, пришедшие только из текста.
+    ///
+    /// Перебор порога по всем размеченным прогонам: без стадии 0.685,
+    /// со стадией всегда 0.745, со стадией до пяти слов включительно —
+    /// **0.799**. Число подобрано на тех же данных, на которых измерено,
+    /// поэтому по умолчанию порога нет: его включают вариантом в стенде
+    /// и проверяют на своём наборе.
+    public var textSearchMaxWords: Int?
     public var vectorWeight: Double
     public var textWeight: Double
     /// `rrf_k` — the constant that flattens the curve near the top.
@@ -300,6 +374,8 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         minimumCandidates: Int = 20,
         vectorSearchEnabled: Bool = true,
         textSearchEnabled: Bool = false,
+        textSearchUsesRegex: Bool = true,
+        textSearchMaxWords: Int? = nil,
         vectorWeight: Double = 1,
         textWeight: Double = 1,
         fusionK: Double = ReciprocalRankFusion.defaultK,
@@ -330,6 +406,8 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         self.minimumCandidates = minimumCandidates
         self.vectorSearchEnabled = vectorSearchEnabled
         self.textSearchEnabled = textSearchEnabled
+        self.textSearchUsesRegex = textSearchUsesRegex
+        self.textSearchMaxWords = textSearchMaxWords
         self.vectorWeight = vectorWeight
         self.textWeight = textWeight
         self.fusionK = fusionK
@@ -392,10 +470,11 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     // нет», and a tuned search silently becomes the default one. Found exactly
     // that way, on a file written two commits earlier.
 
-    private enum CodingKeys: String, CodingKey {
+    private enum CodingKeys: String, CodingKey, CaseIterable {
         case id, name, collectionName, isDefault
         case candidateMultiplier, minimumCandidates
-        case vectorSearchEnabled, textSearchEnabled, vectorWeight, textWeight
+        case vectorSearchEnabled, textSearchEnabled, textSearchMaxWords, textSearchUsesRegex
+        case vectorWeight, textWeight
         case fusionK, splitQueryIntoWords
         case minimumCharacters, lengthPenaltyEnabled, lengthTarget, lengthPenaltyPower
         case queryPrefix
@@ -420,6 +499,14 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
 
         vectorSearchEnabled = try container.decodeIfPresent(Bool.self, forKey: .vectorSearchEnabled) ?? true
         textSearchEnabled = try container.decodeIfPresent(Bool.self, forKey: .textSearchEnabled) ?? false
+        textSearchMaxWords = try container.decodeIfPresent(Int.self, forKey: .textSearchMaxWords)
+        // Новый профиль строится с выражением, сохранённый — как записан.
+        // Асимметрия намеренная и та же, что у штрафа за длину:
+        // умолчание для нового профиля — это выбор приложения, а способ
+        // поиска у сохранённого профиля выбрал человек, и менять его молча
+        // нельзя. Разница видна и в выдаче: граница слова отсекает вхождения
+        // внутри слова, у терма «рис» — 577 чанков из 758.
+        textSearchUsesRegex = try container.decodeIfPresent(Bool.self, forKey: .textSearchUsesRegex) ?? false
         vectorWeight = try container.decodeIfPresent(Double.self, forKey: .vectorWeight) ?? 1
         textWeight = try container.decodeIfPresent(Double.self, forKey: .textWeight) ?? 1
         fusionK = try container.decodeIfPresent(Double.self, forKey: .fusionK) ?? ReciprocalRankFusion.defaultK
@@ -453,6 +540,20 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         // увидел бы никакого действия — и решил бы, что оно не работает.
         marksEnabled = try container.decodeIfPresent(Bool.self, forKey: .marksEnabled) ?? true
         contextWindow = try container.decodeIfPresent(Int.self, forKey: .contextWindow)
+
+        // Настройки, которых эта сборка не знает. Терпимость к
+        // незнакомым ключам обязательна — без неё файл профилей перестал бы
+        // читаться целиком, — но молчать о них нельзя: настройка стоит в
+        // файле, в поиске не участвует и пропадёт при первом сохранении.
+        //
+        // Ключи спрашиваются у **свободного** контейнера: типизированный
+        // возвращает только то, что перечислено в `CodingKeys`, то есть
+        // ровно то, о чём предупреждать не надо.
+        let raw = try? decoder.container(keyedBy: AnyCodingKey.self)
+        let known = Set(CodingKeys.allCases.map(\.rawValue))
+        unknownSettings = (raw?.allKeys.map(\.stringValue) ?? [])
+            .filter { !known.contains($0) }
+            .sorted()
     }
 
     /// Stages this profile asks for, whether or not the collection can provide
@@ -489,6 +590,29 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     /// класс поломок ловился в, и, и повторять его не стоит.
     public func embeddedQuery(_ text: String) -> String {
         queryPrefix.isEmpty ? text : queryPrefix + text
+    }
+
+    /// Работает ли текстовая стадия на **этом** запросе.
+    ///
+    /// Одно место на приложение: конвейер спрашивает трижды — считать ли
+    /// вектор, идти ли за текстовыми кандидатами и что написать в заметке
+    /// стадии, — и три разных ответа на один вопрос были бы поиском,
+    /// который сам себе противоречит.
+    ///
+    /// Считается **исходный** запрос, без приставки к вектору: приставка —
+    /// слова модели, а не человека, и к текстовому поиску отношения не имеет.
+    public func textSearchApplies(to query: String) -> Bool {
+        guard textSearchEnabled else { return false }
+        guard let limit = textSearchMaxWords else { return true }
+        return Self.wordCount(query) <= limit
+    }
+
+    /// Слов в запросе. Пунктуация словом не считается: «vCPU, МВХ» — два
+    /// слова, а не три.
+    static func wordCount(_ query: String) -> Int {
+        query.split(whereSeparator: { $0.isWhitespace })
+            .filter { $0.contains(where: { $0.isLetter || $0.isNumber }) }
+            .count
     }
 
     /// How many candidates stage 1 asks the collection for.

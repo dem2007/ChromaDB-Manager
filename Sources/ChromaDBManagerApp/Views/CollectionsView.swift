@@ -1043,7 +1043,7 @@ struct CollectionsView: View {
                 alsoSearchInRow(collection)
 
                 HStack {
-                    Stepper("n_results: \(model.numberOfResults)", value: $model.numberOfResults, in: 1...50)
+                    Stepper("n_results: \(model.numberOfResults)", value: $model.numberOfResults, in: 1...RetrievalLimits.maximumResults)
                         .frame(width: 190)
                     if !model.filter.isEmpty {
                         Toggle(String(localized: "с фильтром"), isOn: $model.applyFilterToQuery)
@@ -2097,7 +2097,7 @@ struct CollectionsView: View {
             if let summary = model.importSummary {
                 MessageBanner(
                     kind: .success,
-                    text: String(localized: "Записано \(summary.written), пропущено пустых строк \(summary.skippedEmpty), модель \(summary.model), размерность \(summary.dimension.plainDigits), за \(String(format: "%.1f", summary.duration)) с.")
+                    text: String(localized: "Записано \(summary.written), пропущено пустых строк \(summary.skippedEmpty), модель \(summary.model), размерность \(summary.dimension.plainDigits), за \(SecondsText.line(summary.duration)).")
                 )
                 if !summary.skippedDuplicates.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {

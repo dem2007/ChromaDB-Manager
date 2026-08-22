@@ -53,6 +53,25 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
     }
 
     public var rowCount: Int { sheets.values.reduce(0) { $0 + $1.rowCount } }
+
+    /// Забыть лист перед переиндексацией.
+    ///
+    /// Возвращает идентификаторы документов, которые лист занимал: их
+    /// вызывающий сначала кладёт в корзину, потом удаляет из коллекции.
+    /// Сам манифест после этого не помнит о листе ничего, поэтому следующий
+    /// прогон пишет **все** его строки заново — по новой разметке, а не
+    /// упирается в «сопоставление изменилось».
+    ///
+    /// Подпись профилей файла тоже сбрасывается. Без этого файл, у которого
+    /// на диске ничего не менялось, план объявил бы неизменившимся и не открыл
+    /// бы вовсе: переиндексация прошла бы вхолостую, а лист остался бы пустым.
+    public mutating func forgetSheet(_ sheetName: String) -> [String] {
+        guard let sheet = sheets[sheetName] else { return [] }
+        sheets[sheetName] = nil
+        pendingRemovals[sheetName] = nil
+        profilesSignature = ""
+        return sheet.documentIDs
+    }
 }
 
 /// Исчезнувшие строки одного листа, ждущие решения человека.
@@ -472,7 +491,7 @@ public actor TableSyncService {
                 // backup, offered as its own operation. The sheet is left alone.
                 report.sheetsNeedingReindex.append(sheetName)
                 log(.warning, "Таблицы",
-                    "Лист «\(sheetName)» файла \(context.relativePath): сопоставление изменилось — нужна переиндексация листа, автоматически ничего не пересчитывается")
+                    "Лист «\(sheetName)» файла \(context.relativePath): сопоставление изменилось — нужна переиндексация листа (экран «Таблицы», кнопка «Переиндексировать лист»), автоматически ничего не пересчитывается")
                 continue
             }
 

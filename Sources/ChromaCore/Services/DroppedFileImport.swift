@@ -74,7 +74,8 @@ public enum DroppedFileImport {
                         // Полный путь: у разового добавления папки-источника
                         // нет, и относительный путь не от чего считать.
                         "source_file": .string(url.path),
-                        "file_name": .string(name),
+                        // Путь — как на диске, имя — как задумано.
+                        "file_name": .string(FileNameEncoding.repaired(name)),
                         "origin": .string("drop"),
                     ]
                 ))

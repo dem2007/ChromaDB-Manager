@@ -481,7 +481,7 @@ public actor RetrievalPipeline {
         var diagnostics = RetrievalDiagnostics()
         diagnostics.profileName = profile.name
 
-        let nResults = max(1, min(request.nResults, 100))
+        let nResults = max(1, min(request.nResults, RetrievalLimits.maximumResults))
 
         // What the profile asks for, narrowed by what the collection can
         // actually provide. A one-level collection makes the hierarchy stages
@@ -491,8 +491,21 @@ public actor RetrievalPipeline {
             of: request.collectionID, collectionName: request.collectionName, database: database
         )
         var stages = profile.requestedStages
-        if !shape.isHierarchical { stages.subtract([.collapse, .promote]) }
-        let pool = profile.poolSize(nResults: nResults, stages: stages)
+        // На плоской коллекции подниматься некуда, а вот сворачивать есть что:
+        // стадия 3 по E0.1 сворачивает «дубли **и** детей одного родителя»,
+        // и половина про дубли нужна как раз там, где родителей нет.
+        if !shape.isHierarchical { stages.subtract([.promote]) }
+        // Пул считается по стадиям, которым нужен **запас**. Свёртке дублей он
+        // не нужен: она убирает повтор из того, что уже нашли, и оставить
+        // четыре результата вместо пяти с повтором — честнее, чем поднимать
+        // пул впятеро всем поискам подряд. Свёртка по родителю запас требует,
+        // но на плоской коллекции её не бывает.
+        //
+        // Проверено тестом, а не рассуждением: без этой строки ненастроенный
+        // профиль просил у базы 25 кандидатов вместо 5 и переставал совпадать
+        // с поиском этапа 2.
+        let poolStages = shape.isHierarchical ? stages : stages.subtracting([.collapse])
+        let pool = profile.poolSize(nResults: nResults, stages: poolStages)
         var skipped: [RetrievalStage: String] = [:]
         for stage in profile.requestedStages.subtracting(stages) {
             skipped[stage] = String(localized: "коллекция нарезана одним уровнем")
@@ -503,7 +516,14 @@ public actor RetrievalPipeline {
         // One list or two. Vector search needs the query embedded; text
         // search does not, and «только текстовый поиск» must not pay for a
         // vector it will never use.
-        let wantsVector = profile.vectorSearchEnabled || !profile.textSearchEnabled
+        // Работает ли текстовая стадия на этом запросе — спрашивается **один
+        // раз** и дальше используется везде: порог по длине запроса
+        // выключает её на длинных вопросах, где она приносит мусор, и
+        // оставляет на аббревиатурах, где без неё не находится ничего.
+        let textStageApplies = profile.textSearchApplies(to: request.text)
+        // Вектор считается и тогда, когда текстовую стадию отменил порог:
+        // иначе искать станет нечем вовсе.
+        let wantsVector = profile.vectorSearchEnabled || !textStageApplies
         let (filter, levelNote) = candidateFilter(request: request, profile: profile, shape: shape)
 
         // Embedding is timed apart from the stage and happens before its clock
@@ -530,7 +550,7 @@ public actor RetrievalPipeline {
 
         var textHits: [RetrievalHit] = []
         var textNote: String?
-        if profile.textSearchEnabled {
+        if textStageApplies {
             let found = try await textCandidates(
                 request: request, profile: profile, filter: filter, limit: pool
             )
@@ -590,6 +610,13 @@ public actor RetrievalPipeline {
             candidateNote += ", " + String(localized: "приставка к запросу: \(String(cut))")
         }
         if let textNote { candidateNote += ", \(textNote)" }
+        // «Стадия включена, но на этом запросе не работала» — то, о чём иначе
+        // не догадаться: выдача выглядит как поиск без текстовой половины,
+        // а в профиле стоит галочка.
+        if profile.textSearchEnabled, !textStageApplies, let limit = profile.textSearchMaxWords {
+            candidateNote += ", " + String(localized:
+                "текстовый поиск пропущен: слов в запросе \(SearchProfile.wordCount(request.text).plainDigits), порог \(limit.plainDigits)")
+        }
         for note in lengthNotes { candidateNote += ", \(note)" }
         diagnostics.stages.append(.init(
             stage: .candidates, ran: true, inputCount: 0,
@@ -614,7 +641,7 @@ public actor RetrievalPipeline {
         } else {
             // One source and nothing to merge — including the case where the
             // other source simply found nothing, which is worth saying.
-            if textHits.isEmpty && profile.textSearchEnabled && !vectorHits.isEmpty {
+            if textHits.isEmpty && textStageApplies && !vectorHits.isEmpty {
                 hits = vectorHits
                 diagnostics.stages.append(.init(
                     stage: .fusion, ran: false, inputCount: hits.count, outputCount: hits.count,
@@ -665,12 +692,22 @@ public actor RetrievalPipeline {
             let stageStarted = Date()
             let before = hits.count
             hits = Self.collapsingByParent(hits)
+            let afterParents = hits.count
+            hits = Self.collapsingIdenticalText(hits)
+            let duplicates = afterParents - hits.count
+            var parts: [String] = []
+            if before > afterParents {
+                parts.append(String(localized: "свёрнуто \(RussianCount.phrase(before - afterParents, "дочерний чанк", "дочерних чанка", "дочерних чанков")) в \(RussianCount.phrase(hits.filter { $0.collapsed > 0 }.count, "раздел", "раздела", "разделов"))"))
+            }
+            if duplicates > 0 {
+                parts.append(String(localized: "убрано повторов текста: \(duplicates.plainDigits)"))
+            }
             diagnostics.stages.append(.init(
                 stage: .collapse, ran: true, inputCount: before, outputCount: hits.count,
                 duration: Date().timeIntervalSince(stageStarted),
-                note: before == hits.count
-                    ? String(localized: "у кандидатов нет общих родителей")
-                    : String(localized: "свёрнуто \(RussianCount.phrase(before - hits.count, "дочерний чанк", "дочерних чанка", "дочерних чанков")) в \(RussianCount.phrase(hits.filter { $0.collapsed > 0 }.count, "раздел", "раздела", "разделов"))")
+                note: parts.isEmpty
+                    ? String(localized: "ни общих родителей, ни повторов текста")
+                    : parts.joined(separator: ", ")
             ))
         } else {
             diagnostics.stages.append(off(.collapse, count: hits.count, skipped: skipped))
@@ -940,6 +977,14 @@ public actor RetrievalPipeline {
                report.note == String(localized: "помеченных документов в выдаче нет") {
                 continue
             }
+            // Свёртка ничего не переставляет — она только убирает.
+            // Значит для неё «сколько вошло, столько и вышло» и есть «ничего
+            // не сделала». Для стадий, которые двигают порядок, — пометки,
+            // разнообразие, переранжирование — этого признака не хватило бы:
+            // они меняют выдачу, не меняя её длины.
+            if report.stage == .collapse, report.outputCount == report.inputCount {
+                continue
+            }
             return false
         }
         return true
@@ -1006,6 +1051,50 @@ public actor RetrievalPipeline {
     /// and a fold must not reshuffle them. A candidate with no parent — a chunk
     /// of a flat file in a mixed collection, or a parent that matched directly
     /// — passes through untouched rather than being grouped with the others.
+    /// Один и тот же текст — один результат.
+    ///
+    /// Стадия 3 по определению из E0.1 сворачивает «дубли **и** детей одного
+    /// родителя». Половина про дубли не работала там, где нужнее всего:
+    /// на плоской коллекции стадия пропускалась целиком, потому что родителей
+    /// у неё нет. Замер на рабочей коллекции: 1106 дублей из 5765 чанков
+    /// (19%), в верхушку доходят 2.2% мест, и в 7 ячейках из 195 один и тот же
+    /// абзац показан дважды.
+    ///
+    /// Сравнение по приведённому тексту, а не по идентификатору: копии
+    /// приходят из разных файлов и одинаковых идентификаторов не имеют.
+    /// Отличаются они обычно только пробелами, поэтому пробелы схлопываются.
+    ///
+    /// Что происходит с копией: она **отбрасывается**, а не приписывается
+    /// к первой через `collapsed`. Это поле означает «ещё N совпадений
+    /// в этом разделе» — про раздел, а не про чужой файл, и врать им нельзя.
+    static func collapsingIdenticalText(_ hits: [RetrievalHit]) -> [RetrievalHit] {
+        var result: [RetrievalHit] = []
+        var seen = Set<String>()
+        for hit in hits {
+            // Строка таблицы одинаковым текстом дублем не становится.
+            //
+            // Её текст — это подписи выбранных колонок, а всё содержимое живёт
+            // в метаданных: «Наименование статьи расходов: Трудозатраты
+            // (чел-мес)» — один и тот же текст у двадцати четырёх строк
+            // с разными числами (8.3, 136.9, 506.5 чел-мес). Сравнение по
+            // тексту объявляло их копиями и выбрасывало двадцать три ответа
+            // из двадцати четырёх.
+            if hit.metadata?["row_number"] != nil {
+                result.append(hit)
+                continue
+            }
+            let key = (hit.document ?? "").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            // Пустой текст дублем не считается: его нечем сравнивать, и
+            // выбрасывать результаты без текста эта стадия не нанималась.
+            guard !key.isEmpty else {
+                result.append(hit)
+                continue
+            }
+            if seen.insert(key).inserted { result.append(hit) }
+        }
+        return result
+    }
+
     static func collapsingByParent(_ hits: [RetrievalHit]) -> [RetrievalHit] {
         var result: [RetrievalHit] = []
         var positionOfParent: [String: Int] = [:]
@@ -1112,21 +1201,52 @@ public actor RetrievalPipeline {
         let terms = TextRelevance.terms(in: request.text, splitIntoWords: profile.splitQueryIntoWords)
         guard !terms.isEmpty else { return ([], String(localized: "текстовый поиск: пустой запрос")) }
 
+        // Одним выражением или перебором написаний. Полнота у них
+        // одинаковая, цена — нет: двенадцать подстрочных условий против одного
+        // выражения это 5079 мс против 600 мс на живой коллекции.
+        //
+        // Пустое выражение — не «искать всё»: `$regex: ""` совпал бы с каждым
+        // чанком. Если строить его не из чего, стадия работает по-старому.
+        let pattern = profile.textSearchUsesRegex ? TextRelevance.regexPattern(of: terms) : ""
+        let usesRegex = !pattern.isEmpty
         // `$contains` у ChromaDB различает регистр, а ранжирование здесь — нет.
         // Без вариантов написания стадия честно спрашивала «astra» у текста со
-        // словом «Astra» и не находила ничего.
-        let variants = TextRelevance.caseVariants(of: terms)
+        // словом «Astra» и не находила ничего. Выражению это не нужно:
+        // регистр ему снимает `(?i)`.
+        let variants = usesRegex ? [] : TextRelevance.caseVariants(of: terms)
         var textFilter = filter ?? DocumentFilter()
         // Условие по тексту, заданное вызывающим («документ обязан содержать
         // это слово»), — ограничение, а не подсказка. Дописать варианты запроса
         // в тот же список значило бы соединить их с ним через `$or` и вернуть
         // документы, которые чужого условия не выполняют вовсе.
         let existing = textFilter.whereDocumentClause()
-        let ownClause: [String: Any] = variants.count > 1
-            ? [FilterLogic.or.rawValue: variants.map { [DocumentTextOperator.contains.rawValue: $0] }]
-            : [DocumentTextOperator.contains.rawValue: variants.first ?? ""]
+        let ownClause: [String: Any]
+        if usesRegex {
+            ownClause = [TextRelevance.regexOperator: pattern]
+        } else if variants.count > 1 {
+            ownClause = [FilterLogic.or.rawValue: variants.map { [DocumentTextOperator.contains.rawValue: $0] }]
+        } else {
+            ownClause = [DocumentTextOperator.contains.rawValue: variants.first ?? ""]
+        }
 
-        if let existing {
+        // Выражение не собирается из условий формы, поэтому уходит сырым JSON
+        // и тогда, когда чужого условия нет: `DocumentTextCondition` знает
+        // только «содержит» и «не содержит», и учить его регулярным выражениям
+        // значило бы вывести их в конструктор фильтров, которого никто не
+        // просил.
+        if usesRegex {
+            let clause: [String: Any] = existing.map {
+                [FilterLogic.and.rawValue: [$0, ownClause]]
+            } ?? ownClause
+            // Если JSON не собрался, стадия молчит, а не ищет без условия:
+            // пустой `where_document` — это «отдай первые попавшиеся
+            // документы коллекции», и они уехали бы в выдачу как найденные.
+            guard let json = Self.json(of: clause) else {
+                return ([], String(localized: "текстовый поиск: условие не собралось"))
+            }
+            textFilter.textConditions = []
+            textFilter.rawWhereDocumentJSON = json
+        } else if let existing {
             textFilter.textConditions = []
             textFilter.rawWhereDocumentJSON = Self.json(
                 of: [FilterLogic.and.rawValue: [existing, ownClause]]
@@ -1487,7 +1607,7 @@ public actor RetrievalPipeline {
             // одного вызова, зато это единственный способ, которым такая
             // модель вообще умеет отвечать.
             let instruction = CrossEncoderReranker.instruction(from: profile.rerankInstruction)
-            var verdicts: [Bool?] = []
+            var scores: [Double?] = []
             for hit in head {
                 let answer = try await completePlain(
                     CrossEncoderReranker.prompt(
@@ -1496,17 +1616,32 @@ public actor RetrievalPipeline {
                     ),
                     profile.rerankModel
                 )
-                verdicts.append(CrossEncoderReranker.verdict(answer))
+                scores.append(CrossEncoderReranker.score(answer))
             }
-            guard verdicts.contains(where: { $0 != nil }) else { throw RerankError.nothingUsable }
-            let yes = verdicts.filter { $0 == true }.count
-            let unclear = verdicts.filter { $0 == nil }.count
+            guard scores.contains(where: { $0 != nil }) else { throw RerankError.nothingUsable }
+            let understood = scores.compactMap { $0 }
+            let unclear = scores.count - understood.count
+            // Заметка говорит про шкалу, а не про «подошло»: у «да/нет» это
+            // 1 и 0, у балльной модели — 5 и 1, и одно слово «подошло» на обе
+            // не годится.
+            let range = understood.isEmpty
+                ? ""
+                : String(localized: ", баллы от \(Self.plain(understood.min() ?? 0)) до \(Self.plain(understood.max() ?? 0))")
             return (
-                CrossEncoderReranker.reordered(head, verdicts: verdicts) + tail,
-                String(localized: "переранжировщик \(profile.rerankModel): подошло \(yes) из \(head.count), вызовов \(head.count)")
+                CrossEncoderReranker.reordered(head, scores: scores) + tail,
+                String(localized: "переранжировщик \(profile.rerankModel): вызовов \(head.count)")
+                    + range
                     + (unclear > 0 ? String(localized: ", не понят ответ по \(unclear)") : "")
             )
         }
+    }
+
+    /// Балл в заметке — без хвоста «.0»: шкала бывает целой («5») и дробной
+    /// («0.87»), и показывать «5.0» значит выдумывать точность.
+    static func plain(_ value: Double) -> String {
+        value == value.rounded()
+            ? String(Int(value))
+            : String(format: "%.2f", value)
     }
 
     // MARK: - Diagnostics for stages that did not run

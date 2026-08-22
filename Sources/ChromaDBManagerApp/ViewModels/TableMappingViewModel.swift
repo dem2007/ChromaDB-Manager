@@ -2,6 +2,18 @@ import Foundation
 import SwiftUI
 import ChromaCore
 
+/// Почему переиндексация листа не состоялась.
+enum TableReindexError: LocalizedError {
+    case noCollection(String)
+
+    nonisolated var errorDescription: String? {
+        switch self {
+        case .noCollection(let name):
+            return String(localized: "коллекции «\(name)» нет в базе — удалять нечего, а записывать некуда")
+        }
+    }
+}
+
 /// The screen of: what a table file holds, what a row will become, and the
 /// mapping that decides it.
 @MainActor
@@ -76,6 +88,12 @@ final class TableMappingViewModel: ObservableObject {
     @Published var infoMessage: String?
     /// Which saved profile the open sheet matched, if any.
     @Published var matchNote: String?
+    /// Что манифест помнит про листы **открытого** файла.
+    ///
+    /// Читается один раз при открытии файла, а не в теле экрана: манифест
+    /// таблиц у большого источника весит мегабайты, и перечитывать его на
+    /// каждую перерисовку значило бы платить диском за наведение мыши.
+    @Published private(set) var indexedSheets: [String: SheetManifest] = [:]
 
     /// 8 asks for the first twenty rows.
     /// `nonisolated`: к ней обращается вложенный `SheetPreview`, который
@@ -223,6 +241,7 @@ final class TableMappingViewModel: ObservableObject {
         // Empty for a file opened from outside the source — the list marks its
         // own files, and a stranger is not one of them.
         openedPath = sourceFiles.first { $0.url == url }?.relativePath
+        refreshIndexedSheets(app, source: source)
 
         Task {
             defer { isBusy = false }
@@ -613,6 +632,128 @@ final class TableMappingViewModel: ObservableObject {
             note += " " + String(localized: "Из области «\(movedFrom.title)» он убран: профиль живёт в одной области, иначе на лист претендовали бы два одинаковых.")
         }
         infoMessage = note
+    }
+
+    // MARK: - Переиндексация листа
+
+    /// Перечитать, что манифест помнит про листы открытого файла.
+    ///
+    /// Читается при открытии файла и после переиндексации, а не в теле экрана:
+    /// манифест таблиц у большого источника весит мегабайты, и перечитывать
+    /// его на каждую перерисовку значило бы платить диском за наведение мыши.
+    /// Чтение уходит с главного потока по той же причине.
+    func refreshIndexedSheets(_ app: AppEnvironment, source: DataSource) {
+        guard let path = openedPath else {
+            indexedSheets = [:]
+            return
+        }
+        let service = app.syncService
+        let sourceID = source.id
+        Task { [weak self] in
+            let sheets = await service.indexedSheets(sourceID: sourceID, relativePath: path)
+            await MainActor.run { self?.indexedSheets = sheets }
+        }
+    }
+
+    /// Подставить состояние манифеста в обход диска — только для проверок.
+    func setIndexedSheetsForTesting(_ sheets: [String: SheetManifest]) {
+        indexedSheets = sheets
+    }
+
+    /// Строки листа, записанные прошлой разметкой, и разошлась ли она с нынешней.
+    ///
+    /// Спрашивается у манифеста, а не у базы: именно он помнит, каким рецептом
+    /// лист писали. `nil` — либо лист ещё не индексировался, либо экран его
+    /// ещё не прочитал: сравнивать разметку не с чем, и предлагать операцию,
+    /// последствия которой неизвестны, нельзя.
+    func reindexState() -> (rows: Int, changed: Bool)? {
+        guard let sheet = selectedSheet,
+              let stored = indexedSheets[sheet], stored.rowCount > 0,
+              let current = drafts[sheet]?.signature, !current.isEmpty
+        else { return nil }
+        return (stored.rowCount, stored.mappingSignature != current)
+    }
+
+    /// Переиндексировать лист: строки в корзину, из коллекции — вон, манифест
+    /// забывает лист.
+    ///
+    /// Сама запись идёт обычной синхронизацией: второго конвейера для строк
+    /// не заводится, иначе разметка, отлаженная на одном пути, применялась бы
+    /// другим. Здесь только подготовка — и она названа вслух, потому что до
+    /// следующего прогона лист в коллекции пуст.
+    ///
+    /// Занятость источника и порядок действий держит служба: она владеет
+    /// манифестом и тем же замком, что и прогон.
+    @MainActor
+    func reindexSheet(_ app: AppEnvironment, source: DataSource) async {
+        guard let path = openedPath, let sheet = selectedSheet else { return }
+        guard let client = app.client else {
+            errorMessage = String(localized: "Нет подключения к базе: переиндексация трогает коллекцию, а не только настройки.")
+            return
+        }
+        let usesTrash = app.settings.configuration.trashEnabled
+
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            var kept = 0
+            let forgotten = try await app.syncService.reindexSheet(
+                source: source, relativePath: path, sheetName: sheet
+            ) { target in
+                guard let collection = try await client.listCollections(withCounts: false)
+                    .first(where: { $0.name == target.collectionName })
+                else {
+                    throw TableReindexError.noCollection(target.collectionName)
+                }
+                // Копия в корзину до удаления (: операция с бэкапом).
+                // Восстановление идёт из сохранённого вектора, поэтому вектор
+                // и берётся: пересчитать его заново стоило бы столько же,
+                // сколько сама переиндексация.
+                if usesTrash {
+                    for page in stride(from: 0, to: target.documentIDs.count, by: 200).map({
+                        Array(target.documentIDs[$0..<min($0 + 200, target.documentIDs.count)])
+                    }) {
+                        let documents = try await client.getDocuments(
+                            collectionID: collection.id, limit: page.count, ids: page
+                        )
+                        let vectors = try await client.embeddings(collectionID: collection.id, ids: page)
+                        let entries = documents.map { document in
+                            TrashEntry(
+                                documentID: document.id,
+                                document: document.document,
+                                metadata: document.metadata,
+                                embedding: vectors[document.id],
+                                collectionName: collection.name,
+                                collectionMetric: collection.space,
+                                collectionModel: collection.boundModel,
+                                collectionDimension: collection.effectiveDimension,
+                                reason: .document
+                            )
+                        }
+                        try await MainActor.run {
+                            try app.trash.record(entries)
+                            kept += documents.count
+                        }
+                    }
+                }
+                try await client.deleteDocuments(collectionID: collection.id, ids: target.documentIDs)
+            }
+
+            guard forgotten > 0 else {
+                infoMessage = String(localized: "Лист «\(sheet)» ещё не индексировался — переиндексировать нечего, достаточно синхронизации.")
+                return
+            }
+            app.log.record(
+                .warning, "Таблицы",
+                "Источник «\(source.name)», лист «\(sheet)» файла \(path): переиндексация — удалено строк \(forgotten.plainDigits), в корзину положено \(kept.plainDigits)"
+            )
+            refreshIndexedSheets(app, source: source)
+            infoMessage = usesTrash
+                ? String(localized: "Лист «\(sheet)» очищен: строк убрано \(forgotten.plainDigits), копии лежат в корзине. Запустите синхронизацию источника — строки запишутся заново по нынешней разметке.")
+                : String(localized: "Лист «\(sheet)» очищен: строк убрано \(forgotten.plainDigits). Корзина выключена, копий не осталось. Запустите синхронизацию источника — строки запишутся заново по нынешней разметке.")
+        } catch {
+            errorMessage = String(localized: "Переиндексация листа не удалась: \(error.localizedDescription). Лист остался таким, каким был: манифест забывает его только после того, как строки убраны из коллекции.")
+        }
     }
 
     /// Удаляет профиль из той области, где он лежит — из обеих, если

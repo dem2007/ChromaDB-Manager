@@ -438,27 +438,27 @@ final class CrossEncoderRerankTests: XCTestCase {
     }
 
     func testTheAnswerIsReadInTheFormsModelsActuallyGive() {
-        XCTAssertEqual(CrossEncoderReranker.verdict("Yes"), true)
-        XCTAssertEqual(CrossEncoderReranker.verdict("yes\n\nYes"), true)
-        XCTAssertEqual(CrossEncoderReranker.verdict(" NO."), false)
-        XCTAssertEqual(CrossEncoderReranker.verdict("нет"), false)
+        XCTAssertEqual(CrossEncoderReranker.score("Yes"), 1)
+        XCTAssertEqual(CrossEncoderReranker.score("yes\n\nYes"), 1)
+        XCTAssertEqual(CrossEncoderReranker.score(" NO."), 0)
+        XCTAssertEqual(CrossEncoderReranker.score("нет"), 0)
         // Непонятый ответ — не «нет»: считать его отказом значило бы молча
         // выбросить фрагмент.
-        XCTAssertNil(CrossEncoderReranker.verdict("Мне кажется, это подходит"))
-        XCTAssertNil(CrossEncoderReranker.verdict(""))
+        XCTAssertNil(CrossEncoderReranker.score("Мне кажется, это подходит"))
+        XCTAssertNil(CrossEncoderReranker.score(""))
     }
 
     /// Ответ «да/нет» не даёт градаций, поэтому стадия вправе только поднять
     /// подошедшие — не трогая порядок, который нашли предыдущие стадии.
     func testAcceptedRiseAndTheOrderInsideTheGroupsIsKept() {
         let items = ["a", "b", "c", "d"]
-        let reordered = CrossEncoderReranker.reordered(items, verdicts: [false, true, nil, true])
+        let reordered = CrossEncoderReranker.reordered(items, scores: [0, 1, nil, 1])
         XCTAssertEqual(reordered, ["b", "d", "a", "c"])
     }
 
     func testAShortVerdictListDoesNotLoseTheTail() {
         let items = ["a", "b", "c"]
-        XCTAssertEqual(CrossEncoderReranker.reordered(items, verdicts: [true]), ["a", "b", "c"])
+        XCTAssertEqual(CrossEncoderReranker.reordered(items, scores: [1]), ["a", "b", "c"])
     }
 
     /// Конвейер целиком: модель отвечает «yes» только про нужный фрагмент, и он
@@ -495,7 +495,10 @@ final class CrossEncoderRerankTests: XCTestCase {
         XCTAssertEqual(count, 3, "вызов на фрагмент — это и есть цена режима")
         let report = outcome.diagnostics.stages.first { $0.stage == RetrievalStage.rerank }
         XCTAssertTrue(report?.ran ?? false)
-        XCTAssertTrue(report?.note?.contains("подошло 1 из 3") ?? false, report?.note ?? "")
+        // Заметка говорит про шкалу, а не про «подошло»: у «да/нет» это 1 и 0,
+        // у балльной модели — 5 и 1, и одно слово на обе не годится.
+        XCTAssertTrue(report?.note?.contains("вызовов 3") ?? false, report?.note ?? "")
+        XCTAssertTrue(report?.note?.contains("баллы от 0 до 1") ?? false, report?.note ?? "")
     }
 
     /// Поле, которое видно в форме, обязано доходить до модели. Оно было
@@ -633,4 +636,59 @@ private actor CallCounter {
 private actor PromptRecorder {
     private(set) var prompts: [String] = []
     func record(_ prompt: String) { prompts.append(prompt) }
+}
+
+/// Переранжировщики говорят на двух языках.
+///
+/// `qwen3-reranker-0.6b` отвечает «yes»/«no». `jina-reranker-v3.5-mlx` на тот
+/// же промпт отвечает баллом в скобках — проверено на живой LM Studio: «[5]»
+/// ближайшему фрагменту, «[2]» отдалённому, «[1]» постороннему. Прежний разбор
+/// знал, что «1» значит «да», и потому ставил посторонние фрагменты первыми:
+/// на стенде это выглядело как «переранжировщик хуже опорного».
+final class CrossEncoderScoreTests: XCTestCase {
+
+    func testABracketedScoreIsRead() {
+        XCTAssertEqual(CrossEncoderReranker.score("[5]"), 5)
+        XCTAssertEqual(CrossEncoderReranker.score("[1]"), 1)
+        XCTAssertEqual(CrossEncoderReranker.score("(3)"), 3)
+        XCTAssertEqual(CrossEncoderReranker.score("\"4\""), 4)
+    }
+
+    /// Самый низкий балл — это «плохо», а не «да».
+    func testTheLowestScoreIsNotAgreement() {
+        let items = ["первый", "второй", "третий"]
+        let order = CrossEncoderReranker.reordered(items, scores: [1, 5, 2])
+        XCTAssertEqual(order, ["второй", "третий", "первый"])
+    }
+
+    /// Модель «да/нет» ведёт себя ровно как прежде: два балла, подошедшие
+    /// впереди, внутри групп прежний порядок.
+    func testAYesNoModelBehavesAsBefore() {
+        let items = ["a", "b", "c", "d"]
+        XCTAssertEqual(
+            CrossEncoderReranker.reordered(items, scores: [0, 1, nil, 1]),
+            ["b", "d", "a", "c"]
+        )
+    }
+
+    /// Непонятый ответ уходит в хвост, но не выбрасывается: «не ответила» —
+    /// не то же, что «сказала нет».
+    func testAnUnreadAnswerGoesLastAndSurvives() {
+        let items = ["a", "b", "c"]
+        let order = CrossEncoderReranker.reordered(items, scores: [nil, 0, 5])
+        XCTAssertEqual(order, ["c", "b", "a"])
+    }
+
+    func testADecimalScoreIsRead() {
+        XCTAssertEqual(CrossEncoderReranker.score("0.87"), 0.87)
+        XCTAssertEqual(CrossEncoderReranker.score("0,87"), 0.87)
+    }
+
+    /// Балл сам по себе ничего не значит: сравниваются только баллы одной
+    /// модели, поэтому шкалу приложение не нормализует и не выдумывает.
+    func testScoresAreComparedOnlyWithinOneAnswerSet() {
+        let items = ["a", "b"]
+        XCTAssertEqual(CrossEncoderReranker.reordered(items, scores: [5, 100]), ["b", "a"])
+        XCTAssertEqual(CrossEncoderReranker.reordered(items, scores: [0.9, 0.1]), ["a", "b"])
+    }
 }

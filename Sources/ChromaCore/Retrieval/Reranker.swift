@@ -431,31 +431,58 @@ public enum CrossEncoderReranker {
         """
     }
 
-    /// Ответ модели как решение. `nil` — ответ не понят: это не «нет», и
-    /// считать его отказом значило бы молча выбросить фрагмент.
-    public static func verdict(_ answer: String) -> Bool? {
-        let trimmed = answer
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard let first = trimmed.split(whereSeparator: { $0.isWhitespace || $0.isPunctuation }).first
-        else { return nil }
-        switch first {
-        case "yes", "да", "true", "1": return true
-        case "no", "нет", "false", "0": return false
-        default: return nil
+    /// Ответ модели как **оценка**: чем больше, тем ближе фрагмент к запросу.
+    ///
+    /// Переранжировщики говорят на двух языках, и это выяснилось дорого
+    ///. `qwen3-reranker-0.6b` отвечает «yes» или «no». А
+    /// `jina-reranker-v3.5-mlx` на тот же промпт отвечает баллом в скобках:
+    /// «[5]» ближайшему фрагменту, «[2]» отдалённому, «[1]» постороннему.
+    ///
+    /// Разбор «да/нет» читал первое слово и знал, что «1» — это «да». Балл
+    /// «[1]» — самый низкий у jina — становился согласием, а «[5]» не
+    /// опознавался вовсе. Стадия не ломалась и не жаловалась: она **переворачивала**
+    /// порядок, ставя посторонние фрагменты первыми. На стенде это выглядело
+    /// как «переранжировщик хуже опорного» — 0.495 против 0.621.
+    ///
+    /// Поэтому решение — число, а не «да/нет»: «yes» это 1, «no» это 0, балл
+    /// это он сам. Модель, отвечающая «1» и «0», получает те же 1 и 0 и ведёт
+    /// себя ровно как прежде, а балльная модель наконец читается правильно.
+    public static func score(_ answer: String) -> Double? {
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let first = trimmed.split(whereSeparator: \.isWhitespace).first else { return nil }
+        // Оправа балла снимается **с краёв**, а не разбиением по знакам:
+        // «[5]», «(5)», «"5"», «NO.» — да, но «0.87» обязано остаться числом,
+        // а не превратиться в ноль. Разбиение по точке ровно это и делало.
+        let bare = first.trimmingCharacters(in: CharacterSet(charactersIn: "[](){}<>\"'«»:;!?.,"))
+        switch bare {
+        case "yes", "да", "true": return 1
+        case "no", "нет", "false": return 0
+        default: break
         }
+        // Балл может быть дробным: «0.87» у моделей с вероятностью.
+        guard let value = Double(bare.replacingOccurrences(of: ",", with: ".")) else { return nil }
+        return value.isFinite ? value : nil
     }
 
-    /// Порядок после переранжирования: подошедшие впереди, и **внутри групп
-    /// прежний порядок сохраняется**.
+
+    /// Порядок после переранжирования: по убыванию балла, **устойчиво**.
     ///
-    /// Ответ «да/нет» не даёт градаций, и выдумывать их нельзя. Значит, всё, что
-    /// эта стадия вправе сделать, — поднять подошедшие над остальными, не трогая
-    /// то, что уже нашли предыдущие стадии.
-    public static func reordered<T>(_ items: [T], verdicts: [Bool?]) -> [T] {
-        let paired = zip(items, verdicts + Array(repeating: nil, count: max(0, items.count - verdicts.count)))
-        let accepted = paired.filter { $0.1 == true }.map(\.0)
-        let rest = paired.filter { $0.1 != true }.map(\.0)
-        return accepted + rest
+    /// Внутри одного балла порядок остаётся прежним — тот, что нашли
+    /// предыдущие стадии. У модели «да/нет» баллов ровно два, и правило
+    /// вырождается в старое: подошедшие впереди, прочие следом, каждая группа
+    /// в своём прежнем порядке.
+    ///
+    /// Непонятый ответ уходит в хвост, но не выбрасывается: «модель не
+    /// ответила» — не то же самое, что «модель сказала нет».
+    public static func reordered<T>(_ items: [T], scores: [Double?]) -> [T] {
+        let filled = scores + Array(repeating: nil, count: max(0, items.count - scores.count))
+        let indexed = Array(zip(items.indices, zip(items, filled)))
+        let scored = indexed.filter { $0.1.1 != nil }
+            .sorted { left, right in
+                let a = left.1.1 ?? 0, b = right.1.1 ?? 0
+                return a == b ? left.0 < right.0 : a > b
+            }
+        let unclear = indexed.filter { $0.1.1 == nil }
+        return (scored + unclear).map(\.1.0)
     }
 }

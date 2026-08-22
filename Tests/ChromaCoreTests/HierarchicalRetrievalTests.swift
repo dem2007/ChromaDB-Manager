@@ -54,6 +54,28 @@ private actor HierarchicalDatabase: RetrievalDatabase {
 
 /// §E1 — children for the hit, parents for the context.
 final class HierarchicalRetrievalTests: XCTestCase {
+    /// Куски без уровня — строки таблиц — обязаны оставаться в поиске.
+    ///
+    /// Уровень пишет только нарезчик текста, а строку таблицы делает разбор
+    /// таблицы. Условие «уровень равен нулю» выбрасывало их целиком: на живой
+    /// коллекции это была треть базы.
+    func testTheChildScopeKeepsChunksThatHaveNoLevelAtAll() throws {
+        let filter = DocumentFilter(conditions: [ChunkLevelScope.children.condition!])
+        let clause = try XCTUnwrap(try filter.whereClause())
+        let level = try XCTUnwrap(clause["chunk_level"] as? [String: Any])
+        XCTAssertNotNil(level["$ne"], "«дочерние» спрашиваются не через $ne: \(level)")
+        XCTAssertNil(level["$eq"], "$eq отвечает только тем, у кого поле есть")
+    }
+
+    /// Форма коллекции решается по **настоящим** детям, иначе «не родитель»
+    /// объявит иерархической любую плоскую коллекцию.
+    func testTheShapeProbeAsksForARealChildLevel() throws {
+        let filter = DocumentFilter(conditions: [ChunkLevelScope.childLevelProbe])
+        let clause = try XCTUnwrap(try filter.whereClause())
+        let level = try XCTUnwrap(clause["chunk_level"] as? [String: Any])
+        XCTAssertEqual(level["$eq"] as? Int, 0)
+    }
+
     private func child(_ id: String, parent: String, text: String, distance: Double) -> (DocumentRecord, QueryHit) {
         let metadata: ChromaMetadata = ["chunk_level": .int(0), "parent_chunk_id": .string(parent)]
         return (
@@ -220,7 +242,9 @@ final class HierarchicalRetrievalTests: XCTestCase {
 
         let filters = await database.filters()
         let clause = try XCTUnwrap(filters.first ?? nil).whereClause()
-        XCTAssertEqual((try clause?["chunk_level"] as? [String: Any])?["$eq"] as? Int, 0)
+        // «Не родитель»: условие обязано пропускать и куски без уровня —
+        // строки таблиц уровня не имеют, а искаться должны.
+        XCTAssertEqual((try clause?["chunk_level"] as? [String: Any])?["$ne"] as? Int, 1)
     }
 
     func testAManualJSONFilterIsLeftExactlyAsWritten() async throws {
@@ -266,7 +290,7 @@ final class HierarchicalRetrievalTests: XCTestCase {
 
     // MARK: - A collection with one level
 
-    func testAFlatCollectionRunsNeitherStageAndIsNotFiltered() async throws {
+    func testAFlatCollectionPromotesNothingAndIsNotFiltered() async throws {
         let hits = (0..<4).map {
             QueryHit(id: "d\($0)", document: "т\($0)", metadata: ["chunk_level": .int(0)], distance: Double($0) / 10)
         }
@@ -279,11 +303,19 @@ final class HierarchicalRetrievalTests: XCTestCase {
         let ran = outcome.diagnostics.stages.filter(\.ran).map(\.stage)
         // Пометки — стадия, включённая у нового профиля: она выполняется
         // всегда и на неразмеченной коллекции ничего не двигает.
-        XCTAssertEqual(ran, [.candidates, .marks, .truncate])
-        for stage in [RetrievalStage.collapse, .promote] {
-            let report = outcome.diagnostics.stages.first { $0.stage == stage }
-            XCTAssertEqual(report?.note, "коллекция нарезана одним уровнем")
-        }
+        // Свёртка на плоской коллекции **выполняется**, но только своей
+        // половиной про дубли: родителей у такой коллекции нет, а одинаковые
+        // тексты есть — 19% на живой базе. Подъём к родителю
+        // по-прежнему пропускается за ненадобностью.
+        XCTAssertEqual(ran, [.candidates, .collapse, .marks, .truncate])
+        XCTAssertEqual(
+            outcome.diagnostics.stages.first { $0.stage == .collapse }?.note,
+            "ни общих родителей, ни повторов текста"
+        )
+        XCTAssertEqual(
+            outcome.diagnostics.stages.first { $0.stage == .promote }?.note,
+            "коллекция нарезана одним уровнем"
+        )
         // No condition on chunk_level: a document written by another client may
         // not have the field at all, and filtering on it would drop it.
         let filters = await database.filters()

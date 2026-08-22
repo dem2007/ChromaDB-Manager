@@ -324,15 +324,39 @@ private actor ErrorCodeDatabase: RetrievalDatabase {
         records.filter { ids.contains($0.id) }
     }
 
-    /// Honours `$contains` the way the server does — on the document text.
+    /// Honours `$contains` **and** `$regex` the way the server does.
+    ///
+    /// Через `whereDocumentClause()`, а не по `textConditions`: стадия отдаёт
+    /// выражение сырым JSON, и двойник, знающий только список условий, молча
+    /// не находил ничего — тест падал так, будто сломан поиск, а сломан был
+    /// двойник.
     func documents(
         collectionID: String, matching filter: DocumentFilter, limit: Int
     ) async throws -> [DocumentRecord] {
-        let terms = filter.textConditions.map(\.text)
+        guard let clause = filter.whereDocumentClause() else { return [] }
         return records.filter { record in
             guard let document = record.document else { return false }
-            return terms.contains { document.contains($0) }
+            return Self.matches(document, clause: clause)
         }
+    }
+
+    /// Тот же разбор, что делает сервер: «содержит», «не содержит»,
+    /// регулярное выражение и связки над ними.
+    static func matches(_ document: String, clause: [String: Any]) -> Bool {
+        if let text = clause["$contains"] as? String { return document.contains(text) }
+        if let text = clause["$not_contains"] as? String { return !document.contains(text) }
+        if let pattern = clause["$regex"] as? String {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { return false }
+            let range = NSRange(document.startIndex..., in: document)
+            return expression.firstMatch(in: document, range: range) != nil
+        }
+        if let parts = clause["$and"] as? [[String: Any]] {
+            return parts.allSatisfy { matches(document, clause: $0) }
+        }
+        if let parts = clause["$or"] as? [[String: Any]] {
+            return parts.contains { matches(document, clause: $0) }
+        }
+        return false
     }
 
     func anyDocument(collectionID: String, matching filter: DocumentFilter) async throws -> Bool { false }

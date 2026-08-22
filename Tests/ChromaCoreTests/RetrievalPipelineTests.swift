@@ -137,9 +137,31 @@ final class RetrievalPipelineTests: XCTestCase {
     /// через `$or`, и текстовая стадия возвращала бы документы, которые его
     /// не выполняют вовсе.
     func testACallersTextConditionSurvivesTheTextStage() async throws {
+        let parts = try await callersConditionParts(usesRegex: false)
+        XCTAssertEqual(parts.count, 2, "условие вызывающего и варианты запроса должны быть двумя частями")
+        XCTAssertEqual(parts.first?["$contains"] as? String, "лицензия")
+        let variants = try XCTUnwrap(parts.last?["$or"] as? [[String: String]])
+        XCTAssertTrue(variants.contains { $0["$contains"] == "запрос" }, "\(variants)")
+        XCTAssertTrue(variants.contains { $0["$contains"] == "Запрос" }, "\(variants)")
+    }
+
+    /// То же правило для второго способа спрашивать: выражение уходит
+    /// сырым JSON, и соблазн дописать его к условиям вызывающего там ровно
+    /// такой же — с той же ценой.
+    func testACallersTextConditionSurvivesTheRegexTextStage() async throws {
+        let parts = try await callersConditionParts(usesRegex: true)
+        XCTAssertEqual(parts.count, 2, "условие вызывающего и выражение должны быть двумя частями")
+        XCTAssertEqual(parts.first?["$contains"] as? String, "лицензия")
+        let pattern = try XCTUnwrap(parts.last?["$regex"] as? String)
+        XCTAssertTrue(pattern.hasPrefix("(?i)"), pattern)
+        XCTAssertTrue(pattern.contains("запрос"), pattern)
+    }
+
+    private func callersConditionParts(usesRegex: Bool) async throws -> [[String: Any]] {
         let database = FakeRetrievalDatabase(hits: hits(3))
         var profile = SearchProfile(collectionName: "заметки")
         profile.textSearchEnabled = true
+        profile.textSearchUsesRegex = usesRegex
 
         var filter = DocumentFilter()
         filter.textConditions = [DocumentTextCondition(op: .contains, text: "лицензия")]
@@ -148,12 +170,7 @@ final class RetrievalPipelineTests: XCTestCase {
 
         let asked = await database.textStageFilters()
         let clause = try XCTUnwrap(asked.first?.whereDocumentClause())
-        let parts = try XCTUnwrap(clause["$and"] as? [[String: Any]])
-        XCTAssertEqual(parts.count, 2, "условие вызывающего и варианты запроса должны быть двумя частями")
-        XCTAssertEqual(parts.first?["$contains"] as? String, "лицензия")
-        let variants = try XCTUnwrap(parts.last?["$or"] as? [[String: String]])
-        XCTAssertTrue(variants.contains { $0["$contains"] == "запрос" }, "\(variants)")
-        XCTAssertTrue(variants.contains { $0["$contains"] == "Запрос" }, "\(variants)")
+        return try XCTUnwrap(clause["$and"] as? [[String: Any]])
     }
 
     // MARK: - Bounds
@@ -180,6 +197,17 @@ final class RetrievalPipelineTests: XCTestCase {
 
     // MARK: - Diagnostics
 
+    /// Предел один на всё приложение. Взят замером: на сотне
+    /// результатов первая пятёрка та же, что на пятёрке, а векторный поиск
+    /// стоит 153 мс против 3 мс.
+    func testThePipelineClampsToTheSharedLimit() async throws {
+        let database = FakeRetrievalDatabase(hits: hits(200))
+        let pipeline = RetrievalPipeline(database: database, embed: { _ in [1] })
+        _ = try await pipeline.run(request(nResults: 5000), profile: SearchProfile(collectionName: "заметки"))
+        let asked = await database.asked()
+        XCTAssertEqual(asked, [RetrievalLimits.maximumResults])
+    }
+
     func testEveryStageIsReportedInOrderIncludingTheOnesThatDidNotRun() async throws {
         let database = FakeRetrievalDatabase(hits: hits(5))
         let pipeline = RetrievalPipeline(database: database, embed: { _ in [1] })
@@ -188,7 +216,9 @@ final class RetrievalPipelineTests: XCTestCase {
         let stages = outcome.diagnostics.stages
 
         XCTAssertEqual(stages.map(\.stage), RetrievalStage.allCases.sorted { $0.order < $1.order })
-        XCTAssertEqual(stages.filter(\.ran).map(\.stage), [.candidates, .marks, .truncate])
+        // Свёртка выполняется и на плоской коллекции: её половина про дубли
+        // нужна как раз там, где родителей нет.
+        XCTAssertEqual(stages.filter(\.ran).map(\.stage), [.candidates, .collapse, .marks, .truncate])
         // A stage that is absent from the report is indistinguishable from one
         // that ran and changed nothing.
         for report in stages where !report.ran {
@@ -378,4 +408,110 @@ final class SearchProfilePoolTests: XCTestCase {
         let profile = SearchProfile(collectionName: "заметки", minimumCandidates: 20)
         XCTAssertGreaterThanOrEqual(profile.poolSize(nResults: 50, stages: [.collapse]), 50)
     }
+}
+
+/// Один и тот же текст — один результат.
+///
+/// Замер на рабочей коллекции: 1106 дублей из 5765 чанков (19%), в верхушку
+/// доходят 2.2% мест, и в семи ячейках из 195 один и тот же абзац показан
+/// дважды. Свёртка по родителю этого не ловит: копии приходят из разных
+/// файлов, общего родителя у них нет, а на плоской коллекции нет и родителей.
+final class IdenticalTextCollapseTests: XCTestCase {
+
+    func testTheSameTextIsShownOnce() {
+        let hits = [
+            RetrievalHit(id: "a", document: "Наименование статьи расходов: Прибыль", metadata: nil, distance: 0.1),
+            RetrievalHit(id: "b", document: "другой текст", metadata: nil, distance: 0.2),
+            RetrievalHit(id: "c", document: "Наименование статьи расходов: Прибыль", metadata: nil, distance: 0.3),
+        ]
+        XCTAssertEqual(RetrievalPipeline.collapsingIdenticalText(hits).map(\.id), ["a", "b"])
+    }
+
+    /// Копии отличаются пробелами чаще, чем буквами: перенос строки в одном
+    /// файле и пробел в другом — тот же текст для читателя.
+    func testWhitespaceDoesNotMakeItANewText() {
+        let hits = [
+            RetrievalHit(id: "a", document: "Строка  текста\nвторая", metadata: nil, distance: 0.1),
+            RetrievalHit(id: "b", document: "Строка текста второая", metadata: nil, distance: 0.2),
+            RetrievalHit(id: "c", document: "Строка текста\n\nвторая", metadata: nil, distance: 0.3),
+        ]
+        XCTAssertEqual(RetrievalPipeline.collapsingIdenticalText(hits).map(\.id), ["a", "b"])
+    }
+
+    /// Первый остаётся: он ближе по расстоянию, и это уже решили стадии до.
+    func testTheBetterRankedCopySurvives() {
+        let hits = [
+            RetrievalHit(id: "далёкий", document: "повтор", metadata: nil, distance: 0.9),
+            RetrievalHit(id: "близкий", document: "повтор", metadata: nil, distance: 0.1),
+        ]
+        XCTAssertEqual(RetrievalPipeline.collapsingIdenticalText(hits).map(\.id), ["далёкий"])
+    }
+
+    /// Строки таблицы с одинаковой подписью — разные ответы, а не копии
+    ///: весь их смысл в колонках, а в тексте одна подпись.
+    ///
+    /// Живой случай: двадцать четыре строки «Наименование статьи расходов:
+    /// Трудозатраты (чел-мес)» с числами от 8.3 до 506.5 сворачивались в одну.
+    func testTableRowsWithTheSameLabelAreNotCopies() {
+        let hits = (1...3).map { number in
+            RetrievalHit(
+                id: "строка\(number)",
+                document: "Наименование статьи расходов: Трудозатраты (чел-мес)",
+                metadata: ["row_number": .int(number), "2026": .double(Double(number) * 10)],
+                distance: 0.1 * Double(number)
+            )
+        }
+        XCTAssertEqual(
+            RetrievalPipeline.collapsingIdenticalText(hits).map(\.id),
+            ["строка1", "строка2", "строка3"]
+        )
+    }
+
+    /// Обычный текст свёртки не теряет: правило про строки таблиц не должно
+    /// отменять саму стадию.
+    func testProseIsStillCollapsedWhenTableRowsAreAround() {
+        let hits = [
+            RetrievalHit(id: "строка", document: "подпись", metadata: ["row_number": .int(1)], distance: 0.1),
+            RetrievalHit(id: "проза1", document: "один и тот же абзац", metadata: nil, distance: 0.2),
+            RetrievalHit(id: "проза2", document: "один и тот же абзац", metadata: nil, distance: 0.3),
+        ]
+        XCTAssertEqual(
+            RetrievalPipeline.collapsingIdenticalText(hits).map(\.id), ["строка", "проза1"]
+        )
+    }
+
+    /// Результат без текста дублем не считается: сравнивать нечем, а
+    /// выбрасывать его эта стадия не нанималась.
+    func testResultsWithoutTextAreKept() {
+        let hits = [
+            RetrievalHit(id: "a", document: nil, metadata: nil, distance: 0.1),
+            RetrievalHit(id: "b", document: "", metadata: nil, distance: 0.2),
+            RetrievalHit(id: "c", document: nil, metadata: nil, distance: 0.3),
+        ]
+        XCTAssertEqual(RetrievalPipeline.collapsingIdenticalText(hits).count, 3)
+    }
+}
+
+/// Один предел на приложение, а не три несовпадающих.
+///
+/// Было: ползунок экрана поиска до 50, конвейер обрезает по 100, ключу агента
+/// можно выписать 500 — и он молча получает сотню.
+final class OneResultLimitTests: XCTestCase {
+
+    /// Потолок ключа не обещает больше, чем отдаст конвейер.
+    func testAClientCeilingCannotPromiseMoreThanThePipelineGives() {
+        let generous = MCPOutputLimits(ceiling: 500)
+        XCTAssertEqual(generous.ceiling, RetrievalLimits.maximumResults)
+        // Меньше — можно: право ключа ограничивает, а не расширяет.
+        XCTAssertEqual(MCPOutputLimits(ceiling: 10).ceiling, 10)
+    }
+
+    /// И об урезании сказано вслух — молча отдать меньше запрошенного нельзя.
+    func testTheAnswerSaysTheRequestWasTrimmed() {
+        let limits = MCPOutputLimits(ceiling: 10)
+        let (count, note) = limits.resolved(requested: 40)
+        XCTAssertEqual(count, 10)
+        XCTAssertNotNil(note, "агент решит, что в коллекции больше ничего нет")
+    }
+
 }

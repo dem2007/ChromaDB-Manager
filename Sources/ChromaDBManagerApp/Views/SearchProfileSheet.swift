@@ -39,6 +39,7 @@ struct SearchProfileSheet: View {
             width: 720,
             height: 620
         ) {
+            unknownSettingsWarning
             identity
             candidates
             sources
@@ -56,6 +57,31 @@ struct SearchProfileSheet: View {
     }
 
     // MARK: - Sections
+
+    /// Настройки из файла, которых эта сборка не знает.
+    ///
+    /// Первой карточкой и оранжевым: это не тонкость настройки, а причина,
+    /// по которой профиль ведёт себя не так, как написано в файле. Живой
+    /// случай — прогон стенда с порогом текстовой стадии на сборке, где
+    /// порога ещё не было: четыре варианта дали числа опорного до третьего
+    /// знака, и объяснения этому на экране не было никакого.
+    @ViewBuilder
+    private var unknownSettingsWarning: some View {
+        if !profile.unknownSettings.isEmpty {
+            SectionCard(title: String(localized: "Настройки, которых эта сборка не знает")) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(profile.unknownSettings.joined(separator: ", "))
+                        .font(Theme.Font.mono)
+                        .foregroundStyle(Theme.Palette.attention)
+                        .textSelection(.enabled)
+                    Text(String(localized: "Они записаны в файле профилей, но в поиске не участвуют — и пропадут, как только вы нажмёте «Сохранить». Обычно это значит, что профиль правила сборка поновее: обновите приложение, прежде чем полагаться на эти настройки."))
+                        .font(Theme.Font.caption)
+                        .foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
 
     private var identity: some View {
         SectionCard(title: String(localized: "Имя")) {
@@ -178,13 +204,45 @@ struct SearchProfileSheet: View {
                     }
                     Toggle(String(localized: "Разбивать запрос на слова"), isOn: $profile.splitQueryIntoWords)
                         .toggleStyle(.checkbox)
-                    Text(String(localized: "Разбиение ищет слова через $or. Поддержка проверена на установленной версии сервера; целиком — надёжнее и по умолчанию."))
+                    Text(String(localized: "Разбиение ищет каждое слово отдельно — через $or или перечисление в выражении, смотря что выбрано ниже. Поддержка проверена на установленной версии сервера; целиком — надёжнее и по умолчанию."))
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    textSearchLengthField
+                    Divider().padding(.vertical, 2)
+                    Toggle(String(localized: "Спрашивать одним регулярным выражением"),
+                           isOn: $profile.textSearchUsesRegex)
+                        .toggleStyle(.checkbox)
+                    Text(String(localized: "Иначе каждое слово спрашивается несколькими написаниями через $or — на запросе из четырёх слов это двенадцать подстрочных условий и пять секунд против шестисот миллисекунд у выражения. Выражение к тому же не путает «ё» с «е» и не считает «характеристики» вхождением слова «рис»."))
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Divider()
                 queryPrefixField
             }
+        }
+    }
+
+    /// Порог длины запроса для текстовой стадии.
+    ///
+    /// Пустое поле значит «без порога» — так вело себя приложение всегда, и
+    /// молча менять это на число нельзя. Подпись говорит не про настройку,
+    /// а про следствие: на аббревиатуре без текстового поиска не находится
+    /// ничего, на длинном вопросе он приносит мусор.
+    private var textSearchLengthField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(String(localized: "Только для запросов не длиннее")).font(Theme.Font.caption)
+                TextField(
+                    String(localized: "без порога"),
+                    value: $profile.textSearchMaxWords,
+                    format: .number
+                )
+                .textFieldStyle(.roundedBorder).frame(width: 70)
+                Text(String(localized: "слов")).font(Theme.Font.caption)
+            }
+            Text(String(localized: "Пусто — текстовый поиск работает на любом запросе. На замерах разработчика лучшим порогом оказались пять слов: аббревиатуру «СМЭВ» без текстового поиска не находит вовсе, а длинный вопрос он засоряет. Число подобрано на своём наборе — проверьте на своём."))
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

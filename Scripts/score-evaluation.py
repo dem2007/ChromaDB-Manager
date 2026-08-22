@@ -71,18 +71,77 @@ def query_set(run: dict) -> dict:
     return {"queries": []}
 
 
+def names(run: dict) -> dict:
+    """Имя варианта — такое, чтобы два варианта нельзя было перепутать.
+
+    Один и тот же профиль часто гоняется по двум коллекциям: «нарезка» — это
+    как раз такой опыт. В отчёте оба варианта звались одинаково, и две строки
+    сводки отличались только числами — прочитать, какая из них чья, было
+    нельзя. Коллекция дописывается **только** к повторяющимся именам: у
+    остальных она в имени лишняя.
+    """
+    plain = {}
+    for variant in run.get("variants", []):
+        plain[variant["id"]] = variant.get("profile", {}).get("name") or variant.get("name", "—")
+    seen = {}
+    for name in plain.values():
+        seen[name] = seen.get(name, 0) + 1
+    result = {}
+    for variant in run.get("variants", []):
+        name = plain[variant["id"]]
+        if seen[name] > 1:
+            collection = variant.get("profile", {}).get("collectionName", "")
+            name = f"{name} · {collection}" if collection else name
+        result[variant["id"]] = name
+    return result
+
+
+def pairwise(titles: dict, variants: dict, ranks: dict, base_id: str) -> None:
+    """Счёт по запросам: сколько улучшилось, сколько ухудшилось.
+
+    Среднее на восемнадцати запросах двигает **один** запрос, съехавший с
+    первого места на второе: разница в 0.04 MRR и есть такой запрос. Поэтому
+    после сводки всегда смотрится счёт — рычаг, который поднял четыре запроса
+    и уронил один, и рычаг, который поднял один, дают одинаковое среднее и
+    разные основания ему верить.
+    """
+    print(f"\nСчёт по запросам против «{variants[base_id]}»")
+    for variant_id, name in variants.items():
+        if variant_id == base_id:
+            continue
+        better, worse, same = [], [], 0
+        for query_id in titles:
+            was = ranks.get((query_id, base_id))
+            now = ranks.get((query_id, variant_id))
+            if was is None and now is None:
+                continue
+            if (now or 0) > (was or 0):
+                better.append(query_id)
+            elif (now or 0) < (was or 0):
+                worse.append(query_id)
+            else:
+                same += 1
+        print(f"   {name}: лучше {len(better)}, хуже {len(worse)}, без изменений {same}")
+        for query_id in better:
+            print(f"      ↑ {titles[query_id][:64]}")
+        for query_id in worse:
+            print(f"      ↓ {titles[query_id][:64]}")
+
+
 def report(path: Path) -> None:
     run = json.loads(path.read_text(encoding="utf-8"))
     marks = {
+        # Отметка с незнакомой градацией отбрасывается, а не роняет разбор:
+        # иначе один странный фрагмент уносит с собой весь отчёт по прогону.
         query["id"]: [
             (normalised(f["fragment"]), f.get("grade"))
-            for f in query.get("fragments", []) if f.get("fragment")
+            for f in query.get("fragments", [])
+            if f.get("fragment") and f.get("grade") in STRENGTH
         ]
         for query in query_set(run).get("queries", [])
     }
     titles = {q["id"]: q.get("text", "") for q in run.get("queries", [])}
-    variants = {v["id"]: v.get("profile", {}).get("name") or v.get("name", "—")
-                for v in run.get("variants", [])}
+    variants = names(run)
 
     def grade(text: str, query_id: str) -> str | None:
         document = normalised(text)
@@ -118,29 +177,54 @@ def report(path: Path) -> None:
 
     print(f"{'вариант':<{width}} {'MRR(Р)':>7} {'hit@1':>6} {'hit@3':>6} "
           f"{'мусор@3':>8} {'коротких@5':>11} {'не размечено':>13}")
+    # Запрос, у которого весь эталон помечен «нерелевантен», — это вопрос,
+    # ответа на который в базе нет. Такие заводятся нарочно: они проверяют,
+    # умеет ли поиск отдать пустоту вместо правдоподобной ерунды. Попадание на
+    # них невозможно по построению, и считать их промахом значило бы наказывать
+    # поиск за разметку — приложение их из MRR и hit@k исключает, и здесь то же
+    # правило. В «мусоре@3» они, наоборот, самое ценное, поэтому он по всем.
+    answerable = {
+        query_id for query_id, fragments in marks.items()
+        if any(grade != "irrelevant" for _, grade in fragments)
+    }
+    # Вклад каждого запроса — он же и есть материал для счёта «лучше/хуже».
+    ranks: dict = {}
     for variant_id, name in variants.items():
-        counted = mrr = hit1 = hit3 = junk = short = unknown = 0
+        counted = scored = mrr = hit1 = hit3 = junk = short = unknown = 0
         for query_id in titles:
             if not marks.get(query_id):
                 continue  # запрос без единой отметки в счёт не идёт
             grades = rows.get((query_id, variant_id), [])
             counted += 1
-            first = next((i + 1 for i, g in enumerate(grades) if g == "relevant"), None)
-            mrr += 1 / first if first else 0
-            hit1 += 1 if grades[:1] and grades[0] in ("relevant", "partial") else 0
-            hit3 += 1 if any(g in ("relevant", "partial") for g in grades[:3]) else 0
             junk += sum(1 for g in grades[:3] if g == "irrelevant")
             short += sum(1 for length in lengths.get((query_id, variant_id), [])[:5] if length < SHORT)
             unknown += sum(1 for g in grades if g is None)
+            if query_id not in answerable:
+                continue
+            scored += 1
+            first = next((i + 1 for i, g in enumerate(grades) if g == "relevant"), None)
+            ranks[(query_id, variant_id)] = 1 / first if first else 0
+            mrr += 1 / first if first else 0
+            hit1 += 1 if grades[:1] and grades[0] in ("relevant", "partial") else 0
+            hit3 += 1 if any(g in ("relevant", "partial") for g in grades[:3]) else 0
         if counted == 0:
             print(f"{name:<{width}}  — ни один запрос не размечен")
             continue
-        print(f"{name:<{width}} {mrr / counted:7.3f} {hit1 / counted:6.2f} {hit3 / counted:6.2f} "
+        if scored == 0:
+            print(f"{name:<{width}}  — ни у одного запроса нет релевантного эталона")
+            continue
+        print(f"{name:<{width}} {mrr / scored:7.3f} {hit1 / scored:6.2f} {hit3 / scored:6.2f} "
               f"{junk / counted:8.2f} {short / counted:11.2f} {unknown / counted:13.1f}")
+
+    if len(variants) > 1:
+        pairwise(titles, variants, ranks, next(iter(variants)))
 
     unmarked = [titles[q] for q in titles if not marks.get(q)]
     if unmarked:
         print(f"\nбез единой отметки и потому вне счёта: {', '.join(unmarked)}")
+    noanswer = [titles[q] for q in titles if marks.get(q) and q not in answerable]
+    if noanswer:
+        print(f"\nответа в базе нет — вне MRR и hit@k, но в «мусоре@3»: {', '.join(noanswer)}")
     print("\nСовпали ли списки двух вариантов до последнего идентификатора — "
           "значит мера не сработала, а не «не помогла» (docs/EVALUATION.md, раздел 6).")
 

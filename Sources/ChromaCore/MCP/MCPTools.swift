@@ -166,17 +166,29 @@ public struct MCPCollectionDescription: Sendable, Hashable {
     /// окажется, во втором кто-то её завёл и оставил пустой.
     public let hasSchema: Bool
     public let allowsExtraFields: Bool
+    /// Поля, которые в выборку попали, но в описание не поместились —
+    /// **одними именами**, без примеров.
+    ///
+    /// Имя стоит десяток знаков, а примеры — сотни, и режется ради контекста
+    /// модели именно второе. Само имя агенту нужнее всего: без него он не
+    /// составит фильтр, а с ним — спросит примеры отдельным вызовом. Молчать
+    /// же нельзя: колонки таблиц («стоимость_тыс_руб», «итого») отрезались
+    /// первыми, потому что кириллица сортируется после латиницы, и агент
+    /// не мог узнать, что цены вообще есть в метаданных.
+    public let otherFields: [String]
 
     public init(
         summary: MCPCollectionSummary,
         fields: [MCPFieldDescription],
         hasSchema: Bool,
-        allowsExtraFields: Bool
+        allowsExtraFields: Bool,
+        otherFields: [String] = []
     ) {
         self.summary = summary
         self.fields = fields
         self.hasSchema = hasSchema
         self.allowsExtraFields = allowsExtraFields
+        self.otherFields = otherFields
     }
 
     public var json: JSONValue {
@@ -185,7 +197,8 @@ public struct MCPCollectionDescription: Sendable, Hashable {
             "hasSchema": .bool(hasSchema),
             "allowsExtraFields": .bool(allowsExtraFields),
             "fields": .array(fields.map(\.json)),
-        ])
+        ]
+        .merging(otherFields.isEmpty ? [:] : ["otherFields": .array(otherFields.map(JSONValue.string))]) { a, _ in a })
     }
 }
 
@@ -481,7 +494,15 @@ public enum MCPToolCatalogue {
         встречаются. Применяй перед тем, как задавать фильтр в поиске: без \
         этого фильтр строится наугад и чаще всего возвращает пустую выдачу. \
         Если у коллекции нет схемы, поля всё равно перечислены — по тому, что \
-        реально записано в документах.
+        реально записано в документах. \
+        **Колонки таблиц — тоже поля.** Строка таблицы попадает в базу \
+        отдельным документом, а её колонки становятся полями метаданных с \
+        именами из шапки: «стоимость_тыс_руб», «итого», «2026». По ним можно \
+        фильтровать и сравнивать числа — так берут все цены одного товара из \
+        десятков файлов, не читая их текст. \
+        Поля, не поместившиеся в описание, перечислены **одними именами** в \
+        «otherFields»: имя — это всё, что нужно для фильтра, а примеры \
+        значений по нему можно взять отдельным вызовом get_documents.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -551,6 +572,23 @@ public enum MCPToolCatalogue {
         """),
     ])
 
+    /// Проекция метаданных: какие поля попадут в ответ.
+    private static let fieldsProperty = JSONValue.object([
+        "type": .string("array"),
+        "items": .object(["type": .string("string")]),
+        "description": .string("""
+        Какие поля метаданных вернуть. Не задано — вернутся все. \
+        Задавай, когда в выдаче строки таблиц: строка тащит в ответ **все свои \
+        колонки**, и бюджет ответа уходит на те, к вопросу не относящиеся. \
+        Замер на живой базе: у ста самых широких строк метаданных 1883 знака \
+        на строку, и в один ответ помещалось восемь строк; с проекцией из \
+        четырёх полей — 94 знака и пятьдесят шесть строк. \
+        Имена — точно как в describe_collection; поле, которого не оказалось \
+        ни у одного документа, названо в ответе. На отбор документов это \
+        не влияет: фильтр работает по всем полям, показываются названные.
+        """),
+    ])
+
     public static let search = MCPToolDefinition(
         name: "search",
         title: "Поиск по смыслу",
@@ -609,6 +647,7 @@ public enum MCPToolCatalogue {
                 "filter": filterProperty,
                 "file_types": fileTypesProperty,
                 "contains": containsProperty,
+                "fields": fieldsProperty,
             ]),
             "required": .array([.string("query")]),
             "additionalProperties": .bool(false),
@@ -668,6 +707,7 @@ public enum MCPToolCatalogue {
                     "minimum": .int(0),
                     "description": .string("Сколько документов пропустить — для листания страницами."),
                 ]),
+                "fields": fieldsProperty,
             ]),
             "required": .array([.string("collection")]),
             "additionalProperties": .bool(false),
@@ -742,6 +782,7 @@ public enum MCPToolCatalogue {
                     "minimum": .int(0),
                     "description": .string("С какого по счёту чанка продолжать — число из предыдущего ответа."),
                 ]),
+                "fields": fieldsProperty,
             ]),
             // Обязательна только коллекция: файл называют либо отпечатком,
             // либо путём, и требовать оба значит требовать невозможного.
@@ -869,20 +910,101 @@ public enum MCPToolCatalogue {
         permission: .delete
     )
 
+    /// «Собери по теме»: все места, где встречается слово, по файлам.
+    public static let collectMentions = MCPToolDefinition(
+        name: "collect_mentions",
+        title: "Все упоминания по файлам",
+        description: """
+        Собирает **все** места, где встречается слово, и раскладывает их \
+        по файлам: у каждого файла сказано, сколько в нём совпадений, \
+        и показан образец текста. Это инструмент полного охвата — «покажи все \
+        документы, где описана приёмка работ», «во всех ли ТЗ есть требования \
+        к резервному копированию». Поиск по смыслу на такой вопрос не отвечает: \
+        замер на живой базе — по теме «резервное копирование» search приносил \
+        куски трёх файлов из тринадцати при любом числе результатов, потому что \
+        близость возвращает соседние куски одних и тех же документов. \
+        Слово задаётся основой без окончания: «приемк» найдёт и «приемка», \
+        и «приемки». Регистр учитывать не нужно, но сравнение буквальное — \
+        синонимов инструмент не подбирает, для этого есть search. \
+        Файлы идут от самого частого к редкому и листаются параметром offset; \
+        в ответе сказано, сколько файлов показано из скольких.
+        """,
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object([
+                    "type": .string("string"),
+                    "description": .string("Имя коллекции из list_collections."),
+                ]),
+                "contains": .object([
+                    "type": .string("string"),
+                    "description": .string("""
+                    Слово или его основа без окончания: «приемк», «резервн». \
+                    Проверяются обычные варианты написания, но сравнение \
+                    буквальное — берётся то, что действительно есть в текстах.
+                    """),
+                ]),
+                "filter": filterProperty,
+                "file_types": fileTypesProperty,
+                "fields": fieldsProperty,
+                "per_file": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "description": .string("""
+                    Сколько образцов текста показать с каждого файла. \
+                    По умолчанию 1: задача обычно в том, чтобы сравнить \
+                    формулировки между документами, а не вычитать один. \
+                    Больше трёх не отдаётся.
+                    """),
+                ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "description": .string("""
+                    Сколько **файлов** показать за раз. По умолчанию 5, потолок \
+                    задан правами ключа. Считаются здесь файлы, а не куски.
+                    """),
+                ]),
+                "offset": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(0),
+                    "description": .string("Сколько файлов пропустить — для листания страницами."),
+                ]),
+            ]),
+            "required": .array([.string("collection"), .string("contains")]),
+            "additionalProperties": .bool(false),
+        ]),
+        outputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object(["type": .string("string")]),
+                "contains": .object(["type": .string("string")]),
+                "files": .object(["type": .string("array")]),
+                "documents": .object(["type": .string("array")]),
+                "totalMatches": .object(["type": .string("integer")]),
+                "totalFiles": .object(["type": .string("integer")]),
+                "hasMore": .object(["type": .string("boolean")]),
+            ]),
+            "required": .array([.string("collection"), .string("files")]),
+        ]),
+        permission: .read
+    )
+
     /// Все инструменты сервера в постоянном порядке.
     ///
     /// Порядок именно постоянный, а не «какой получится»: спецификация просит
     /// детерминированный список, потому что на нём клиент строит кэш, а модель
     /// — свой контекст.
     public static let all: [MCPToolDefinition] = [
-        listCollections, describeCollection, search, getDocuments, getFile, addDocuments, deleteDocuments,
+        listCollections, describeCollection, search, getDocuments, getFile, collectMentions,
+        addDocuments, deleteDocuments,
     ]
 
     /// Инструменты, которым коллекция обязательна. Список, а не флаг у
     /// определения: он же и отвечает на вопрос «по чему проверять whitelist».
     public static let collectionRequired: Set<String> = [
         describeCollection.name, search.name, getDocuments.name, getFile.name,
-        addDocuments.name, deleteDocuments.name,
+        collectMentions.name, addDocuments.name, deleteDocuments.name,
     ]
 
     /// Инструменты, доступные ключу с такими правами.
@@ -1178,6 +1300,12 @@ public struct MCPToolService: Sendable {
                 case .success(let parsed):
                     return answered(try await file(parsed, limits: limits).result)
                 }
+            case MCPToolCatalogue.collectMentions.name:
+                switch Self.mentionsRequest(collection ?? "", arguments, limits: limits) {
+                case .failure(let error): return refused(error)
+                case .success(let parsed):
+                    return answered(try await mentions(parsed, limits: limits).result)
+                }
             case MCPToolCatalogue.addDocuments.name:
                 guard let writing else {
                     return refused(.invalidParams("Не переданы документы: параметр «documents» обязателен."))
@@ -1268,10 +1396,29 @@ public struct MCPToolService: Sendable {
     private struct ParsedSearch {
         let request: MCPSearchRequest
         let limitNote: String?
+        /// Проекция метаданных. Забота выдачи, а не базы: в запрос
+        /// к ChromaDB она не уходит — предупреждения о плоской таблице и
+        /// отпечаток файла читаются из полных метаданных.
+        let fields: [String]?
     }
 
     private struct ParsedDocuments {
         let request: MCPDocumentsRequest
+        let limitNote: String?
+        let fields: [String]?
+    }
+
+    /// Разобранный «собери по теме».
+    private struct ParsedMentions {
+        let collection: String
+        let contains: String
+        let filter: DocumentFilter
+        /// Сколько **файлов** показать за раз: результат этого инструмента —
+        /// файл, а не кусок.
+        let files: Int
+        let offset: Int
+        let perFile: Int
+        let fields: [String]?
         let limitNote: String?
     }
 
@@ -1282,6 +1429,7 @@ public struct MCPToolService: Sendable {
         let fingerprint: String?
         let request: MCPDocumentsRequest
         let limitNote: String?
+        let fields: [String]?
     }
 
     /// Имена параметров, которыми агент попытался бы передать вектор.
@@ -1361,6 +1509,29 @@ public struct MCPToolService: Sendable {
         }
 
         return .success(used ? filter : nil)
+    }
+
+    /// Какие поля метаданных вернуть.
+    ///
+    /// Пустой список — это не «не возвращать ничего», а «не сказано»: тем же
+    /// правилом живёт `contains`, и агенту, приславшему пустой массив,
+    /// логичнее получить обычный ответ, чем документы без единого поля.
+    static func metadataFields(_ arguments: JSONValue?) -> Result<[String]?, JSONRPCError> {
+        guard let raw = arguments?["fields"], raw != .null else { return .success(nil) }
+        guard let array = raw.arrayValue else {
+            return .failure(.invalidParams("Параметр «fields» должен быть списком имён полей."))
+        }
+        var names: [String] = []
+        for value in array {
+            guard let name = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty
+            else {
+                return .failure(.invalidParams("В «fields» должны быть непустые имена полей метаданных."))
+            }
+            // Повтор поля — не ошибка, но и не повод показывать его дважды.
+            if !names.contains(name) { names.append(name) }
+        }
+        return .success(names.isEmpty ? nil : names)
     }
 
     /// Та же сборка фильтра, доступная тестам: складывание условий по «и»
@@ -1445,6 +1616,12 @@ public struct MCPToolService: Sendable {
         }
         let resolved = limits.resolved(requested: requested)
 
+        let fields: [String]?
+        switch metadataFields(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): fields = value
+        }
+
         switch filter(arguments) {
         case .failure(let error):
             return .failure(error)
@@ -1455,7 +1632,8 @@ public struct MCPToolService: Sendable {
                     nResults: resolved.count, filter: filter,
                     smartSearch: smartSearch
                 ),
-                limitNote: Self.joined(collections.note, resolved.note)
+                limitNote: Self.joined(collections.note, resolved.note),
+                fields: fields
             ))
         }
     }
@@ -1495,6 +1673,12 @@ public struct MCPToolService: Sendable {
         case .success(let value): offset = max(0, value ?? 0)
         }
 
+        let fields: [String]?
+        switch metadataFields(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): fields = value
+        }
+
         switch filter(arguments) {
         case .failure(let error):
             return .failure(error)
@@ -1507,7 +1691,88 @@ public struct MCPToolService: Sendable {
                     limit: resolved.count,
                     offset: ids.isEmpty ? offset : 0
                 ),
-                limitNote: note
+                limitNote: note,
+                fields: fields
+            ))
+        }
+    }
+
+    /// Сколько совпадений приложение готово собрать за один вызов.
+    ///
+    /// Двадцать тысяч — столько же, сколько у `get_file`, и по той же
+    /// причине: охват требует **всех** совпадений, а не первых попавшихся.
+    /// Замер: обход коллекции в 5765 кусков стоит около полутора секунд
+    /// независимо от того, сколько кусков подошло, — цена в самом обходе.
+    static let mentionsScanLimit = 20_000
+
+    /// Больше трёх образцов с файла не отдаётся: задача — сравнить
+    /// формулировки между документами, а не вычитать один документ.
+    static let mentionsMaximumPerFile = 3
+
+    private static func mentionsRequest(
+        _ collection: String, _ arguments: JSONValue?, limits: MCPOutputLimits
+    ) -> Result<ParsedMentions, JSONRPCError> {
+        // Тип и отсутствие — разные беды, и путать их в сообщении нельзя:
+        // «не сказано, что искать» в ответ на число сбивает с толку сильнее,
+        // чем молчание.
+        let missingWord = JSONRPCError.invalidParams(
+            "Не сказано, что искать: параметр «contains» обязателен. Слово задаётся основой без окончания — «приемк»."
+        )
+        guard let raw = arguments?["contains"], raw != .null else { return .failure(missingWord) }
+        guard let text = raw.stringValue else {
+            return .failure(.invalidParams("Параметр «contains» должен быть строкой."))
+        }
+        let contains = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !contains.isEmpty else { return .failure(missingWord) }
+
+        let requested: Int?
+        switch integer(arguments, "limit") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): requested = value
+        }
+        let resolved = limits.resolved(requested: requested)
+
+        let offset: Int
+        switch integer(arguments, "offset") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): offset = max(0, value ?? 0)
+        }
+
+        // Урезание называется вслух (правило 3 приложения 5): иначе агент
+        // попросил девять образцов, получил три и решил, что больше в файле
+        // ничего нет.
+        var perFile = 1
+        var perFileNote: String?
+        switch integer(arguments, "per_file") {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            let asked = max(1, value ?? 1)
+            perFile = min(mentionsMaximumPerFile, asked)
+            if asked > perFile {
+                perFileNote = String(
+                    localized: "Запрошено образцов с файла: \(asked.plainDigits), отдано \(perFile.plainDigits) — это предел инструмента. Все совпадения одного файла — get_file или get_documents с contains."
+                )
+            }
+        }
+
+        let fields: [String]?
+        switch metadataFields(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): fields = value
+        }
+
+        // Условие собирается тем же кодом, что и у остальных инструментов:
+        // вторая сборка «того же самого» — это второй набор ошибок.
+        switch filter(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let base):
+            // Условие по тексту уже собрано общим кодом: «contains» здесь
+            // обязателен, поэтому фильтр не может оказаться пустым.
+            let filter = base ?? DocumentFilter()
+            return .success(ParsedMentions(
+                collection: collection, contains: contains, filter: filter,
+                files: resolved.count, offset: offset, perFile: perFile,
+                fields: fields, limitNote: Self.joined(resolved.note, perFileNote)
             ))
         }
     }
@@ -1545,6 +1810,12 @@ public struct MCPToolService: Sendable {
         case .success(let value): offset = max(0, value ?? 0)
         }
 
+        let fields: [String]?
+        switch metadataFields(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): fields = value
+        }
+
         return .success(ParsedFile(
             path: path ?? "",
             fingerprint: fingerprint,
@@ -1553,7 +1824,8 @@ public struct MCPToolService: Sendable {
                 filter: fingerprint.map { fingerprintFilter($0) } ?? fileFilter(path ?? ""),
                 limit: resolved.count, offset: offset, orderedByChunkIndex: true
             ),
-            limitNote: resolved.note
+            limitNote: resolved.note,
+            fields: fields
         ))
     }
 
@@ -1743,7 +2015,7 @@ public struct MCPToolService: Sendable {
     private func search(_ parsed: ParsedSearch, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.search(parsed.request)
         let rendered = MCPDocumentRendering.render(
-            answer.documents, limits: limits, metric: answer.metric
+            answer.documents, limits: limits, metric: answer.metric, fields: parsed.fields
         )
 
         var structured: [String: JSONValue] = [
@@ -1800,7 +2072,9 @@ public struct MCPToolService: Sendable {
 
     private func documents(_ parsed: ParsedDocuments, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.documents(parsed.request)
-        let rendered = MCPDocumentRendering.render(answer.documents, limits: limits)
+        let rendered = MCPDocumentRendering.render(
+            answer.documents, limits: limits, fields: parsed.fields
+        )
 
         var structured: [String: JSONValue] = [
             "collection": .string(parsed.request.collection),
@@ -1833,6 +2107,165 @@ public struct MCPToolService: Sendable {
         return MCPToolOutcome(text: text, structured: .object(structured))
     }
 
+    /// Один файл в ответе «собери по теме».
+    ///
+    /// Числа совпадений отдельным полем нет: это `samples.count`, и счётчик,
+    /// который живёт рядом со списком, рано или поздно с ним разойдётся.
+    private struct MentionedFile {
+        let path: String
+        let fileID: String?
+        let samples: [MCPDocumentPayload]
+
+        var hits: Int { samples.count }
+    }
+
+    /// Ключ группировки — путь файла.
+    ///
+    /// Куски без пути собираются в одну кучу, а не растворяются поодиночке:
+    /// «файл не назван — 12 совпадений» это ответ, а дюжина безымянных строк
+    /// в списке файлов — нет.
+    private static func filePathKey(of document: MCPDocumentPayload) -> String {
+        if case .string(let path)? = document.metadata?["source_file"], !path.isEmpty { return path }
+        return String(localized: "(файл не назван)")
+    }
+
+    /// «Собери по теме».
+    ///
+    /// Один обход коллекции вместо двадцати: замер показал, что обход по
+    /// текстовому условию стоит около секунды **независимо** от того, сколько
+    /// кусков подошло, и агент, листавший то же самое страницами по сто,
+    /// платил эту секунду за каждую страницу.
+    private func mentions(_ parsed: ParsedMentions, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        let answer = try await backend.documents(MCPDocumentsRequest(
+            collection: parsed.collection, ids: [], filter: parsed.filter,
+            limit: Self.mentionsScanLimit, offset: 0
+        ))
+
+        // Сначала частые файлы: «где этого больше всего» — обычный первый
+        // вопрос. Порядок при равном числе совпадений закреплён путём, иначе
+        // страницы поедут друг относительно друга.
+        let grouped: [String: [MCPDocumentPayload]] = Dictionary(
+            grouping: answer.documents, by: Self.filePathKey
+        )
+        let mentioned: [MentionedFile] = grouped.map { path, documents in
+            MentionedFile(
+                path: path,
+                fileID: Self.storedFingerprint(of: documents),
+                samples: documents
+            )
+        }
+        let files: [MentionedFile] = mentioned.sorted { left, right in
+            left.hits == right.hits ? left.path < right.path : left.hits > right.hits
+        }
+
+        var notes: [String] = []
+        if let limitNote = parsed.limitNote { notes.append(limitNote) }
+        // Предел сбора определяется по ответу базы, а не по одному лишь счёту:
+        // «ровно двадцать тысяч» и «двадцать тысяч и ещё сколько-то» иначе
+        // неотличимы.
+        if answer.hasMore || answer.documents.count >= Self.mentionsScanLimit {
+            notes.append(String(
+                localized: "Совпадений больше, чем приложение собирает за раз (\(Self.mentionsScanLimit.plainDigits)): охват посчитан по собранным. Сузь условие фильтром или возьми более редкое слово."
+            ))
+        }
+
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.collection),
+            "contains": .string(parsed.contains),
+            "totalMatches": .int(answer.documents.count),
+            "totalFiles": .int(files.count),
+        ]
+
+        func answered(_ lines: [String]) -> MCPToolOutcome {
+            if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
+            return MCPToolOutcome(
+                text: (lines + notes).joined(separator: "\n"), structured: .object(structured)
+            )
+        }
+
+        guard !files.isEmpty else {
+            structured["files"] = .array([])
+            structured["documents"] = .array([])
+            structured["hasMore"] = .bool(false)
+            return answered([
+                String(localized: "Слова «\(parsed.contains)» в коллекции «\(parsed.collection)» нет ни в одном документе."),
+                String(localized: "Сравнение буквальное: попробуй основу без окончания или другое написание. Синонимы подбирает search, а не этот инструмент."),
+            ])
+        }
+
+        let page = Array(files.dropFirst(parsed.offset).prefix(parsed.files))
+        guard !page.isEmpty else {
+            structured["files"] = .array([])
+            structured["documents"] = .array([])
+            structured["hasMore"] = .bool(false)
+            return answered([String(
+                localized: "Файлов со словом «\(parsed.contains)»: \(files.count.plainDigits), а offset \(parsed.offset.plainDigits) уже за концом списка."
+            )])
+        }
+
+        // Перечень файлов и образцы делят один бюджет. Раньше перечень в него
+        // не входил вовсе: сотня длинных путей — это двадцать пять тысяч
+        // знаков, и ответ выходил за «Символов в ответе» молча.
+        let listingBudget = max(1, limits.responseCharacters / 2)
+        var listing: [String] = []
+        var listingSize = 0
+        var shown: [MentionedFile] = []
+        for (index, file) in page.enumerated() {
+            let line = String(
+                localized: "\((parsed.offset + index + 1).plainDigits). \(file.path) — \(RussianCount.grouped(file.hits, "совпадение", "совпадения", "совпадений"))"
+            )
+            // Первый файл показывается всегда, как и первый документ в выдаче:
+            // ответ без единого файла хуже ответа с одним.
+            if index > 0, listingSize + line.count + 1 > listingBudget { break }
+            listing.append(line)
+            listingSize += line.count + 1
+            shown.append(file)
+        }
+        if shown.count < page.count {
+            notes.append(String(
+                localized: "Перечень урезан по объёму ответа: показано файлов \(shown.count.plainDigits) из запрошенных \(page.count.plainDigits)."
+            ))
+        }
+
+        let samples = shown.flatMap { file in
+            MCPFileChunks.ordered(file.samples).prefix(parsed.perFile)
+        }
+        let rendered = MCPDocumentRendering.render(
+            samples,
+            limits: MCPOutputLimits(
+                ceiling: limits.ceiling,
+                documentCharacters: limits.documentCharacters,
+                responseCharacters: max(1, limits.responseCharacters - listingSize),
+                collections: limits.collections
+            ),
+            fields: parsed.fields
+        )
+        notes += rendered.notes
+
+        let hasMore = parsed.offset + shown.count < files.count
+        if hasMore {
+            notes.append(String(
+                localized: "Показаны файлы с \((parsed.offset + 1).plainDigits) по \((parsed.offset + shown.count).plainDigits) из \(files.count.plainDigits) — дальше вызовом с offset \((parsed.offset + shown.count).plainDigits)."
+            ))
+        }
+
+        structured["files"] = .array(shown.map { file in
+            var object: [String: JSONValue] = [
+                "file": .string(file.path),
+                "hits": .int(file.hits),
+            ]
+            if let fileID = file.fileID, !fileID.isEmpty { object["fileId"] = .string(fileID) }
+            return .object(object)
+        })
+        structured["documents"] = .array(rendered.documents)
+        structured["hasMore"] = .bool(hasMore)
+
+        let header = String(
+            localized: "«\(parsed.contains)»: \(RussianCount.grouped(answer.documents.count, "совпадение", "совпадения", "совпадений")) в \(RussianCount.grouped(files.count, "файле", "файлах", "файлах")), показано \(shown.count.plainDigits)"
+        )
+        return answered([header] + listing + [""] + rendered.lines)
+    }
+
     /// `get_file` — чанки одного файла по порядку.
     private func file(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let found = try await fileChunks(parsed)
@@ -1841,7 +2274,9 @@ public struct MCPToolService: Sendable {
         // покажет человеку документ, а не шестнадцать знаков.
         let path = found.path.isEmpty ? Self.storedPath(of: answer.documents) : found.path
         let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: answer.documents)
-        let rendered = MCPDocumentRendering.render(answer.documents, limits: limits)
+        let rendered = MCPDocumentRendering.render(
+            answer.documents, limits: limits, fields: parsed.fields
+        )
         // Показано меньше, чем отдала база (сработал потолок объёма ответа), —
         // значит следующая страница начинается там, где оборвался показ,
         // а не там, где кончилась выборка. Иначе агент потеряет чанки
