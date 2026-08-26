@@ -682,7 +682,11 @@ struct CapsuleButtonStyle: ButtonStyle {
             .background(background)
             .overlay(Capsule().strokeBorder(chosen ?? Theme.Palette.border, lineWidth: 1))
             .clipShape(Capsule())
-            .shadow(color: glow, radius: 8, y: 2)
+            // Радиус нулевой, когда свечения нет: проход размытия стоит
+            // денег, даже если цвет прозрачный. «Нет» — это `nil`,
+            // а не прозрачный цвет: равенство цветов SwiftUI не обещает, и
+            // прозрачное свечение, записанное иначе, молча вернуло бы размытие.
+            .shadow(color: glow ?? .clear, radius: glow == nil ? 0 : 8, y: glow == nil ? 0 : 2)
             .opacity(configuration.isPressed ? 0.82 : 1)
     }
 
@@ -718,15 +722,67 @@ struct CapsuleButtonStyle: ButtonStyle {
         }
     }
 
-    private var glow: Color {
-        guard isEnabled else { return .clear }
-        if let chosen { return chosen.opacity(0.35) }
+    /// Свечение — только у главной и у опасной кнопки.
+    ///
+    /// Раньше светилось всё: обычные капсулы чёрным на 6%, выбранные — своим
+    /// цветом. Каждая тень в SwiftUI — отдельный проход размытия, и на экране
+    /// разметки, где капсул девяносто, это оказалось дороже всего остального
+    /// вместе взятого: 497 мс на кадр против 5 мс без свечения (замерено
+    /// прямой отрисовкой). Шести процентов черноты под белой капсулой с
+    /// рамкой не видно, а выбранная и так залита цветом — свечение ей
+    /// ничего не добавляет.
+    ///
+    /// У главной и опасной оно остаётся: их на экране одна-две, а свечение
+    /// у них цветное и заметное — это часть того, чем они выделены.
+    private var glow: Color? {
+        guard isEnabled else { return nil }
         switch kind {
         case .primary: return Theme.Palette.accent.opacity(0.45)
         case .danger: return Theme.Palette.danger.opacity(0.4)
-        case .normal, .secondary: return .black.opacity(0.06)
+        case .normal, .secondary: return nil
         }
     }
+}
+
+/// Флажок приложения.
+///
+/// Родной `.checkbox` — это `NSButton` под каждым флажком, и стоит он дорого:
+/// раскладка тридцати флажков занимает 49 мс против 8 мс у этого стиля,
+/// шестидесяти — 104 против 15. На экране «Клиенты» список коллекций — это
+/// тридцать флажков, и он перестраивался при каждом нажатии, потому что
+/// правка настроек republish'ит всё дерево. Отсюда и «фризит».
+///
+/// Остаётся именно `Toggle`, а не своя кнопка: доступность, чтение с экрана
+/// и поведение по пробелу — его, и терять их ради скорости незачем.
+struct ChromaCheckboxToggleStyle: ToggleStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: configuration.isOn ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 14))
+                    .foregroundStyle(
+                        !isEnabled ? Theme.Palette.captionText
+                            : (configuration.isOn ? Theme.Palette.accent : Theme.Palette.secondaryText)
+                    )
+                configuration.label
+                    .foregroundStyle(isEnabled ? Theme.Palette.primaryText : Theme.Palette.captionText)
+            }
+            // Нажимается значок вместе с подписью — но **не** вся оставшаяся
+            // ширина: `Spacer` внутри подписи делал флажок жадным, и соседи
+            // по строке разъезжались. Замер строки «флажок · путь к файлу»
+            // шириной 600 pt: путь начинался с 337-й точки вместо 24-й.
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+extension ToggleStyle where Self == ChromaCheckboxToggleStyle {
+    static var chromaCheckbox: ChromaCheckboxToggleStyle { ChromaCheckboxToggleStyle() }
 }
 
 extension ButtonStyle where Self == CapsuleButtonStyle {

@@ -71,6 +71,28 @@ public final class TableManifestStore: @unchecked Sendable {
     }
 }
 
+/// Лист, ждущий записи после очистки.
+///
+/// Отдельный тип, а не пара строк: его показывают на двух экранах, и
+/// собирать его из словаря в каждом было бы способом однажды разойтись.
+public struct SheetAwaitingWrite: Hashable, Sendable, Identifiable {
+    public var id: String { "\(relativePath)\u{0}\(sheetName)" }
+    public let relativePath: String
+    public let sheetName: String
+    public let collectionName: String
+
+    public init(relativePath: String, sheetName: String, collectionName: String) {
+        self.relativePath = relativePath
+        self.sheetName = sheetName
+        self.collectionName = collectionName
+    }
+
+    /// Как лист называют человеку: файл и лист, без пути целиком.
+    public var title: String {
+        "\((relativePath as NSString).lastPathComponent) → \(sheetName)"
+    }
+}
+
 /// One line of's statistics: how many rows came from which table.
 public struct TableStatisticsRow: Hashable, Sendable, Identifiable {
     public var id: String { "\(sourceName)\u{0}\(relativePath)\u{0}\(sheetName)" }
@@ -108,6 +130,25 @@ extension TableManifestStore {
                             noticedAt: removal.noticedAt
                         )
                     }
+            }
+            .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
+    }
+
+    /// Листы, очищенные под переиндексацию и ещё не записанные.
+    ///
+    /// Спрашивается теми же экранами, что и строки на решение, и по той же
+    /// причине: пока лист ждёт, его строк в коллекции нет — поиск по ним
+    /// отвечает «ничего не найдено», и человек должен знать почему.
+    public func sheetsAwaitingWrite(sourceID: UUID) -> [SheetAwaitingWrite] {
+        load(sourceID: sourceID).values
+            .flatMap { file in
+                file.sheetsAwaitingWrite.map { sheetName in
+                    SheetAwaitingWrite(
+                        relativePath: file.relativePath,
+                        sheetName: sheetName,
+                        collectionName: file.collectionName
+                    )
+                }
             }
             .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
     }

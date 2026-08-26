@@ -172,6 +172,23 @@ final class ModelJudgeTests: XCTestCase {
         XCTAssertNotNil(JudgePrompt(text: "   ").problem)
     }
 
+    /// Подпись промпта обязана переживать перезапуск.
+    ///
+    /// Она хранится в оценке на диске и при следующем запуске сравнивается
+    /// с посчитанной заново. Пока считался `hashValue`, совпасть они не могли
+    /// никогда: стандартный хеш Swift засеивается случайно на каждый процесс
+    /// (SE-0206). Каждый уже оценённый триплет уходил на переоценку — молча
+    /// и за деньги чат-модели.
+    ///
+    /// Поэтому здесь стоит **записанное** значение, посчитанное независимо:
+    /// SHA-256 от приведённого текста, первые четыре байта. Случайный хеш
+    /// такую проверку не пройдёт ни на одном запуске.
+    func testTheFingerprintSurvivesARestart() {
+        let prompt = JudgePrompt(text: "Запрос: {query}\nФрагмент: {document}")
+        XCTAssertEqual(prompt.fingerprint, "d9791a67")
+        XCTAssertEqual(prompt.fingerprint.count, 8)
+    }
+
     func testTheFingerprintFollowsTheMeaningNotTheWhitespace() {
         let one = JudgePrompt(text: "Запрос: {query}\nФрагмент: {document}")
         let same = JudgePrompt(text: "Запрос:   {query}\n\n  Фрагмент: {document}")

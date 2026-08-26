@@ -124,6 +124,30 @@ final class AccessRateLimitTests: XCTestCase {
 // MARK: - C4: CORS
 
 final class CORSPermissionTests: XCTestCase {
+    /// Браузеру разрешены все заголовки, без которых транспорт MCP не примет
+    /// запрос.
+    ///
+    /// Preflight проходил, а сам POST браузер блокировал: `Mcp-Method`
+    /// и соседей в списке не было. Сверка идёт с константами транспорта,
+    /// а не со строкой, — иначе переименование там тихо ломало бы браузерных
+    /// клиентов здесь.
+    func testTheMCPHeadersAreAllowedForBrowsers() {
+        let headers = ProxyConnection.corsHeaderList(origin: "https://app.example")
+        let allowed = headers.first { $0.0 == "access-control-allow-headers" }?.1 ?? ""
+        let listed = Set(allowed.components(separatedBy: ", "))
+        for required in [
+            MCPHTTPTransport.protocolVersionHeader,
+            MCPHTTPTransport.methodHeader,
+            MCPHTTPTransport.nameHeader,
+        ] {
+            XCTAssertTrue(listed.contains(required), "браузеру не разрешён заголовок \(required): \(allowed)")
+        }
+        // И прежние никуда не делись.
+        XCTAssertTrue(listed.contains("authorization"))
+        XCTAssertTrue(listed.contains("x-chroma-token"))
+        XCTAssertTrue(listed.contains("content-type"))
+    }
+
     func testCORSIsOffUntilAnOriginIsListed() {
         let permissions = ClientPermissions()
         XCTAssertTrue(permissions.allowedOrigins.isEmpty)

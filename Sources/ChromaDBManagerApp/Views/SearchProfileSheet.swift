@@ -89,7 +89,7 @@ struct SearchProfileSheet: View {
                 TextField(String(localized: "название профиля"), text: $profile.name)
                     .textFieldStyle(.roundedBorder)
                 Toggle(String(localized: "Профиль по умолчанию для этой коллекции"), isOn: $profile.isDefault)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                     .help(String(localized: "Именно этот профиль применяется к запросам, пока не выбран другой."))
             }
         }
@@ -120,7 +120,7 @@ struct SearchProfileSheet: View {
             // кандидаты ещё есть — стадии 3–7 не вернут того, чего нет.
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(String(localized: "Штраф за длину"), isOn: $profile.lengthPenaltyEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                     .help(String(localized: "Оценка умножается на min(1, длина / цель) в степени. Чанк из одного слова перестаёт обыгрывать абзац."))
                 Text(String(localized: "Схожесть меряет совпадение темы, а не полезность: чанк из одного слова «Сервер» отвечает запросу «сервер» дословно, схожесть 1.00. Замер на nomic-embed-text-v1.5: шапка таблицы близка к любому запросу — 0.70 к «сервер», 0.69 к «СКАЛА-Р», 0.74 к «отпуск сотрудника». Штраф ставит содержательные куски вперёд и не стоит ни одного пересчёта векторов."))
                     .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
@@ -178,9 +178,9 @@ struct SearchProfileSheet: View {
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(String(localized: "Векторный поиск"), isOn: $profile.vectorSearchEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 Toggle(String(localized: "Текстовый поиск по содержимому документа"), isOn: $profile.textSearchEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
 
                 if !profile.vectorSearchEnabled && !profile.textSearchEnabled {
                     Text(String(localized: "Оба источника выключены — искать будет нечем. Оставьте хотя бы один."))
@@ -203,14 +203,14 @@ struct SearchProfileSheet: View {
                         .help(String(localized: "Константа RRF: чем меньше, тем сильнее решают первые позиции. По умолчанию 60."))
                     }
                     Toggle(String(localized: "Разбивать запрос на слова"), isOn: $profile.splitQueryIntoWords)
-                        .toggleStyle(.checkbox)
+                        .toggleStyle(.chromaCheckbox)
                     Text(String(localized: "Разбиение ищет каждое слово отдельно — через $or или перечисление в выражении, смотря что выбрано ниже. Поддержка проверена на установленной версии сервера; целиком — надёжнее и по умолчанию."))
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     textSearchLengthField
                     Divider().padding(.vertical, 2)
                     Toggle(String(localized: "Спрашивать одним регулярным выражением"),
                            isOn: $profile.textSearchUsesRegex)
-                        .toggleStyle(.checkbox)
+                        .toggleStyle(.chromaCheckbox)
                     Text(String(localized: "Иначе каждое слово спрашивается несколькими написаниями через $or — на запросе из четырёх слов это двенадцать подстрочных условий и пять секунд против шестисот миллисекунд у выражения. Выражение к тому же не путает «ё» с «е» и не считает «характеристики» вхождением слова «рис»."))
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                         .fixedSize(horizontal: false, vertical: true)
@@ -287,7 +287,7 @@ struct SearchProfileSheet: View {
                 }
                 .frame(width: 340)
                 Toggle(String(localized: "Схлопывать несколько попаданий из одного раздела в один результат"), isOn: $profile.collapseByParent)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 Picker(String(localized: "Возвращать"), selection: $profile.promotion) {
                     ForEach(ParentPromotion.allCases) { mode in
                         Text(mode.title).tag(mode)
@@ -307,7 +307,7 @@ struct SearchProfileSheet: View {
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(String(localized: "Включить разнообразие"), isOn: $profile.diversityEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 if profile.diversityEnabled {
                     HStack(spacing: 12) {
                         Text(String(localized: "разнообразие"))
@@ -341,7 +341,7 @@ struct SearchProfileSheet: View {
                         set: { profile.contextWindow = $0 ? SearchProfile.suggestedContextWindow : 0 }
                     )
                 )
-                .toggleStyle(.checkbox)
+                .toggleStyle(.chromaCheckbox)
                 if profile.resolvedContextWindow > 0 {
                     Stepper(
                         String(localized: "по \(profile.resolvedContextWindow) с каждой стороны"),
@@ -369,7 +369,7 @@ struct SearchProfileSheet: View {
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(String(localized: "Учитывать пометки"), isOn: $profile.marksEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 Text("Выключите, если пометки нужны только как разметка — для курирования базы и наборов оценки, — а порядок выдачи должен оставаться чисто векторным.")
                     .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -383,12 +383,12 @@ struct SearchProfileSheet: View {
             // Цена у режимов разная: один вызов против вызова на фрагмент.
             // Общая формулировка занижала бы вторую в двадцать раз.
             subtitle: profile.rerankEnabled && profile.rerankMode == .crossEncoder
-                ? CrossEncoderReranker.costWarning
+                ? CrossEncoderReranker.costWarning(candidates: profile.rerankCandidates)
                 : Reranker.costWarning
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(String(localized: "Включить переранжирование"), isOn: $profile.rerankEnabled)
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 if profile.rerankEnabled {
                     Picker(String(localized: "Как переранжировать"), selection: $profile.rerankMode) {
                         ForEach(RerankMode.allCases) { mode in
@@ -426,6 +426,23 @@ struct SearchProfileSheet: View {
                         Text(String(localized: "Модель не выбрана — стадия не выполнится. Модель для переранжирования выбирается отдельно от модели чанкинга."))
                             .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
                     }
+                    // Сколько кандидатов показать. Не спрятано в код:
+                    // на замере треть выигрыша пришла из хвоста пула, то есть
+                    // с мест, куда двадцатка не достаёт.
+                    Stepper(
+                        String(localized: "показать переранжировщику: \(profile.rerankCandidates) кандидатов"),
+                        value: $profile.rerankCandidates,
+                        // Шаг пять — и пол пять, а не два: с двойки лестница
+                        // вела в 7, 12, 17, и вернуться к умолчанию в двадцать
+                        // было нечем. Ниже пятёрки настройка всё равно
+                        // бессмысленна, а от двух конвейер защищён сам.
+                        in: 5...Reranker.candidateCeiling, step: 5
+                    )
+                    .frame(width: 340)
+                    Text(profile.rerankMode == .crossEncoder
+                         ? String(localized: "Столько же будет вызовов модели на каждый запрос — вдвое больше кандидатов означает вдвое более долгий поиск.")
+                         : String(localized: "Все они уходят в один промпт: длинный список и медленнее, и хуже — модель перестаёт замечать хвост."))
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                     // Промпт и инструкция — разные поля, и показывается то,
                     // которое в этом режиме действительно применяется. Иначе
                     // человек правит текст, до которого выполнение не доходит

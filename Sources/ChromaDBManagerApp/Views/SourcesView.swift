@@ -462,6 +462,26 @@ struct SourcesSection: View {
                     .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // лист очищен под переиндексацию, а записать его заново
+            // некому до следующего прогона. Пока он ждёт, его строк в базе
+            // нет — поиск по ним отвечает «ничего не найдено», и молчать
+            // об этом нельзя: человек нажал кнопку и отвлёкся.
+            if let awaiting = model.sheetsAwaitingWrite[source.id], !awaiting.isEmpty {
+                HStack(spacing: 8) {
+                    Circle().fill(Theme.Palette.attention)
+                        .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+                    Text("листов очищено под переиндексацию: \(awaiting.count.plainDigits) — их строк в базе сейчас нет")
+                        .font(Theme.Font.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(String(localized: "Синхронизировать")) { model.sync(source, app: app) }
+                        .buttonStyle(.chromaSecondary)
+                        .disabled(model.isBusy(source.id) || !app.connection.isConnected)
+                    Spacer()
+                }
+                Text("Ждут записи: \(awaiting.prefix(3).map(\.title).joined(separator: ", "))\(awaiting.count > 3 ? " и ещё \((awaiting.count - 3).plainDigits)" : ""). Обычная синхронизация запишет их заново — по нынешней разметке.")
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             // в папке появилась ещё одна ступень, и её смысл в базу
             // не попадает. Приложение не выдумывает ей имя и не делает работы
             // — говорит и ждёт, как и в
@@ -736,7 +756,7 @@ struct SourcesSection: View {
                                     get: { !model.isExcluded(item.relativePath, in: plan.sourceID) },
                                     set: { _ in model.toggleExcluded(item.relativePath, in: plan.sourceID) }
                                 ))
-                                .toggleStyle(.checkbox)
+                                .toggleStyle(.chromaCheckbox)
                                 .labelsHidden()
                             }
                             Text(item.kind.title)
@@ -1045,7 +1065,7 @@ struct SourcesSection: View {
                         }
                     ))
                     .labelsHidden()
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(removal.relativePath).font(Theme.Font.caption)
                             .lineLimit(1).truncationMode(.middle)
@@ -1243,7 +1263,7 @@ struct SourceEditorSheet: View {
                             }
                         ))
                         .font(Theme.Font.micro)
-                        .toggleStyle(.checkbox)
+                        .toggleStyle(.chromaCheckbox)
                     }
                 }
                 Text("Ничего не выбрано — Vision выберет сам. Выбор нескольких языков замедляет распознавание.")
@@ -1796,7 +1816,7 @@ struct SourceEditorSheet: View {
                 Toggle(isOn: draft.chunking.contextPrefix) {
                     Text("Дописывать контекст перед вычислением вектора")
                 }
-                .toggleStyle(.checkbox)
+                .toggleStyle(.chromaCheckbox)
                 Text("Перед текстом чанка в модель уходит строка «Документ → Раздел → Подраздел». В самом документе её нет — он остаётся таким, как в файле. Чанк «превышение допустимого значения приводит к отказу» без этой строки не находится ничем: в нём нет ни одного слова о том, о чём он.\n\nСюда же попадает вводная фраза списка — та, что кончается двоеточием. Пункт «восстановление работоспособности в течение четырёх часов» без неё не говорит, чего восстановление и кто обязан: это стояло строкой выше, в «Исполнитель обязан обеспечить:».")
                     .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1849,7 +1869,7 @@ struct SourceEditorSheet: View {
             Toggle(isOn: draft.chunking.contextEnrichment) {
                 Text("Обогащать контекст чат-моделью")
             }
-            .toggleStyle(.checkbox)
+            .toggleStyle(.chromaCheckbox)
             Text("Модель читает фрагмент и пишет одно-два предложения о том, о чём документ и где в нём этот фрагмент. Они уходят в вектор — в документе их нет. Заметно помогает там, где заголовков нет и структурная строка молчит.")
                 .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)

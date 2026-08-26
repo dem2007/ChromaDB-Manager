@@ -502,17 +502,18 @@ public actor ReembeddingService {
                 || error is CancellationError
                 || (error as? URLError)?.code == .cancelled
                 || (error as? ReembeddingError).map { if case .cancelled = $0 { return true } else { return false } } == true
-            journal.record(ReembeddingJournalEntry(
-                startedAt: started,
-                scenario: request.scenario,
-                sourceCollection: request.collection.name,
-                resultCollection: request.scenario == .clone ? request.newCollectionName : request.collection.name,
-                model: request.targetModel,
-                dimension: 0,
-                processed: 0,
-                written: 0,
-                outcome: isCancellation ? .cancelled : .failed,
-                detail: error.localizedDescription
+            // В запись идёт то, что известно, а не нули. Размерность
+            // посчитана до `do` и видна здесь — ноль в ней был просто потерей.
+            // А сколько успела сделать операция на месте, знает контрольная
+            // точка: «не сделано ничего» про отменённый прогон, оставивший
+            // в коллекции новые векторы, — прямая неправда, и человек ищет
+            // по журналу именно это.
+            let done = request.scenario == .inPlace
+                ? journal.checkpoint(for: request.collection.id)?.processed ?? 0
+                : 0
+            journal.record(Self.failureEntry(
+                request: request, started: started, dimension: dimension, done: done,
+                isCancellation: isCancellation, detail: error.localizedDescription
             ))
             log(
                 isCancellation ? .warning : .error,
@@ -523,6 +524,33 @@ public actor ReembeddingService {
             // arrive as a cancellation whatever it looked like underneath.
             throw isCancellation ? CancellationError() : error
         }
+    }
+
+    /// Что записать в журнал о сорвавшемся прогоне.
+    ///
+    /// Отдельной функцией, потому что путь до неё лежит через живые ChromaDB
+    /// и LM Studio: проверить, что в записи стоит известное, а не нули,
+    /// надо без них.
+    static func failureEntry(
+        request: ReembeddingRequest,
+        started: Date,
+        dimension: Int,
+        done: Int,
+        isCancellation: Bool,
+        detail: String
+    ) -> ReembeddingJournalEntry {
+        ReembeddingJournalEntry(
+            startedAt: started,
+            scenario: request.scenario,
+            sourceCollection: request.collection.name,
+            resultCollection: request.scenario == .clone ? request.newCollectionName : request.collection.name,
+            model: request.targetModel,
+            dimension: dimension,
+            processed: done,
+            written: done,
+            outcome: isCancellation ? .cancelled : .failed,
+            detail: detail
+        )
     }
 
     // MARK: - Clone

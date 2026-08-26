@@ -1047,7 +1047,7 @@ struct CollectionsView: View {
                         .frame(width: 190)
                     if !model.filter.isEmpty {
                         Toggle(String(localized: "с фильтром"), isOn: $model.applyFilterToQuery)
-                            .toggleStyle(.checkbox)
+                            .toggleStyle(.chromaCheckbox)
                             .help(String(localized: "Условия из панели фильтра применяются к запросу вместе с вектором."))
                     }
                     // Модель коллекции здесь не повторяется: она стоит

@@ -16,10 +16,37 @@ public struct ChromaRoute: Equatable {
     public enum Access: String, Codable, Equatable, Sendable {
         /// Reads data or metadata.
         case read
-        /// Creates, changes or removes something.
+        /// Creates or changes something.
         case write
+        /// Убирает данные насовсем.
+        ///
+        /// Отдельно от записи, потому что право отдельное: снести коллекцию
+        /// одним неудачным вызовом слишком легко, чтобы это ехало вместе
+        /// с обычной записью. У инструментов MCP так было с самого
+        /// начала, а маршруты HTTP этого различения не знали — и галка
+        /// «Разрешить удаление» на них не действовала.
+        case delete
         /// Heartbeat, version, identity — no collection involved.
         case service
+
+        /// Меняет ли запрос данные. Удаление — тоже изменение: пределы,
+        /// частота записи и отбор «только записи» в журнале считают его
+        /// вместе с остальными.
+        public var changesData: Bool { self == .write || self == .delete }
+
+        /// Как назвать этот вид доступа человеку — в журнале доступа.
+        ///
+        /// Здесь, а не в экране: слова про операции этот файл уже держит
+        /// («сброс базы» и прочие), и новый случай доступа иначе молча
+        /// остался бы без названия — экран лежит двумя модулями дальше
+        ///.
+        public var title: String {
+            switch self {
+            case .read, .service: return String(localized: "чтение")
+            case .write: return String(localized: "запись")
+            case .delete: return String(localized: "удаление")
+            }
+        }
     }
 
     public enum Target: Equatable {
@@ -68,7 +95,7 @@ public struct ChromaRoute: Equatable {
         "add": .write,
         "upsert": .write,
         "update": .write,
-        "delete": .write,
+        "delete": .delete,
         "get": .read,
         "query": .read,
         "count": .read,
@@ -141,7 +168,7 @@ public struct ChromaRoute: Equatable {
         guard segments.count >= 7 else {
             switch method {
             case "DELETE":
-                return ChromaRoute(operation: "delete_collection", access: .write, target: target, tenant: tenant, database: database)
+                return ChromaRoute(operation: "delete_collection", access: .delete, target: target, tenant: tenant, database: database)
             case "PUT", "PATCH":
                 return ChromaRoute(operation: "update_collection", access: .write, target: target, tenant: tenant, database: database)
             case "GET":

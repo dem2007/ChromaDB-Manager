@@ -46,10 +46,8 @@ public final class EvaluationRunStore {
         let loaded = files
             .filter { $0.pathExtension == "json" }
             .compactMap { url -> EvaluationRunSummary? in
-                guard let data = try? Data(contentsOf: url),
-                      let run = try? Self.decoder().decode(EvaluationRun.self, from: data)
-                else { return nil }
-                return EvaluationRunSummary(run)
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                return EvaluationRunSummary.read(data, decoder: Self.decoder())
             }
             .sorted { $0.startedAt > $1.startedAt }
         index = loaded
@@ -65,8 +63,23 @@ public final class EvaluationRunStore {
     public func save(_ run: EvaluationRun) -> Bool {
         do {
             _ = try AppPaths.ensureDirectory(directory)
-            try Self.encoder().encode(run).write(to: url(for: run.id), options: .atomic)
-            index = nil
+            let encoded = try Self.encoder().encode(run)
+            try encoded.write(to: url(for: run.id), options: .atomic)
+            // Список не сбрасывается, а поправляется: сводка только что
+            // сохранённого прогона у нас в руках. Сброс означал полное
+            // перечитывание папки ровно тогда, когда список и открывают, —
+            // сразу после прогона.
+            //
+            // Сводка читается из **записанного**, а не из прогона в памяти:
+            // на диске дата хранится с точностью до секунды, и сводка из
+            // памяти не совпала бы с той, что вернёт этот же файл после
+            // перезапуска. Два прогона в одну секунду сортировались бы
+            // по-разному, смотря тёплый список или холодный.
+            if var known = index, let saved = EvaluationRunSummary.read(encoded, decoder: Self.decoder()) {
+                known.removeAll { $0.id == run.id }
+                known.append(saved)
+                index = known.sorted { $0.startedAt > $1.startedAt }
+            }
             return true
         } catch {
             log(.error, "Оценка", "Не удалось сохранить прогон «\(run.name)»: \(error.localizedDescription)")
@@ -99,6 +112,47 @@ public struct EvaluationRunSummary: Hashable, Sendable, Identifiable {
     public let resultCount: Int
     public let isComplete: Bool
     public let note: String
+
+    /// Те же поля, читаемые **без** результатов прогона.
+    ///
+    /// Docstring типа обещает, что список прогонов не читает их целиком:
+    /// прогон держит полный текст каждого результата каждого варианта, и
+    /// десяток прогонов набора из двадцати запросов — это мегабайты. Обещание
+    /// нарушалось прямо в `summaries()`: там стоял полный `decode` со всеми
+    /// текстами ради девяти полей.
+    private struct Head: Decodable {
+        struct Variant: Decodable { let name: String }
+        let id: UUID
+        let name: String
+        let startedAt: Date
+        let querySetName: String
+        let variants: [Variant]
+        let queries: [Empty]
+        let results: [Empty]
+        let isComplete: Bool
+        let note: String
+
+        /// Место в списке, из которого не читается ничего: нужен только счёт.
+        struct Empty: Decodable {
+            init(from decoder: Decoder) throws {}
+        }
+    }
+
+    private init(head: Head) {
+        id = head.id
+        name = head.name
+        startedAt = head.startedAt
+        querySetName = head.querySetName
+        variantNames = head.variants.map(\.name)
+        queryCount = head.queries.count
+        resultCount = head.results.count
+        isComplete = head.isComplete
+        note = head.note
+    }
+
+    static func read(_ data: Data, decoder: JSONDecoder) -> EvaluationRunSummary? {
+        (try? decoder.decode(Head.self, from: data)).map(EvaluationRunSummary.init(head:))
+    }
 
     public init(_ run: EvaluationRun) {
         id = run.id

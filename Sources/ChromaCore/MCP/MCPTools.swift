@@ -1215,7 +1215,7 @@ public struct MCPToolService: Sendable {
             // по ключу, и на карточке она обязана быть видна.
             // Незарегистрированный и выключенный ключи следов не оставляют:
             // иначе перебор чужих ключей выглядел бы активностью клиента.
-            if let known = await access.client(withKey: key), known.isEnabled {
+            if let known = await access.activeClient(withKey: key) {
                 onClientSeen?(known.id)
             }
             let outcome = MCPToolOutcome.failure(decision.refusal ?? "Отказано.").result

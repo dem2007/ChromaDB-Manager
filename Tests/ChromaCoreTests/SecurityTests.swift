@@ -675,6 +675,137 @@ final class ProxyExposureTests: XCTestCase {
         XCTAssertTrue(canConnect(host: address, port: port), "открытый наружу прокси должен отвечать на \(address)")
     }
 
+    /// Живьём: абсолютная форма в строке запроса — отказ, и прокси никуда
+    /// не идёт.
+    ///
+    /// Разбор строки запроса проверен сторожами отдельно, но цена ошибки
+    /// здесь — запрос от имени приложения в чужую сеть, и «по коду выходит,
+    /// что откажет» для такого мало. Здесь настоящий сокет и настоящий ответ.
+    ///
+    /// Отличие 400 от 502 и есть доказательство: сервер, на который прокси
+    /// смотрит, — порт 9 (discard), и всё, что до него дойдёт, кончается
+    /// 502 «сервер не ответил». Абсолютная форма обязана кончиться раньше.
+    func testAnAbsoluteRequestTargetIsRefusedOverTheWire() throws {
+        let proxy = makeProxy()
+        let port = PortUtility.freePort()
+        try proxy.start(upstreamHost: "127.0.0.1", upstreamPort: 9, listenPort: port, exposure: .loopback)
+        defer { proxy.stop() }
+        XCTAssertTrue(waitForListener(proxy))
+
+        let absolute = firstLine(
+            sending: "GET http://example.invalid/admin HTTP/1.1\r\nHost: h\r\n\r\n", toPort: port
+        )
+        XCTAssertEqual(absolute, "HTTP/1.1 400 Bad Request", "абсолютная форма должна отвергаться разбором")
+
+        let protocolRelative = firstLine(
+            sending: "GET //example.invalid/admin HTTP/1.1\r\nHost: h\r\n\r\n", toPort: port
+        )
+        XCTAssertEqual(protocolRelative, "HTTP/1.1 400 Bad Request")
+
+        // А обычный путь до разбора прав доходит: ответ другой, каким бы он
+        // ни был. Иначе сторож проходил бы и на прокси, который отвечает 400
+        // вообще на всё.
+        let ordinary = firstLine(
+            sending: "GET /api/v2/heartbeat HTTP/1.1\r\nHost: h\r\n\r\n", toPort: port
+        )
+        XCTAssertNotNil(ordinary)
+        XCTAssertNotEqual(ordinary, "HTTP/1.1 400 Bad Request", "обычный путь не должен считаться неразборным")
+    }
+
+    /// То же с настоящим ключом — и с доказательством из журнала.
+    ///
+    /// Предыдущий сторож ловит отказ разбора, но у того прокси нет ни одного
+    /// клиента, и без ключа запрос всё равно кончился бы 401. Здесь ключ
+    /// настоящий и включённый — тот самый случай, в котором дыра и работала:
+    /// маршрут неизвестен, метод GET, а неизвестные чтения проходят.
+    ///
+    /// Доказательство — запись в журнале доступа. «unparseable» означает, что
+    /// запрос кончился на разборе; поход наружу оставил бы «unknown» и ответ
+    /// сервера, которого нет.
+    func testWithARealKeyTheAbsoluteFormNeverLeavesTheProxy() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cdbm-ssrf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let audit = AuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
+        let key = ClientKey.generate()
+        let access = AccessController()
+        await access.setClients([ExternalClient(
+            name: "читатель", keyHash: ClientKey.hash(key), keyPrefix: ClientKey.prefix(of: key),
+            permissions: ClientPermissions(collections: ["одна"], allowsWrite: false)
+        )])
+
+        let proxy = ProxyServer(audit: audit, access: access)
+        let port = PortUtility.freePort()
+        try proxy.start(upstreamHost: "127.0.0.1", upstreamPort: 9, listenPort: port, exposure: .loopback)
+        defer { proxy.stop() }
+        // Ждём асинхронно: `waitForListener` крутит `RunLoop`, а в async-тесте
+        // крутить его некому.
+        for _ in 0..<100 where !proxy.state.isRunning {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(proxy.state.isRunning)
+
+        let answer = firstLine(
+            sending: "GET http://example.invalid/admin HTTP/1.1\r\nHost: h\r\nX-Chroma-Token: \(key)\r\n\r\n",
+            toPort: port
+        )
+        XCTAssertEqual(answer, "HTTP/1.1 400 Bad Request")
+
+        // Запись в память кладётся отдельной задачей — ждём её появления.
+        var entries = audit.filtered(writesOnly: false, collection: nil, search: "")
+        for _ in 0..<100 where entries.isEmpty {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            entries = audit.filtered(writesOnly: false, collection: nil, search: "")
+        }
+        XCTAssertEqual(entries.first?.operation, "unparseable", "запрос обязан кончиться на разборе")
+        XCTAssertFalse(
+            entries.contains { $0.path.contains("example.invalid") && $0.operation != "unparseable" },
+            "в журнале не должно быть похода на чужой хост"
+        )
+    }
+
+    /// Отправляет байты как есть и возвращает первую строку ответа.
+    private func firstLine(sending request: String, toPort port: Int, timeout: TimeInterval = 3) -> String? {
+        guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else { return nil }
+        let connection = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+        let answer = Answer()
+        connection.stateUpdateHandler = { state in
+            guard case .ready = state else { return }
+            connection.send(content: Data(request.utf8), completion: .contentProcessed { _ in })
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
+                answer.finish(data.flatMap { String(data: $0, encoding: .utf8) })
+            }
+        }
+        connection.start(queue: DispatchQueue(label: "raw.\(port)"))
+        defer { connection.cancel() }
+        return answer.wait(timeout)?.components(separatedBy: "\r\n").first
+    }
+
+    private final class Answer: @unchecked Sendable {
+        private let semaphore = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var value: String?
+        private var isFinished = false
+
+        func finish(_ text: String?) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isFinished else { return }
+            isFinished = true
+            value = text
+            semaphore.signal()
+        }
+
+        func wait(_ timeout: TimeInterval) -> String? {
+            _ = semaphore.wait(timeout: .now() + timeout)
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     /// The switch is not allowed to put a bare ChromaDB on the network by way
     /// of a proxy that forwards to it.
     func testTheProxyRefusesToBeOpenedInFrontOfANonLoopbackServer() {

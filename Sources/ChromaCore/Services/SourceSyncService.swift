@@ -95,6 +95,23 @@ public struct SyncPlanItem: Identifiable, Hashable {
         self.refresh = refresh
         self.isRemote = isRemote
     }
+
+    /// Тот же элемент с другим видом работы.
+    ///
+    /// Копия собирается **здесь**, рядом с полями, а не на месте вызова.
+    /// Переизвлечение пересобирало элемент перечислением полей и уже потеряло
+    /// так два: `isRemote` — и веб-страница после переизвлечения выдавала себя
+    /// за локальный файл, забирая имя и время у временного файла загрузки, —
+    /// и `refresh`. Пока копия живёт строкой ниже объявлений, забыть новое
+    /// поле труднее.
+    public func changing(kind: SyncItemKind) -> SyncPlanItem {
+        SyncPlanItem(
+            relativePath: relativePath, url: url, kind: kind,
+            collectionName: collectionName, size: size, modifiedAt: modifiedAt,
+            contentHash: contentHash, textLength: textLength,
+            routeMetadata: routeMetadata, refresh: refresh, isRemote: isRemote
+        )
+    }
 }
 
 /// The result of comparing a folder against its manifest — cheap, read-only and
@@ -899,12 +916,8 @@ public actor SourceSyncService {
         guard !paths.isEmpty else { return plan }
         let items = plan.items.map { item -> SyncPlanItem in
             guard item.kind == .unchanged, paths.contains(item.relativePath) else { return item }
-            return SyncPlanItem(
-                relativePath: item.relativePath, url: item.url,
-                kind: .changed(reason: String(localized: "переизвлечение прежней версией экстрактора")),
-                collectionName: item.collectionName, size: item.size, modifiedAt: item.modifiedAt,
-                contentHash: item.contentHash, textLength: item.textLength,
-                routeMetadata: item.routeMetadata
+            return item.changing(
+                kind: .changed(reason: String(localized: "переизвлечение прежней версией экстрактора"))
             )
         }
         // Переносится **всё**, кроме того, что этот вызов меняет намеренно.
@@ -988,6 +1001,18 @@ public actor SourceSyncService {
     /// записи.
     public func indexedSheets(sourceID: UUID, relativePath: String) -> [String: SheetManifest] {
         tableManifests.load(sourceID: sourceID)[relativePath]?.sheets ?? [:]
+    }
+
+    /// То же и заодно листы, ждущие записи.
+    ///
+    /// Одним чтением манифеста, а не двумя: экран спрашивает оба ответа
+    /// сразу, и второй поход на диск ради множества имён — это тот же файл,
+    /// прочитанный дважды.
+    public func indexedSheetState(
+        sourceID: UUID, relativePath: String
+    ) -> (sheets: [String: SheetManifest], awaitingWrite: Set<String>) {
+        let file = tableManifests.load(sourceID: sourceID)[relativePath]
+        return (file?.sheets ?? [:], file?.sheetsAwaitingWrite ?? [])
     }
 
     /// Записать манифест, изменённый снаружи.

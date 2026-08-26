@@ -63,4 +63,31 @@ final class SheetReindexStateTests: XCTestCase {
         let model = model(stored: nil, draft: "{Название}")
         XCTAssertNil(model.reindexState())
     }
+    /// После очистки строк ноль — и карточка с кнопкой пропадает. На её место
+    /// встаёт «лист ждёт записи»: состояние «строк в базе нет, и это
+    /// мы их убрали» должно быть видно, а не жить в сообщении, которое
+    /// исчезает вместе с экраном.
+    func testAClearedSheetSaysItAwaitsWrite() {
+        let model = model(stored: nil, draft: "{Название}")
+        model.setIndexedSheetsForTesting([:], awaitingWrite: ["Лист"])
+
+        XCTAssertNil(model.reindexState(), "предлагать переиндексацию нечего: строк ноль")
+        XCTAssertTrue(model.selectedSheetAwaitsWrite, "но ждущий лист обязан о себе говорить")
+    }
+
+    /// Ждёт другой лист — выбранный молчит: напоминание относится к своему.
+    func testAnotherSheetWaitingDoesNotSpeakForThisOne() {
+        let model = model(stored: nil, draft: "{Название}")
+        model.setIndexedSheetsForTesting([:], awaitingWrite: ["Услуги"])
+        XCTAssertFalse(model.selectedSheetAwaitsWrite)
+    }
+
+    /// Записанный лист не считается ждущим — иначе напоминание осталось бы
+    /// навсегда.
+    func testAWrittenSheetIsNotWaiting() {
+        let model = model(stored: manifest(rows: 3, signature: "прежняя"), draft: "{Название}")
+        XCTAssertFalse(model.selectedSheetAwaitsWrite)
+        XCTAssertNotNil(model.reindexState())
+    }
+
 }

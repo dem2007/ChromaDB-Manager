@@ -256,11 +256,24 @@ public extension EvaluationReport {
         // текст каждого результата заново — 132 мс на живом прогоне, и это
         // повторялось при каждой перерисовке экрана.
         let grades = precomputed ?? EvaluationMetrics.GradeIndex(run: run, truth: truth)
+        // Ячейки берутся из готового словаря, а не поиском по всему списку
+        // результатов на каждую. Поиск стоил O((запросов × вариантов)²):
+        // на прогоне 50 × 5 это 62 тысячи сравнений за построение, а строится
+        // оно и обоими экспортами, и экраном разметки — после каждой
+        // проставленной оценки.
+        var byCell: [CellSlot: EvaluationResult] = [:]
+        byCell.reserveCapacity(run.results.count)
+        for result in run.results {
+            byCell[CellSlot(query: result.queryID, variant: result.variantID)] = result
+        }
         let order = run.queries.map(\.id)
         return order.compactMap { queryID -> QueryRow? in
             guard let query = truth[queryID] else { return nil }
             let outcomes = run.variants.map { variant -> QueryOutcome in
-                outcome(run: run, query: query, variant: variant, grades: grades)
+                outcome(
+                    result: byCell[CellSlot(query: query.id, variant: variant.id)],
+                    query: query, variant: variant, grades: grades
+                )
             }
             let ranks = zip(outcomes, run.variants).compactMap { outcome, variant in
                 outcome.comparableRank(outOf: variant.nResults)
@@ -270,13 +283,18 @@ public extension EvaluationReport {
         }
     }
 
+    /// Ключ ячейки прогона: запрос и вариант. Имя со «слотом», потому что
+    /// `Cell` в этом типе уже занята — так называется клетка таблицы отчёта.
+    private struct CellSlot: Hashable {
+        let query: UUID
+        let variant: UUID
+    }
+
     private static func outcome(
-        run: EvaluationRun, query: EvaluationQuery, variant: EvaluationVariant,
+        result: EvaluationResult?, query: EvaluationQuery, variant: EvaluationVariant,
         grades: EvaluationMetrics.GradeIndex
     ) -> QueryOutcome {
-        guard let result = run.results.first(where: {
-            $0.queryID == query.id && $0.variantID == variant.id
-        }) else {
+        guard let result else {
             return .failed(reason: String(localized: "ячейка не выполнялась"))
         }
         if let failure = result.failure { return .failed(reason: failure) }
@@ -411,10 +429,15 @@ public extension EvaluationReport {
     static func compare(
         before: EvaluationRun, after: EvaluationRun,
         beforeSet: QuerySet? = nil, afterSet: QuerySet? = nil,
-        ks: [Int] = EvaluationMetrics.defaultKs
+        ks: [Int] = EvaluationMetrics.defaultKs,
+        /// Готовые индексы, если вызывающий их уже держит. Сравнение считает
+        /// метрики **обоих** прогонов, то есть строит два индекса — а на
+        /// экране разметки это происходит при каждой отметке.
+        beforeGrades: EvaluationMetrics.GradeIndex? = nil,
+        afterGrades: EvaluationMetrics.GradeIndex? = nil
     ) -> RunComparison {
-        let beforeMetrics = EvaluationMetrics.compute(run: before, set: beforeSet, ks: ks)
-        let afterMetrics = EvaluationMetrics.compute(run: after, set: afterSet, ks: ks)
+        let beforeMetrics = EvaluationMetrics.compute(run: before, set: beforeSet, ks: ks, grades: beforeGrades)
+        let afterMetrics = EvaluationMetrics.compute(run: after, set: afterSet, ks: ks, grades: afterGrades)
         let beforeByName = Dictionary(beforeMetrics.map { ($0.variantName, $0) }) { first, _ in first }
         let afterByName = Dictionary(afterMetrics.map { ($0.variantName, $0) }) { first, _ in first }
 

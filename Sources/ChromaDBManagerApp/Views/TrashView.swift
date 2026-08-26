@@ -213,7 +213,7 @@ struct TrashView: View {
                 get: { model.selectedIDs.contains(entry.id) },
                 set: { _ in model.toggle(entry) }
             ))
-            .toggleStyle(.checkbox)
+            .toggleStyle(.chromaCheckbox)
             .labelsHidden()
 
             VStack(alignment: .leading, spacing: 3) {

@@ -185,6 +185,25 @@ public enum EvaluationMetrics {
         /// именно совпало. Ключ без запроса переносил текст с одного запроса
         /// на другой; поймано тестом.
         private let normalisedTexts: [Key: String]
+        /// Какие фрагменты эталона встретились в тексте результата.
+        ///
+        /// Считается там же, где градация, — сравнение уже проделано, и
+        /// хранить его ответ дешевле, чем повторять. Ради этого и заведено:
+        /// nDCG спрашивал «какие ожидания не сбылись» заново на каждом `k`
+        /// и на каждом варианте, перебирая фрагменты по текстам. На живом
+        /// прогоне (3 варианта × 18 запросов × 10 результатов, 1,67 млн
+        /// знаков, 483 фрагмента) это и было теми 1097 мс, которые расчёт
+        /// метрик занимал при каждой отметке.
+        private let matchedFragments: [Key: Set<UUID>]
+        /// Ключи прогона по запросам — чтобы отметка пересчитывала свой
+        /// запрос, а не весь прогон.
+        private let keysByQuery: [UUID: [Key]]
+        /// Какие фрагменты индекс видел, когда строился.
+        ///
+        /// Эталон живёт своей жизнью: его правят, переносят, читают из файла.
+        /// Фрагмент, которого индекс не видел, считается по тексту — как
+        /// раньше, — а не молча объявляется ненайденным.
+        private let knownFragments: [UUID: Set<UUID>]
 
         public init(run: EvaluationRun, truth: [UUID: EvaluationQuery]) {
             self.init(results: run.results, truth: truth)
@@ -192,40 +211,116 @@ public enum EvaluationMetrics {
 
         public init(results: [EvaluationResult], truth: [UUID: EvaluationQuery]) {
             var texts: [Key: String] = [:]
+            var keysByQuery: [UUID: [Key]] = [:]
+            var seen: Set<Key> = []
             for result in results {
                 for hit in result.hits {
                     let key = Key(query: result.queryID, variant: result.variantID, document: hit.id)
+                    if seen.insert(key).inserted {
+                        keysByQuery[result.queryID, default: []].append(key)
+                    }
                     guard texts[key] == nil, let text = hit.text else { continue }
                     texts[key] = ExpectedFragment.normalised(text)
                 }
             }
 
             var grades: [Key: RelevanceGrade] = [:]
-            for result in results {
-                guard let query = truth[result.queryID] else { continue }
-                for hit in result.hits {
-                    let key = Key(query: result.queryID, variant: result.variantID, document: hit.id)
-                    guard grades[key] == nil else { continue }
-                    let normalised = texts[key]
-                    if let grade = Self.grade(of: query, document: hit.id, normalised: normalised) {
-                        grades[key] = grade
-                    }
-                }
+            var matched: [Key: Set<UUID>] = [:]
+            var known: [UUID: Set<UUID>] = [:]
+            for (queryID, keys) in keysByQuery {
+                guard let query = truth[queryID] else { continue }
+                Self.grade(query: query, keys: keys, texts: texts, into: &grades, matched: &matched)
+                known[queryID] = Set(query.fragments.map(\.id))
             }
             self.grades = grades
             self.normalisedTexts = texts
+            self.matchedFragments = matched
+            self.keysByQuery = keysByQuery
+            self.knownFragments = known
+        }
+
+        private init(
+            grades: [Key: RelevanceGrade],
+            normalisedTexts: [Key: String],
+            matchedFragments: [Key: Set<UUID>],
+            keysByQuery: [UUID: [Key]],
+            knownFragments: [UUID: Set<UUID>]
+        ) {
+            self.grades = grades
+            self.normalisedTexts = normalisedTexts
+            self.matchedFragments = matchedFragments
+            self.keysByQuery = keysByQuery
+            self.knownFragments = knownFragments
+        }
+
+        /// Тот же индекс, но с заново посчитанным **одним** запросом.
+        ///
+        /// Отметка меняет эталон ровно одного запроса, а пересборка индекса
+        /// целиком приводила к сравнимому виду все 1,67 млн знаков выдачи —
+        /// 1547 мс на каждое нажатие, и тем дороже, чем больше размечено.
+        /// Приведённые тексты не зависят от разметки вовсе, поэтому
+        /// переиспользуются как есть, а сравнение с фрагментами повторяется
+        /// только для тех тридцати результатов, которых отметка касается.
+        public func regrading(query queryID: UUID, truth: [UUID: EvaluationQuery]) -> GradeIndex {
+            let keys = keysByQuery[queryID] ?? []
+            var grades = self.grades
+            var matched = self.matchedFragments
+            var known = self.knownFragments
+            for key in keys {
+                grades[key] = nil
+                matched[key] = nil
+            }
+            if let query = truth[queryID] {
+                Self.grade(query: query, keys: keys, texts: normalisedTexts, into: &grades, matched: &matched)
+                known[queryID] = Set(query.fragments.map(\.id))
+            } else {
+                known[queryID] = nil
+            }
+            return GradeIndex(
+                grades: grades, normalisedTexts: normalisedTexts, matchedFragments: matched,
+                keysByQuery: keysByQuery, knownFragments: known
+            )
         }
 
         /// То же правило, что в `EvaluationQuery.grade(forDocument:text:)`,
-        /// но по уже приведённому тексту.
+        /// но сразу по всем результатам одного запроса.
+        ///
+        /// Разом, а не по одному: фрагмент эталона приводится к сравнимому
+        /// виду один раз на запрос, а не один раз на каждое сравнение. При
+        /// отметке фрагментом становится найденный текст целиком — до 120
+        /// знаков, — и приводить его заново на каждый из тридцати результатов
+        /// значило повторять одну и ту же работу.
         private static func grade(
-            of query: EvaluationQuery, document: String, normalised: String?
-        ) -> RelevanceGrade? {
-            if let normalised {
-                let matched = query.fragments.filter { $0.matches(normalisedDocument: normalised) }
-                if let best = matched.map(\.grade).min(by: { $0.gain > $1.gain }) { return best }
+            query: EvaluationQuery,
+            keys: [Key],
+            texts: [Key: String],
+            into grades: inout [Key: RelevanceGrade],
+            matched: inout [Key: Set<UUID>]
+        ) {
+            let fragments: [(id: UUID, needle: String, grade: RelevanceGrade)] = query.fragments
+                .map { (id: $0.id, needle: ExpectedFragment.normalised($0.fragment), grade: $0.grade) }
+                .filter { !$0.needle.isEmpty }
+            var documents: [String: RelevanceGrade] = [:]
+            for document in query.documents where documents[document.id] == nil {
+                documents[document.id] = document.grade
             }
-            return query.documents.first { $0.id == document }?.grade
+
+            for key in keys {
+                var best: RelevanceGrade?
+                if let text = texts[key], !fragments.isEmpty {
+                    var found: Set<UUID> = []
+                    for fragment in fragments where ExpectedFragment.contains(text, fragment.needle) {
+                        found.insert(fragment.id)
+                        if best == nil || fragment.grade.gain > best!.gain { best = fragment.grade }
+                    }
+                    if !found.isEmpty { matched[key] = found }
+                }
+                if let best {
+                    grades[key] = best
+                } else if let byID = documents[key.document] {
+                    grades[key] = byID
+                }
+            }
         }
 
         public func grade(query: UUID, variant: UUID, document: String) -> RelevanceGrade? {
@@ -236,6 +331,16 @@ public enum EvaluationMetrics {
         /// «какая градация», а «встретился ли **этот** фрагмент».
         public func normalisedText(query: UUID, variant: UUID, document: String) -> String? {
             normalisedTexts[Key(query: query, variant: variant, document: document)]
+        }
+
+        /// Фрагменты эталона, встретившиеся в тексте этого результата.
+        public func matched(query: UUID, variant: UUID, document: String) -> Set<UUID> {
+            matchedFragments[Key(query: query, variant: variant, document: document)] ?? []
+        }
+
+        /// Знал ли индекс про этот фрагмент, когда строился.
+        public func knows(fragment: UUID, of query: UUID) -> Bool {
+            knownFragments[query]?.contains(fragment) ?? false
         }
     }
 
@@ -445,15 +550,28 @@ public enum EvaluationMetrics {
         query: EvaluationQuery, hits: [EvaluationHit], variant: UUID, grades: GradeIndex
     ) -> [Double] {
         let queryID = query.id
-        // Приведённые тексты берутся из индекса: раньше здесь текст каждого
-        // результата приводился заново на каждый фрагмент эталона, на каждом
-        // `k` и на каждом варианте — 185 мс из 306.
-        let texts = hits.compactMap {
-            grades.normalisedText(query: queryID, variant: variant, document: $0.id)
+        // Совпадения берутся у индекса готовыми: он их уже искал, когда
+        // считал градации. Раньше здесь каждый фрагмент эталона сверялся с
+        // текстом каждого результата — заново на каждом `k` и на каждом
+        // варианте.
+        var matched: Set<UUID> = []
+        for hit in hits {
+            matched.formUnion(grades.matched(query: queryID, variant: variant, document: hit.id))
         }
+        // Тексты — только если попался фрагмент, которого индекс не видел:
+        // эталон могли поправить после того, как индекс построили.
+        var texts: [String]?
         var gains: [Double] = []
         for fragment in query.fragments where fragment.grade.isHit {
-            if !texts.contains(where: { fragment.matches(normalisedDocument: $0) }) {
+            if grades.knows(fragment: fragment.id, of: queryID) {
+                if !matched.contains(fragment.id) { gains.append(fragment.grade.gain) }
+                continue
+            }
+            let known = texts ?? hits.compactMap {
+                grades.normalisedText(query: queryID, variant: variant, document: $0.id)
+            }
+            texts = known
+            if !known.contains(where: { fragment.matches(normalisedDocument: $0) }) {
                 gains.append(fragment.grade.gain)
             }
         }

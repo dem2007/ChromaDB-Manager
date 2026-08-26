@@ -65,6 +65,26 @@ struct HTTPRequestParser {
         let parts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
         guard parts.count >= 2 else { throw Failure.malformed("некорректная строка запроса") }
 
+        // В строке запроса — только путь, и ничего кроме пути.
+        //
+        // HTTP/1.1 разрешает клиенту написать там целый адрес —
+        // `GET http://internal.local/admin HTTP/1.1`. Так разговаривают
+        // с **прямым** прокси, которому каждый раз называют, куда идти.
+        // Этот прокси обратный: куда идти, он знает сам, и цель запроса для
+        // него — путь внутри своего сервера.
+        //
+        // Разница не теоретическая. Дальше адрес собирался как
+        // `URL(string: путь, relativeTo: сервер)`, а абсолютная строка
+        // основание отбрасывает: прокси уходил на чужой хост и приносил
+        // ответ клиенту. Маршрут при этом не узнавался («http:», «internal.local»
+        // — не те сегменты), а неизвестное чтение проходит по правилу
+        // «новая ручка будущей ChromaDB не должна ломать никому жизнь».
+        // Годился любой включённый ключ, хоть с одной коллекцией и без записи.
+        // То же самое умеет протокол-относительная форма `//internal.local/admin`.
+        guard parts[1].hasPrefix("/"), !parts[1].hasPrefix("//") else {
+            throw Failure.malformed("в строке запроса должен стоять путь, а не адрес: «\(parts[1].prefix(80))»")
+        }
+
         var headers: [(String, String)] = []
         for line in lines where !line.isEmpty {
             guard let colon = line.firstIndex(of: ":") else { continue }
@@ -720,7 +740,14 @@ final class ProxyConnection: @unchecked Sendable {
     }
 
     private func forward(_ request: ProxiedRequest) async throws -> (Int, [(String, String)], Data) {
-        guard let url = URL(string: request.path, relativeTo: upstream) else {
+        // Второй пояс к разбору строки запроса: куда бы ни указывал
+        // собранный адрес, уйти он может только на свой сервер. Разбор уже
+        // не пропускает чужие адреса, но цена ошибки здесь — запрос от имени
+        // приложения в чужую сеть, и одной проверки для такого мало.
+        guard let url = URL(string: request.path, relativeTo: upstream),
+              url.scheme == upstream.scheme,
+              url.host == upstream.host,
+              url.port == upstream.port else {
             throw URLError(.badURL)
         }
         var outgoing = URLRequest(url: url)
@@ -773,18 +800,29 @@ final class ProxyConnection: @unchecked Sendable {
     /// «off» means no headers at all rather than headers that deny.
     private func corsHeaders(for request: ProxiedRequest) async -> [(String, String)] {
         guard let origin = request.origin, !origin.isEmpty else { return [] }
-        guard let client = await access.client(withKey: request.accessKey),
-              client.isEnabled, client.permissions.allowsOrigin(origin) else { return [] }
+        guard let client = await access.activeClient(withKey: request.accessKey),
+              client.permissions.allowsOrigin(origin) else { return [] }
         return Self.corsHeaderList(origin: origin)
     }
 
-    private static func corsHeaderList(origin: String) -> [(String, String)] {
+    /// Не `private`: список разрешённых заголовков сверяется тестом с тем,
+    /// что на самом деле требует транспорт MCP.
+    static func corsHeaderList(origin: String) -> [(String, String)] {
         [
             // The concrete origin, never `*`, even when the client allowed any:
             // echoing the request's own origin is what lets a browser send
             // credentials at all, and it keeps the answer specific.
             ("access-control-allow-origin", origin),
-            ("access-control-allow-headers", "authorization, x-chroma-token, content-type"),
+            // Заголовки MCP названы своими константами, а не строкой: браузер
+            // блокирует POST с заголовком, которого нет в этом списке, и
+            // переименование в транспорте иначе тихо ломало бы браузерных
+            // клиентов — preflight бы прошёл, а сам запрос нет.
+            ("access-control-allow-headers", [
+                "authorization", "x-chroma-token", "content-type",
+                MCPHTTPTransport.protocolVersionHeader,
+                MCPHTTPTransport.methodHeader,
+                MCPHTTPTransport.nameHeader,
+            ].joined(separator: ", ")),
             ("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS"),
             ("access-control-max-age", "600"),
             ("vary", "origin"),
@@ -838,8 +876,12 @@ final class ProxyConnection: @unchecked Sendable {
         //
         // Поиск по ключу не расходует лимит частоты: у известного клиента его
         // возьмёт слой инструментов, а неизвестному брать нечего.
-        guard let client = await access.client(withKey: request.accessKey) else {
-            let message = String(localized: "Ключ доступа не передан или не зарегистрирован.")
+        // Один поиск на оба вопроса — «пускать ли» и «как назвать в отказе»:
+        // второй сходил бы к тому же актору за тем же ключом.
+        let known = await access.client(withKey: request.accessKey)
+        guard let client = known, client.isEnabled else {
+            let message = known.map { String(localized: "Клиент «\($0.name)» отключён в ChromaDB Manager.") }
+                ?? String(localized: "Ключ доступа не передан или не зарегистрирован.")
             respond(
                 status: 401,
                 headers: corsHeaders + [("Content-Type", "application/json; charset=utf-8")],

@@ -339,6 +339,51 @@ final class EvaluationReportTests: XCTestCase {
         XCTAssertTrue(text.contains("отменён на середине"), text)
     }
 
+    /// Черта приходит не только из текста запроса.
+    ///
+    /// Имена вариантов пишет человек, а причины сбоя приходят из
+    /// `error.localizedDescription`, где и черта, и перевод строки — дело
+    /// обычное. Экранировался же долгое время только запрос: имя вида
+    /// «bge-small | tuned» разъезжало таблицу с первой строки.
+    func testAPipeInANameOrAFailureDoesNotBreakTheTable() {
+        let q = query("запрос", relevant: "нужный текст")
+        let a = variant("bge-small | tuned")
+        let run = EvaluationRun(
+            name: "прогон", querySetID: UUID(), querySetName: "набор",
+            queries: [q], variants: [a],
+            results: [
+                EvaluationResult(
+                    queryID: q.id, variantID: a.id, hits: [], searchSeconds: 0,
+                    failure: "модель не ответила: тайм-аут | попробуйте\nещё раз"
+                ),
+            ],
+            isComplete: true
+        )
+        let text = EvaluationExport.markdown(run: run)
+
+        // Разметка цела: в каждой строке таблицы одинаковое число неэкранированных черт.
+        for table in ["| Метрика |", "| Запрос |"] {
+            let rows = text
+                .components(separatedBy: "\n")
+                .drop { !$0.hasPrefix(table) }
+                .prefix { $0.hasPrefix("|") }
+            let counts = Set(rows.map { Self.unescapedPipes(in: $0) })
+            XCTAssertEqual(counts.count, 1, "таблица «\(table)» разъехалась: \(rows.joined(separator: "\n"))")
+        }
+        XCTAssertTrue(text.contains("bge-small \\| tuned"), text)
+        XCTAssertFalse(text.contains("тайм-аут | попробуйте"), "причина сбоя не экранирована")
+    }
+
+    private static func unescapedPipes(in line: String) -> Int {
+        var count = 0
+        var previous: Character?
+        for character in line {
+            if character == "|", previous != "\\" { count += 1 }
+            previous = character
+        }
+        return count
+    }
+
     /// Вертикальная черта в тексте запроса разломала бы таблицу.
     func testAPipeInAQueryDoesNotBreakTheTable() {
         XCTAssertEqual(EvaluationExport.escaped("a|b"), "a\\|b")

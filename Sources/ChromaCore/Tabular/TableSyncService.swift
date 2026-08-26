@@ -20,6 +20,18 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
     /// причине: удалять их приложение не вправе, а молчать о них — значит
     /// оставить в коллекции строки, которые продолжают находиться поиском.
     public var pendingRemovals: [String: SheetRowRemoval]
+    /// Листы, очищенные под переиндексацию и ещё не записанные заново.
+    ///
+    /// Без этого признака состояние «строк в базе нет, и это мы их убрали»
+    /// не хранилось нигде: лист исчезал из манифеста целиком, карточка
+    /// с кнопкой пропадала вместе с ним (она показывается, пока строк
+    /// больше нуля), и единственным следом оставалось сообщение на экране.
+    /// Закрыли экран — следа нет, а пятисот строк в коллекции нет тоже,
+    /// и поиск по ним честно отвечает «ничего не найдено».
+    ///
+    /// Снимается там же, где лист записывается заново, — прогоном
+    /// синхронизации.
+    public var sheetsAwaitingWrite: Set<String>
 
     public init(
         relativePath: String,
@@ -28,7 +40,8 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         modifiedAt: Date = Date(),
         size: Int64 = 0,
         profilesSignature: String = "",
-        pendingRemovals: [String: SheetRowRemoval] = [:]
+        pendingRemovals: [String: SheetRowRemoval] = [:],
+        sheetsAwaitingWrite: Set<String> = []
     ) {
         self.relativePath = relativePath
         self.collectionName = collectionName
@@ -37,6 +50,7 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         self.size = size
         self.profilesSignature = profilesSignature
         self.pendingRemovals = pendingRemovals
+        self.sheetsAwaitingWrite = sheetsAwaitingWrite
     }
 
     /// Манифест прошлых версий читается как есть: списка на решение в нём
@@ -50,6 +64,9 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
         profilesSignature = try container.decodeIfPresent(String.self, forKey: .profilesSignature) ?? ""
         pendingRemovals = try container.decodeIfPresent([String: SheetRowRemoval].self, forKey: .pendingRemovals) ?? [:]
+        // Манифест, записанный до появления признака, читается как «ничего
+        // не ждёт»: там и очищать листы было нечем.
+        sheetsAwaitingWrite = try container.decodeIfPresent(Set<String>.self, forKey: .sheetsAwaitingWrite) ?? []
     }
 
     public var rowCount: Int { sheets.values.reduce(0) { $0 + $1.rowCount } }
@@ -65,12 +82,21 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
     /// Подпись профилей файла тоже сбрасывается. Без этого файл, у которого
     /// на диске ничего не менялось, план объявил бы неизменившимся и не открыл
     /// бы вовсе: переиндексация прошла бы вхолостую, а лист остался бы пустым.
+    ///
+    /// Лист помечается ждущим записи: до следующего прогона его
+    /// строк в коллекции нет, и человек должен видеть это, даже закрыв экран.
     public mutating func forgetSheet(_ sheetName: String) -> [String] {
         guard let sheet = sheets[sheetName] else { return [] }
         sheets[sheetName] = nil
         pendingRemovals[sheetName] = nil
         profilesSignature = ""
+        sheetsAwaitingWrite.insert(sheetName)
         return sheet.documentIDs
+    }
+
+    /// Лист записан — ждать больше нечего.
+    public mutating func noteSheetWritten(_ sheetName: String) {
+        sheetsAwaitingWrite.remove(sheetName)
     }
 }
 
@@ -476,6 +502,8 @@ public actor TableSyncService {
                 context: context, chroma: chroma, embeddings: embeddings, coverage: coverage
             )
             report.sheetsIndexed.append(entry.sheet.name)
+            // Лист записан — ждать его больше нечего.
+            manifest.noteSheetWritten(entry.sheet.name)
             report.rowsAdded += written.added
             report.rowsReembedded += written.reembedded
             report.rowsUnchanged += written.unchanged
@@ -560,6 +588,7 @@ public actor TableSyncService {
             manifest.sheets[sheetName] = sheetManifest
 
             report.sheetsIndexed.append(sheetName)
+            manifest.noteSheetWritten(sheetName)
             report.rowsAdded += sheetPlan.added.count
             report.rowsReembedded += sheetPlan.reembedded.count
             report.rowsMetadataOnly += sheetPlan.metadataOnly.count

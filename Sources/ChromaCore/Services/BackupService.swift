@@ -61,8 +61,16 @@ public final class BackupService: @unchecked Sendable {
         self.log = log
     }
 
-    private static let stampFormatter: DateFormatter = {
+    /// Метка времени в имени копии. Не `private`: локаль у неё закреплена
+    /// сторожем.
+    ///
+    /// `en_US_POSIX` обязателен там, где формат задан строкой: без него
+    /// `DateFormatter` берёт локаль системы, и на персидской в имени файла
+    /// окажется «۲۰۲۶-۰۸-۲۵», а на тайской — год 2569. Имя копии после этого
+    /// не сортируется рядом с остальными и не разбирается обратно.
+    static let stampFormatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         return f
     }()

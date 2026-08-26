@@ -33,6 +33,23 @@ final class EvaluationViewModel: ObservableObject {
     /// а вычисление её требует приведения текста результата — на живом прогоне
     /// это 209 мс на проход. Считается один раз вместе с метриками.
     @Published private(set) var grades: EvaluationMetrics.GradeIndex?
+    /// Тексты карточек выдачи — окно совпадения и длина куска.
+    ///
+    /// От разметки они не зависят вовсе: прогон записан и больше не меняется,
+    /// — поэтому считаются один раз и хранятся. В `body` это стоило 695 мс на
+    /// перерисовку: перебор всей выдачи.
+    ///
+    /// Считаются **по требованию**, а не все разом при открытии прогона
+    ///. Список выдачи стал ленивым, и на экране живёт не пятьсот
+    /// карточек, а три десятка: считать остальные заранее значило задержать
+    /// открытие на полсекунды ради того, что человек, может быть, и не
+    /// пролистает.
+    ///
+    /// Не `@Published`: заполнение кэша ничего не меняет на экране — оно
+    /// отвечает на вопрос, который экран уже задал.
+    private var cardCache: [EvaluationPreview.Key: EvaluationPreview.Card] = [:]
+    /// Прогон, которому принадлежат посчитанные карточки.
+    private var cardsRunID: UUID?
     /// Строки детализации и оговорка о длине — тоже посчитанные, а не
     /// вычисляемые в `body`.
     @Published private(set) var rows: [EvaluationReport.QueryRow] = []
@@ -435,7 +452,7 @@ final class EvaluationViewModel: ObservableObject {
                                 try await lmStudio.complete(prompt: prompt, model: chatModel, schema: schema)
                             }
                         },
-                        completePlain: { prompt, model in
+                        completePlain: { prompt, model, maxTokens in
                             // Режим переранжировщика обязан работать
                             // и на стенде: иначе вариант с ним не сравнить
                             // ни с чем.
@@ -445,7 +462,9 @@ final class EvaluationViewModel: ObservableObject {
                                 group: .lmStudio,
                                 connectionID: id
                             )) { _ in
-                                try await lmStudio.rawCompletion(prompt: prompt, model: model)
+                                try await lmStudio.rawCompletion(
+                                    prompt: prompt, model: model, maxTokens: maxTokens
+                                )
                             }
                         },
                         rerankContextTokens: rerankContext,
@@ -503,6 +522,28 @@ final class EvaluationViewModel: ObservableObject {
         loadJudgements(app)
     }
 
+    /// Пересчёт после отметки — по одному запросу.
+    ///
+    /// Отметка меняет эталон ровно одного запроса, а приведение выдачи к
+    /// сравнимому виду от разметки не зависит вовсе. Полная пересборка
+    /// индекса стоила 1547 мс на каждое нажатие и дорожала по мере разметки;
+    /// пересчёт одного запроса — 64 мс, и он не растёт.
+    func refreshMetrics(_ app: AppEnvironment, changed queryID: UUID) {
+        guard let run = lastRun, let index = grades else {
+            refreshMetrics(app)
+            return
+        }
+        let set = app.querySets.set(id: run.querySetID)
+        let truth = EvaluationMetrics.groundTruth(for: run, set: set)
+        let updated = index.regrading(query: queryID, truth: truth)
+        groundTruth = truth
+        grades = updated
+        metrics = EvaluationMetrics.compute(run: run, set: set, ks: ks(app), grades: updated)
+        rows = EvaluationReport.queryRows(run: run, set: set, grades: updated)
+        lengthCaveat = EvaluationReport.lengthCaveat(run)
+        refreshComparison(app, changed: queryID)
+    }
+
     /// Пересчёт метрик по тому, что размечено сейчас.
     /// Всё, что зависит от прогона и эталона, считается **здесь** — один раз
     /// на изменение, а не в `body` на каждую перерисовку.
@@ -511,6 +552,10 @@ final class EvaluationViewModel: ObservableObject {
             metrics = []
             groundTruth = [:]
             grades = nil
+            comparisonGrades = nil
+            comparison = nil
+            cardCache = [:]
+            cardsRunID = nil
             rows = []
             lengthCaveat = nil
             return
@@ -520,6 +565,12 @@ final class EvaluationViewModel: ObservableObject {
         let index = EvaluationMetrics.GradeIndex(run: run, truth: truth)
         groundTruth = truth
         grades = index
+        // Тексты карточек зависят только от прогона: на смену `k` их
+        // выбрасывать не за что.
+        if cardsRunID != run.id {
+            cardCache = [:]
+            cardsRunID = run.id
+        }
         metrics = EvaluationMetrics.compute(run: run, set: set, ks: ks(app), grades: index)
         rows = EvaluationReport.queryRows(run: run, set: set, grades: index)
         lengthCaveat = EvaluationReport.lengthCaveat(run)
@@ -548,21 +599,45 @@ final class EvaluationViewModel: ObservableObject {
     ///.
     @Published private(set) var comparison: EvaluationReport.RunComparison?
 
-    private func refreshComparison(_ app: AppEnvironment) {
+    /// Индекс прогона, с которым сравнивают, — рядом с ним самим.
+    ///
+    /// Сравнение считает метрики обоих прогонов, а при разметке это
+    /// происходит на каждое нажатие: без своего индекса второй прогон
+    /// приводил бы всю свою выдачу к сравнимому виду заново.
+    /// Сбрасывается вместе с самим прогоном сравнения — иначе индекс одного
+    /// прогона достался бы другому.
+    private var comparisonGrades: EvaluationMetrics.GradeIndex?
+
+    private func refreshComparison(_ app: AppEnvironment, changed queryID: UUID? = nil) {
         guard let after = lastRun, let before = comparisonRun else {
             comparison = nil
+            comparisonGrades = nil
             return
         }
+        let beforeSet = app.querySets.set(id: before.querySetID)
+        let beforeTruth = EvaluationMetrics.groundTruth(for: before, set: beforeSet)
+        // Отметка меняет один запрос и во втором прогоне тоже — если он
+        // вообще про этот запрос. Если нет, пересчёт вернёт то же самое.
+        let beforeIndex: EvaluationMetrics.GradeIndex
+        if let cached = comparisonGrades, let queryID {
+            beforeIndex = cached.regrading(query: queryID, truth: beforeTruth)
+        } else {
+            beforeIndex = EvaluationMetrics.GradeIndex(run: before, truth: beforeTruth)
+        }
+        comparisonGrades = beforeIndex
         comparison = EvaluationReport.compare(
             before: before, after: after,
-            beforeSet: app.querySets.set(id: before.querySetID),
+            beforeSet: beforeSet,
             afterSet: app.querySets.set(id: after.querySetID),
-            ks: ks(app)
+            ks: ks(app),
+            beforeGrades: beforeIndex,
+            afterGrades: grades
         )
     }
 
     func selectComparison(_ id: UUID?, app: AppEnvironment) {
         comparisonRunID = id
+        comparisonGrades = nil
         guard let id else {
             comparisonRun = nil
             refreshComparison(app)
@@ -771,6 +846,19 @@ final class EvaluationViewModel: ObservableObject {
 
     // MARK: - Разметка
 
+    /// Текст карточки результата — посчитанный один раз.
+    ///
+    /// Спрашивает его `body`, и спрашивает часто: перерисовка случается на
+    /// каждую отметку. Считается он при первом вопросе о **видимой** строке —
+    /// список выдачи ленивый, и заранее считать всё незачем.
+    func card(queryID: UUID, variantID: UUID, hit: EvaluationHit, query: String) -> EvaluationPreview.Card {
+        let key = EvaluationPreview.Key(query: queryID, variant: variantID, document: hit.id)
+        if let ready = cardCache[key] { return ready }
+        let card = EvaluationPreview.card(for: hit, query: query)
+        cardCache[key] = card
+        return card
+    }
+
     /// Оценка, уже стоящая у этого результата, — `nil` значит «не размечено».
     func grade(queryID: UUID, variantID: UUID, hit: EvaluationHit) -> RelevanceGrade? {
         grades?.grade(query: queryID, variant: variantID, document: hit.id)
@@ -804,7 +892,8 @@ final class EvaluationViewModel: ObservableObject {
 
         sets = app.querySets.all()
         // Немедленно и без повторного прогона: выдача уже сохранена.
-        refreshMetrics(app)
+        // По одному запросу — по тому, который отметили.
+        refreshMetrics(app, changed: queryID)
         statusMessage = removed
             ? String(localized: "Отметка снята.")
             : String(localized: "Отмечено «\(grade.title)» — сохранено в эталон набора «\(run.querySetName)» как фрагмент найденного текста.")
@@ -817,9 +906,13 @@ final class EvaluationViewModel: ObservableObject {
         app.modelJudgements.remove(runID: summary.id)
         if lastRun?.id == summary.id {
             lastRun = nil
-            metrics = []
             judgements = nil
             judgeCost = nil
+            // Всё производное — одним местом. Порознь оно и разошлось:
+            // метрики очищались, а индекс, карточки и строки детализации
+            // оставались жить в модели вместе со всей выдачей удалённого
+            // прогона — мегабайты за прогоном, которого больше нет.
+            refreshMetrics(app)
         }
         runs = app.evaluationRuns.summaries()
     }

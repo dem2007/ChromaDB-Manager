@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Оценка релевантности, выставленная чат-моделью.
@@ -143,9 +144,21 @@ public struct JudgePrompt: Codable, Hashable, Sendable {
     }
 
     /// Короткая подпись редакции промпта — чтобы оценка помнила, чем получена.
+    ///
+    /// SHA-256, а не `hashValue`. Стандартный хеш Swift засеивается случайно
+    /// при каждом запуске процесса — это записано в SE-0206, и сохранять его
+    /// нельзя. А эта подпись именно сохраняется: она лежит в оценке на диске
+    /// и при следующем запуске сравнивается с посчитанной заново. Под другим
+    /// зерном совпасть они не могли **никогда**, поэтому каждый уже оценённый
+    /// триплет уходил на переоценку, и чат-модель молча считала всё заново.
+    /// Самопроверка `isDefault` этого не ловила: там оба хеша считаются
+    /// в одном процессе.
     public var fingerprint: String {
         let normalised = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
-        return String(format: "%08x", UInt32(truncatingIfNeeded: normalised.hashValue))
+        return SHA256.hash(data: Data(normalised.utf8))
+            .prefix(4)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     public var isDefault: Bool {

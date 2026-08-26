@@ -1538,6 +1538,20 @@ final class CollectionsViewModel: ObservableObject {
         let requested = numberOfResults
         let queryFilter = applyFilterToQuery && !filter.isEmpty ? filter : nil
 
+        // Стадия 7 — одна на всю слитую выдачу, а не по разу на коллекцию:
+        // модель обязана сравнивать кандидатов между коллекциями, а не только
+        // с земляками. Чьими настройками спрашивать, решает правило
+        // согласия профилей.
+        let plan = MultiCollectionSearch.rerankPlan(targets: targets)
+        var rerank: RerankStage?
+        if let governing = plan.profile {
+            rerank = try? await app.makeRerankStage(
+                for: governing,
+                title: String(localized: "Переранжирование по нескольким коллекциям"),
+                priority: .interactive
+            )
+        }
+
         let search = MultiCollectionSearch(
             embed: { query, model in
                 // Через очередь и с приоритетом человека у экрана: поиск
@@ -1566,7 +1580,8 @@ final class CollectionsViewModel: ObservableObject {
                     ),
                     profile: target.profile
                 )
-            }
+            },
+            rerank: rerank
         )
 
         let answer = await search.run(query: text, targets: targets, nResults: requested)

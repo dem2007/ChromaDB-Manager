@@ -18,6 +18,57 @@ extension AppEnvironment {
         let smartSearchEnabled: Bool
     }
 
+    /// Стадия 7 со всеми вызовами модели: одна сборка на три места.
+    ///
+    /// Кроме обычного поиска её просит поиск сразу по нескольким коллекциям —
+    /// он спрашивает модель один раз про слитую выдачу. Собирать
+    /// вызовы модели в каждом месте по-своему значит разойтись в мелочах:
+    /// очередь, приоритет, место под ответ.
+    ///
+    /// - Parameter title: что показывать в очереди — при слитом поиске это
+    ///   не «в такой-то коллекции», а «по нескольким».
+    @MainActor
+    func makeRerankStage(
+        for profile: SearchProfile,
+        title: String,
+        priority: QueuePriority
+    ) async throws -> RerankStage {
+        let lmStudio = try makeLMStudioClient()
+        // Контекст переранжировщика спрашивается только когда стадия включена:
+        // лишний вызов к LM Studio на каждый поиск не нужен.
+        let asked = profile.rerankEnabled && !profile.rerankModel.isEmpty
+        let contextTokens: Int? = asked
+            ? await bindingService.loadedContextLength(of: profile.rerankModel, lmStudio: lmStudio)
+            : nil
+        // «3.5 символа на токен» ошибается на русском юридическом тексте
+        // на 40 % в опасную сторону — берётся измеренное.
+        let charactersPerToken: Double? = asked
+            ? await lmStudio.charactersPerToken(of: profile.rerankModel)
+            : nil
+        return RerankStage(
+            complete: { [queue = queue, id = connectionID] prompt, chatModel, schema in
+                try await queue.run(QueueTicket(
+                    title: title, priority: priority, group: .lmStudio, connectionID: id
+                )) { _ in
+                    try await lmStudio.complete(prompt: prompt, model: chatModel, schema: schema)
+                }
+            },
+            completePlain: { [queue = queue, id = connectionID] prompt, model, maxTokens in
+                // Переранжировщику — прямой вызов без шаблона чата,
+                // и место под ответ называет стадия.
+                try await queue.run(QueueTicket(
+                    title: title, priority: priority, group: .lmStudio, connectionID: id
+                )) { _ in
+                    try await lmStudio.rawCompletion(
+                        prompt: prompt, model: model, maxTokens: maxTokens
+                    )
+                }
+            },
+            contextTokens: contextTokens,
+            charactersPerToken: charactersPerToken
+        )
+    }
+
     /// Готовит конвейер для коллекции: проверяет модель, поднимает её в
     /// LM Studio и подставляет очередь на каждый вызов модели.
     ///
@@ -50,17 +101,11 @@ extension AppEnvironment {
         let profile = smartSearch
             ? configured
             : SearchProfile.plain(collectionName: collection.name, name: configured.name)
-        // Контекст переранжировщика спрашивается только когда стадия включена:
-        // лишний вызов к LM Studio на каждый поиск не нужен.
-        let rerankOn = profile.rerankEnabled && !profile.rerankModel.isEmpty
-        let rerankContext: Int? = rerankOn
-            ? await bindingService.loadedContextLength(of: profile.rerankModel, lmStudio: lmStudio)
-            : nil
-        // «3.5 символа на токен» ошибается на русском юридическом тексте
-        // на 40 % в опасную сторону — берётся измеренное.
-        let rerankRatio: Double? = rerankOn
-            ? await lmStudio.charactersPerToken(of: profile.rerankModel)
-            : nil
+        let rerankStage = try await makeRerankStage(
+            for: profile,
+            title: String(localized: "Переранжирование в «\(collection.name)»"),
+            priority: priority
+        )
 
         let pipeline = RetrievalPipeline(
             database: client,
@@ -80,29 +125,7 @@ extension AppEnvironment {
                 try await binding.validate(vectorLength: vector.count, for: collection)
                 return vector
             },
-            complete: { [queue = queue, id = connectionID] prompt, chatModel, schema in
-                try await queue.run(QueueTicket(
-                    title: String(localized: "Переранжирование в «\(collection.name)»"),
-                    priority: priority,
-                    group: .lmStudio,
-                    connectionID: id
-                )) { _ in
-                    try await lmStudio.complete(prompt: prompt, model: chatModel, schema: schema)
-                }
-            },
-            completePlain: { [queue = queue, id = connectionID] prompt, model in
-                // Переранжировщику — прямой вызов без шаблона чата.
-                try await queue.run(QueueTicket(
-                    title: String(localized: "Переранжирование в «\(collection.name)»"),
-                    priority: priority,
-                    group: .lmStudio,
-                    connectionID: id
-                )) { _ in
-                    try await lmStudio.rawCompletion(prompt: prompt, model: model)
-                }
-            },
-            rerankContextTokens: rerankContext,
-            rerankCharactersPerToken: rerankRatio,
+            rerank: rerankStage,
             log: logHandler
         )
         return PreparedSearch(

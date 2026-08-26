@@ -108,7 +108,7 @@ public enum EvaluationExport {
 
     private static func markdownTable(_ table: EvaluationReport.Table) -> String {
         var lines: [String] = []
-        lines.append("| Метрика | " + table.variantNames.joined(separator: " | ") + " |")
+        lines.append("| Метрика | " + table.variantNames.map(escaped).joined(separator: " | ") + " |")
         lines.append("|---|" + String(repeating: "---|", count: table.variantNames.count))
         for column in table.columns {
             let cells = column.cells.map { cell in
@@ -125,19 +125,26 @@ public enum EvaluationExport {
         _ rows: [EvaluationReport.QueryRow], variants: [EvaluationVariant]
     ) -> String {
         var lines: [String] = []
-        lines.append("| Запрос | " + variants.map(\.name).joined(separator: " | ") + " |")
+        lines.append("| Запрос | " + variants.map { escaped($0.name) }.joined(separator: " | ") + " |")
         lines.append("|---|" + String(repeating: "---|", count: variants.count))
         for row in rows {
             let cells = row.outcomes.map { outcome -> String in
-                if case .failed(let reason) = outcome { return "сбой: \(reason)" }
-                return outcome.text
+                if case .failed(let reason) = outcome { return escaped("сбой: \(reason)") }
+                return escaped(outcome.text)
             }
             lines.append("| \(escaped(row.text)) | " + cells.joined(separator: " | ") + " |")
         }
         return lines.joined(separator: "\n")
     }
 
-    /// Вертикальная черта в тексте запроса разломала бы таблицу Markdown.
+    /// Вертикальная черта разломала бы таблицу Markdown — и приходит она
+    /// не только из текста запроса.
+    ///
+    /// Долгое время экранировался ровно он. А в шапках обеих таблиц стоят
+    /// имена вариантов, которые человек пишет сам, и в ячейках — причины
+    /// сбоя из `error.localizedDescription`, где и черта, и перевод строки
+    /// дело обычное. Имя вида «bge-small | tuned» разъезжало всю таблицу
+    /// с первой же строки.
     static func escaped(_ text: String) -> String {
         text.replacingOccurrences(of: "|", with: "\\|")
             .replacingOccurrences(of: "\n", with: " ")

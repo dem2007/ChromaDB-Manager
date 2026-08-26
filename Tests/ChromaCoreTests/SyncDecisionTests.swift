@@ -328,6 +328,48 @@ final class ReextractionPlanTests: XCTestCase {
         XCTAssertEqual(forced.tableRowsToEmbed, 42)
     }
 
+    /// Переизвлечение сохраняет **все** поля самого элемента, а не только
+    /// те, что вспомнил вызывающий.
+    ///
+    /// Прежняя пересборка перечисляла девять полей из одиннадцати. Терялся
+    /// `isRemote` — и веб-страница после переизвлечения шла по ветке для
+    /// локальных файлов, получая имя, время и размер от временного файла
+    /// загрузки: ровно та подмена, против которой флаг и заводили. Терялся
+    /// и `refresh`.
+    func testForcingKeepsEveryFieldOfTheItem() {
+        let refresh = ManifestRefresh(
+            fileHash: "хеш-файла", contentHash: "хеш-текста",
+            extractor: ExtractorStamp(id: "office", version: 8),
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000), size: 123
+        )
+        let page = SyncPlanItem(
+            relativePath: "https://example.org/page", url: URL(fileURLWithPath: "/tmp/загрузка.html"),
+            kind: .unchanged, collectionName: "сайт", size: 4096,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_100),
+            contentHash: "хеш", textLength: 512, routeMetadata: ["relative_path": .string("page")],
+            refresh: refresh, isRemote: true
+        )
+        let original = SyncPlan(
+            sourceID: UUID(), sourceName: "сайт", items: [page],
+            newlyMissing: [], pendingRemovals: []
+        )
+
+        let forced = SourceSyncService.forcing([page.relativePath], in: original)
+        let item = try? XCTUnwrap(forced.items.first)
+
+        XCTAssertEqual(item?.isRemote, true, "страница из сети после переизвлечения выдаёт себя за файл")
+        XCTAssertEqual(item?.refresh, refresh)
+        XCTAssertEqual(item?.routeMetadata, page.routeMetadata)
+        XCTAssertEqual(item?.contentHash, page.contentHash)
+        XCTAssertEqual(item?.textLength, page.textLength)
+        XCTAssertEqual(item?.size, page.size)
+        XCTAssertEqual(item?.modifiedAt, page.modifiedAt)
+        XCTAssertEqual(item?.collectionName, page.collectionName)
+        XCTAssertEqual(item?.url, page.url)
+        // Меняется ровно одно — вид работы.
+        XCTAssertNotEqual(item?.kind, .unchanged)
+    }
+
     func testAnEmptyRequestChangesNothing() {
         let original = plan(stale: ["a.pdf"])
         let forced = SourceSyncService.forcing([], in: original)

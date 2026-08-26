@@ -451,7 +451,7 @@ struct DiagnosticsSection: View {
                     }
                 ))
                 .labelsHidden()
-                .toggleStyle(.checkbox)
+                .toggleStyle(.chromaCheckbox)
                 Text(problem.relativePath).font(Theme.Font.body)
                     .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 0)

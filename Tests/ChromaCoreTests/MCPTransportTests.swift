@@ -261,3 +261,31 @@ final class MCPTransportTests: XCTestCase {
         XCTAssertEqual(error["code"], .int(JSONRPCError.methodNotFound))
     }
 }
+
+/// Числа из чужого JSON-RPC.
+final class JSONValueNumberTests: XCTestCase {
+
+    /// Целое, записанное дробью, читается как целое — так его пишут чужие
+    /// сериализаторы, и придираться к форме записи незачем.
+    func testAWholeDoubleIsAnInteger() {
+        XCTAssertEqual(JSONValue.double(10).intValue, 10)
+        XCTAssertEqual(JSONValue.double(-3).intValue, -3)
+        XCTAssertEqual(JSONValue.int(7).intValue, 7)
+        XCTAssertNil(JSONValue.double(1.5).intValue)
+    }
+
+    /// Число вне диапазона `Int` — отказ, а не падение процесса.
+    ///
+    /// `Int(_: Double)` на `1e19` — фатальная ошибка, и проверка «целое ли»
+    /// от неё не спасает: у чисел больше 2^53 дробной части не бывает.
+    /// Клиенту достаточно было прислать `{"n_results": 1e19}`, чтобы уронить
+    /// приложение вместе со всеми чужими запросами.
+    func testANumberTooBigForAnIntegerIsRefusedNotFatal() {
+        XCTAssertNil(JSONValue.double(1e19).intValue)
+        XCTAssertNil(JSONValue.double(-1e19).intValue)
+        XCTAssertNil(JSONValue.double(.infinity).intValue)
+        XCTAssertNil(JSONValue.double(.nan).intValue)
+        // Границы диапазона по-прежнему читаются.
+        XCTAssertEqual(JSONValue.double(9_007_199_254_740_992).intValue, 9_007_199_254_740_992)
+    }
+}

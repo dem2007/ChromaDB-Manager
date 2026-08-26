@@ -98,7 +98,7 @@ public struct AuditEntry: Codable, Identifiable, Hashable, Sendable {
         parameters = (try? container.decodeIfPresent(String.self, forKey: .parameters)) ?? nil
     }
 
-    public var isWrite: Bool { access == .write }
+    public var isWrite: Bool { access.changesData }
 
     /// Что именно сделали — одной строкой для журнала на экране.
     public var title: String {

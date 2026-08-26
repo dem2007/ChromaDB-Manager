@@ -941,23 +941,176 @@ struct EvaluationView: View {
                 // же, сколько запросов, и колёсико трекпада металось между
                 // ними: страница дёргалась туда-сюда, а колонки соседних
                 // запросов стояли на разных сдвигах.
-                ScrollView(.horizontal) {
+                //
+                // Прокрутка **обеих** осей и своя высота — иначе ленивый стек
+                // не ленив вовсе. Горизонтальная прокрутка внутри
+                // страничной не ограничивает высоту: стек обязан назвать
+                // полную и потому строит все строки разом. Замерено на
+                // прогоне из 18 запросов по 3 варианта: 1200 мс раскладки
+                // против 105 мс — и второе не растёт с числом запросов.
+                //
+                // Высота — от видимой части страницы, а не число из головы:
+                // разметка идёт в этой панели, и на большом экране она обязана
+                // быть большой. Меньше 420 pt не бывает: ниже в панель не
+                // помещается даже один результат со строкой оценок.
+                ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(run.queries) { query in
                             VStack(alignment: .leading, spacing: 6) {
+                                // Место под две строки — всегда, и ширина по
+                                // сетке: длинный запрос иначе и высоту
+                                // блока менял, и содержимое панели растягивал
+                                // шире сетки.
                                 Text(query.text).font(Theme.Font.body).bold()
+                                    .lineLimit(2, reservesSpace: true)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(width: Self.gridWidth(for: run), alignment: .leading)
                                 // Варианты — колонками рядом: различие
                                 // видно только тогда, когда выдачи стоят друг
                                 // напротив друга.
                                 comparisonGrid(run: run, query: query)
+                                Divider().frame(width: Self.gridWidth(for: run))
                             }
-                            Divider()
+                            // Высота блока закреплена. Ленивый список
+                            // оценивает высоту ещё не построенного, и когда при
+                            // прокрутке **вверх** блок наконец строится, оценка
+                            // заменяется настоящей высотой — содержимое дёргает
+                            // назад на пару строк. Ровно это и было видно: вниз
+                            // катится гладко, вверх — перескакивает, когда в
+                            // поле зрения входит заголовок запроса.
+                            //
+                            // Разделитель для этого переехал **внутрь** блока:
+                            // закрепить можно только то, что является одним
+                            // видом, а не двумя подряд.
+                            .frame(height: blockHeight(run: run, query: query), alignment: .topLeading)
                         }
                     }
+                    // Место под полосы прокрутки. Панель листается по
+                    // обеим осям, полосы рисуются **поверх** содержимого — и
+                    // вертикальная накрывала значок «показать в источнике»
+                    // у правой колонки: он стоит вплотную к её краю,
+                    // и нажать было не на что. Отступ идёт содержимому, а не
+                    // панели: полоса стоит у края видимой части, и увести
+                    // из-под неё надо именно содержимое, когда оно долистано
+                    // до конца.
+                    .padding(.trailing, Self.scrollerClearance)
+                    .padding(.bottom, Self.scrollerClearance)
+                }
+                .containerRelativeFrame(.vertical) { height, _ in
+                    Self.paneHeight(for: run, container: height)
                 }
             }
         }
     }
+
+    /// Сколько строк результатов у этого запроса — столько, сколько у самого
+    /// длинного варианта: пустые ячейки держат колонку.
+    static func rowCount(run: EvaluationRun, query: EvaluationQuery) -> Int {
+        run.variants
+            .map { run.result(query: query.id, variant: $0.id)?.hits.count ?? 0 }
+            .max() ?? 0
+    }
+
+    /// Подпись запроса — ровно две строки, всегда. 32 pt при кегле
+    /// `Theme.Font.body`; сторож меряет.
+    static let queryTitleHeight: CGFloat = 32
+    /// Промежуток внутри блока и между рядами сетки — одно число, и оно
+    /// стоит в обоих местах разметки.
+    static let blockSpacing: CGFloat = 6
+    static let dividerHeight: CGFloat = 1
+
+    /// Высота блока одного запроса.
+    ///
+    /// **Складывается из уже закреплённого, а не подбирается.** Высота строки
+    /// и шапки закреплены с и проверены замером настоящей разметки;
+    /// подпись занимает две строки; остальное — промежутки и разделитель.
+    /// Поэтому число здесь точное: ленивому списку больше нечего угадывать,
+    /// и прокрутка вверх перестала дёргаться назад.
+    ///
+    /// Мнение модели делает строку выше — и правило здесь **то же самое**,
+    /// что у самой строки: высота одна на весь прогон, как только у него
+    /// появился набор мнений.
+    ///
+    /// Первая редакция считала иначе — спрашивала мнение по каждой ячейке,
+    /// — и на прогоне, где модель оценила три ряда из десяти, блок выходил
+    /// на четыреста точек короче своих же строк и наезжал на соседний.
+    /// Два правила для одной высоты — это и есть ошибка; правило одно.
+    private func blockHeight(run: EvaluationRun, query: EvaluationQuery) -> CGFloat {
+        let rows = CGFloat(Self.rowCount(run: run, query: query))
+        let grid = Self.headerHeight(for: run)
+            + rows * (Self.blockSpacing + Self.rowHeight(judged: model.judgements != nil))
+        return Self.queryTitleHeight + Self.blockSpacing
+            + grid + Self.blockSpacing + Self.dividerHeight
+    }
+
+    /// Высота панели выдачи.
+    ///
+    /// Не число из головы и не измерение содержимого: измерить его значит
+    /// построить всё целиком — ровно то, ради чего панель и заведена. Поэтому
+    /// оценка по числу строк — прогону из одного запроса незачем занимать
+    /// весь экран пустотой, а прогону из восемнадцати всё равно не хватит
+    /// никакой высоты.
+    ///
+    /// Потолок — видимая часть страницы **во весь рост**, за вычетом только
+    /// того, что панель никак не может занять: нижнего поля карточки и поля
+    /// страницы под ней. Разметка идёт здесь, и просили именно этого — чтобы
+    /// панель была размером с экран. Пол — 420 pt: ниже в панель не
+    /// помещается даже один результат со строкой оценок, и листать становится
+    /// нечем.
+    ///
+    /// 110 и 88 — не круглые числа: столько заняли в замере подпись запроса
+    /// с шапками колонок и одна строка результата (981 pt на запрос из
+    /// десяти строк).
+    static func paneHeight(for run: EvaluationRun, container: CGFloat) -> CGFloat {
+        let rows = run.results.map(\.hits.count).max() ?? 0
+        let estimate = CGFloat(run.queries.count) * (110 + CGFloat(rows) * 88)
+        let chrome = Theme.Padding.cardVertical + Theme.contentPadding
+        return max(420, min(container - chrome, estimate))
+    }
+
+    // MARK: - Ровные ряды
+
+    /// Высота строки результата — одна на весь прогон.
+    ///
+    /// Ленивый список судит о высоте ещё не построенных запросов по
+    /// построенным. Пока строки разной высоты, эта оценка расходится
+    /// с действительностью, и прокрутка подпрыгивает — та же беда, что
+    /// чинили в для текста, но этажом выше.
+    ///
+    /// Числа — из замера настоящей строки, а не из головы: 101 pt это
+    /// подпись с длиной куска, три строки текста и ряд оценок; 162 pt — то же
+    /// плюс мнение модели с тремя строками причины. Сторож —
+    /// `ResultRowHeightTests`: он собирает строку и меряет.
+    static func rowHeight(judged: Bool) -> CGFloat { judged ? 162 : 101 }
+
+    /// Высота шапки колонки — тоже одна на прогон.
+    ///
+    /// Оговорка про метаданные бывает только у прогонов, записанных до того,
+    /// как их стали сохранять, — то есть либо у всех колонок прогона, либо ни
+    /// у одной. Место под неё держится по прогону целиком, чтобы ряды не
+    /// разъезжались на тех запросах, где она есть.
+    static func headerHeight(for run: EvaluationRun) -> CGFloat {
+        let needsNote = run.results.contains { result in
+            !result.hits.isEmpty && result.hits.allSatisfy { $0.metadata == nil }
+        }
+        return needsNote ? 66 : 34
+    }
+
+    /// Ширина сетки вариантов.
+    ///
+    /// Ею же ограничены подпись запроса и разделитель: без этого длинный
+    /// запрос растягивал содержимое панели шире сетки, и при прокрутке до
+    /// него дёргалась горизонталь.
+    static func gridWidth(for run: EvaluationRun) -> CGFloat {
+        let columns = max(1, run.variants.count)
+        return CGFloat(columns) * columnWidth + CGFloat(columns - 1) * 12
+    }
+
+    /// Сколько места оставлено полосам прокрутки панели.
+    ///
+    /// Накладная полоса macOS — 15 pt вместе с отбивкой от края; 18 оставляет
+    /// зазор, по которому видно, что значок не прижат к ней вплотную.
+    static let scrollerClearance: CGFloat = 18
 
     /// Ширина колонки варианта. Одна на весь экран: колонки стоят рядом,
     /// и разной ширины у них быть не может.
@@ -984,7 +1137,7 @@ struct EvaluationView: View {
         return Grid(alignment: .topLeading, horizontalSpacing: 12, verticalSpacing: 6) {
             GridRow {
                 ForEach(Array(run.variants.enumerated()), id: \.element.id) { index, variant in
-                    columnHeader(variant: variant, result: results[index])
+                    columnHeader(run: run, variant: variant, result: results[index])
                 }
             }
             ForEach(0..<rows, id: \.self) { position in
@@ -992,8 +1145,11 @@ struct EvaluationView: View {
                     ForEach(Array(run.variants.enumerated()), id: \.element.id) { index, variant in
                         if let hits = results[index]?.hits, position < hits.count {
                             let hit = hits[position]
-                            resultRow(queryID: query.id, variantID: variant.id, hit: hit)
-                                .frame(width: Self.columnWidth, alignment: .topLeading)
+                            resultRow(
+                                queryID: query.id, queryText: query.text,
+                                variantID: variant.id, hit: hit
+                            )
+                            .frame(width: Self.columnWidth, alignment: .topLeading)
                         } else {
                             // Пустая ячейка держит колонку: без неё соседние
                             // съезжают влево и сравнивать снова нечего.
@@ -1006,7 +1162,7 @@ struct EvaluationView: View {
     }
 
     /// Шапка колонки: чей это вариант и чем кончился его поиск.
-    private func columnHeader(variant: EvaluationVariant, result: EvaluationResult?) -> some View {
+    private func columnHeader(run: EvaluationRun, variant: EvaluationVariant, result: EvaluationResult?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(variant.name).font(Theme.Font.caption).bold()
             if let failure = result?.failure {
@@ -1019,6 +1175,7 @@ struct EvaluationView: View {
                 if !result.hits.isEmpty, result.hits.allSatisfy({ $0.metadata == nil }) {
                     Text("Прогон записан до того, как метаданные стали сохраняться: перехода к исходнику по нему нет. Прогоните набор заново.")
                         .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if result.hits.isEmpty {
@@ -1028,21 +1185,35 @@ struct EvaluationView: View {
                 Text("не выполнялся").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
             }
         }
-        .frame(width: Self.columnWidth, alignment: .leading)
+        .frame(width: Self.columnWidth, height: Self.headerHeight(for: run), alignment: .topLeading)
     }
 
     /// Один результат с тремя кнопками — разметка прямо в отчёте.
     ///
     /// Здесь и нигде больше: главная проблема оценки в том, что эталона нет и
     /// размечать его скучно. Первый прогон и есть инструмент его создания.
-    private func resultRow(queryID: UUID, variantID: UUID, hit: EvaluationHit) -> some View {
+    private func resultRow(
+        queryID: UUID, queryText: String, variantID: UUID, hit: EvaluationHit
+    ) -> some View {
         let grade = model.grade(queryID: queryID, variantID: variantID, hit: hit)
+        // Готовый текст карточки, а не посчитанный здесь: `body` вызывается
+        // на каждую отметку, а перебор всей выдачи стоил 695 мс.
+        let card = model.card(queryID: queryID, variantID: variantID, hit: hit, query: queryText)
         return VStack(alignment: .leading, spacing: 3) {
+            // Длина куска и уровень — прежде текста. На иерархической
+            // коллекции родитель и его первый ребёнок начинаются одинаково, и
+            // без этой строки два варианта выглядят одним и тем же результатом.
+            Text(Self.rankLine(hit, card))
+                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .lineLimit(1)
             // Место под три строки — всегда, даже если текст короче.
             // Плавающая высота строки — это и есть «скачет при прокрутке»:
             // ленивый список оценивает высоту ещё не построенных кусков, и
             // каждая построенная строка сдвигает всё, что ниже.
-            Text("\(hit.position). \(Self.preview(hit))")
+            //
+            // Показывается окрестность совпадения с запросом, а не начало
+            // куска: начало у родителя и ребёнка одно и то же.
+            Text(card.snippet)
                 .font(Theme.Font.caption)
                 .lineLimit(3, reservesSpace: true)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1098,6 +1269,22 @@ struct EvaluationView: View {
             judgementRow(queryID: queryID, variantID: variantID, hit: hit)
         }
         .padding(.vertical, 3)
+        // Высота — одна на весь прогон. Ленивый список судит о ещё
+        // не построенных запросах по построенным, и пока строки разной
+        // высоты, прокрутка подпрыгивает.
+        .frame(height: Self.rowHeight(judged: model.judgements != nil), alignment: .topLeading)
+    }
+
+    /// Заголовок строки результата: номер позиции и, если есть что сказать,
+    /// длина куска с его уровнем.
+    ///
+    /// Номер — **всегда**, даже у результата без текста: колонки сравнивают
+    /// по строкам, и «что у всех на четвёртом месте» невозможно спросить,
+    /// если четвёртое место не подписано. Текст результата необязателен
+    /// (`RetrievalHit.document` — `String?`), и прежняя строка это учитывала.
+    static func rankLine(_ hit: EvaluationHit, _ card: EvaluationPreview.Card) -> String {
+        guard let shape = card.shape else { return "\(hit.position)." }
+        return "\(hit.position). \(shape)"
     }
 
     private static func tint(_ grade: RelevanceGrade) -> Color {
@@ -1183,12 +1370,6 @@ struct EvaluationView: View {
         parts.append(String(localized: "поиск \(Int(result.searchSeconds * 1000)) мс"))
         parts.append(RussianCount.phrase(result.hits.count, "результат", "результата", "результатов"))
         return parts.joined(separator: " · ")
-    }
-
-    private static func preview(_ hit: EvaluationHit) -> String {
-        let text = (hit.text ?? "").split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-            .joined(separator: " ")
-        return text.isEmpty ? hit.id : String(text.prefix(120))
     }
 
     // MARK: - Сохранённые прогоны

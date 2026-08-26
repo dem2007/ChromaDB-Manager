@@ -209,11 +209,25 @@ public actor AccessController {
         clients.contains { $0.isEnabled && !$0.isRevoked && $0.permissions.allowsOrigin(origin) }
     }
 
-    /// Whether this client may be answered with CORS headers for that origin.
+    /// Клиент по ключу — **любой известный**, включая отключённого.
+    ///
+    /// Нужен там, где спрашивают имя: карточка соединения обязана назвать
+    /// ключ, даже если им сейчас нельзя пользоваться. Для решения «пускать
+    /// ли» это не тот метод — берите `activeClient(withKey:)`.
     public func client(withKey key: String?) -> ExternalClient? {
         guard let key, !key.isEmpty else { return nil }
         let hash = ClientKey.hash(key)
         return clients.first { !$0.isRevoked && $0.keyHash == hash }
+    }
+
+    /// Клиент, которым **можно** пользоваться прямо сейчас.
+    ///
+    /// Отдельным методом, а не проверкой на месте: пока каждый вызывающий
+    /// дописывал `isEnabled` сам, одно место его забыло — и отключённый ключ
+    /// проходил в MCP через прокси, получая имя сервера, версию и подсказки
+    /// модели. Условие живёт там же, где поиск по ключу.
+    public func activeClient(withKey key: String?) -> ExternalClient? {
+        client(withKey: key).flatMap { $0.isEnabled ? $0 : nil }
     }
 
     // MARK: - Deciding
@@ -291,7 +305,7 @@ public actor AccessController {
             return .allow(clientID: client.id, clientName: client.name, filter: .none)
         }
 
-        if route.access == .write && !client.permissions.allowsWrite {
+        if route.access.changesData && !client.permissions.allowsWrite {
             return .reject(
                 status: 403,
                 message: String(localized: "Клиенту «\(client.name)» разрешено только чтение."),
@@ -299,10 +313,22 @@ public actor AccessController {
             )
         }
 
+        // Удаление — отдельное право поверх записи, и по HTTP оно значит ровно
+        // то же, что у инструментов MCP. Пока `Access` знал
+        // только «запись», галка «Разрешить удаление документов» на прокси
+        // не действовала вовсе: клиент с записью сносил коллекцию.
+        if route.access == .delete && !client.permissions.allowsDelete {
+            return .reject(
+                status: 403,
+                message: String(localized: "Клиенту «\(client.name)» разрешена запись, но не удаление — это отдельное право, и оно не выдано."),
+                clientName: client.name
+            )
+        }
+
         // An endpoint we do not recognise: reads pass (a new read-only endpoint
         // in a future ChromaDB should not break anyone), writes do not.
         guard route.isKnown else {
-            return route.access == .write
+            return route.access.changesData
                 ? .reject(
                     status: 403,
                     message: String(localized: "Неизвестная операция записи отклонена: прокси не может проверить её права."),
@@ -330,7 +356,7 @@ public actor AccessController {
             )
         }
 
-        if route.access == .write, let payload = WritePayload.parse(body) {
+        if route.access.changesData, let payload = WritePayload.parse(body) {
             if let problem = checkLimits(payload, client: client) {
                 return .reject(status: 429, message: problem, clientName: client.name)
             }
@@ -463,7 +489,7 @@ public actor AccessController {
             )
         }
 
-        if route.access == .write {
+        if route.access.changesData {
             var writeBucket = writeBuckets[client.id]
                 ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: max(1, client.permissions.burst / 2))
             let write = writeBucket.take()

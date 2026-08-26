@@ -74,8 +74,10 @@ final class CollectionTransferTests: XCTestCase {
 
     private final class Embedder: EmbeddingProvider, @unchecked Sendable {
         private(set) var calls = 0
+        private(set) var asked: [String] = []
         func embed(texts: [String], model: String) async throws -> [[Double]] {
             calls += 1
+            asked += texts
             return texts.map { text in [Double(text.count), 1, 0, 0] }
         }
     }
@@ -325,6 +327,139 @@ final class CollectionTransferTests: XCTestCase {
         )
         XCTAssertEqual(stopReport.stoppedAtConflict, "d0")
         XCTAssertFalse(stopReport.finished)
+    }
+
+    /// Страница экспорта не просит векторы, которые всё равно выбросит.
+    ///
+    /// `DocumentRecord` хранит только длину вектора, а не сам вектор: векторы,
+    /// запрошенные страницей, приезжали по сети, разбирались и выбрасывались,
+    /// после чего те же самые запрашивались вторым вызовом.
+    func testTheExportPageDoesNotAskForVectorsItThrowsAway() async throws {
+        final class Fake: HTTPTransport, @unchecked Sendable {
+            var bodies: [[String: Any]] = []
+            func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+                if let body = request.httpBody,
+                   let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                    bodies.append(object)
+                }
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+                )!
+                return (Data(#"{"ids":[],"documents":[],"metadatas":[]}"#.utf8), response)
+            }
+        }
+        let fake = Fake()
+        let client = ChromaClient(endpoint: ChromaEndpoint(host: "127.0.0.1", port: 8000), transport: fake)
+        _ = try await client.page(
+            collectionID: "c", limit: 100, offset: 0,
+            filter: DocumentFilter?.none, includeEmbeddings: true
+        )
+
+        let include = (fake.bodies.first?["include"] as? [String]) ?? []
+        XCTAssertFalse(include.contains("embeddings"), "страница просит векторы, хотя выбросит их: \(include)")
+        XCTAssertTrue(include.contains("documents"))
+    }
+
+    /// Готовые векторы из пакета не пересчитываются.
+    ///
+    /// Прежде хватало одного документа без вектора, чтобы в модель ушла вся
+    /// пачка, и привезённые векторы затирались векторами выбранной модели.
+    /// Размерности совпадают, отказа нет — а в коллекции с одной привязкой
+    /// лежит смесь двух моделей.
+    func testOnlyTheMissingVectorsAreComputed() async throws {
+        let source = Source()
+        source.documents = documents(4)
+        // У двух документов вектора нет — как в пакете, собранном частично.
+        source.documents[1] = ExportedDocument(
+            id: source.documents[1].id, document: source.documents[1].document,
+            metadata: source.documents[1].metadata, embedding: nil
+        )
+        source.documents[3] = ExportedDocument(
+            id: source.documents[3].id, document: source.documents[3].document,
+            metadata: source.documents[3].metadata, embedding: nil
+        )
+        let exported = try await exportPackage(source)
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+
+        let destination = Destination()
+        let embedder = Embedder()
+        let report = try await CollectionImporter(destination: destination, embeddings: embedder).import(
+            package: exported.url, manifest: manifest, into: "t", collectionName: "цель",
+            options: .init(resumesFromCheckpoint: false, embeddingModel: "модель")
+        )
+
+        XCTAssertEqual(report.reembedded, 2, "пересчитаны только пустые места")
+        XCTAssertEqual(embedder.asked.count, 2, "в модель ушли только документы без вектора")
+        XCTAssertEqual(Set(embedder.asked), Set([source.documents[1].document, source.documents[3].document].compactMap { $0 }))
+        // Привезённые пакетом векторы остались нетронутыми.
+        XCTAssertEqual(destination.stored["d0"]?.embedding, [0, 0.5, -0.25, 0.125])
+        XCTAssertEqual(destination.stored["d2"]?.embedding, [0.2, 0.5, -0.25, 0.125])
+        // А пустые получили вектор модели — по длине текста, как её стенд.
+        XCTAssertEqual(destination.stored["d1"]?.embedding.first, Double(source.documents[1].document?.count ?? 0))
+    }
+
+    /// Остановка на конфликте не уносит с собой чистые документы.
+    ///
+    /// Раньше `write` выходил, не записав **ничего**, — включая документы
+    /// пачки до конфликтного, — а отметка о месте остановки всё равно
+    /// вставала на конец пачки и не снималась. Следующий заход начинал уже
+    /// после неё: пропадали и чистые документы, и сам конфликт, ради которого
+    /// импорт останавливали. Молча, без следа в сводке.
+    func testStoppingAtAConflictKeepsWhatCameBeforeIt() async throws {
+        let source = Source()
+        source.documents = documents(6)
+        let exported = try await exportPackage(source)
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+        let store = ImportCheckpointStore(directory: box.appendingPathComponent("checkpoints-stop"))
+
+        // Конфликт — на четвёртом документе, то есть в середине второй пачки.
+        let destination = Destination()
+        destination.stored["d3"] = EmbeddedRecord(id: "d3", document: "старое", embedding: [9, 9, 9, 9], metadata: [:])
+        let importer = CollectionImporter(destination: destination, checkpoints: store)
+        let stopped = try await importer.import(
+            package: exported.url, manifest: manifest, into: "t", collectionName: "цель",
+            options: .init(conflictPolicy: .stop, batchSize: 3)
+        )
+
+        XCTAssertEqual(stopped.stoppedAtConflict, "d3")
+        XCTAssertFalse(stopped.finished)
+        XCTAssertEqual(stopped.written, 3, "первая пачка обязана быть записана")
+        XCTAssertEqual(destination.stored["d0"]?.document, source.documents[0].document)
+        XCTAssertEqual(destination.stored["d2"]?.document, source.documents[2].document)
+
+        // Отметка стоит на последнем записанном, а не на конце пачки.
+        let checkpoint = try XCTUnwrap(store.load(checksum: manifest.dataSHA256))
+        XCTAssertEqual(checkpoint.processedLines, 3, "отметка обязана указывать на записанное")
+
+        // Продолжение после того, как человек разобрался с конфликтом:
+        // ни один документ не потерян.
+        let second = try await importer.import(
+            package: exported.url, manifest: manifest, into: "t", collectionName: "цель",
+            options: .init(conflictPolicy: .overwrite, batchSize: 3)
+        )
+        XCTAssertTrue(second.finished)
+        XCTAssertEqual(destination.stored.count, 6, "после продолжения на месте все шесть")
+        XCTAssertNotEqual(destination.stored["d3"]?.document, "старое", "конфликтный документ не пропущен")
+    }
+
+    /// Конфликт на первом документе пачки: записывать нечего, и отметка
+    /// не должна уехать вперёд.
+    func testAConflictOnTheFirstDocumentMovesNothing() async throws {
+        let source = Source()
+        source.documents = documents(4)
+        let exported = try await exportPackage(source)
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+        let store = ImportCheckpointStore(directory: box.appendingPathComponent("checkpoints-first"))
+
+        let destination = Destination()
+        destination.stored["d0"] = EmbeddedRecord(id: "d0", document: "старое", embedding: [9, 9, 9, 9], metadata: [:])
+        let report = try await CollectionImporter(destination: destination, checkpoints: store).import(
+            package: exported.url, manifest: manifest, into: "t", collectionName: "цель",
+            options: .init(conflictPolicy: .stop, batchSize: 2)
+        )
+        XCTAssertEqual(report.written, 0)
+        let checkpoint = try XCTUnwrap(store.load(checksum: manifest.dataSHA256))
+        XCTAssertEqual(checkpoint.processedLines, 0, "ничего не записано — отметке некуда двигаться")
     }
 
     /// Один битый документ не роняет перенос миллиона — и не исчезает молча.

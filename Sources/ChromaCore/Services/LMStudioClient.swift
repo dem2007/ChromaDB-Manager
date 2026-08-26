@@ -648,10 +648,13 @@ public actor LMStudioClient {
     /// собственную разметку промпта, а шаблон чата, который LM Studio
     /// подставляет на `/v1/chat/completions`, её ломает — модель отвечает
     /// «No document is provided» вместо «yes»/«no». Здесь текст уходит как есть.
+    /// Место под ответ называет **вызывающий**: умолчание здесь было бы
+    /// тем самым молчаливым обрезанием, из-за которого балл терял цифру
+    ///.
     public func rawCompletion(
         prompt: String,
         model: String,
-        maxTokens: Int = 4,
+        maxTokens: Int,
         timeout: TimeInterval? = nil
     ) async throws -> String {
         let body: [String: Any] = [

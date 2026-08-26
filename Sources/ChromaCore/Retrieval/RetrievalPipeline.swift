@@ -437,24 +437,46 @@ public actor RetrievalPipeline {
     /// Prompt, model and the schema the answer must fit — the app supplies the
     /// LM Studio call, the queue and the timeout.
     public typealias ChatCompleter = @Sendable (String, String, ChatJSONSchema) async throws -> String
-    /// Промпт и модель — без схемы и без шаблона чата. Нужен
-    /// специализированным переранжировщикам: их разметку промпта шаблон чата
-    /// ломает, а схемы они не понимают вовсе.
-    public typealias PlainCompleter = @Sendable (String, String) async throws -> String
+    /// Промпт, модель и место под ответ — без схемы и без шаблона чата
+    ///. Нужен специализированным переранжировщикам: их разметку
+    /// промпта шаблон чата ломает, а схемы они не понимают вовсе.
+    ///
+    /// Место под ответ называет **конвейер**, а не тот, кто его собирает:
+    /// сколько токенов нужно ответу, знает стадия, а места сборки —
+    /// водопровод. Пока число жило у них, правка держалась на том,
+    /// что о ней помнят в каждом месте отдельно.
+    public typealias PlainCompleter = @Sendable (String, String, Int) async throws -> String
 
     private let database: any RetrievalDatabase
     private let shapes: CollectionShapeCache
     private let embed: Embedder
-    private let complete: ChatCompleter?
-    private let completePlain: PlainCompleter?
-    /// Контекст, с которым **загружена** модель переранжирования, — не потолок
-    /// из её карточки: потолок недостижим без перезагрузки модели.
-    /// `nil` — LM Studio не сказала; тогда бюджет не считается.
-    private let rerankContextTokens: Int?
-    /// Измеренное «символов на токен» модели переранжирования.
-    /// `nil` — не измерялось, тогда берётся пессимистичная оценка.
-    private let rerankCharactersPerToken: Double?
+    /// Стадия 7 целиком — вместе с моделями и бюджетами, которые ей нужны.
+    ///
+    /// Одним полем, а не четырьмя врозь: у неё есть второй вызывающий —
+    /// поиск по нескольким коллекциям, который спрашивает модель один раз
+    /// про слитую выдачу. Разложенные по конвейеру поля пришлось бы
+    /// собирать заново на той стороне.
+    private let rerankStage: RerankStage
     private let log: LogHandler
+
+    /// Со стадией 7, собранной снаружи.
+    ///
+    /// Нужен там, где ту же стадию отдают ещё кому-то: поиск по нескольким
+    /// коллекциям спрашивает модель один раз про слитую выдачу, и собирать
+    /// вызовы модели дважды — значит разойтись в мелочах.
+    public init(
+        database: any RetrievalDatabase,
+        shapes: CollectionShapeCache = CollectionShapeCache(),
+        embed: @escaping Embedder,
+        rerank: RerankStage,
+        log: @escaping LogHandler = noopLogHandler
+    ) {
+        self.database = database
+        self.shapes = shapes
+        self.embed = embed
+        self.rerankStage = rerank
+        self.log = log
+    }
 
     public init(
         database: any RetrievalDatabase,
@@ -469,10 +491,10 @@ public actor RetrievalPipeline {
         self.database = database
         self.shapes = shapes
         self.embed = embed
-        self.complete = complete
-        self.completePlain = completePlain
-        self.rerankContextTokens = rerankContextTokens
-        self.rerankCharactersPerToken = rerankCharactersPerToken
+        self.rerankStage = RerankStage(
+            complete: complete, completePlain: completePlain,
+            contextTokens: rerankContextTokens, charactersPerToken: rerankCharactersPerToken
+        )
         self.log = log
     }
 
@@ -776,17 +798,12 @@ public actor RetrievalPipeline {
             ))
         }
         // MARK: Stage 7 — reranking by a chat model
-        // Готовность стадии зависит от режима: чат-схеме нужна чат-модель,
-        // переранжировщику — прямой вызов. Проверять только чат значило бы
-        // объявлять «модель не передана» там, где она и не нужна.
-        let rerankReady = profile.rerankMode == .crossEncoder
-            ? completePlain != nil
-            : complete != nil
+        let rerankReady = rerankStage.isReady(for: profile.rerankMode)
         if stages.contains(.rerank), rerankReady {
             let stageStarted = Date()
             let before = hits.count
             do {
-                let result = try await reranking(hits, profile: profile, query: request.text)
+                let result = try await rerankStage.run(hits, profile: profile, query: request.text)
                 hits = result.hits
                 diagnostics.stages.append(.init(
                     stage: .rerank, ran: true, inputCount: before, outputCount: hits.count,
@@ -926,11 +943,9 @@ public actor RetrievalPipeline {
         // условие — значит переписать чужой запрос (то же правило, что
         // и у выбора уровня иерархии).
         guard !pinnedFilter.usesRawJSON else { return [] }
-        pinnedFilter.root = .group(.and, pinnedFilter.root.children + [
-            .leaf(MetadataCondition(
-                field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
-            )),
-        ])
+        pinnedFilter = pinnedFilter.adding(MetadataCondition(
+            field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
+        ))
         let known = Set(hits.map(\.id))
         let found = try await database.documents(
             collectionID: collectionID, matching: pinnedFilter, limit: Self.pinnedLimit
@@ -1035,12 +1050,11 @@ public actor RetrievalPipeline {
         guard shape.isHierarchical, let condition = profile.searchLevel.condition else {
             return (request.filter, nil)
         }
-        var filter = request.filter ?? DocumentFilter()
+        let filter = request.filter ?? DocumentFilter()
         guard !filter.usesRawJSON else {
             return (request.filter, String(localized: "уровень не ограничен: фильтр задан вручную в JSON"))
         }
-        filter.root = .group(.and, filter.root.children + [.leaf(condition)])
-        return (filter, String(localized: "поиск по \(profile.searchLevel.title)"))
+        return (filter.adding(condition), String(localized: "поиск по \(profile.searchLevel.title)"))
     }
 
     // MARK: - Stage 3: one result per parent
@@ -1540,107 +1554,6 @@ public actor RetrievalPipeline {
             return expanded
         }
         return (result, String(localized: "присоединено соседних чанков: \(attached), запросов: 1"))
-    }
-
-    // MARK: - Stage 7: the model reorders what is left
-
-    /// Sends the head of the list to a chat model and applies its order.
-    ///
-    /// Only the head: twenty is the cap the section fixes, and a longer prompt
-    /// is both slower and worse. The tail keeps its place — it was never shown
-    /// to the model, so nothing has been said about it.
-    ///
-    /// The text sent is the result's own, without the context attached in stage
-    /// 6: ranking by the surroundings would rank by the surroundings.
-    private func reranking(
-        _ hits: [RetrievalHit], profile: SearchProfile, query: String
-    ) async throws -> (hits: [RetrievalHit], note: String) {
-        guard !profile.rerankModel.isEmpty else { throw RerankError.noModelChosen }
-        let head = Array(hits.prefix(Reranker.maximumCandidates))
-        let tail = Array(hits.dropFirst(head.count))
-        guard head.count > 1 else {
-            return (hits, String(localized: "переранжировать нечего: кандидат один"))
-        }
-
-        switch profile.rerankMode {
-        case .chatSchema:
-            guard let complete else { throw RerankError.noModelChosen }
-            // Промпт укладывается в контекст **до** отправки. Иначе один движок
-            // отвечает 400, а другой молча обрезает список — и ранжирование
-            // выходит по обрубку, о чём никто не узнаёт.
-            let fitted = Reranker.fit(
-                documents: head.map { $0.document ?? "" },
-                query: query, template: profile.rerankPrompt,
-                contextTokens: rerankContextTokens,
-                charactersPerToken: rerankCharactersPerToken
-                    ?? TokenEstimator.pessimisticCharactersPerToken,
-                ratioWasMeasured: rerankCharactersPerToken != nil
-            )
-            guard !fitted.documents.isEmpty else {
-                throw RerankError.contextTooSmall(tokens: rerankContextTokens ?? 0)
-            }
-            // Отброшенные хвостом кандидаты остаются на своих местах, как всё,
-            // о чём модель не высказалась.
-            let asked = Array(head.prefix(fitted.documents.count))
-            let unasked = Array(head.dropFirst(asked.count))
-            let prompt = Reranker.prompt(
-                template: profile.rerankPrompt, query: query, documents: fitted.documents
-            )
-            let answer = try await complete(prompt, profile.rerankModel, Reranker.schema)
-            let verdicts = try Reranker.verdicts(from: answer, count: asked.count)
-            return (
-                Reranker.reordered(asked, by: verdicts) + unasked + tail,
-                String(localized: "модель \(profile.rerankModel), кандидатов \(asked.count), один вызов по схеме")
-                    + (fitted.note.map { ", \($0)" } ?? "")
-            )
-
-        case .crossEncoder:
-            guard let completePlain else { throw RerankError.noPlainCompleter }
-            let plainRatio = rerankCharactersPerToken ?? TokenEstimator.pessimisticCharactersPerToken
-            guard CrossEncoderReranker.documentLimit(
-                contextTokens: rerankContextTokens, charactersPerToken: plainRatio
-            ) > 0 else {
-                throw RerankError.contextTooSmall(tokens: rerankContextTokens ?? 0)
-            }
-            // По вызову на фрагмент — так устроены переранжировщики. Дороже
-            // одного вызова, зато это единственный способ, которым такая
-            // модель вообще умеет отвечать.
-            let instruction = CrossEncoderReranker.instruction(from: profile.rerankInstruction)
-            var scores: [Double?] = []
-            for hit in head {
-                let answer = try await completePlain(
-                    CrossEncoderReranker.prompt(
-                        query: query, document: hit.document ?? "", instruction: instruction,
-                        contextTokens: rerankContextTokens, charactersPerToken: plainRatio
-                    ),
-                    profile.rerankModel
-                )
-                scores.append(CrossEncoderReranker.score(answer))
-            }
-            guard scores.contains(where: { $0 != nil }) else { throw RerankError.nothingUsable }
-            let understood = scores.compactMap { $0 }
-            let unclear = scores.count - understood.count
-            // Заметка говорит про шкалу, а не про «подошло»: у «да/нет» это
-            // 1 и 0, у балльной модели — 5 и 1, и одно слово «подошло» на обе
-            // не годится.
-            let range = understood.isEmpty
-                ? ""
-                : String(localized: ", баллы от \(Self.plain(understood.min() ?? 0)) до \(Self.plain(understood.max() ?? 0))")
-            return (
-                CrossEncoderReranker.reordered(head, scores: scores) + tail,
-                String(localized: "переранжировщик \(profile.rerankModel): вызовов \(head.count)")
-                    + range
-                    + (unclear > 0 ? String(localized: ", не понят ответ по \(unclear)") : "")
-            )
-        }
-    }
-
-    /// Балл в заметке — без хвоста «.0»: шкала бывает целой («5») и дробной
-    /// («0.87»), и показывать «5.0» значит выдумывать точность.
-    static func plain(_ value: Double) -> String {
-        value == value.rounded()
-            ? String(Int(value))
-            : String(format: "%.2f", value)
     }
 
     // MARK: - Diagnostics for stages that did not run

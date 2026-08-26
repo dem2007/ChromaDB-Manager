@@ -81,12 +81,28 @@ public struct ExpectedFragment: Codable, Hashable, Sendable, Identifiable {
     /// Whitespace is collapsed and case ignored: re-chunking rewraps lines, and
     /// a fragment that stopped matching because a newline moved would quietly
     /// turn a hit into a miss — the failure mode this whole design avoids.
+    ///
+    /// В конце — составленная форма (NFC). Одна и та же буква приходит из
+    /// файла то одним знаком, то знаком со значком отдельно; раньше это
+    /// скрывало сравнение строк Swift, которое считает такие формы равными
+    /// само, а теперь сравнение литеральное (`matches`), и сводить формы к
+    /// одной обязано это место. Стоит оно 20 мс на 1,67 млн знаков.
+    ///
+    /// **На кириллице и латинице это ничего не меняет**, и проверять её тут
+    /// бессмысленно: свёртка значков строкой выше снимает значок и с «ё»,
+    /// и с разложенной пары, так что обе формы совпадают побайтово ещё до
+    /// NFC — замерено. Разница видна там, где состав буквы не сводится к
+    /// значкам: корейский слог без NFC литеральным поиском не находится,
+    /// с NFC находится. Сторож — `QuerySetTests`, и он написан именно на
+    /// таком письме: на русском примере он проходил бы и с удалённой
+    /// строкой NFC, то есть не сторожил бы ничего.
     public static func normalised(_ text: String) -> String {
         text
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .joined(separator: " ")
             .lowercased()
             .folding(options: .diacriticInsensitive, locale: nil)
+            .precomposedStringWithCanonicalMapping
     }
 
     /// Whether a document's text satisfies this expectation.
@@ -105,7 +121,21 @@ public struct ExpectedFragment: Codable, Hashable, Sendable, Identifiable {
     /// превращало пересчёт метрик в 873 мс.
     public func matches(normalisedDocument: String) -> Bool {
         guard !fragment.isEmpty else { return false }
-        return normalisedDocument.contains(Self.normalised(fragment))
+        return Self.contains(normalisedDocument, Self.normalised(fragment))
+    }
+
+    /// Поиск подстроки в приведённых формах — литеральный.
+    ///
+    /// `String.contains` сравнивает с точностью до канонической
+    /// равносильности: на каждом знаке он готов разобрать букву на составные
+    /// части и сверить их. Это ровно то, что уже сделано в `normalised` — и
+    /// сделано один раз, а не на каждом сравнении. Замер на живом прогоне
+    /// (540 текстов × 565 фрагментов): 26,9 с против 5,8 с при **тех же
+    /// 1167 совпадениях** — сверено полным перебором, а не на выбранных
+    /// примерах.
+    static func contains(_ document: String, _ needle: String) -> Bool {
+        guard !needle.isEmpty else { return false }
+        return document.range(of: needle, options: .literal) != nil
     }
 }
 

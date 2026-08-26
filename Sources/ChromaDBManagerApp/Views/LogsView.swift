@@ -36,7 +36,13 @@ struct LogsView: View {
     @State private var searchText = ""
     @State private var showJournal = false
     @State private var showAudit = false
-    @State private var auditWritesOnly = true
+    /// Отбор «только запись» — выключен.
+    ///
+    /// Был включён с самого начала, и это выглядело как «журнал не пишется»:
+    /// агент почти всегда читает, а на экране оставались одни записи — самая
+    /// свежая позавчерашняя. Журнал доступа открывается целиком; сузить его
+    /// до записи — отдельное решение человека, а не то, с чего он начинает.
+    @State private var auditWritesOnly = false
     @State private var auditCollection: String?
     @State private var auditSearch = ""
     @State private var archiveToDelete: AuditArchive?
@@ -63,7 +69,11 @@ struct LogsView: View {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 SectionCard(
                     title: String(localized: "Журнал доступа"),
-                    subtitle: String(localized: "Каждый запрос, прошедший через прокси или MCP: кто, к какой коллекции и чем закончилось. Записей: \(rows.count.formatted())."),
+                    // Число отобранных выдавалось за число записей вовсе —
+                    // и включённый отбор читался как пустой журнал.
+                    subtitle: rows.count == audit.entries.count
+                        ? String(localized: "Каждый запрос, прошедший через прокси или MCP: кто, к какой коллекции и чем закончилось. Записей: \(rows.count.formatted()).")
+                        : String(localized: "Каждый запрос, прошедший через прокси или MCP: кто, к какой коллекции и чем закончилось. Показано \(rows.count.formatted()) из \(audit.entries.count.formatted()) — остальное скрыто отбором."),
                     help: String(localized: "Пишет прокси, а не движок: обращения локальных программ напрямую к 127.0.0.1 сюда не попадают — их никто не видит. Ключи в записях маскируются.")
                 ) {
                     VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
@@ -80,9 +90,20 @@ struct LogsView: View {
                             // своего ScrollView не давал раскладке посчитать
                             // высоту, и содержимое окна разъезжалось вверх
                             // вместе с боковым меню.
+                            // По дням: в строке только время, и без
+                            // даты «0:56:07» не говорит, вчера это было или
+                            // неделю назад. Разделитель дешевле даты в каждой
+                            // строке: он не растягивает колонку времени и
+                            // сразу показывает, где кончился день.
                             LazyVStack(alignment: .leading, spacing: 4) {
-                                ForEach(rows.prefix(500)) { entry in
-                                    auditRow(entry)
+                                ForEach(Self.byDay(Array(rows.prefix(500)), date: \.date)) { day in
+                                    Text(day.title)
+                                        .font(Theme.Font.micro)
+                                        .foregroundStyle(Theme.Palette.captionText)
+                                        .padding(.top, 6)
+                                    ForEach(day.items) { entry in
+                                        auditRow(entry)
+                                    }
                                 }
                             }
                             if rows.count > 500 {
@@ -103,7 +124,7 @@ struct LogsView: View {
     private func auditControls(_ rows: [AuditEntry]) -> some View {
         HStack(spacing: 10) {
             Toggle(String(localized: "Только запись"), isOn: $auditWritesOnly)
-                .toggleStyle(.checkbox)
+                .toggleStyle(.chromaCheckbox)
                 .font(Theme.Font.control)
             Picker(String(localized: "Коллекция"), selection: $auditCollection) {
                 Text(String(localized: "Все коллекции")).tag(String?.none)
@@ -147,12 +168,52 @@ struct LogsView: View {
         }
     }
 
+    /// Записи одного дня — с подписью, которую можно прочесть вслух.
+    struct DayGroup<Item: Identifiable>: Identifiable {
+        let id: Date
+        let title: String
+        let items: [Item]
+    }
+
+    /// Разбивает журнал по дням, сохраняя порядок записей.
+    ///
+    /// Один на оба журнала: и у доступа, и у событий в строке только время,
+    /// и обоим нужно одно и то же — граница дня.
+    static func byDay<Item: Identifiable>(
+        _ items: [Item], date: (Item) -> Date
+    ) -> [DayGroup<Item>] {
+        let calendar = Calendar.current
+        var order: [Date] = []
+        var grouped: [Date: [Item]] = [:]
+        for item in items {
+            let day = calendar.startOfDay(for: date(item))
+            if grouped[day] == nil { order.append(day) }
+            grouped[day, default: []].append(item)
+        }
+        return order.map { day in
+            DayGroup(id: day, title: dayTitle(day, calendar: calendar), items: grouped[day] ?? [])
+        }
+    }
+
+    static func dayTitle(_ day: Date, calendar: Calendar = .current) -> String {
+        if calendar.isDateInToday(day) { return String(localized: "сегодня") }
+        if calendar.isDateInYesterday(day) { return String(localized: "вчера") }
+        let sameYear = calendar.component(.year, from: day) == calendar.component(.year, from: Date())
+        return day.formatted(
+            sameYear ? Date.FormatStyle().day().month(.wide)
+                     : Date.FormatStyle().day().month(.wide).year()
+        )
+    }
+
     private func auditRow(_ entry: AuditEntry) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(entry.access == .write ? String(localized: "запись") : String(localized: "чтение"))
+            // Удаление названо своим словом, а не «записью»: с это
+            // отдельный вид доступа и отдельное право, и в журнале доступа
+            // его ищут глазами именно как удаление.
+            Text(entry.access.title)
                 .font(Theme.Font.micro)
                 .padding(.horizontal, 5).padding(.vertical, 1)
-                .background((entry.access == .write
+                .background((entry.access.changesData
                              ? Theme.Palette.attention
                              : Theme.Palette.stopped).opacity(0.18))
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip))
@@ -413,7 +474,12 @@ struct LogsView: View {
                 Spacer(minLength: 0)
             }
         }
-        .padding(16)
+        // По общему полю страницы, а не по своему: 16 pt против 30
+        // у всего остального — подпись и поиск торчали левее заголовка,
+        // вкладок и самого журнала.
+        .padding(.vertical, 16)
+        .padding(.leading, Theme.contentPadding)
+        .padding(.trailing, Theme.contentPadding + Theme.Size.scrollGutter)
     }
 
     /// Журнал событий текстом — ровно в том отборе, что виден на экране.
@@ -533,7 +599,25 @@ struct LogsView: View {
                     ScrollView {
                         LogBlock(caption: String(localized: "Журнал событий")) {
                             LazyVStack(alignment: .leading, spacing: 1) {
-                                ForEach(entries) { entry in
+                                // Граница дня — как в журнале доступа:
+                                // в строке одно время, и «22:48:44» само
+                                // не говорит, сегодня это или на прошлой
+                                // неделе.
+                                //
+                                // Но здесь — сравнением с предыдущей записью,
+                                // а не разбивкой на группы: буфер держит до
+                                // пяти тысяч строк и переиздаётся на каждую
+                                // новую, а группировка строила бы словарь дней
+                                // и копировала весь буфер при каждом проходе.
+                                ForEach(Array(entries.enumerated()), id: \.element.id) { position, entry in
+                                if position == 0 || !Calendar.current.isDate(
+                                    entry.date, inSameDayAs: entries[position - 1].date
+                                ) {
+                                    Text("── \(Self.dayTitle(entry.date)) ──")
+                                        .font(Theme.Font.mono)
+                                        .foregroundStyle(Theme.Palette.captionText)
+                                        .padding(.top, position == 0 ? 0 : 8)
+                                }
                                     // `formatted` already carries the level
                                     // symbol — the same string the copy button
                                     // puts on the clipboard.
@@ -600,7 +684,7 @@ struct LogsView: View {
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 260)
                     Toggle(String(localized: "Следить за концом"), isOn: $serverModel.followsTail)
-                        .toggleStyle(.checkbox)
+                        .toggleStyle(.chromaCheckbox)
                     Spacer()
                     Button(String(localized: "Скопировать")) { serverModel.copyLog(processManager.recentOutput) }
                         .disabled(processManager.recentOutput.isEmpty)

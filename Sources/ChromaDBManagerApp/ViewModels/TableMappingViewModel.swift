@@ -94,6 +94,9 @@ final class TableMappingViewModel: ObservableObject {
     /// таблиц у большого источника весит мегабайты, и перечитывать его на
     /// каждую перерисовку значило бы платить диском за наведение мыши.
     @Published private(set) var indexedSheets: [String: SheetManifest] = [:]
+    /// Листы этого файла, очищенные под переиндексацию и ждущие записи.
+    /// Держится рядом с `indexedSheets` и читается тем же обращением к службе.
+    @Published private(set) var sheetsAwaitingWrite: Set<String> = []
 
     /// 8 asks for the first twenty rows.
     /// `nonisolated`: к ней обращается вложенный `SheetPreview`, который
@@ -645,19 +648,33 @@ final class TableMappingViewModel: ObservableObject {
     func refreshIndexedSheets(_ app: AppEnvironment, source: DataSource) {
         guard let path = openedPath else {
             indexedSheets = [:]
+            sheetsAwaitingWrite = []
             return
         }
         let service = app.syncService
         let sourceID = source.id
         Task { [weak self] in
-            let sheets = await service.indexedSheets(sourceID: sourceID, relativePath: path)
-            await MainActor.run { self?.indexedSheets = sheets }
+            let state = await service.indexedSheetState(sourceID: sourceID, relativePath: path)
+            await MainActor.run {
+                self?.indexedSheets = state.sheets
+                self?.sheetsAwaitingWrite = state.awaitingWrite
+            }
         }
     }
 
     /// Подставить состояние манифеста в обход диска — только для проверок.
-    func setIndexedSheetsForTesting(_ sheets: [String: SheetManifest]) {
+    func setIndexedSheetsForTesting(_ sheets: [String: SheetManifest], awaitingWrite: Set<String> = []) {
         indexedSheets = sheets
+        sheetsAwaitingWrite = awaitingWrite
+    }
+
+    /// Ждёт ли выбранный лист записи.
+    ///
+    /// Отдельно от `reindexState`: тот отвечает «что будет, если нажать», а
+    /// этот — «что уже нажали». После очистки строк ноль, и первый молчит.
+    var selectedSheetAwaitsWrite: Bool {
+        guard let sheet = selectedSheet else { return false }
+        return sheetsAwaitingWrite.contains(sheet)
     }
 
     /// Строки листа, записанные прошлой разметкой, и разошлась ли она с нынешней.

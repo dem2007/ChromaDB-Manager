@@ -146,6 +146,29 @@ final class AuditArchivingTests: XCTestCase {
 // MARK: - B3: space and unfinished copies
 
 final class BackupSafetyTests: XCTestCase {
+
+    /// Имя копии не зависит от локали системы.
+    ///
+    /// Формат задан строкой, а `DateFormatter` без закреплённой локали берёт
+    /// системную: на персидской в имени файла окажется «۲۰۲۶-۰۸-۲۵»,
+    /// на тайской — год 2569. Такое имя не встанет по порядку рядом
+    /// с остальными копиями и не разберётся обратно.
+    func testTheBackupStampIsIndependentOfTheSystemLocale() {
+        XCTAssertEqual(BackupService.stampFormatter.locale, Locale(identifier: "en_US_POSIX"))
+
+        let date = Date(timeIntervalSince1970: 1_787_000_000)
+        let stamp = BackupService.stampFormatter.string(from: date)
+        XCTAssertTrue(stamp.allSatisfy { $0.isASCII }, "в метке не-ASCII: \(stamp)")
+
+        // Чем это грозило: тот же формат с чужой локалью.
+        let persian = DateFormatter()
+        persian.locale = Locale(identifier: "fa_IR")
+        persian.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        XCTAssertFalse(
+            persian.string(from: date).allSatisfy { $0.isASCII },
+            "проверка бессмысленна, если чужая локаль ничего не меняет"
+        )
+    }
     private var root: URL!
 
     override func setUpWithError() throws {

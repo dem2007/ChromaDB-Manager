@@ -237,3 +237,162 @@ final class MultiCollectionScreenUsesTheCoreTests: XCTestCase {
         )
     }
 }
+
+/// Стадия 7 на слитой выдаче.
+///
+/// Прежде переранжирования на этом пути не было вовсе: конвейер каждой
+/// коллекции собирался без вызовов модели, и профиль, просивший стадию,
+/// молча её не получал. Теперь она есть — и одна на всех, после слияния.
+final class MultiCollectionRerankTests: XCTestCase {
+
+    private func target(
+        _ name: String, rerank: Bool = true, mode: RerankMode = .crossEncoder,
+        model: String = "qwen3-reranker-0.6b", candidates: Int = 20
+    ) -> MultiCollectionSearch.Target {
+        var profile = SearchProfile(collectionName: name)
+        profile.rerankEnabled = rerank
+        profile.rerankMode = mode
+        profile.rerankModel = model
+        profile.rerankCandidates = candidates
+        return MultiCollectionSearch.Target(
+            collectionID: "id-\(name)", collectionName: name, model: "bge-m3",
+            metric: .cosine, profile: profile
+        )
+    }
+
+    private func hit(_ id: String, distance: Double) -> RetrievalHit {
+        RetrievalHit(id: id, document: "текст \(id)", metadata: nil, distance: distance)
+    }
+
+    private func outcome(_ hits: [RetrievalHit]) -> RetrievalOutcome {
+        RetrievalOutcome(hits: hits, diagnostics: RetrievalDiagnostics())
+    }
+
+    private actor Asked {
+        private(set) var documents: [String] = []
+        private(set) var rerankFlags: [Bool] = []
+        func record(prompt: String) { documents.append(prompt) }
+        func record(rerankEnabled: Bool) { rerankFlags.append(rerankEnabled) }
+    }
+
+    /// Стадия, которая говорит «да» только про названный документ.
+    private func stage(saysYesTo wanted: String, asked: Asked) -> RerankStage {
+        RerankStage(completePlain: { prompt, _, _ in
+            await asked.record(prompt: prompt)
+            return prompt.contains("<Document>: текст \(wanted)") ? "yes" : "no"
+        })
+    }
+
+    /// Главное: модель сравнивает кандидатов **между** коллекциями.
+    ///
+    /// Лучший ответ лежит в чужой коллекции и на последнем месте слияния.
+    /// Пока каждую коллекцию переранжировали отдельно, поднять его выше
+    /// земляков было нечем: списки сливались уже после того, как модель
+    /// высказалась.
+    func testTheModelComparesCandidatesFromDifferentCollections() async {
+        let asked = Asked()
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { target, _, _ in
+                target.collectionName == "а"
+                    ? self.outcome([self.hit("a1", distance: 0.1), self.hit("a2", distance: 0.2)])
+                    : self.outcome([self.hit("b1", distance: 0.1), self.hit("b2", distance: 0.2)])
+            },
+            rerank: stage(saysYesTo: "b2", asked: asked)
+        )
+        let answer = await search.run(query: "q", targets: [target("а"), target("б")], nResults: 4)
+        XCTAssertEqual(answer.hits.first?.id, "b2")
+        XCTAssertEqual(answer.hits.first?.collectionName, "б")
+        // Спрошено по разу про каждого кандидата слитого списка, а не по разу
+        // на коллекцию: в этом вся разница.
+        let documents = await asked.documents
+        XCTAssertEqual(documents.count, 4)
+    }
+
+    /// Коллекции ищутся **без** стадии 7: иначе модель спросят дважды —
+    /// сперва внутри коллекции, потом на слиянии.
+    func testEachCollectionIsSearchedWithoutRerank() async {
+        let asked = Asked()
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { target, _, _ in
+                await asked.record(rerankEnabled: target.profile.rerankEnabled)
+                return self.outcome([self.hit("d1", distance: 0.1)])
+            },
+            rerank: stage(saysYesTo: "нет такого", asked: asked)
+        )
+        _ = await search.run(query: "q", targets: [target("а"), target("б")], nResults: 4)
+        let flags = await asked.rerankFlags
+        XCTAssertEqual(flags, [false, false])
+    }
+
+    /// Разные настройки — не повод решать за человека, чьи главнее.
+    func testCollectionsAskingDifferentThingsAreNotReranked() async {
+        let asked = Asked()
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) },
+            rerank: stage(saysYesTo: "d1", asked: asked)
+        )
+        let answer = await search.run(
+            query: "q", targets: [target("а"), target("б", mode: .chatSchema)], nResults: 4
+        )
+        let documents = await asked.documents
+        XCTAssertTrue(documents.isEmpty, "модель спрошена вопреки несогласию профилей")
+        XCTAssertEqual(answer.rerankNote, "коллекции просят разного переранжирования — выдача слита рангами")
+    }
+
+    /// Одна коллекция стадию выключила — значит её документы не судят
+    /// настройками чужого профиля. Молчание об этом было бы хуже отказа.
+    func testWhenNotEveryCollectionAsksTheMergedListIsLeftAlone() async {
+        let asked = Asked()
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) },
+            rerank: stage(saysYesTo: "d1", asked: asked)
+        )
+        let answer = await search.run(
+            query: "q", targets: [target("а"), target("заметки", rerank: false)], nResults: 4
+        )
+        let documents = await asked.documents
+        XCTAssertTrue(documents.isEmpty)
+        XCTAssertEqual(
+            answer.rerankNote,
+            "переранжирование просят не все коллекции (без него: заметки) — выдача слита рангами"
+        )
+    }
+
+    /// Профили просят, а вызывать нечем — это говорится вслух, как в конвейере
+    ///. Ровно тот случай, из-за которого стадия здесь и пропадала.
+    func testWithoutAStageTheReasonIsNamed() async {
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { _, _, _ in self.outcome([self.hit("d1", distance: 0.1)]) }
+        )
+        let answer = await search.run(query: "q", targets: [target("а")], nResults: 4)
+        XCTAssertEqual(
+            answer.rerankNote,
+            "переранжировать нечем: прямой вызов модели этому поиску не передан"
+        )
+    }
+
+    /// Пул под стадию шире выдачи: треть выигрыша приходит из хвоста, куда
+    /// десятка не достаёт. Обрезка — после модели, а не до неё.
+    func testThePoolIsWiderThanTheAnswer() async {
+        let asked = Asked()
+        let search = MultiCollectionSearch(
+            embed: { _, _ in [1, 0] },
+            search: { target, _, _ in
+                self.outcome((0..<10).map {
+                    self.hit("\(target.collectionName)\($0)", distance: Double($0) / 100)
+                })
+            },
+            rerank: stage(saysYesTo: "б9", asked: asked)
+        )
+        let answer = await search.run(query: "q", targets: [target("а"), target("б")], nResults: 2)
+        let documents = await asked.documents
+        XCTAssertEqual(documents.count, 20, "модели показали только выдачу, а не пул")
+        XCTAssertEqual(answer.hits.count, 2)
+        XCTAssertEqual(answer.hits.first?.id, "б9", "поднятое моделью не пережило обрезку")
+    }
+}

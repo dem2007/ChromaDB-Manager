@@ -310,6 +310,24 @@ public struct DocumentFilter: Hashable, Codable, Sendable {
     /// Everything the server would reject, collected before sending.
     public var problems: [String] { root.problems }
 
+    /// Тот же фильтр плюс условие, которое дописывает приложение.
+    ///
+    /// Условие кладётся **рядом с корнем**, а не к его детям. Пока брались
+    /// дети, корень терял собственную логику: человек собрал «файл A ИЛИ
+    /// файл Б», приложение добавляло свой уровень или пометку — и выходило
+    /// «A И Б И условие». У документа одно значение `source_file`, поэтому
+    /// такой запрос невыполним, и поиск молча возвращал пусто. Выбор логики
+    /// стоит на каждом уровне дерева, включая корень, так что случай не
+    /// экзотический.
+    ///
+    /// Пустой корень при этом ничего не портит: пустая группа не даёт
+    /// условия и схлопывается при сборке запроса.
+    public func adding(_ condition: MetadataCondition) -> DocumentFilter {
+        var copy = self
+        copy.root = .group(.and, [root, .leaf(condition)])
+        return copy
+    }
+
     /// `where` clause, or `nil` when nothing is filtered.
     ///
     /// Never `{}`: an empty object is answered with `400 Invalid where clause`

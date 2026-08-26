@@ -516,7 +516,30 @@ struct TableMappingSheet: View {
     /// говорило «переиндексируйте вручную», не давая способа.
     @ViewBuilder
     private var reindexCard: some View {
-        if let state = model.reindexState() {
+        // Лист уже очищен и ждёт записи. Карточка с кнопкой при этом
+        // исчезает — она живёт, пока строк больше нуля, — и до этой правки
+        // состояние «строк в базе нет, и это мы их убрали» не показывалось
+        // нигде: закрыли экран, и следа не осталось.
+        if model.selectedSheetAwaitsWrite {
+            SectionCard(
+                title: "Лист ждёт записи",
+                subtitle: "Лист очищен под переиндексацию: его строк в коллекции сейчас нет, и поиск по ним ничего не находит."
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Запишет их обычная синхронизация источника — по нынешней разметке. Пока она не прошла, лист в базе пуст.")
+                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Circle().fill(Theme.Palette.attention)
+                            .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
+                        Text(model.selectedSheet.map { String(localized: "Лист «\($0)» ждёт записи") }
+                            ?? String(localized: "Лист ждёт записи"))
+                            .font(Theme.Font.caption)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        } else if let state = model.reindexState() {
             SectionCard(
                 title: "Переиндексация листа",
                 subtitle: state.changed

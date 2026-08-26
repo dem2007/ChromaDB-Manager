@@ -636,7 +636,7 @@ struct EnvironmentStatusView: View {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             if item.isOptional {
                                 Toggle(isOn: $model.wipeIncludesBackups) { Text(item.title) }
-                                    .toggleStyle(.checkbox)
+                                    .toggleStyle(.chromaCheckbox)
                             } else {
                                 Text("• " + item.title)
                             }

@@ -18,7 +18,8 @@ final class ChromaRouteTests: XCTestCase {
         XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "\(tenantPath)/\(uuid)/add").access, .write)
         XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "\(tenantPath)/\(uuid)/upsert").access, .write)
         XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "\(tenantPath)/\(uuid)/update").access, .write)
-        XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "\(tenantPath)/\(uuid)/delete").access, .write)
+        // Удаление — свой вид доступа с: у него отдельное право.
+        XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "\(tenantPath)/\(uuid)/delete").access, .delete)
     }
 
     func testCountIsAGETWithAQueryString() {
@@ -35,7 +36,7 @@ final class ChromaRouteTests: XCTestCase {
         // Data operations use the UUID; delete_collection uses the name.
         let byName = ChromaRoute.parse(method: "DELETE", path: "\(tenantPath)/proxy_probe")
         XCTAssertEqual(byName.operation, "delete_collection")
-        XCTAssertEqual(byName.access, .write)
+        XCTAssertEqual(byName.access, .delete)
         XCTAssertEqual(byName.target, .collection(reference: "proxy_probe", looksLikeID: false))
 
         let byID = ChromaRoute.parse(method: "PUT", path: "\(tenantPath)/1916a0d6-cabc-4569-b1f4-3ff9df0d154c")
@@ -106,6 +107,51 @@ final class HTTPRequestParserTests: XCTestCase {
         XCTAssertNil(try parser.next())
         parser.append(Data("\n\r\n".utf8))
         XCTAssertEqual(try parser.next()?.path, "/api/v2/heartbeat")
+    }
+
+    /// В строке запроса — только путь.
+    ///
+    /// Абсолютная форма — законный HTTP/1.1, но она для прямых прокси, а этот
+    /// обратный. Пропустив её, прокси собирал адрес как
+    /// `URL(string: цель, relativeTo: сервер)`, основание отбрасывалось,
+    /// и запрос уходил на чужой хост — а ответ возвращался клиенту. Маршрут
+    /// при этом не узнавался, а неизвестные чтения проходят: годился любой
+    /// включённый ключ.
+    func testAnAbsoluteRequestTargetIsRefused() {
+        var parser = HTTPRequestParser()
+        parser.append(Data("GET http://internal.local/admin HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+        XCTAssertThrowsError(try parser.next()) { error in
+            guard case HTTPRequestParser.Failure.malformed(let text)? = error as? HTTPRequestParser.Failure else {
+                return XCTFail("ожидался отказ разбора, пришло \(error)")
+            }
+            XCTAssertTrue(text.contains("путь"), text)
+        }
+    }
+
+    /// Протокол-относительная форма — та же беда с другого конца:
+    /// `URL(string: "//internal.local/admin", relativeTo: "http://127.0.0.1:8000")`
+    /// это `http://internal.local/admin`.
+    func testAProtocolRelativeRequestTargetIsRefused() {
+        var parser = HTTPRequestParser()
+        parser.append(Data("GET //internal.local/admin HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+        XCTAssertThrowsError(try parser.next())
+    }
+
+    /// Проверка узкая: обычный путь с запросом и с двоеточием внутри проходит,
+    /// иначе сторож стоил бы работающих запросов.
+    func testAnOrdinaryPathStillParses() throws {
+        var parser = HTTPRequestParser()
+        parser.append(Data("GET /api/v2/tenants/t:1/databases/d/collections?limit=10 HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+        XCTAssertEqual(try parser.next()?.path, "/api/v2/tenants/t:1/databases/d/collections?limit=10")
+    }
+
+    /// Что именно делала абсолютная форма — на самой арифметике адресов,
+    /// без прокси: основание отбрасывается, хост становится чужим.
+    func testWhyItMattered() throws {
+        let upstream = try XCTUnwrap(URL(string: "http://127.0.0.1:8000"))
+        XCTAssertEqual(URL(string: "/api/v2/heartbeat", relativeTo: upstream)?.host, "127.0.0.1")
+        XCTAssertEqual(URL(string: "http://internal.local/admin", relativeTo: upstream)?.host, "internal.local")
+        XCTAssertEqual(URL(string: "//internal.local/admin", relativeTo: upstream)?.host, "internal.local")
     }
 
     func testABodyThatHasNotArrivedYetIsNotAHalfRequest() throws {
@@ -236,6 +282,83 @@ final class AccessControllerTests: XCTestCase {
         )
         if case .reject(let status, _, _, _) = decision { return status }
         return 200
+    }
+
+    /// Причина отказа словами — иногда важнее кода.
+    private func reason(
+        _ controller: AccessController, key: String?, _ method: String, _ path: String, body: String = ""
+    ) async -> String? {
+        let decision = await controller.decide(
+            key: key, route: ChromaRoute.parse(method: method, path: path), body: Data(body.utf8)
+        )
+        if case .reject(_, let message, _, _) = decision { return message }
+        return nil
+    }
+
+    // MARK: - Удаление как отдельное право
+
+    /// Галка «Разрешить удаление документов» действует и на прокси.
+    ///
+    /// До `ChromaRoute.Access` знал только чтение и запись, оба удаления
+    /// были помечены записью, и клиент с записью сносил коллекцию при снятой
+    /// галке. У инструментов MCP это право проверялось с самого начала —
+    /// расходились две модели прав на одни и те же данные.
+    func testAWriterWithoutDeleteCannotDelete() async {
+        let controller = await makeController(writer("k"))
+        let documents = await code(
+            controller, key: "k", "POST", "\(tenant)/\(allowedID)/delete", body: #"{"ids":["a1"]}"#
+        )
+        let collection = await code(controller, key: "k", "DELETE", "\(tenant)/public")
+        XCTAssertEqual([documents, collection], [403, 403])
+
+        let said = await reason(controller, key: "k", "DELETE", "\(tenant)/public")
+        XCTAssertEqual(said?.contains("не удаление"), true, said ?? "—")
+    }
+
+    /// С выданным правом те же два маршрута проходят.
+    func testAWriterWithDeleteMayDelete() async {
+        var client = writer("k")
+        client.permissions.allowsDelete = true
+        let controller = await makeController(client)
+        let documents = await code(
+            controller, key: "k", "POST", "\(tenant)/\(allowedID)/delete", body: #"{"ids":["a1"]}"#
+        )
+        let collection = await code(controller, key: "k", "DELETE", "\(tenant)/public")
+        XCTAssertEqual([documents, collection], [200, 200])
+    }
+
+    /// Проверка узкая: обычная запись у того же клиента как проходила, так и
+    /// проходит. Иначе новое право стоило бы работающих клиентов.
+    func testOrdinaryWritesAreUntouchedByTheDeleteRight() async {
+        let controller = await makeController(writer("k"))
+        let add = await code(
+            controller, key: "k", "POST", "\(tenant)/\(allowedID)/add",
+            body: #"{"ids":["a1"],"documents":["текст"]}"#
+        )
+        let update = await code(
+            controller, key: "k", "POST", "\(tenant)/\(allowedID)/update",
+            body: #"{"ids":["a1"],"documents":["текст"]}"#
+        )
+        XCTAssertEqual([add, update], [200, 200])
+    }
+
+    /// Читателю по-прежнему первым делом говорят про чтение, а не про
+    /// удаление: он не дошёл до этого различения.
+    func testAReaderHearsAboutReadingFirst() async {
+        let controller = await makeController(reader("k"))
+        let said = await reason(controller, key: "k", "DELETE", "\(tenant)/public")
+        XCTAssertEqual(said?.contains("только чтение"), true, said ?? "—")
+    }
+
+    /// В журнале доступа удаление считается изменением данных: отбор
+    /// «только записи» обязан его показывать.
+    func testADeletionCountsAsAWriteInTheLog() {
+        let entry = AuditEntry(
+            client: "к", method: "DELETE", path: "/api/v2/…/collections/public",
+            operation: "delete_collection", access: .delete, collection: "public",
+            requestBytes: 0, responseStatus: 200, responseBytes: 0, durationSeconds: 0
+        )
+        XCTAssertTrue(entry.isWrite)
     }
 
     func testNoKeyAndUnknownKeyAreBothRefused() async {

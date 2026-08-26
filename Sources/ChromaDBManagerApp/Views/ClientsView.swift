@@ -494,7 +494,7 @@ struct ClientsView: View {
                         get: { permissions.wrappedValue.collections.contains(name) },
                         set: { _ in model.toggleCollection(name, for: client, app: app) }
                     ))
-                    .toggleStyle(.checkbox)
+                    .toggleStyle(.chromaCheckbox)
                 }
             }
         }

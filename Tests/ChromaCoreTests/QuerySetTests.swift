@@ -32,6 +32,45 @@ final class QuerySetTests: XCTestCase {
         XCTAssertTrue(expectation.matches(asAnotherChunk), "перенос строки не должен ломать совпадение")
     }
 
+    /// Одна и та же буква, записанная двумя способами, — одна и та же буква
+    ///.
+    ///
+    /// Сравнение подстрок стало литеральным ради скорости, и приведение
+    /// к составленной форме (NFC) — то, чем за это платят.
+    ///
+    /// **Письмо здесь корейское, и это не прихоть.** На русском примере
+    /// проверка ничего не проверяет: свёртка значков снимает значок и с «ё»,
+    /// и с разложенной пары, обе формы совпадают побайтово ещё до NFC — и
+    /// тест проходил бы с удалённой строкой NFC. Проверено удалением. Там,
+    /// где состав буквы не сводится к значкам, формы остаются разными, и
+    /// сводит их только NFC.
+    func testTheSameLetterWrittenTwoWaysStillMatches() {
+        // «한국» — слог целиком против тех же букв по отдельности.
+        let precomposed = "Документ 한국 о лицензировании"
+        let decomposed = precomposed.decomposedStringWithCanonicalMapping
+        XCTAssertNotEqual(
+            Array(ExpectedFragment.normalised(precomposed).utf8),
+            Array(decomposed.utf8),
+            "проверка бессмысленна, если формы совпали побайтово сами собой"
+        )
+        XCTAssertTrue(ExpectedFragment(fragment: "한국 о лицензировании").matches(decomposed))
+        XCTAssertTrue(
+            ExpectedFragment(fragment: decomposed).matches(precomposed),
+            "и в обратную сторону: фрагмент разложенный, текст составленный"
+        )
+    }
+
+    /// А на кириллице формы сходятся и без NFC — свёрткой значков. Проверка
+    /// стоит рядом, чтобы было видно: это тот случай, который NFC **не**
+    /// сторожит.
+    func testDiacriticFoldingAlreadyHandlesCyrillic() {
+        let precomposed = "приёмка выполняется комиссией"
+        let decomposed = precomposed.decomposedStringWithCanonicalMapping
+        XCTAssertNotEqual(Array(precomposed.utf8), Array(decomposed.utf8))
+        XCTAssertTrue(ExpectedFragment(fragment: precomposed).matches(decomposed))
+        XCTAssertTrue(ExpectedFragment(fragment: decomposed).matches(precomposed))
+    }
+
     func testCaseAndAccentsDoNotMatter() {
         let expectation = ExpectedFragment(fragment: "ЁЛКА зелёная")
         XCTAssertTrue(expectation.matches("в лесу росла елка зеленая"))

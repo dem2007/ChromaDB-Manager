@@ -416,11 +416,40 @@ final class CrossEncoderRerankTests: XCTestCase {
     /// Цена режима — вызов на кандидат, а не один на запрос: общая
     /// формулировка занижала бы её в двадцать раз.
     func testTheCostOfThisModeIsStatedInItsOwnTerms() {
-        XCTAssertNotEqual(CrossEncoderReranker.costWarning, Reranker.costWarning)
+        XCTAssertNotEqual(CrossEncoderReranker.costWarning(), Reranker.costWarning)
         XCTAssertTrue(
-            CrossEncoderReranker.costWarning.contains("\(Reranker.maximumCandidates) вызов"),
-            CrossEncoderReranker.costWarning
+            CrossEncoderReranker.costWarning().contains("\(Reranker.maximumCandidates) вызов"),
+            CrossEncoderReranker.costWarning()
         )
+    }
+
+    /// Предупреждение называет то число, которое стоит в профиле, а не
+    /// умолчание: цена стадии — это оно.
+    func testTheCostFollowsTheNumberInTheProfile() {
+        XCTAssertTrue(CrossEncoderReranker.costWarning(candidates: 40).contains("40 вызов"),
+                      CrossEncoderReranker.costWarning(candidates: 40))
+        // Заведомо невозможное число не попадает в предупреждение как есть.
+        XCTAssertTrue(CrossEncoderReranker.costWarning(candidates: 5000)
+                        .contains("\(Reranker.candidateCeiling) вызов"))
+    }
+
+    /// Сколько кандидатов показать — из профиля, с потолком и полом.
+    func testTheCandidateCountIsKeptSane() {
+        XCTAssertEqual(Reranker.candidateCount(40), 40)
+        XCTAssertEqual(Reranker.candidateCount(1), 2, "переранжировать один кандидат нечем")
+        XCTAssertEqual(Reranker.candidateCount(0), 2)
+        XCTAssertEqual(Reranker.candidateCount(-5), 2)
+        XCTAssertEqual(Reranker.candidateCount(10_000), Reranker.candidateCeiling)
+    }
+
+    /// Новый профиль ведёт себя как раньше, а старый — читается.
+    func testProfilesWithoutTheFieldKeepTheOldNumber() throws {
+        XCTAssertEqual(SearchProfile(collectionName: "к").rerankCandidates, Reranker.maximumCandidates)
+        let json = Data("""
+        {"id":"E4E5AD46-C9F8-45FC-8AC0-C71F24353C90","name":"старый","collectionName":"к"}
+        """.utf8)
+        let old = try JSONDecoder().decode(SearchProfile.self, from: json)
+        XCTAssertEqual(old.rerankCandidates, Reranker.maximumCandidates)
     }
 
     func testAnEmptyInstructionMeansTheStandardOne() {
@@ -478,7 +507,7 @@ final class CrossEncoderRerankTests: XCTestCase {
         let pipeline = RetrievalPipeline(
             database: database,
             embed: { _ in [1] },
-            completePlain: { prompt, _ in
+            completePlain: { prompt, _, _ in
                 await calls.record()
                 // Проверяем по тексту документа, а не по запросу: запрос есть в
                 // каждом промпте.
@@ -518,7 +547,7 @@ final class CrossEncoderRerankTests: XCTestCase {
                 QueryHit(id: "d1", document: "два", metadata: nil, distance: 0.2),
             ]),
             embed: { _ in [1] },
-            completePlain: { prompt, _ in await seen.record(prompt); return "no" }
+            completePlain: { prompt, _, _ in await seen.record(prompt); return "no" }
         )
         _ = try await pipeline.run(
             RetrievalRequest(text: "q", collectionID: "c", collectionName: "к", nResults: 2),
@@ -530,6 +559,66 @@ final class CrossEncoderRerankTests: XCTestCase {
             XCTAssertTrue(prompt.contains("<Instruct>: Найди фрагменты про сроки"), prompt)
             XCTAssertFalse(prompt.contains(CrossEncoderReranker.defaultInstruction), prompt)
         }
+    }
+
+    /// Число из профиля доходит до модели: спрошено ровно столько кандидатов,
+    /// сколько в нём стоит.
+    ///
+    /// Без этой проверки поле показывалось бы в форме, а конвейер брал бы
+    /// прежнюю константу — ровно та беда, что была с инструкцией.
+    func testTheCandidateCountFromTheProfileReachesTheModel() async throws {
+        let hits = (0..<30).map {
+            QueryHit(id: "d\($0)", document: "кусок \($0)", metadata: nil, distance: Double($0) / 100)
+        }
+        for asked in [5, 25] {
+            var profile = SearchProfile(collectionName: "к")
+            profile.rerankEnabled = true
+            profile.rerankModel = "qwen3-reranker-0.6b"
+            profile.rerankMode = .crossEncoder
+            profile.rerankCandidates = asked
+
+            let seen = PromptRecorder()
+            let pipeline = RetrievalPipeline(
+                database: PlainDatabase(hits: hits),
+                embed: { _ in [1] },
+                completePlain: { prompt, _, _ in await seen.record(prompt); return "no" }
+            )
+            _ = try await pipeline.run(
+                RetrievalRequest(text: "q", collectionID: "c", collectionName: "к", nResults: 10),
+                profile: profile
+            )
+            let prompts = await seen.prompts
+            XCTAssertEqual(prompts.count, asked, "спрошено не столько кандидатов, сколько в профиле")
+        }
+    }
+
+    /// Место под ответ конвейер называет сам, и называет верное.
+    ///
+    /// Пока число жило в местах сборки конвейера, правка держалась на
+    /// том, что о ней помнят в каждом из них по отдельности: одно место,
+    /// написанное с прежней четвёркой, вернуло бы молчаливо обрезанный балл,
+    /// и ни один сторож бы этого не заметил.
+    func testTheAnswerBudgetReachesTheModel() async throws {
+        var profile = SearchProfile(collectionName: "к")
+        profile.rerankEnabled = true
+        profile.rerankModel = "qwen3-reranker-0.6b"
+        profile.rerankMode = .crossEncoder
+
+        let budgets = BudgetRecorder()
+        let pipeline = RetrievalPipeline(
+            database: PlainDatabase(hits: [
+                QueryHit(id: "d0", document: "раз", metadata: nil, distance: 0.1),
+                QueryHit(id: "d1", document: "два", metadata: nil, distance: 0.2),
+            ]),
+            embed: { _ in [1] },
+            completePlain: { _, _, maxTokens in await budgets.record(maxTokens); return "no" }
+        )
+        _ = try await pipeline.run(
+            RetrievalRequest(text: "q", collectionID: "c", collectionName: "к", nResults: 2),
+            profile: profile
+        )
+        let asked = await budgets.values
+        XCTAssertEqual(asked, [CrossEncoderReranker.answerTokens, CrossEncoderReranker.answerTokens])
     }
 
     /// Шаблон чат-схемы не должен утекать в `<Instruct>`: у полей разный формат,
@@ -548,7 +637,7 @@ final class CrossEncoderRerankTests: XCTestCase {
                 QueryHit(id: "d1", document: "два", metadata: nil, distance: 0.2),
             ]),
             embed: { _ in [1] },
-            completePlain: { prompt, _ in await seen.record(prompt); return "no" }
+            completePlain: { prompt, _, _ in await seen.record(prompt); return "no" }
         )
         _ = try await pipeline.run(
             RetrievalRequest(text: "q", collectionID: "c", collectionName: "к", nResults: 2),
@@ -602,7 +691,7 @@ final class CrossEncoderRerankTests: XCTestCase {
                 QueryHit(id: "d1", document: "два", metadata: nil, distance: 0.2),
             ]),
             embed: { _ in [1] },
-            completePlain: { _, _ in "Затрудняюсь ответить" }
+            completePlain: { _, _, _ in "Затрудняюсь ответить" }
         )
         let outcome = try await pipeline.run(
             RetrievalRequest(text: "q", collectionID: "c", collectionName: "к", nResults: 2),
@@ -645,6 +734,12 @@ private actor PromptRecorder {
 /// ближайшему фрагменту, «[2]» отдалённому, «[1]» постороннему. Прежний разбор
 /// знал, что «1» значит «да», и потому ставил посторонние фрагменты первыми:
 /// на стенде это выглядело как «переранжировщик хуже опорного».
+/// Копилка запрошенных бюджетов ответа — под стать `PromptRecorder`.
+private actor BudgetRecorder {
+    private(set) var values: [Int] = []
+    func record(_ value: Int) { values.append(value) }
+}
+
 final class CrossEncoderScoreTests: XCTestCase {
 
     func testABracketedScoreIsRead() {
@@ -677,6 +772,28 @@ final class CrossEncoderScoreTests: XCTestCase {
         let items = ["a", "b", "c"]
         let order = CrossEncoderReranker.reordered(items, scores: [nil, 0, 5])
         XCTAssertEqual(order, ["c", "b", "a"])
+    }
+
+    /// Места под ответ должно хватать на балл целиком, и с запасом в два
+    /// токена.
+    ///
+    /// Запас не на глаз, а по замеру. `jina-reranker-v3.5-mlx`, тот же промпт,
+    /// растущий предел: 1 токен — пусто, 2 — «[», 3 — «[6», 4 — «[60»,
+    /// 5 — «[60]», 6 — «[60]» и модель останавливается сама. То есть первый
+    /// токен не даёт ни одного знака, дальше по знаку на токен, и ещё один
+    /// уходит на остановку. Значит ответу из N знаков нужно N + 2.
+    ///
+    /// Отсюда и «плюс два» в проверке. Сравнение «знаков не больше, чем
+    /// токенов» было бы слабее замера: оно пропустило бы шестёрку, на которой
+    /// четырёхзначный балл «[1000]» пришёл бы как «[100» и молча стал бы
+    /// сотней — ровно тот вдесятеро заниженный балл, ради которого запас
+    /// и заводится.
+    func testTheAnswerBudgetFitsAThreeDigitScore() {
+        XCTAssertLessThanOrEqual("[100]".count + 2, CrossEncoderReranker.answerTokens)
+        XCTAssertEqual(CrossEncoderReranker.score("[100]"), 100)
+        // Та самая ошибка, которую предотвращает запас: обрезанный балл
+        // читается как меньшее число, а не как сбой.
+        XCTAssertEqual(CrossEncoderReranker.score("[10"), 10)
     }
 
     func testADecimalScoreIsRead() {

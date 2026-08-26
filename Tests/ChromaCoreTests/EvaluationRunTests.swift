@@ -21,9 +21,11 @@ final class EvaluationRunTests: XCTestCase {
         _ name: String,
         model: String = "bge-m3",
         textOnly: Bool = false,
-        nResults: Int = 5
+        nResults: Int = 5,
+        queryPrefix: String = ""
     ) -> EvaluationVariant {
         var profile = SearchProfile.plain(collectionName: "c-\(name)", name: "профиль \(name)")
+        profile.queryPrefix = queryPrefix
         if textOnly {
             profile.vectorSearchEnabled = false
             profile.textSearchEnabled = true
@@ -279,6 +281,43 @@ final class EvaluationRunTests: XCTestCase {
         XCTAssertTrue(cost.line.contains("10 × 4 = 40"), cost.line)
     }
 
+    /// Приставка к запросу — часть ключа запаса, а не украшение.
+    ///
+    /// Раньше варианты схлопывались по одной лишь модели, а раннер запасает
+    /// вектор по «модель + текст, уходящий в модель». Сравнение приставок
+    /// на одной модели — ровно то, ради чего `queryPrefix` живёт в профиле, —
+    /// давало вчетверо больше вызовов, чем обещала оценка.
+    func testThePrefixIsPartOfTheVectorKey() {
+        let queries = (1...5).map { EvaluationQuery(text: "запрос \($0)") }
+        let cost = EvaluationCost.estimate(
+            queries: queries,
+            variants: [
+                variant("без приставки"),
+                variant("поиск", queryPrefix: "search_query: "),
+                variant("инструкция", queryPrefix: "Instruct: найди\nQuery: "),
+                variant("passage", queryPrefix: "passage: "),
+            ],
+            metrics: MetricsSnapshot()
+        )
+        XCTAssertEqual(cost.embeddingCalls, 20, "четыре приставки — четыре набора векторов")
+        XCTAssertEqual(cost.savedEmbeddingCalls, 0, "запасать нечего: все тексты разные")
+    }
+
+    /// А одинаковые приставки на одной модели по-прежнему считаются один раз.
+    func testTheSamePrefixOnOneModelIsStillCountedOnce() {
+        let queries = (1...5).map { EvaluationQuery(text: "запрос \($0)") }
+        let cost = EvaluationCost.estimate(
+            queries: queries,
+            variants: [
+                variant("A", queryPrefix: "search_query: "),
+                variant("Б", queryPrefix: "search_query: "),
+            ],
+            metrics: MetricsSnapshot()
+        )
+        XCTAssertEqual(cost.embeddingCalls, 5)
+        XCTAssertEqual(cost.savedEmbeddingCalls, 5)
+    }
+
     /// Строка стоимости читается вслух, и «2 поисковых запросов» в ней выглядит
     /// как ошибка во всём остальном на экране. Найдено на живом прогоне.
     func testTheCostLineAgreesWithItsNumbers() {
@@ -391,6 +430,87 @@ final class EvaluationRunTests: XCTestCase {
         XCTAssertEqual(reopened?.variants.first?.nResults, 7)
         XCTAssertEqual(reopened?.variants.first?.profile.name, "профиль 512")
         XCTAssertEqual(reopened?.variants.first?.model, "bge-m3")
+    }
+
+    /// Список прогонов читает только шапку — но читает её верно.
+    ///
+    /// Прогон держит полный текст каждого результата каждого варианта:
+    /// на живой папке это 70 МБ на 48 прогонов, и полный разбор ради девяти
+    /// полей стоил 1776 мс против 49. Сводка обязана при этом остаться той же,
+    /// что получилась бы из полностью разобранного прогона.
+    func testTheListReadsTheSameSummaryAsAFullRun() async {
+        let store = EvaluationRunStore(directory: directory)
+        let runner = EvaluationRunner(
+            embed: { _, _ in [1] },
+            search: { [self] _, _, _ in outcome(["a", "b"]) }
+        )
+        var made = await runner.run(
+            set: set(["первый", "второй"]),
+            variants: [variant("A"), variant("Б")]
+        )
+        made.name = "сравнение"
+        made.note = "заметка о прогоне"
+        XCTAssertTrue(store.save(made))
+
+        // Сравнивается с разбором **того же файла** целиком, а не с прогоном
+        // в памяти: дата на диске хранится с точностью до секунды, и доля
+        // секунды теряется при любом чтении, хоть полном, хоть по шапке.
+        let reopened = EvaluationRunStore(directory: directory)
+        let fromList = reopened.summaries().first
+        let fromFullRead = reopened.run(id: made.id).map(EvaluationRunSummary.init)
+        XCTAssertEqual(fromList, fromFullRead)
+        XCTAssertEqual(fromList?.queryCount, 2)
+        XCTAssertEqual(fromList?.resultCount, 4)
+        XCTAssertEqual(fromList?.variantNames, ["A", "Б"])
+        XCTAssertEqual(fromList?.note, "заметка о прогоне")
+    }
+
+    /// Сохранение поправляет список, а не сбрасывает его.
+    ///
+    /// Сброс означал полное перечитывание папки ровно тогда, когда список
+    /// и открывают, — сразу после прогона. Здесь проверяется, что список
+    /// после сохранения верен: и свежий прогон в нём, и прежний, и порядок
+    /// от свежего к старому. Выигрыш по времени сторожем не меряется —
+    /// он в замере на живой папке.
+    func testSavingKeepsTheListCorrect() async {
+        let store = EvaluationRunStore(directory: directory)
+        var old = EvaluationRun(
+            name: "прежний", startedAt: Date(timeIntervalSinceNow: -3_600),
+            querySetID: UUID(), querySetName: "н"
+        )
+        old.note = "прежняя заметка"
+        XCTAssertTrue(store.save(old))
+        XCTAssertEqual(store.summaries().count, 1)
+
+        let fresh = EvaluationRun(name: "свежий", querySetID: UUID(), querySetName: "н")
+        XCTAssertTrue(store.save(fresh))
+        XCTAssertEqual(store.summaries().map(\.name), ["свежий", "прежний"])
+
+        // И правка того же прогона не задваивает его в списке.
+        var renamed = fresh
+        renamed.name = "свежий, переименованный"
+        XCTAssertTrue(store.save(renamed))
+        XCTAssertEqual(store.summaries().map(\.name), ["свежий, переименованный", "прежний"])
+    }
+
+    /// Тёплый список и холодный отвечают одинаково.
+    ///
+    /// Сводка только что сохранённого прогона кладётся в запас, чтобы
+    /// не перечитывать папку. Если положить туда прогон **из памяти**,
+    /// в запасе окажется дата с долями секунды, а с диска та же дата
+    /// приходит округлённой до секунды: два прогона в одну секунду
+    /// сортировались бы по-разному, смотря был запас тёплым или нет.
+    func testTheWarmListAnswersTheSameAsAColdOne() async {
+        let store = EvaluationRunStore(directory: directory)
+        let runner = EvaluationRunner(embed: { _, _ in [1] }, search: { [self] _, _, _ in outcome(["a"]) })
+        var made = await runner.run(set: set(["з"]), variants: [variant("A")])
+        made.name = "прогон"
+        _ = store.summaries()          // список прогрет до сохранения
+        XCTAssertTrue(store.save(made))
+
+        let warm = store.summaries()
+        let cold = EvaluationRunStore(directory: directory).summaries()
+        XCTAssertEqual(warm, cold)
     }
 
     func testTheListShowsNewestFirstAndSurvivesAStrayFile() throws {

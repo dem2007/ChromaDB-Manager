@@ -103,6 +103,29 @@ final class ReembeddingJournalTests: XCTestCase {
         XCTAssertEqual(reloaded.entries.first?.outcome, .cancelled, "последняя операция должна быть сверху")
     }
 
+    /// Запись о сорвавшемся прогоне несёт известное, а не нули.
+    ///
+    /// Размерность считается до начала работы и в обработчике ошибки видна,
+    /// а сколько успела сделать операция на месте — знает контрольная точка.
+    /// Прежде в журнал шли `0, 0, 0`, и про отменённый прогон, оставивший
+    /// в коллекции новые векторы, журнал говорил «не сделано ничего».
+    func testAFailedRunRecordsWhatIsKnown() {
+        let request = ReembeddingRequest(
+            collection: ChromaCollection(id: "abc", name: "docs"),
+            targetModel: "модель",
+            scenario: .inPlace
+        )
+        let entry = ReembeddingService.failureEntry(
+            request: request, started: Date(timeIntervalSince1970: 1_787_000_000),
+            dimension: 1024, done: 17, isCancellation: true, detail: "остановлено человеком"
+        )
+        XCTAssertEqual(entry.dimension, 1024)
+        XCTAssertEqual(entry.processed, 17)
+        XCTAssertEqual(entry.written, 17)
+        XCTAssertEqual(entry.outcome, .cancelled)
+        XCTAssertEqual(entry.resultCollection, "docs", "у операции на месте результат — та же коллекция")
+    }
+
     func testCheckpointRoundTripAndReplacement() {
         let first = ReembeddingCheckpoint(
             collectionID: "abc", collectionName: "docs", targetModel: "m",

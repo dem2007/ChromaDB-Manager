@@ -283,9 +283,15 @@ extension ChromaClient: CollectionExporter.Source, CollectionImporter.Destinatio
         collectionID: String, limit: Int, offset: Int,
         filter: DocumentFilter?, includeEmbeddings: Bool
     ) async throws -> [ExportedDocument] {
+        // Страница берётся **без** векторов, даже когда они нужны: в
+        // `DocumentRecord` вектор всё равно не попадает — там только его
+        // длина, — так что запрошенные векторы приезжали по сети, разбирались
+        // и выбрасывались, после чего те же самые запрашивались вторым
+        // вызовом. Двойной трафик на каждой странице экспорта и вдобавок
+        // ложное предупреждение «запрошены векторы страницей».
         let records = try await getDocuments(
             collectionID: collectionID, limit: limit, offset: offset,
-            filter: filter, includeEmbeddings: includeEmbeddings
+            filter: filter, includeEmbeddings: false
         )
         guard includeEmbeddings, !records.isEmpty else {
             return records.map {

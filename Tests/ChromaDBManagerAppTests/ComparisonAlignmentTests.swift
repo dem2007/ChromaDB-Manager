@@ -33,7 +33,54 @@ final class ComparisonAlignmentTests: XCTestCase {
     func testThereIsOneHorizontalScrollForTheWholeCard() throws {
         let view = try source()
         let occurrences = view.components(separatedBy: "ScrollView(.horizontal").count - 1
+            + view.components(separatedBy: "ScrollView([.horizontal").count - 1
         XCTAssertLessThanOrEqual(occurrences, 2, "лишние вложенные прокрутки: \(occurrences)")
+    }
+
+    /// Выдача листается в собственной панели с заданной высотой.
+    ///
+    /// Без своей высоты ленивый стек не ленив: горизонтальная прокрутка
+    /// внутри страничной не ограничивает высоту, стек обязан назвать полную
+    /// и потому строит все строки разом. Замерено: 18 запросов по три
+    /// варианта — 1200 мс раскладки против 105 мс, и второе не растёт.
+    /// Сломать это можно молча — убрав одну строку с высотой, — а видно
+    /// будет только по тому, что окно «подлагивает».
+    func testTheResultsScrollInTheirOwnPane() throws {
+        let view = try source()
+        XCTAssertTrue(
+            view.contains("ScrollView([.horizontal, .vertical])"),
+            "панель выдачи обязана листаться по обеим осям"
+        )
+        XCTAssertTrue(
+            view.contains("containerRelativeFrame(.vertical)"),
+            "у панели обязана быть своя высота — от видимой части страницы"
+        )
+        XCTAssertTrue(view.contains("LazyVStack"), "список запросов обязан быть ленивым")
+    }
+
+    /// Полосе прокрутки отведено своё место.
+    ///
+    /// Накладная полоса рисуется поверх содержимого, а значок «показать
+    /// в источнике» стоит вплотную к правому краю колонки: без
+    /// отступа полоса накрывала его целиком, и нажать было не на что.
+    /// Видно это только глазами и только долистав панель до правого края,
+    /// поэтому — тест.
+    func testTheScrollersHaveRoomOfTheirOwn() throws {
+        let view = try source()
+        XCTAssertTrue(
+            view.contains("padding(.trailing, Self.scrollerClearance)"),
+            "содержимому панели нужен отступ справа под полосу прокрутки"
+        )
+        XCTAssertTrue(
+            view.contains("padding(.bottom, Self.scrollerClearance)"),
+            "и снизу — под горизонтальную полосу"
+        )
+        let clearance = try XCTUnwrap(
+            Self.number(after: "static let scrollerClearance: CGFloat = ", in: view),
+            "не нашлось место под полосу прокрутки"
+        )
+        // Накладная полоса macOS — 15 pt вместе с отбивкой.
+        XCTAssertGreaterThanOrEqual(clearance, 15, "полоса шире отведённого места")
     }
 
     /// Высота строки не пляшет: место под три строки текста отведено всегда.

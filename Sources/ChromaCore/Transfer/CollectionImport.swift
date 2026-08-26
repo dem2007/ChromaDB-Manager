@@ -316,17 +316,27 @@ public struct CollectionImporter: Sendable {
         let decoder = JSONDecoder()
 
         var line = 0
-        var batch: [ExportedDocument] = []
+        // Номер строки хранится вместе с документом. Отметка о месте остановки
+        // обязана указывать на **записанное**, а битые строки в пачку не
+        // попадают — по её длине номер не восстановить.
+        var batch: [(line: Int, document: ExportedDocument)] = []
 
         func flush() async throws {
             guard !batch.isEmpty else { return }
-            try await write(batch, into: collectionID, options: options, report: &report)
+            let consumed = try await write(
+                batch.map(\.document), into: collectionID, options: options, report: &report
+            )
+            // Отметка — по последнему записанному документу, а не по концу
+            // пачки. Пока она безусловно вставала на конец, остановка на
+            // конфликте уносила с собой и чистые документы перед ним, и сам
+            // конфликт: следующий заход начинал уже после них.
+            let reached = consumed > 0 ? batch[consumed - 1].line : batch[0].line - 1
             batch.removeAll(keepingCapacity: true)
             checkpoints.save(ImportCheckpoint(
                 packagePath: package.path, dataSHA256: manifest.dataSHA256,
-                collectionName: collectionName, processedLines: line
+                collectionName: collectionName, processedLines: reached
             ))
-            progress?(Progress(processed: line, total: manifest.documentCount))
+            progress?(Progress(processed: reached, total: manifest.documentCount))
         }
 
         while let data = try reader.next() {
@@ -339,7 +349,7 @@ public struct CollectionImporter: Sendable {
                 // они копятся до конца файла. На ста тысячах строк это
                 // 600 МБ вместо 25 — измерено, а не предположено.
                 try autoreleasepool {
-                    batch.append(try decoder.decode(ExportedDocument.self, from: data))
+                    batch.append((line: line, document: try decoder.decode(ExportedDocument.self, from: data)))
                 }
             } catch {
                 // Один битый документ не должен ронять перенос миллиона —
@@ -360,13 +370,18 @@ public struct CollectionImporter: Sendable {
         return report
     }
 
+    /// Сколько документов пачки обработано: все — или те, что успели пройти
+    /// до конфликта. По этому числу вызывающий ставит отметку о месте
+    /// остановки.
+    @discardableResult
     private func write(
         _ documents: [ExportedDocument],
         into collectionID: String,
         options: Options,
         report: inout ImportReport
-    ) async throws {
+    ) async throws -> Int {
         var incoming = documents
+        var consumed = documents.count
         let existing = try await destination.existingIDs(collectionID: collectionID, ids: incoming.map(\.id))
 
         switch options.conflictPolicy {
@@ -377,32 +392,46 @@ public struct CollectionImporter: Sendable {
         case .overwrite:
             report.overwritten += incoming.filter { existing.contains($0.id) }.count
         case .stop:
-            if let clash = incoming.first(where: { existing.contains($0.id) }) {
-                report.stoppedAtConflict = clash.id
-                log(.warning, "Перенос", "Импорт остановлен: документ \(clash.id) уже есть в коллекции")
-                return
+            if let clash = incoming.firstIndex(where: { existing.contains($0.id) }) {
+                report.stoppedAtConflict = incoming[clash].id
+                log(.warning, "Перенос", "Импорт остановлен: документ \(incoming[clash].id) уже есть в коллекции")
+                // Чистые документы перед конфликтным записываются: они ни в чём
+                // не виноваты, а продолжить импорт нужно ровно с конфликта.
+                // Раньше пачка не записывалась целиком — и терялась целиком.
+                incoming = Array(incoming.prefix(clash))
+                consumed = clash
             }
         }
-        guard !incoming.isEmpty else { return }
+        guard !incoming.isEmpty else { return consumed }
 
         // Векторов нет — считаем заново выбранной моделью. Это единственное
         // место, где импорт обращается к модели, и оно оплачивается временем,
         // о котором человека предупредили заранее (12.7).
         var vectors: [[Double]] = incoming.map { $0.embedding ?? [] }
-        if incoming.contains(where: { ($0.embedding ?? []).isEmpty }) {
+        // Считаются **только пустые места**, а готовые векторы остаются
+        // из пакета.
+        //
+        // Прежде хватало одного документа без вектора, чтобы вся пачка ушла
+        // в модель, — и векторы, привезённые пакетом, затирались векторами
+        // выбранной модели. Размерности при этом совпадают, никто не жалуется,
+        // а в коллекции с одной привязкой лежит смесь двух моделей: поиск
+        // сравнивает несравнимое. Заодно счётчик пересчитанных завышался
+        // на всю пачку.
+        let missing = vectors.indices.filter { vectors[$0].isEmpty }
+        if !missing.isEmpty {
             guard let embeddings, let model = options.embeddingModel else {
                 throw TransferError.noEmbeddingsAndNoModel
             }
-            let texts = incoming.map { $0.document ?? "" }
-            vectors = try await embeddings.embed(texts: texts, model: model)
-            // Вторая линия к проверке внутри клиента: `zip` ниже молча
-            // обрезается по короткой стороне, то есть недосчитанные векторы
+            let texts = missing.map { incoming[$0].document ?? "" }
+            let computed = try await embeddings.embed(texts: texts, model: model)
+            // Вторая линия к проверке внутри клиента: недосчитанные векторы
             // означали бы тихо не импортированные документы — при отчёте,
             // где они посчитаны импортированными.
-            guard vectors.count == incoming.count else {
-                throw LMStudioError.embeddingCountMismatch(sent: incoming.count, received: vectors.count)
+            guard computed.count == missing.count else {
+                throw LMStudioError.embeddingCountMismatch(sent: missing.count, received: computed.count)
             }
-            report.reembedded += incoming.count
+            for (slot, vector) in zip(missing, computed) { vectors[slot] = vector }
+            report.reembedded += missing.count
         }
 
         let records = zip(incoming, vectors).map { document, vector in
@@ -415,5 +444,6 @@ public struct CollectionImporter: Sendable {
         }
         try await destination.upsert(collectionID: collectionID, records: records)
         report.written += records.count
+        return consumed
     }
 }

@@ -526,6 +526,19 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         let client = try await client()
         let shapes = app.collectionShapes
 
+        // Стадия 7 — одна на всю слитую выдачу, а не по разу на коллекцию:
+        // модель обязана сравнивать кандидатов между коллекциями.
+        // Чьими настройками спрашивать, решает правило согласия профилей.
+        let plan = MultiCollectionSearch.rerankPlan(targets: targets)
+        var rerank: RerankStage?
+        if let governing = plan.profile {
+            rerank = try await app.makeRerankStage(
+                for: governing,
+                title: String(localized: "Переранжирование по нескольким коллекциям"),
+                priority: .agent
+            )
+        }
+
         let search = MultiCollectionSearch(
             embed: { text, model in
                 try await queue.run(QueueTicket(
@@ -554,7 +567,8 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                     ),
                     profile: target.profile
                 )
-            }
+            },
+            rerank: rerank
         )
         let answer = await search.run(
             query: request.query, targets: targets, nResults: request.nResults

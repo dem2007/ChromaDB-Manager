@@ -51,6 +51,44 @@ final class TextDocumentLoaderTests: XCTestCase {
         }
     }
 
+    /// Форматированный документ меряется по тексту, а не по весу файла
+    ///: в `.docx` вес — это картинки.
+    @MainActor
+    func testARichDocumentIsMeasuredByItsTextAndNotByItsWeight() throws {
+        // Тот же случай, что у заказчика: файл заметно тяжелее прежнего
+        // предела в 12 МБ, а текста в нём — на пару страниц.
+        let url = directory.appendingPathComponent("тяжёлый.rtf")
+        let padding = String(repeating: "0", count: 20 * 1024 * 1024)
+        let rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Helvetica;}}"
+            + "\\f0 Doostupnost rasschityvaetsya kak otnoshenie vremeni.\n"
+            + "{\\*\\padding \(padding)}}"
+        try rtf.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertGreaterThan(
+            (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0,
+            TextDocumentLoader.maximumBytes
+        )
+
+        let text = try TextDocumentLoader.richText(at: url)
+        XCTAssertTrue(text.string.contains("otnoshenie"), text.string)
+        XCTAssertLessThan(text.length, 1000, "текста в файле мало, что бы ни весил файл")
+    }
+
+    /// Но текста бывает и правда слишком много — тогда отказ называет знаки,
+    /// а не мегабайты: мерили именно их.
+    func testTooMuchTextIsNamedInCharacters() {
+        let error = TextDocumentLoader.LoadError.tooMuchText(characters: 9_000_000)
+        XCTAssertTrue(error.localizedDescription.contains("знаков"), error.localizedDescription)
+    }
+
+    /// Отказ по весу называет тот предел, по которому отказали, а не всегда
+    /// предел простого текста.
+    func testTheRefusalNamesTheLimitItUsed() {
+        let error = TextDocumentLoader.LoadError.tooLarge(
+            bytes: 300 * 1024 * 1024, limit: TextDocumentLoader.maximumRichBytes
+        )
+        XCTAssertTrue(error.localizedDescription.contains("200 МБ"), error.localizedDescription)
+    }
+
     func testABinaryFileIsRefusedRatherThanShownAsGarbage() throws {
         let url = directory.appendingPathComponent("двоичный.txt")
         // UTF-16 без BOM и с нечётной длиной не читается ни одной кодировкой

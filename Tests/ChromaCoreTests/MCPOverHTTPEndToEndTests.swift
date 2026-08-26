@@ -25,7 +25,7 @@ final class MCPOverHTTPEndToEndTests: XCTestCase {
 
     /// Поднимает прокси с включённым HTTP-режимом MCP и отдаёт его порт.
     @MainActor
-    private func startProxy() async throws -> (port: Int, audit: AuditLog) {
+    private func startProxy(clientIsEnabled: Bool = true) async throws -> (port: Int, audit: AuditLog) {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("mcp-http-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -43,6 +43,7 @@ final class MCPOverHTTPEndToEndTests: XCTestCase {
                 name: "агент",
                 keyHash: ClientKey.hash(Self.key),
                 keyPrefix: ClientKey.prefix(of: Self.key),
+                isEnabled: clientIsEnabled,
                 permissions: ClientPermissions(collections: [], allowsWrite: false)
             ),
         ])
@@ -168,6 +169,27 @@ final class MCPOverHTTPEndToEndTests: XCTestCase {
             + ["X-Chroma-Token: не-тот-ключ", "Mcp-Method: \(MCPProtocol.discoverMethod)"]
         let response = post(port: port, headers: headers, body: request(id: 10, method: MCPProtocol.discoverMethod))
         XCTAssertEqual(response.status, 401, response.body)
+    }
+
+    /// Отключённый ключ — то же самое, что чужой.
+    ///
+    /// `initialize`, `ping` и `server/discover` отвечают раньше, чем слой
+    /// инструментов спрашивает про права, а гейт у входа фильтровал только
+    /// **отозванных**. Значит выключенный на экране клиент по-прежнему
+    /// получал имя сервера, версию и подсказки модели о том, как
+    /// пользоваться базой. Строкой выше, в заголовках CORS, `isEnabled`
+    /// при этом проверялся — расходились соседние строки.
+    func testADisabledClientIsRefusedLikeAStranger() async throws {
+        let (port, _) = try await startProxy(clientIsEnabled: false)
+        let response = post(
+            port: port,
+            headers: goodHeaders + ["Mcp-Method: \(MCPProtocol.discoverMethod)"],
+            body: request(id: 11, method: MCPProtocol.discoverMethod)
+        )
+        XCTAssertEqual(response.status, 401, response.body)
+        XCTAssertTrue(response.body.contains("отключён"), "причина отказа должна быть названа: \(response.body)")
+        XCTAssertFalse(response.body.contains(MCPProtocol.serverName), "имя сервера не должно уезжать отключённому")
+        XCTAssertFalse(response.body.contains("supportedVersions"), "и список возможностей тоже")
     }
 
     @MainActor

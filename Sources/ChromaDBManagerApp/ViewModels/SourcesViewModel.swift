@@ -130,6 +130,10 @@ final class SourcesViewModel: ObservableObject {
     /// Исчезнувшие строки таблиц — по источникам. Отдельно от файлов:
     /// у них свой манифест, своя единица удаления и своё «оставить в базе».
     @Published var pendingRowRemovals: [UUID: [PendingRowRemoval]] = [:]
+    /// Листы, очищенные под переиндексацию и ещё не записанные.
+    /// Пока лист ждёт, его строк в коллекции нет — и это должно быть видно
+    /// на карточке источника, а не только на экране, где нажали кнопку.
+    @Published var sheetsAwaitingWrite: [UUID: [SheetAwaitingWrite]] = [:]
     /// rows indexed from tables, per source. The file manifest knows
     /// nothing about them — a source of spreadsheets would otherwise report
     /// «ещё не синхронизирован» after indexing thousands of rows.
@@ -715,6 +719,7 @@ final class SourcesViewModel: ObservableObject {
             var tableRowCounts: [UUID: Int] = [:]
             var tableFileCounts: [UUID: Int] = [:]
             var tableRemovals: [UUID: [PendingRowRemoval]] = [:]
+            var awaitingWrite: [UUID: [SheetAwaitingWrite]] = [:]
             var git: [UUID: GitSyncService.Status] = [:]
             var blocked: [UUID: String] = [:]
             var stale: [UUID: [StaleExtraction]] = [:]
@@ -772,6 +777,19 @@ final class SourcesViewModel: ObservableObject {
                     }
                     .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
                 if !rowRemovals.isEmpty { tableRemovals[source.id] = rowRemovals }
+                // Листы, ждущие записи, — из того же прочитанного.
+                let awaiting = tables.values
+                    .flatMap { file in
+                        file.sheetsAwaitingWrite.map { sheetName in
+                            SheetAwaitingWrite(
+                                relativePath: file.relativePath,
+                                sheetName: sheetName,
+                                collectionName: file.collectionName
+                            )
+                        }
+                    }
+                    .sorted { ($0.relativePath, $0.sheetName) < ($1.relativePath, $1.sheetName) }
+                if !awaiting.isEmpty { awaitingWrite[source.id] = awaiting }
                 if !manifest.problems.isEmpty { problems[source.id] = manifest.problems.sorted { $0.relativePath < $1.relativePath } }
                 let warnedEntries = manifest.warnedEntries
                 if !warnedEntries.isEmpty { warned[source.id] = warnedEntries }
@@ -794,6 +812,7 @@ final class SourcesViewModel: ObservableObject {
                     self.tableRows[source.id] = tableRowCounts[source.id]
                     self.tableFiles[source.id] = tableFileCounts[source.id]
                     self.pendingRowRemovals[source.id] = tableRemovals[source.id]
+                    self.sheetsAwaitingWrite[source.id] = awaitingWrite[source.id]
                     self.gitStatus[source.id] = git[source.id]
                     self.recoveryBlocks[source.id] = blocked[source.id]
                     self.staleExtraction[source.id] = stale[source.id]

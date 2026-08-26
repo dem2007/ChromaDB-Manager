@@ -300,15 +300,29 @@ public struct EvaluationCost: Hashable, Sendable {
         for variant in variants where variant.needsVector {
             naive += queries.count
         }
-        // The deduplication this stage is built around: one vector per (query,
-        // model), reused by every variant on that model.
-        let models = Set(variants.filter(\.needsVector).map(\.model))
-        var texts = Set<String>()
-        for query in queries {
-            texts.insert(query.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        // Ключ запаса — «модель плюс текст, уходящий в модель», ровно тот же,
+        // что у раннера. Приставка живёт в профиле, и два варианта
+        // на одной модели с разными приставками — это два разных вектора.
+        //
+        // Пока варианты схлопывались по одной лишь модели, оценка обещала
+        // вчетверо меньше вызовов, чем будет: сравнение четырёх приставок
+        // на одной модели — это 80 вызовов, а обещалось 20. И «переиспользовано
+        // векторов» врало в ту же сторону.
+        struct VectorKey: Hashable {
+            let model: String
+            let text: String
         }
-        for model in models {
-            callsPerModel[model] = texts.count
+        var keys = Set<VectorKey>()
+        for variant in variants where variant.needsVector {
+            for query in queries {
+                keys.insert(VectorKey(
+                    model: variant.model,
+                    text: variant.profile.embeddedQuery(query.text)
+                ))
+            }
+        }
+        for key in keys {
+            callsPerModel[key.model, default: 0] += 1
         }
 
         var seconds: Double = 0

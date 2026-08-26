@@ -16,7 +16,27 @@ public enum Reranker {
     /// At most this many candidates are sent. Twenty is what the section fixes,
     /// and the reason is the prompt: a longer list is both slower and worse,
     /// because the model stops attending to the tail.
+    ///
+    /// Умолчание, а не предел: с число живёт в профиле. Замер показал,
+    /// что треть выигрыша переранжировщик приносит из хвоста пула — то есть
+    /// как раз оттуда, куда двадцатка не достаёт, — и у разных
+    /// собраний ответ на «сколько показать» разный.
     public static let maximumCandidates = 20
+
+    /// Выше этого не поднимается даже вручную.
+    ///
+    /// У режима переранжировщика это вызовы модели один за другим: сотня —
+    /// уже минуты на один запрос, и такую настройку человек ставит не потому,
+    /// что взвесил цену, а потому, что поле позволило.
+    public static let candidateCeiling = 100
+
+    /// Сколько кандидатов показать на самом деле.
+    ///
+    /// Меньше двух переранжировать нечего: порядок из одного элемента
+    /// не меняется ничем.
+    public static func candidateCount(_ requested: Int) -> Int {
+        max(2, min(candidateCeiling, requested))
+    }
 
     /// What the model must answer with. Without a schema the stage is not
     /// workable — G2 makes it compulsory, and it is what removes the whole
@@ -353,12 +373,14 @@ public enum CrossEncoderReranker {
 
     /// Цена этого режима — не «один вызов на запрос», а вызов на каждый
     /// кандидат. Говорится до включения, а не после (правило 4 Приложения 5).
-    public static let costWarning = String(localized: """
-    Переранжировщик спрашивается отдельно про каждый фрагмент: до \
-    \(Reranker.maximumCandidates) вызовов модели на один запрос, один за другим. \
-    Это дороже по времени, чем режим чат-схемы, но иначе такая модель отвечать \
-    не умеет.
-    """)
+    public static func costWarning(candidates: Int = Reranker.maximumCandidates) -> String {
+        String(localized: """
+        Переранжировщик спрашивается отдельно про каждый фрагмент: до \
+        \(Reranker.candidateCount(candidates)) вызовов модели на один запрос, один за другим. \
+        Это дороже по времени, чем режим чат-схемы, но иначе такая модель отвечать \
+        не умеет.
+        """)
+    }
 
     /// Инструкция, приведённая к рабочему виду: пустая строка означает
     /// «стандартная», а переносы строк ломают разметку `<Instruct>:` —
@@ -401,8 +423,17 @@ public enum CrossEncoderReranker {
         return min(documentLimit, max(1, Int(Double(available) * ratio)))
     }
 
-    /// Ответ — одно слово; четырёх токенов хватает и на «yes», и на «No, I».
-    public static let answerTokens = 4
+    /// Сколько места оставить под ответ.
+    ///
+    /// Восемь, а не четыре: у «да/нет» ответ и правда одно слово, но балльная
+    /// модель отвечает числом в скобках, а число из нескольких цифр — это
+    /// несколько токенов. Замерено на живой `jina-reranker-v3.5-mlx`: с
+    /// четырьмя токенами «[60]» приходит как «[60» с `finish_reason: length`.
+    /// Балл там уцелел случайно — `score` снимает оправу **с краёв**, и «[60»
+    /// читается как 60. А трёхзначный «[100]» пришёл бы как «[10» и молча
+    /// стал бы десяткой: оценка вдесятеро ниже настоящей, без единой жалобы
+    ///.
+    public static let answerTokens = 8
 
     public static func prompt(
         query: String, document: String,

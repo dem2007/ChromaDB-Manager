@@ -71,7 +71,15 @@ public enum JSONValue: Codable, Hashable, Sendable {
         case .int(let value): return value
         // 10.0 от агента — это 10. Отвергать такое значило бы придираться
         // к тому, как чужой сериализатор записал целое число.
-        case .double(let value) where value == value.rounded(): return Int(value)
+        //
+        // Но **только** если число в `Int` помещается. `Int(_: Double)` за
+        // границей диапазона — не отказ, а фатальная ошибка: процесс падает
+        // целиком, вместе с чужими запросами и открытыми соединениями.
+        // А проверка «целое ли» тут не помогает: у чисел больше 2^53 дробной
+        // части не бывает вовсе, и `1e19 == 1e19.rounded()` — правда.
+        // `Int(exactly:)` отвечает `nil`, а вызывающий уже умеет сказать
+        // «параметр должен быть целым числом».
+        case .double(let value) where value == value.rounded(): return Int(exactly: value)
         default: return nil
         }
     }

@@ -72,6 +72,93 @@ final class EvaluationMetricsTests: XCTestCase {
         }
     }
 
+    // MARK: - Пересчёт одного запроса
+
+    /// Пересчёт по одному запросу обязан давать ровно то же, что пересборка
+    /// целиком, — иначе ускорение куплено за счёт правильности.
+    func testRegradingOneQueryAgreesWithRebuildingEverything() {
+        var first = EvaluationQuery(text: "первый", fragments: [ExpectedFragment(fragment: "формула")])
+        let second = EvaluationQuery(text: "второй", fragments: [ExpectedFragment(fragment: "период")])
+        let a = UUID(), b = UUID()
+        func hits(_ texts: [String]) -> [EvaluationHit] {
+            texts.enumerated().map {
+                EvaluationHit(id: "d\($0.offset)", text: $0.element, distance: nil, position: $0.offset + 1)
+            }
+        }
+        let results = [
+            EvaluationResult(queryID: first.id, variantID: a, hits: hits(["формула доступности", "отчетный период", "мимо"])),
+            EvaluationResult(queryID: first.id, variantID: b, hits: hits(["мимо", "формула доступности за период", "ещё мимо"])),
+            EvaluationResult(queryID: second.id, variantID: a, hits: hits(["отчетный период", "мимо", "формула"])),
+        ]
+        let before = [first.id: first, second.id: second]
+        let index = EvaluationMetrics.GradeIndex(results: results, truth: before)
+
+        // Разметили ещё один фрагмент — как это делает нажатие на карточке.
+        first.fragments.append(ExpectedFragment(fragment: "доступности", grade: .partial))
+        let after = [first.id: first, second.id: second]
+        let updated = index.regrading(query: first.id, truth: after)
+        let rebuilt = EvaluationMetrics.GradeIndex(results: results, truth: after)
+
+        for result in results {
+            for hit in result.hits {
+                XCTAssertEqual(
+                    updated.grade(query: result.queryID, variant: result.variantID, document: hit.id),
+                    rebuilt.grade(query: result.queryID, variant: result.variantID, document: hit.id),
+                    "\(hit.text ?? "")"
+                )
+                XCTAssertEqual(
+                    updated.matched(query: result.queryID, variant: result.variantID, document: hit.id),
+                    rebuilt.matched(query: result.queryID, variant: result.variantID, document: hit.id)
+                )
+            }
+        }
+    }
+
+    /// Снятие отметки тоже: пересчёт обязан **убирать** оценку, а не только
+    /// добавлять её.
+    func testRegradingTakesAGradeAwayAgain() {
+        var query = EvaluationQuery(text: "з", fragments: [ExpectedFragment(fragment: "формула")])
+        let variant = UUID()
+        let results = [EvaluationResult(
+            queryID: query.id, variantID: variant,
+            hits: [EvaluationHit(id: "d0", text: "формула доступности", distance: nil, position: 1)]
+        )]
+        let index = EvaluationMetrics.GradeIndex(results: results, truth: [query.id: query])
+        XCTAssertEqual(index.grade(query: query.id, variant: variant, document: "d0"), .relevant)
+
+        query.fragments = []
+        let updated = index.regrading(query: query.id, truth: [query.id: query])
+        XCTAssertNil(updated.grade(query: query.id, variant: variant, document: "d0"))
+        XCTAssertTrue(updated.matched(query: query.id, variant: variant, document: "d0").isEmpty)
+    }
+
+    /// Фрагмент, которого индекс не видел, не объявляется ненайденным молча:
+    /// эталон правят и помимо отметок, и nDCG обязан считать по тому, что
+    /// в нём есть сейчас.
+    func testAFragmentTheIndexNeverSawIsStillChecked() {
+        let query = EvaluationQuery(text: "з", fragments: [ExpectedFragment(fragment: "формула")])
+        let variant = UUID()
+        let results = [EvaluationResult(
+            queryID: query.id, variantID: variant,
+            hits: [
+                EvaluationHit(id: "d0", text: "формула доступности", distance: nil, position: 1),
+                EvaluationHit(id: "d1", text: "совсем про другое", distance: nil, position: 2),
+            ]
+        )]
+        let stale = EvaluationMetrics.GradeIndex(results: results, truth: [query.id: query])
+
+        // Эталон подменили целиком — другой фрагмент с другим id, но он тоже
+        // есть в тексте результата.
+        var edited = query
+        edited.fragments = [ExpectedFragment(fragment: "доступности")]
+        let score = EvaluationMetrics.ndcgScore(
+            results: results, truth: [edited.id: edited], grades: stale, k: 2
+        )
+        // Ожидание сбылось: идеальная выдача не лучше полученной. Если бы
+        // незнакомый фрагмент молча считался ненайденным, вышло бы 0.61.
+        XCTAssertEqual(score.value ?? 0, 1, accuracy: 0.0001)
+    }
+
     // MARK: - Стенд
 
     private func hits(_ ids: [String]) -> [EvaluationHit] {

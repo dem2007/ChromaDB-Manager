@@ -322,7 +322,7 @@ struct InspectorTabs: View {
                     set: { _ in model.toggleSelection(finding) }
                 ))
                 .labelsHidden()
-                .toggleStyle(.checkbox)
+                .toggleStyle(.chromaCheckbox)
             }
             VStack(alignment: .leading, spacing: 2) {
                 // У дублей находка названа началом повторившегося текста, а

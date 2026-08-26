@@ -328,6 +328,18 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     /// means depends on the corpus. Относится **только** к режиму `.chatSchema`:
     /// это шаблон целого промпта с подстановками `{query}` и `{documents}`.
     public var rerankPrompt: String
+    /// Сколько кандидатов показать переранжировщику.
+    ///
+    /// Двадцать — умолчание раздела E5, и до замера оно выглядело просто
+    /// пределом. Но на живом прогоне треть выигрыша переранжировщик принёс
+    /// **из хвоста пула**: состав десятки у него совпал с опорным лишь в 145
+    /// случаях из 180 — остальное он поднял с мест, куда обычный поиск
+    /// не дотянулся. Сколько показывать — вопрос про собрание, а не
+    /// про раздел, поэтому число стало настройкой.
+    ///
+    /// Цена прямая: в режиме переранжировщика это вызовы модели один за
+    /// другим, вдвое больше кандидатов — вдвое дольше поиск.
+    public var rerankCandidates: Int
     /// Строка `<Instruct>` для режима `.crossEncoder`, пустая — стандартная
     /// (`CrossEncoderReranker.defaultInstruction`).
     ///
@@ -394,6 +406,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         rerankMode: RerankMode = .chatSchema,
         rerankPrompt: String = "",
         rerankInstruction: String = "",
+        rerankCandidates: Int = Reranker.maximumCandidates,
         marksEnabled: Bool = true,
         contextWindow: Int? = nil
     ) {
@@ -427,6 +440,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         self.rerankMode = rerankMode
         self.rerankPrompt = rerankPrompt
         self.rerankInstruction = rerankInstruction
+        self.rerankCandidates = rerankCandidates
         self.contextWindow = contextWindow
     }
 
@@ -479,7 +493,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         case queryPrefix
         case searchLevel, collapseByParent, promotion
         case diversityEnabled, diversityLambda
-        case rerankEnabled, rerankModel, rerankMode, rerankPrompt, rerankInstruction
+        case rerankEnabled, rerankModel, rerankMode, rerankPrompt, rerankInstruction, rerankCandidates
         case marksEnabled
         case contextWindow
     }
@@ -533,6 +547,10 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         rerankMode = ((try? container.decodeIfPresent(RerankMode.self, forKey: .rerankMode)) ?? nil) ?? .chatSchema
         rerankPrompt = try container.decodeIfPresent(String.self, forKey: .rerankPrompt) ?? ""
         rerankInstruction = try container.decodeIfPresent(String.self, forKey: .rerankInstruction) ?? ""
+        // Профиль, записанный до того, как число стало настройкой, ведёт себя
+        // ровно как прежде: двадцать кандидатов.
+        rerankCandidates = try container.decodeIfPresent(Int.self, forKey: .rerankCandidates)
+            ?? Reranker.maximumCandidates
 
         // Профиль, записанный до появления пометок, ведёт себя как новый:
         // пометки учитываются. Иначе человек, поставивший «закрепить», не

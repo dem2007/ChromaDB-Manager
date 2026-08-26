@@ -162,6 +162,48 @@ final class TableSyncServiceTests: XCTestCase {
     }
 
 
+    /// Очищенный лист ждёт записи, и прогон это ожидание снимает.
+    ///
+    /// Полный круг: лист записан, человек нажал «Переиндексировать»,
+    /// манифест забыл лист и пометил его ждущим, синхронизация записала
+    /// строки заново — и признак снялся. Пока он стоит, приложение говорит
+    /// человеку, что этих строк в базе нет.
+    func testAForgottenSheetAwaitsWriteUntilTheRunWritesIt() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+        XCTAssertTrue(manifest.sheetsAwaitingWrite.isEmpty, "записанный лист ничего не ждёт")
+
+        // Человек нажал кнопку: строки из коллекции убраны, лист забыт.
+        let forgotten = manifest.forgetSheet("Каталог")
+        XCTAssertEqual(forgotten.count, 2)
+        XCTAssertEqual(manifest.sheetsAwaitingWrite, ["Каталог"])
+        XCTAssertEqual(manifest.rowCount, 0, "строк листа манифест больше не помнит")
+
+        let report = try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+
+        XCTAssertEqual(report.rowsAdded, 2, "строки записаны заново — по нынешней разметке")
+        XCTAssertTrue(manifest.sheetsAwaitingWrite.isEmpty, "ожидание снимает та самая запись, которой ждали")
+    }
+
+    /// Ожидание снимается только у того листа, который записан: у соседнего
+    /// оно остаётся, иначе один прогон гасил бы напоминание про другой лист.
+    func testWritingOneSheetLeavesTheOtherWaiting() async throws {
+        let url = try workbook([("A-1", "Болт", 12)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        manifest.sheetsAwaitingWrite = ["Каталог", "Услуги"]
+
+        try await run(
+            url, manifest: &manifest, profiles: [profile()],
+            database: FakeDatabase(), embeddings: FakeEmbeddings()
+        )
+
+        XCTAssertEqual(manifest.sheetsAwaitingWrite, ["Услуги"])
+    }
+
     /// Отмена слышна на каждом листе, а не только внутри пакетов записи.
     ///
     /// У книги, где почти всё не изменилось, до пакетов дело может не дойти
