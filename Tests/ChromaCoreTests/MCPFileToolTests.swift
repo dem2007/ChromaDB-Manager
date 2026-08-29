@@ -215,7 +215,7 @@ final class MCPFileToolTests: XCTestCase {
             "collection": .string("заметки"), "file": .string("папка/файл.md"),
         ])
         let notes = result["structuredContent"]?["notes"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-        XCTAssertTrue(notes.contains { $0.contains("произвольном порядке") }, "\(notes)")
+        XCTAssertTrue(notes.contains { $0.contains("arbitrary order") }, "\(notes)")
     }
 
     func testAnUnknownFileIsAnAnswerNotAnError() async throws {
@@ -386,7 +386,7 @@ final class MCPMultiCollectionToolTests: XCTestCase {
         ])
         guard case .failure(let error) = result else { return XCTFail("надо отказать") }
         XCTAssertEqual(error.code, -32602)
-        XCTAssertTrue(error.message.contains("одно"), error.message)
+        XCTAssertTrue(error.message.contains("keep one of them"), error.message)
     }
 
     /// Коллекция вне списка доступа не ищется — и вызов отвергается целиком,
@@ -418,7 +418,7 @@ final class MCPMultiCollectionToolTests: XCTestCase {
 
         XCTAssertEqual(backend.received.search?.collections, ["доки", "код"])
         let notes = result["structuredContent"]?["notes"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-        XCTAssertTrue(notes.contains { $0.contains("потолок") }, "\(notes)")
+        XCTAssertTrue(notes.contains { $0.contains("ceiling") }, "\(notes)")
     }
 
     func testRepeatedNamesAreCollapsed() async throws {

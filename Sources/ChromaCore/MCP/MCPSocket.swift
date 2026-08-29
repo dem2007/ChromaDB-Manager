@@ -274,11 +274,10 @@ public enum MCPConnector {
         case appNotRunning
 
         public var errorDescription: String? {
-            // Текст читает не программист, а человек, у которого агент
-            // отказался работать. Он должен узнать, что делать.
-            String(
-                localized: "Приложение ChromaDB Manager не запущено. Запустите его — MCP-сервер работает только вместе с ним."
-            )
+            // Текст читает модель и пересказывает человеку, у которого агент
+            // отказался работать. Он должен узнать, что делать; язык — по
+            // английский, как и весь ответ MCP.
+            "ChromaDB Manager is not running. Start it — the MCP server works only together with the application."
         }
     }
 

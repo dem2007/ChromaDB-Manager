@@ -73,7 +73,7 @@ final class SheetCoverageMetadataTests: XCTestCase {
         )
         let output = MCPDocumentRendering.render([payload], limits: MCPOutputLimits())
         XCTAssertTrue(
-            output.notes.contains { $0.contains("размечено листов") && $0.contains("итоги нельзя") },
+            output.notes.contains { $0.contains("sheets of") && $0.contains("no total may be built") },
             "\(output.notes)"
         )
     }
@@ -84,6 +84,6 @@ final class SheetCoverageMetadataTests: XCTestCase {
             metadata: ["sheets_indexed": .int(14), "sheets_total": .int(14)]
         )
         let output = MCPDocumentRendering.render([payload], limits: MCPOutputLimits())
-        XCTAssertFalse(output.notes.contains { $0.contains("размечено листов") }, "\(output.notes)")
+        XCTAssertFalse(output.notes.contains { $0.contains("sheets of") }, "\(output.notes)")
     }
 }

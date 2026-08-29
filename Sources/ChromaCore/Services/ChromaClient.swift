@@ -143,6 +143,45 @@ public enum ChromaError: LocalizedError {
     }
 }
 
+/// Те же беды — словами для модели: русские тексты выше писались
+/// человеку у экрана, а агенту нужна причина по-английски.
+extension ChromaError: MCPReadableError {
+    public var mcpReason: String {
+        switch self {
+        case .notConfigured:
+            return "the application is not connected to a ChromaDB server"
+        case .unreachable(let endpoint, let reason):
+            return "ChromaDB at «\(endpoint)» is not reachable: «\(reason)»"
+        case .serverTooOld(let endpoint):
+            return "the server at \(endpoint) speaks the removed v1 API; ChromaDB 1.0 or newer is required"
+        case .api(let status, let code, let message):
+            return "ChromaDB answered with an error \(status.plainDigits)\(code.map { " (\($0))" } ?? ""): «\(message)»"
+        case .decoding(let what):
+            return "the answer of ChromaDB could not be read: «\(what)»"
+        case .resetForbidden:
+            return "resetting the database is forbidden by its settings"
+        case .unauthorized:
+            return "ChromaDB refused the credentials of this connection"
+        case .dimensionMismatch(let expected, let got):
+            return "the collection stores vectors of \(expected.plainDigits) numbers, the model returned \(got.plainDigits)"
+        case .collectionNotFound(let name):
+            return "collection not found: «\(name)»"
+        case .tenantNotFound(let name):
+            return "tenant not found: «\(name)»"
+        case .databaseNotFound(let database, let tenant):
+            return "database «\(database)» not found in tenant «\(tenant)»"
+        case .invalidRequest(let what):
+            return "the request was refused before it was sent: «\(what)»"
+        case .readOnly(let operation):
+            return "this connection is open for reading only, so «\(operation)» is refused"
+        case .timedOut(let operation, let seconds):
+            return "ChromaDB did not answer in \(Int(seconds).plainDigits) seconds (\(operation.rawValue))"
+        case .partialWrite(let write):
+            return "the write went in partially: \(write.written.plainDigits) of \(write.total.plainDigits) documents, batch \(write.failedBatch.plainDigits) failed"
+        }
+    }
+}
+
 public struct ChromaServerInfo {
     public let version: String
     public let isHealthy: Bool

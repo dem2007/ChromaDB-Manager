@@ -38,6 +38,20 @@ public enum BindingError: LocalizedError {
     }
 }
 
+/// То же для модели: русский текст выше — человеку у экрана.
+extension BindingError: MCPReadableError {
+    public var mcpReason: String {
+        switch self {
+        case .notBound(let collection):
+            return "the collection «\(collection)» has no embedding model bound; bind one in ChromaDB Manager"
+        case .modelUnavailable(let model):
+            return "the embedding model «\(model)» is not loaded in LM Studio right now"
+        case .dimensionConflict(let collection, let stored, let model):
+            return "the collection «\(collection)» stores vectors of \(stored.plainDigits) numbers, the chosen model returns \(model.plainDigits)"
+        }
+    }
+}
+
 /// Keeps the "collection → embedding model" binding honest.
 ///
 /// ChromaDB has no idea what produced its vectors: the dimension is fixed by

@@ -20,7 +20,7 @@ final class FlatTableWarningTests: XCTestCase {
             limits: MCPOutputLimits()
         )
         XCTAssertTrue(
-            output.notes.contains { $0.contains("колонки в ней не разделены") },
+            output.notes.contains { $0.contains("columns are not separated") },
             "\(output.notes)"
         )
     }
@@ -31,7 +31,7 @@ final class FlatTableWarningTests: XCTestCase {
         let output = MCPDocumentRendering.render(
             [payload("1", flat: false)], limits: MCPOutputLimits()
         )
-        XCTAssertFalse(output.notes.contains { $0.contains("колонки") }, "\(output.notes)")
+        XCTAssertFalse(output.notes.contains { $0.contains("columns") }, "\(output.notes)")
     }
 
     /// Признак ставится по разбору, а не по разбору русской фразы: у оговорки

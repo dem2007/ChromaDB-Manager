@@ -286,14 +286,14 @@ final class MCPToolTests: XCTestCase {
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
         // Коллекция вне whitelist называется несуществующей: сказать «доступ
         // закрыт» значило бы сообщить агенту, что она есть.
-        XCTAssertTrue(text.contains("не найдена"), text)
+        XCTAssertTrue(text.contains("not found"), text)
     }
 
     func testAnUnknownKeyIsRefusedWithAnExplanationOfWhereToGetOne() async throws {
         let service = await service(clients: [client()])
         let result = try await call(service, "list_collections", key: "чужой").get()
         XCTAssertEqual(result["isError"], .bool(true))
-        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("не зарегистрирован") ?? false)
+        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("not registered") ?? false)
     }
 
     func testAMissingKeyNamesTheSettingThatCarriesIt() async throws {
@@ -330,15 +330,39 @@ final class MCPToolTests: XCTestCase {
 
     /// Сбой базы — тоже ошибка выполнения: она объяснима, и агент передаст
     /// причину человеку вместо «инструмент недоступен».
+    ///
+    /// Причина доходит до модели, когда написана на её языке: поверхность MCP
+    /// английская, и русский текст из глубины приложения заменяется общей
+    /// английской причиной, а сам остаётся в журнале (проверяется в
+    /// `MCPAnswerSurfaceTests`).
     func testABackendFailureComesBackAsAReadableToolError() async throws {
         var backend = Backend()
         backend.failure = NSError(
-            domain: "тест", code: 7, userInfo: [NSLocalizedDescriptionKey: "база не отвечает"]
+            domain: "test", code: 7, userInfo: [NSLocalizedDescriptionKey: "the database does not answer"]
         )
         let service = await service(clients: [client()], backend: backend)
         let result = try await call(service, "list_collections", key: key).get()
         XCTAssertEqual(result["isError"], .bool(true))
-        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("база не отвечает") ?? false)
+        XCTAssertTrue(
+            result["content"]?[0]?["text"]?.stringValue?.contains("the database does not answer") ?? false
+        )
+    }
+
+    /// Потолки ключа названы в первом же вызове.
+    ///
+    /// Агент выбирает `n_results` до того, как в потолок упрётся, а узнать его
+    /// было неоткуда: описание говорило «обычно 10», и на живом ключе с сотней
+    /// агент брал десять — 120 поисков подряд по журналу доступа.
+    func testListCollectionsStatesTheLimitsOfTheKey() async throws {
+        let service = await service(clients: [client(maxResults: 100)])
+        let result = try await call(service, "list_collections", key: key).get()
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("100"), "потолок не назван: \(text)")
+        XCTAssertTrue(text.lowercased().contains("limits"), text)
+        XCTAssertEqual(
+            result["structuredContent"]?["limits"]?["maxResultsPerSearch"], .int(100),
+            "потолок обязан быть и в разобранном ответе"
+        )
     }
 
     func testAKeyWithNoCollectionsIsToldWhereAccessIsGranted() async throws {
@@ -347,7 +371,9 @@ final class MCPToolTests: XCTestCase {
         // Не ошибка: ключ заведён, просто пуст. Но молчаливый пустой список
         // модель истолкует как «база пуста».
         XCTAssertEqual(result["isError"], .bool(false))
-        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("Клиенты") ?? false)
+        // Текст, который читает модель, английский с — экран назван так,
+        // как он подписан в приложении.
+        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("Clients") ?? false)
     }
 
     /// Частота ограничивается тем же ведром, что и у прокси.
@@ -356,7 +382,7 @@ final class MCPToolTests: XCTestCase {
         _ = try await call(service, "list_collections", key: key).get()
         let second = try await call(service, "list_collections", key: key).get()
         XCTAssertEqual(second["isError"], .bool(true))
-        XCTAssertTrue(second["content"]?[0]?["text"]?.stringValue?.contains("Слишком много запросов") ?? false)
+        XCTAssertTrue(second["content"]?[0]?["text"]?.stringValue?.contains("Too many requests") ?? false)
     }
 
     // MARK: - Поиск
@@ -399,7 +425,7 @@ final class MCPToolTests: XCTestCase {
             XCTAssertEqual(result["isError"], .bool(true), parameter)
             let text = result["content"]?[0]?["text"]?.stringValue ?? ""
             XCTAssertTrue(text.contains(parameter), text)
-            XCTAssertTrue(text.contains("текстом"), text)
+            XCTAssertTrue(text.contains("as text"), text)
         }
     }
 
@@ -494,7 +520,7 @@ final class MCPToolTests: XCTestCase {
 
         XCTAssertEqual(result["isError"], .bool(false))
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("ничего не найдено"), text)
+        XCTAssertTrue(text.contains("Nothing was found"), text)
         XCTAssertTrue(text.contains("describe_collection"), text)
     }
 
@@ -549,7 +575,7 @@ final class MCPToolTests: XCTestCase {
         }
         XCTAssertEqual(documents.count, 2)
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("потолок"), text)
+        XCTAssertTrue(text.contains("ceiling"), text)
     }
 
     func testADocumentLongerThanTheLimitIsCutWithAMarkerAndItsID() async throws {
@@ -577,7 +603,7 @@ final class MCPToolTests: XCTestCase {
             documents.first?["textCharacters"], .int(MCPOutputLimits.defaultDocumentCharacters + 500)
         )
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("текст обрезан"), "нет пометки об обрезке")
+        XCTAssertTrue(text.contains("text cut"), "нет пометки об обрезке")
         // Без идентификатора пометка бесполезна: дочитать нечем.
         XCTAssertTrue(text.contains("длинный"), text)
         XCTAssertTrue(text.contains("get_documents"), text)
@@ -612,7 +638,7 @@ final class MCPToolTests: XCTestCase {
         XCTAssertGreaterThan(documents.count, 0)
         XCTAssertEqual(result["structuredContent"]?["truncated"], .bool(true))
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("усечён"), text)
+        XCTAssertTrue(text.contains("was cut"), text)
     }
 
     /// Метаданные занимают бюджет наравне с текстом. У документа из настоящей
@@ -629,7 +655,7 @@ final class MCPToolTests: XCTestCase {
         }
         let rendered = MCPDocumentRendering.render(payloads, limits: MCPOutputLimits())
         XCTAssertLessThan(rendered.shown, 6)
-        XCTAssertTrue(rendered.notes.contains { $0.contains("усечён") })
+        XCTAssertTrue(rendered.notes.contains { $0.contains("was cut") })
     }
 
     /// Один документ длиннее всего бюджета всё равно отдаётся: ответ без
@@ -756,7 +782,7 @@ final class MCPToolTests: XCTestCase {
             key: key
         ).get()
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("буквальное"), text)
+        XCTAssertTrue(text.contains("literal"), text)
         XCTAssertTrue(text.contains("search"), text)
         XCTAssertEqual(result["structuredContent"]?["totalFiles"], .int(0))
     }
@@ -787,7 +813,7 @@ final class MCPToolTests: XCTestCase {
             key: key
         ).get()
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("Запрошено образцов с файла: 9"), text)
+        XCTAssertTrue(text.contains("Samples per file asked for: 9"), text)
     }
 
     /// Перечень файлов занимает место в ответе наравне с текстами: сотня
@@ -829,7 +855,7 @@ final class MCPToolTests: XCTestCase {
         // их render в бюджет не считает, и это его давнее правило, общее для
         // всех инструментов. Без правки перечня ответ выходил за 35 000.
         XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters + 2000)
-        XCTAssertTrue(text.contains("Перечень урезан"), String(text.prefix(400)))
+        XCTAssertTrue(text.contains("The list was trimmed"), String(text.prefix(400)))
     }
 
     /// Проекция полей доходит и до образцов «собери по теме».
@@ -861,7 +887,7 @@ final class MCPToolTests: XCTestCase {
             key: key
         )
         guard case .failure(let error) = result else { return XCTFail("число принято как слово") }
-        XCTAssertTrue(error.message.contains("строкой"), error.message)
+        XCTAssertTrue(error.message.contains("must be a string"), error.message)
         XCTAssertNil(backend.received.documents)
     }
 
@@ -939,7 +965,7 @@ final class MCPToolTests: XCTestCase {
             fields: ["цена_руб"]
         )
         XCTAssertEqual(rendered.documents.first?["fileId"], .string("7b0d604937a1c2e4"))
-        XCTAssertTrue(rendered.notes.contains { $0.contains("плоским текстом") })
+        XCTAssertTrue(rendered.notes.contains { $0.contains("stayed flat text") })
         guard case .object(let visible)? = rendered.documents.first?["metadata"] else {
             return XCTFail("метаданных нет вовсе")
         }
@@ -991,8 +1017,8 @@ final class MCPToolTests: XCTestCase {
             key: key
         ).get()
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("ничего не найдено"), text)
-        XCTAssertFalse(text.contains("Запрошенных полей нет"), text)
+        XCTAssertTrue(text.contains("Nothing was found"), text)
+        XCTAssertFalse(text.contains("Not one document in this answer carries the requested fields"), text)
     }
 
     func testFieldsOfTheWrongShapeAreRefusedBeforeTheDatabaseIsTouched() async {
@@ -1102,7 +1128,7 @@ final class MCPToolTests: XCTestCase {
         XCTAssertEqual(result["isError"], .bool(true))
         XCTAssertNil(backend.received.search)
         XCTAssertTrue(
-            result["content"]?[0]?["text"]?.stringValue?.contains("не найдена") ?? false,
+            result["content"]?[0]?["text"]?.stringValue?.contains("not found") ?? false,
             "чужая коллекция не должна опознаваться как существующая"
         )
     }
@@ -1186,7 +1212,7 @@ final class MCPToolTests: XCTestCase {
         ).get()
 
         XCTAssertEqual(result["isError"], .bool(true))
-        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("только чтение") ?? false)
+        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("read only") ?? false)
         XCTAssertNil(backend.received.add, "отказанная запись не должна доходить до базы")
     }
 
@@ -1202,7 +1228,7 @@ final class MCPToolTests: XCTestCase {
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
         // Причина названа именно серверная: ключ-то писать вправе, и без этого
         // владелец пойдёт править права, которые ни при чём.
-        XCTAssertTrue(text.contains("режим только чтения"), text)
+        XCTAssertTrue(text.contains("read-only mode"), text)
         XCTAssertNil(backend.received.add)
     }
 
@@ -1216,7 +1242,7 @@ final class MCPToolTests: XCTestCase {
         let result = try await call(service, "add_documents", three, key: key).get()
 
         XCTAssertEqual(result["isError"], .bool(true))
-        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("лимит") ?? false)
+        XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("limit") ?? false)
         XCTAssertNil(backend.received.add, "лимит обязан сработать до записи, а не после")
     }
 
@@ -1311,7 +1337,7 @@ final class MCPToolTests: XCTestCase {
         // Перечислением, а не числом: «удалено 1 из 2» оставляет агента
         // гадать, какой второй.
         XCTAssertTrue(text.contains("которого-нет"), text)
-        XCTAssertTrue(text.contains("корзине"), text)
+        XCTAssertTrue(text.contains("trash"), text)
     }
 
     /// Удаление — отдельное право поверх записи (DoD этапа 7).
@@ -1324,7 +1350,7 @@ final class MCPToolTests: XCTestCase {
 
         XCTAssertEqual(result["isError"], .bool(true))
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("отдельное право"), text)
+        XCTAssertTrue(text.contains("a right of its own"), text)
         XCTAssertNil(backend.received.delete, "отказанное удаление не должно доходить до базы")
     }
 
@@ -1428,7 +1454,7 @@ final class MCPToolTests: XCTestCase {
 
         let entry = try XCTUnwrap(recorded.entries.first)
         XCTAssertEqual(entry.transport, .mcp)
-        XCTAssertTrue(entry.note?.contains("только чтение") ?? false, entry.note ?? "нет причины")
+        XCTAssertTrue(entry.note?.contains("read only") ?? false, entry.note ?? "нет причины")
         // Отказ подписан именем клиента, а не префиксом ключа: иначе владелец
         // сверяет его со списком глазами.
         XCTAssertEqual(entry.client, "агент")
@@ -1456,7 +1482,7 @@ final class MCPToolTests: XCTestCase {
 
         let entry = try XCTUnwrap(recorded.entries.first)
         XCTAssertEqual(entry.access, .write)
-        XCTAssertTrue(entry.note?.contains("удалено: d1") ?? false, entry.note ?? "нет итога")
+        XCTAssertTrue(entry.note?.contains("deleted: d1") ?? false, entry.note ?? "нет итога")
     }
 
     /// Запись, которая не состоялась, обязана и в журнале выглядеть
@@ -1548,7 +1574,7 @@ final class MCPToolTests: XCTestCase {
 
         let parameters = try XCTUnwrap(recorded.entries.first?.parameters)
         XCTAssertLessThan(parameters.count, 60_000)
-        XCTAssertTrue(parameters.contains("обрезан"), "обрезка не помечена")
+        XCTAssertTrue(parameters.contains("truncated"), "обрезка не помечена")
     }
 
     private final class Recorder: @unchecked Sendable {

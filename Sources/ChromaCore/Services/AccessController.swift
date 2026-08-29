@@ -398,14 +398,14 @@ public actor AccessController {
         rolloverIfNeeded()
 
         guard let key, !key.isEmpty else {
-            return .reject(String(localized: "Ключ доступа не передан. Пропишите его в конфигурации подключения агента (переменная CHROMADB_MCP_KEY)."))
+            return .reject("No access key was sent. Set it in the agent's connection configuration — the CHROMADB_MCP_KEY variable.")
         }
         let hash = ClientKey.hash(key)
         guard let client = clients.first(where: { !$0.isRevoked && $0.keyHash == hash }) else {
-            return .reject(String(localized: "Ключ доступа не зарегистрирован в ChromaDB Manager."))
+            return .reject("This access key is not registered in ChromaDB Manager.")
         }
         guard client.isEnabled else {
-            return .reject(String(localized: "Клиент «\(client.name)» отключён в ChromaDB Manager."), clientName: client.name)
+            return .reject("The client «\(client.name)» is switched off in ChromaDB Manager.", clientName: client.name)
         }
 
         // Частота — до всего остального: разогнавшийся агент должен стоить
@@ -416,21 +416,21 @@ public actor AccessController {
         buckets[client.id] = bucket
         guard general.allowed else {
             throttled[client.id, default: 0] += 1
-            return .reject(String(localized: "Слишком много запросов: клиенту «\(client.name)» разрешено \(client.permissions.requestsPerMinute.plainDigits) в минуту. Повторите через \(general.retryAfterSeconds.plainDigits) с."), clientName: client.name)
+            return .reject("Too many requests: the client «\(client.name)» is allowed \(client.permissions.requestsPerMinute.plainDigits) per minute. Retry in \(general.retryAfterSeconds.plainDigits) s.", clientName: client.name)
         }
 
         if permission != .read {
             if isReadOnlyServer {
-                return .reject(String(localized: "MCP-сервер переведён в режим только чтения — запись запрещена всем ключам, независимо от их прав."), clientName: client.name)
+                return .reject("The MCP server is in read-only mode — writing is refused for every key, whatever its rights.", clientName: client.name)
             }
             guard client.permissions.allowsWrite else {
-                return .reject(String(localized: "Клиенту «\(client.name)» разрешено только чтение."), clientName: client.name)
+                return .reject("The client «\(client.name)» is allowed to read only.", clientName: client.name)
             }
             // Удаление — отдельное право поверх записи: снести коллекцию одним
             // неудачным вызовом слишком легко, чтобы это ехало вместе
             // с обычной записью.
             if permission == .delete, !client.permissions.allowsDelete {
-                return .reject(String(localized: "Клиенту «\(client.name)» разрешена запись, но не удаление — это отдельное право, и оно не выдано."), clientName: client.name)
+                return .reject("The client «\(client.name)» may write but not delete — that is a right of its own, and it has not been granted.", clientName: client.name)
             }
             var writeBucket = writeBuckets[client.id]
                 ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: max(1, client.permissions.burst / 2))
@@ -438,7 +438,7 @@ public actor AccessController {
             writeBuckets[client.id] = writeBucket
             guard write.allowed else {
                 throttled[client.id, default: 0] += 1
-                return .reject(String(localized: "Слишком много операций записи: клиенту «\(client.name)» разрешено \(client.permissions.writesPerMinute.plainDigits) в минуту."), clientName: client.name)
+                return .reject("Too many write operations: the client «\(client.name)» is allowed \(client.permissions.writesPerMinute.plainDigits) per minute.", clientName: client.name)
             }
         }
 
@@ -450,7 +450,7 @@ public actor AccessController {
         // изменись бэкенд — и щель стала бы дырой.
         if let collection {
             guard client.permissions.allows(collection: collection) else {
-                return .reject(String(localized: "Коллекция не найдена: \(collection)"), clientName: client.name)
+                return .reject("Collection not found: \(collection)", clientName: client.name)
             }
         }
 
@@ -463,7 +463,7 @@ public actor AccessController {
                 largestDocumentBytes: writing.largestDocumentBytes,
                 dimensions: []
             )
-            if let problem = checkLimits(payload, client: client) {
+            if let problem = checkLimits(payload, client: client, forAgent: true) {
                 return .reject(problem, clientName: client.name)
             }
             written[client.id, default: 0] += writing.documentCount
@@ -525,16 +525,24 @@ public actor AccessController {
         return object["name"] as? String
     }
 
-    private func checkLimits(_ payload: WritePayload, client: ExternalClient) -> String? {
+    /// - Parameter forAgent: отвечаем ли модели по MCP. У прокси и у MCP разные
+    /// читатели: HTTP-ответ читает человек, ответ MCP — модель, и по
+    ///   ей отвечают по-английски. Умолчание — прокси, чтобы вызов из `decide`
+    ///   остался прежним.
+    private func checkLimits(_ payload: WritePayload, client: ExternalClient, forAgent: Bool = false) -> String? {
         if let maximum = client.permissions.maxDocumentBytes, payload.largestDocumentBytes > maximum {
             let actual = ByteCountFormatter.string(fromByteCount: Int64(payload.largestDocumentBytes), countStyle: .file)
             let allowed = ByteCountFormatter.string(fromByteCount: Int64(maximum), countStyle: .file)
-            return String(localized: "Документ больше разрешённого: \(actual) при пределе \(allowed).")
+            return forAgent
+                ? "The document is larger than allowed: \(actual) against a limit of \(allowed)."
+                : String(localized: "Документ больше разрешённого: \(actual) при пределе \(allowed).")
         }
         if let perDay = client.permissions.maxDocumentsPerDay {
             let already = written[client.id] ?? 0
             if already + payload.documentCount > perDay {
-                return String(localized: "Суточный лимит исчерпан: \(already.plainDigits) из \(perDay.plainDigits) документов уже записано сегодня.")
+                return forAgent
+                    ? "The daily limit is spent: \(already.plainDigits) of \(perDay.plainDigits) documents are already written today."
+                    : String(localized: "Суточный лимит исчерпан: \(already.plainDigits) из \(perDay.plainDigits) документов уже записано сегодня.")
             }
         }
         return nil

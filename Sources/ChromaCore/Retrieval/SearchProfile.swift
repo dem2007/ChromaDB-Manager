@@ -67,6 +67,26 @@ public enum RetrievalStage: String, Codable, Sendable, CaseIterable, Identifiabl
         case .truncate: return String(localized: "Усечение")
         }
     }
+
+    /// То же название для агента — по-английски.
+    ///
+    /// `title` читает человек в панели поиска, `agentName` — модель в заметке
+    /// о том, как собиралась выдача. Одно поле на двоих не годится: перевести
+    /// его значило бы сделать английским интерфейс, оставить как есть —
+    /// послать модели русский текст посреди английского ответа.
+    public var agentName: String {
+        switch self {
+        case .candidates: return "candidate generation"
+        case .fusion: return "fusion"
+        case .collapse: return "collapse"
+        case .diversity: return "diversity"
+        case .promote: return "promotion to parent"
+        case .context: return "context expansion"
+        case .marks: return "manual marks"
+        case .rerank: return "reranking"
+        case .truncate: return "truncation"
+        }
+    }
 }
 
 /// Which chunks a search looks at when the collection has two levels.

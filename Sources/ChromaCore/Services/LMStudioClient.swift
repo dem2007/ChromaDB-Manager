@@ -152,6 +152,33 @@ public enum LMStudioError: LocalizedError {
     }
 }
 
+/// Те же беды — словами для модели. Русские тексты выше писались
+/// человеку у экрана; агенту нужна та же причина по-английски.
+extension LMStudioError: MCPReadableError {
+    public var mcpReason: String {
+        switch self {
+        case .badURL(let value):
+            return "the LM Studio address is malformed: «\(value)»"
+        case .unreachable(let reason):
+            return "LM Studio is not reachable: «\(reason)». It must be running with Local Server enabled."
+        case .api(let status, let message):
+            return "LM Studio answered with an error \(status.plainDigits): «\(message)»"
+        case .emptyResponse:
+            return "LM Studio returned an empty answer"
+        case .modelNotEmbedding(let model):
+            return "the model «\(model)» returned no vector — it is most likely a chat model, not an embedding one"
+        case .timedOut(let what, let seconds):
+            return "LM Studio did not answer in \(Int(seconds).plainDigits) seconds (\(what))"
+        case .truncatedByTokenLimit(let model):
+            return "the answer of «\(model)» was cut off by the token limit, so it is a fragment"
+        case .embeddingCountMismatch(let sent, let received):
+            return "LM Studio returned \(received.plainDigits) vectors for \(sent.plainDigits) texts"
+        case .modelSubstituted(let requested, let returned):
+            return "LM Studio answered with the model «\(returned)» instead of the requested «\(requested)»"
+        }
+    }
+}
+
 /// Talks to the LM Studio local server over its OpenAI-compatible API.
 ///
 /// The app never downloads, loads or deletes models — that stays in LM Studio.
@@ -627,7 +654,6 @@ public actor LMStudioClient {
         }
         return answer
     }
-
 
     /// Сколько раз за сеанс ответ пришлось взять из канала рассуждения.
     /// Считается, чтобы разовая особенность одной модели не выглядела нормой.

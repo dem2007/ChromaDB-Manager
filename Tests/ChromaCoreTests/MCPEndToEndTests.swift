@@ -195,7 +195,7 @@ final class MCPEndToEndTests: XCTestCase {
         let value = try JSONDecoder().decode(JSONValue.self, from: messages[0])
         XCTAssertEqual(value["id"], .int(5))
         let message = try XCTUnwrap(value["error"]?["message"]?.stringValue)
-        XCTAssertTrue(message.contains("не запущено"), "причина должна быть названа: \(message)")
+        XCTAssertTrue(message.contains("is not running"), "причина должна быть названа: \(message)")
     }
 
     /// Собранный `chromadb-mcp` лежит рядом с бандлом тестов.

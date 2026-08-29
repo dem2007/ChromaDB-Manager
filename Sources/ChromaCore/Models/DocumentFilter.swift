@@ -246,6 +246,16 @@ public enum FilterError: LocalizedError {
     }
 }
 
+/// Фильтр приходит и от агента, значит и отказ по нему адресован ему.
+extension FilterError: MCPReadableError {
+    public var mcpReason: String {
+        switch self {
+        case .invalidRawJSON(let details):
+            return "the filter is not valid JSON: «\(details)»"
+        }
+    }
+}
+
 /// A condition builder for `where` / `where_document`, with a raw-JSON escape
 /// hatch for people who already know the query language.
 public struct DocumentFilter: Hashable, Codable, Sendable {

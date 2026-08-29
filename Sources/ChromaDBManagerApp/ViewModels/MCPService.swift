@@ -301,22 +301,29 @@ final class MCPService: ObservableObject {
     /// Здесь же и главное правило выбора инструмента: агент, которому
     /// его не сказали, на вопрос «во всех ли документах это есть» зовёт поиск
     /// по смыслу и получает три файла из тринадцати. Текст короткий нарочно:
-    /// он попадает в контекст **каждой** сессии.
-    private static let instructions = """
-    Это база документов ChromaDB, доступная через ChromaDB Manager. \
-    Начинай с list_collections, чтобы узнать доступные коллекции, затем \
-    describe_collection, чтобы понять, по каким полям метаданных можно \
-    фильтровать. Запросы к поиску пиши текстом — векторы считает приложение \
-    моделью, привязанной к коллекции. \
-    Инструмент выбирай по вопросу. «Что здесь про это сказано» — search. \
-    «Покажи все места, где это есть», «во всех ли документах это описано» — \
-    collect_mentions: поиск по смыслу полного охвата не даёт, замер на живой \
-    базе — куски трёх файлов из тринадцати при любом числе результатов. \
-    Документ целиком — get_file, только он держит порядок кусков. \
-    Если в выдаче строки таблиц, их колонки — это поля фильтра; проси в \
-    «fields» только нужные, иначе строка приносит все свои колонки и ответ \
-    обрывается по объёму. \
-    Коллекции вне списка доступа не видны, создавать и удалять коллекции нельзя.
+    /// он попадает в контекст **каждой** сессии. Язык — английский по:
+    /// читатель этого текста — модель, а не человек за экраном.
+    /// Открыто для сторожа `MCPHandshakeLanguageTests`: подсказку читает модель,
+    /// и её язык обязан проверяться, а не заявляться.
+    static let instructions = """
+    This is a ChromaDB document base reached through ChromaDB Manager. \
+    Start with list_collections to learn which collections are available and \
+    what the ceilings of your key are, then describe_collection to learn which \
+    metadata fields you may filter on. Write search queries as text — the \
+    application computes the vectors with the model bound to the collection. \
+    Pick the tool by the question. «What does it say about this» — search. \
+    «Show every place this appears», «is it described in every document» — \
+    collect_mentions: search by meaning does not give coverage, and the \
+    measurement on a live base is chunks of three files out of thirteen at any \
+    number of results. \
+    A whole document — get_file; only it keeps the order of the chunks. \
+    The documents are in Russian: pass stems for «contains» and table column \
+    names in Russian, and answer the user in the language the user wrote in. \
+    If the answer holds table rows, their columns are the filter fields; ask \
+    for only the ones you need in «fields», or the row brings all of its \
+    columns and the answer is cut off by size. \
+    Collections outside the access list are invisible; creating and deleting \
+    collections is not allowed.
     """
 }
 
@@ -325,7 +332,9 @@ final class MCPService: ObservableObject {
 /// Тонкая прослойка: вся логика прав и форм ответа — в ядре, здесь только
 /// обращения к базе и к схемам, каждое на главном акторе, потому что там живут
 /// клиент и хранилище схем.
-private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
+/// Видимость обычная, не `private`: заметки этого класса уезжают в ответ
+/// модели, и сторож `MCPAnswerLanguageTests` обязан до них дотянуться.
+final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     private weak var app: AppEnvironment?
 
     init(app: AppEnvironment) {
@@ -339,9 +348,9 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         var errorDescription: String? {
             switch self {
             case .notConnected:
-                return String(localized: "ChromaDB Manager не подключён к базе. Откройте приложение и подключитесь.")
+                return "ChromaDB Manager is not connected to the database. Open the application and connect."
             case .noCollection(let name):
-                return String(localized: "Коллекция не найдена: \(name)")
+                return "Collection not found: \(name)"
             }
         }
     }
@@ -584,10 +593,10 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
 
         var notes = [answer.line]
         if !missing.isEmpty {
-            notes.append(String(localized: "Не найдены коллекции: \(missing.joined(separator: ", ")) — проверь имена через list_collections."))
+            notes.append("Collections not found: \(missing.joined(separator: ", ")) — check the names with list_collections.")
         }
         for report in answer.collections where report.failure != nil {
-            notes.append(String(localized: "Коллекция «\(report.name)» не ответила: \(report.failure ?? "")"))
+            notes.append("The collection «\(report.name)» did not answer: \(report.failure ?? "")")
         }
 
         await MainActor.run {
@@ -685,6 +694,11 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         let client = try await client()
         let collection = try await collection(named: request.collection)
 
+        // Ошибки привязки и LM Studio отвечают по-русски — их тексты писались
+        // человеку у экрана. Модели они уходят по-английски: `BindingError`
+        // и `LMStudioError` умеют говорить с ней сами (`MCPReadableError`,
+        //). Оборачивать их здесь своей формулировкой нельзя: «модель
+        // не загружена» вместо «LM Studio не отвечает» — это подмена причины.
         let model = try await app.bindingService.requiredModel(for: collection)
         let lmStudio = try await MainActor.run { try app.makeLMStudioClient() }
         try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
@@ -696,9 +710,9 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         if !named.isEmpty {
             let taken = try await client.existingIDs(collectionID: collection.id, ids: named)
             if !taken.isEmpty {
-                throw MCPToolFailure(String(
-                    localized: "Эти идентификаторы уже заняты: \(taken.sorted().joined(separator: ", ")). Перезаписывать существующие документы этот инструмент не будет — задай другие id или не задавай их вовсе."
-                ))
+                throw MCPToolFailure(
+                    "These identifiers are already taken: \(taken.sorted().joined(separator: ", ")). This tool will not overwrite existing documents — give other ids, or give none at all."
+                )
             }
         }
 
@@ -713,9 +727,9 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         for (index, incoming) in request.documents.enumerated() {
             let number = index + 1
             if case .tooLong(let tokens, let allowed) = ContextBudget.check(incoming.text, contextLength: contextLength) {
-                throw MCPToolFailure(String(
-                    localized: "Документ \(number.plainDigits) длиннее контекста модели \(model): примерно \(tokens.plainDigits) токенов при пределе \(allowed.plainDigits). Раздели его на части и пришли их отдельными документами — этот инструмент текст не режет. Не записано ничего."
-                ))
+                throw MCPToolFailure(
+                    "Document \(number.plainDigits) is longer than the context of the model \(model): about \(tokens.plainDigits) tokens against a limit of \(allowed.plainDigits). Split it and send the parts as separate documents — this tool does not cut text. Nothing was written."
+                )
             }
 
             var metadata = incoming.metadata ?? [:]
@@ -723,9 +737,9 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                 metadata = validator.normalised(metadata, schema: schema)
                 let result = validator.validate(metadata, against: schema, documentID: incoming.id)
                 guard result.isValid else {
-                    throw MCPToolFailure(String(
-                        localized: "Документ \(number.plainDigits) не соответствует схеме коллекции: \(result.violations.map(\.message).joined(separator: "; ")). Поля и типы — в describe_collection. Не записано ничего."
-                    ))
+                    throw MCPToolFailure(
+                        "Document \(number.plainDigits) does not match the collection schema: \(result.violations.map(\.message).joined(separator: "; ")). The fields and their types are in describe_collection. Nothing was written."
+                    )
                 }
             }
             // Происхождение проставляет приложение, а не агент: поле отвечает
@@ -767,7 +781,7 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
 
         if request.documents.contains(where: { ($0.metadata?[DocumentOrigin.metadataKey]) != nil }) {
             // Молчаливая подмена — та же ложь, что и молчаливая обрезка.
-            warnings.append(String(localized: "Поле origin задано приложением: у документов, пришедших через MCP, оно всегда «mcp»."))
+            warnings.append("The origin field is set by the application: for documents that arrive over MCP it is always «mcp».")
         }
 
         return MCPAddAnswer(
@@ -833,10 +847,12 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         )
     }
 
-    private static func contextNote(_ kind: ContextKind?) -> String? {
+    /// Открыто для сторожа `MCPAnswerLanguageTests`: этот ярлык
+    /// уезжает в ответ модели, и его язык обязан проверяться.
+    static func contextNote(_ kind: ContextKind?) -> String? {
         switch kind {
-        case .parent: return String(localized: "раздел, к которому относится совпадение")
-        case .neighbour: return String(localized: "соседний фрагмент того же файла")
+        case .parent: return "the section the match belongs to"
+        case .neighbour: return "a neighbouring chunk of the same file"
         case nil: return nil
         }
     }
@@ -858,21 +874,23 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     /// Не диагностика ради диагностики: выдача умного поиска отличается от
     /// выдачи обычного, и агент, пересказывающий результат человеку, вправе
     /// знать, что список ему переупорядочил переранжировщик.
-    private static func pipelineNote(
+    /// Открыто для сторожа `MCPAnswerLanguageTests`: заметка уезжает
+    /// в ответ модели, и её язык обязан проверяться, а не заявляться.
+    static func pipelineNote(
         _ diagnostics: RetrievalDiagnostics, smartSearch: Bool, decidedByKey: Bool
     ) -> String? {
         guard smartSearch else {
             // Где именно выключено, названо прямо: иначе владелец базы будет
             // искать причину в настройках коллекции, а она в правах ключа.
             return decidedByKey
-                ? String(localized: "Умный поиск выключен в правах этого ключа — обычный векторный поиск.")
-                : String(localized: "Умный поиск для этой коллекции выключен — обычный векторный поиск.")
+                ? "Smart search is switched off in this key's rights — a plain vector search."
+                : "Smart search is switched off for this collection — a plain vector search."
         }
         let sorted = diagnostics.stages.sorted { $0.stage.order < $1.stage.order }
         var lines: [String] = []
 
-        let ran = sorted.filter { $0.ran && $0.stage.isOptional }.map(\.stage.title)
-        if !ran.isEmpty { lines.append(String(localized: "Как искали: \(ran.joined(separator: ", ")).")) }
+        let ran = sorted.filter { $0.ran && $0.stage.isOptional }.map(\.stage.agentName)
+        if !ran.isEmpty { lines.append("How the list was built: \(ran.joined(separator: ", ")).") }
 
         // Стадия, которую попросили и которая упала, — не то же самое, что
         // выключенная. Промолчать о ней значит выдать агенту список, который
@@ -880,8 +898,8 @@ private final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         for stage in sorted where stage.failed {
             let reason = stage.note.map(Self.shortReason)
             lines.append(reason.map {
-                String(localized: "Не отработало: \(stage.stage.title) — \($0). Выдача собрана без этой стадии.")
-            } ?? String(localized: "Не отработало: \(stage.stage.title). Выдача собрана без этой стадии."))
+                "Did not run: \(stage.stage.agentName) — \($0). The list was assembled without that stage."
+            } ?? "Did not run: \(stage.stage.agentName). The list was assembled without that stage.")
         }
 
         return lines.isEmpty ? nil : lines.joined(separator: " ")

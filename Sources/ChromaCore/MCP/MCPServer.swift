@@ -57,7 +57,7 @@ public struct MCPServer: Sendable {
         guard let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message) else {
             return .unidentifiedFailure(JSONRPCError(
                 code: JSONRPCError.parseError,
-                message: "Сообщение не разобрано как JSON-RPC"
+                message: "The message could not be parsed as JSON-RPC"
             ))
         }
         return await respond(to: incoming, key: key)
@@ -110,7 +110,7 @@ public struct MCPServer: Sendable {
         case MCPProtocol.callToolMethod:
             guard let tools else { return .failure(id: id, .methodNotFound(incoming.method)) }
             guard let name = incoming.params?["name"]?.stringValue, !name.isEmpty else {
-                return .failure(id: id, .invalidParams("Не указано имя инструмента."))
+                return .failure(id: id, .invalidParams("No tool name given."))
             }
             switch await tools.call(name: name, arguments: incoming.params?["arguments"], key: key) {
             case .success(let result): return .result(id: id, result)

@@ -301,7 +301,7 @@ final class MCPFileFingerprintTests: XCTestCase {
 
         let miss = try await call(service, ["file_id": .string(SourceSyncService.fileFingerprint(path))])
         let text = miss["content"]?[0]?["text"]?.stringValue ?? ""
-        XCTAssertTrue(text.contains("прежними сборками"), "надо сказать, почему промах и что делать: \(text)")
+        XCTAssertTrue(text.contains("earlier builds"), "надо сказать, почему промах и что делать: \(text)")
     }
 
     /// Без обоих параметров вызов отвергается — но текст ошибки называет оба
@@ -334,7 +334,7 @@ final class MCPFileFingerprintTests: XCTestCase {
         let documents = result["structuredContent"]?["documents"]?.arrayValue ?? []
         XCTAssertEqual(documents.first?["fileId"]?.stringValue, fingerprint)
         XCTAssertTrue(
-            result["content"]?[0]?["text"]?.stringValue?.contains("get_file с file_id \(fingerprint)") ?? false,
+            result["content"]?[0]?["text"]?.stringValue?.contains("get_file with file_id \(fingerprint)") ?? false,
             "и словами тоже: модель читает текст"
         )
     }

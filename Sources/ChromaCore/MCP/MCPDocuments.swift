@@ -6,6 +6,20 @@ import Foundation
 /// в контекст модели целиком и вытесняет оттуда сам разговор. Поэтому потолка
 /// три, и каждый закрывает свой способ переполнить ответ: слишком много
 /// результатов, один слишком длинный документ и сумма из многих средних.
+/// Число со словом по-английски — для ответов MCP.
+///
+/// Ответы этого слоя читает модель, а не человек, и язык у них один
+/// независимо от языка приложения. Русский `RussianCount` остаётся экранам.
+enum EnglishCount {
+    /// Число пишется без разделителя разрядов: `formatted()` берёт его из
+    /// текущей локали, и на русской машине счётчик приезжал как «1 234» —
+    /// с неразрывным пробелом, посреди английской фразы, рядом с соседним
+    /// числом через `plainDigits` в той же строке.
+    static func grouped(_ count: Int, _ one: String, _ many: String) -> String {
+        "\(count.plainDigits) \(count == 1 ? one : many)"
+    }
+}
+
 public struct MCPOutputLimits: Sendable, Hashable {
     /// Сколько результатов отдаётся, когда агент не попросил иначе.
     public static let defaultResults = 5
@@ -49,7 +63,7 @@ public struct MCPOutputLimits: Sendable, Hashable {
         guard requested.count > collections else { return (requested, nil) }
         return (
             Array(requested.prefix(collections)),
-            String(localized: "Запрошено коллекций: \(requested.count.plainDigits), обыскано \(collections.plainDigits) — это потолок, заданный правами ключа. Остальные — следующим вызовом.")
+            "Collections asked for: \(requested.count.plainDigits), searched \(collections.plainDigits) — the ceiling set by the key's rights. The rest come with the next call."
         )
     }
 
@@ -76,9 +90,7 @@ public struct MCPOutputLimits: Sendable, Hashable {
         guard let requested else { return (min(Self.defaultResults, ceiling), nil) }
         let asked = max(1, requested)
         guard asked > ceiling else { return (asked, nil) }
-        return (ceiling, String(
-            localized: "Запрошено результатов: \(asked.plainDigits), отдано \(ceiling.plainDigits) — это потолок, заданный правами ключа."
-        ))
+        return (ceiling, "Results asked for: \(asked.plainDigits), returned \(ceiling.plainDigits) — the ceiling set by the key's rights.")
     }
 }
 
@@ -281,16 +293,23 @@ public enum MCPDocumentRendering {
             .joined(separator: ", ")
     }
 
+    /// Запас под обвязку, которую этот рендер не строит: заголовок ответа,
+    /// пометки под ним и объект-обёртка `structuredContent` с его ключами.
+    /// Без запаса ответ переваливал за объявленный потолок на несколько сотен
+    /// символов — немного, но обещание либо держится, либо нет.
+    static let envelopeReserve = 1024
+
     public static func render(
         _ payloads: [MCPDocumentPayload],
         limits: MCPOutputLimits,
         metric: String? = nil,
-        fields: [String]? = nil
+        fields: [String]? = nil,
+        budget: Int? = nil
     ) -> Output {
         var documents: [JSONValue] = []
         var lines: [String] = []
         var notes: [String] = []
-        var budget = limits.responseCharacters
+        var budget = max(1, (budget ?? limits.responseCharacters) - Self.envelopeReserve)
         // Множество собирается один раз на весь ответ: полей у документа
         // бывает под две сотни, а искать каждое из них по списку — это работа
         // на ровном месте.
@@ -310,19 +329,23 @@ public enum MCPDocumentRendering {
             // Дальше список обрывается, не дожидаясь нуля: результат, которому
             // осталось полста символов текста, — это не результат, а шум.
             if index > 0, room < minimumUsefulText {
-                notes.append(String(
-                    localized: "Список усечён по суммарному размеру ответа: показано \(index.plainDigits) из \(payloads.count.plainDigits). Остальное — get_documents по id или повторный вызов с меньшим n_results."
-                ))
+                notes.append("The list was cut by total answer size: \(index.plainDigits) of \(payloads.count.plainDigits) shown. For the rest use get_documents by id, or call again with a smaller n_results.")
                 break
             }
 
+            // Место делится на двоих: текст уедет ещё раз зеркалом в
+            // `structuredContent`, и зеркало не легче. Брать под текст весь
+            // остаток значило обещать 24 000 и отдавать 24 581 — а ключу с
+            // малым потолком и вовсе 8 190 вместо 2 000.
+            let shareOfRoom = max(0, room) / 2
             let allowance = index == 0
-                ? limits.documentCharacters
-                : min(limits.documentCharacters, max(0, room))
+                // Первый документ отдаётся всегда: ответ без единого
+                // результата хуже урезанного. Но и он теперь считается — не
+                // больше того, что влезет вдвоём с зеркалом.
+                ? min(limits.documentCharacters, max(Self.minimumUsefulText, shareOfRoom))
+                : min(limits.documentCharacters, shareOfRoom)
             let shownText = full.count > allowance ? String(full.prefix(allowance)) : full
             let wasCut = shownText.count < full.count
-            budget -= shownText.count + metadataLine.count
-
             var object: [String: JSONValue] = ["id": .string(payload.id)]
             // Отпечаток файла отдельным полем, а не только среди трёх десятков
             // метаданных: им агент просит документ целиком, и увидеть
@@ -349,24 +372,30 @@ public enum MCPDocumentRendering {
                 object["textCharacters"] = .int(full.count)
                 object["shownCharacters"] = .int(shownText.count)
             }
-            documents.append(.object(object))
+            // Зеркало уезжает агенту наравне с текстом, значит и платит из
+            // того же бюджета. Раньше бюджет видел только текст, и обещанные
+            // «24 000 символов на ответ» превращались в 42 281 — модель
+            // планировала по одному числу, а получала вдвое больше и
+            // выталкивала ответ из контекста.
+            let mirror = JSONValue.object(object)
+            documents.append(mirror)
 
             var header = payload.role == .context
-                ? String(localized: "— контекст, id «\(payload.id)»")
-                : String(localized: "\((index + 1).plainDigits). id «\(payload.id)»")
+                ? "— context, id «\(payload.id)»"
+                : "\((index + 1).plainDigits). id «\(payload.id)»"
             // То же, что и в структурированном ответе, и по той же причине:
             // модель читает текст, а в строке метаданных отпечаток теряется
             // среди трёх десятков полей.
             if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
-                header += String(localized: ", файл целиком — get_file с file_id \(fileID)")
+                header += ", whole file — get_file with file_id \(fileID)"
             }
             if let distance = payload.distance {
                 let value = String(format: "%.4f", distance)
-                header += metric.map { String(localized: ", расстояние \(value) (\($0))") }
-                    ?? String(localized: ", расстояние \(value)")
+                header += metric.map { ", distance \(value) (\($0))" }
+                    ?? ", distance \(value)"
             }
             if let collection = payload.collection {
-                header += String(localized: ", коллекция «\(collection)»")
+                header += ", collection «\(collection)»"
             }
             if let note = payload.note { header += ", \(note)" }
             if !metadataLine.isEmpty { header += "\n   " + metadataLine }
@@ -374,12 +403,17 @@ public enum MCPDocumentRendering {
             if payload.text != nil {
                 body += "\n" + shownText
                 if wasCut {
-                    body += "\n" + String(
-                        localized: "[текст обрезан: показано \(shownText.count.plainDigits) \(RussianCount.word(shownText.count, "символ", "символа", "символов")) из \(full.count.plainDigits); полный документ — get_documents с id «\(payload.id)»]"
-                    )
+                    body += "\n" + "[text cut: \(shownText.count.plainDigits) of \(full.count.plainDigits) characters shown; the whole document — get_documents with id «\(payload.id)»]"
                 }
             }
             lines.append(body)
+            // С бюджета списывается **всё, что уезжает**: готовая строка со
+            // своей обвязкой — заголовком, отпечатком, расстоянием, пометкой
+            // об обрезке — и зеркало в `structuredContent`. Считать один голый
+            // текст было мало: обещанные «24 000 символов на ответ»
+            // оборачивались 42 281, и агент планировал по числу вдвое меньше
+            // правды.
+            budget -= body.count + 1 + mirror.deliveredSize
         }
 
         // Имя поля, которого нет ни у одного документа, называется вслух
@@ -397,7 +431,7 @@ public enum MCPDocumentRendering {
             let missing = fields.filter { !present.contains($0) }
             if !missing.isEmpty {
                 notes.append(String(
-                    localized: "Запрошенных полей нет ни у одного документа в этой выдаче: \(missing.joined(separator: ", ")). Точные имена — describe_collection."
+                    "Not one document in this answer carries the requested fields: \(missing.joined(separator: ", ")). The exact names are in describe_collection."
                 ))
             }
         }
@@ -410,9 +444,7 @@ public enum MCPDocumentRendering {
             if case .bool(true)? = document.metadata?["tables_flat"] { return true }
             return false
         }) {
-            notes.append(String(
-                localized: "Внимание: в части этих фрагментов таблица осталась плоским текстом — колонки в ней не разделены. Числа оттуда нельзя раскладывать по колонкам и складывать; сверься с исходным файлом."
-            ))
+            notes.append("Warning: in some of these fragments the table stayed flat text — its columns are not separated. Numbers from there must not be assigned to columns or summed; check against the source file.")
         }
 
         // Книга попала в базу не целиком: у строки записано, сколько
@@ -427,15 +459,11 @@ public enum MCPDocumentRendering {
             return (indexed, total)
         }
         if let (indexed, total) = partial.first {
-            notes.append(String(
-                localized: "Внимание: книга проиндексирована не целиком — размечено листов \(indexed.plainDigits) из \(total.plainDigits). Строк с неразмеченных листов в базе нет, и считать по этой выдаче итоги нельзя."
-            ))
+            notes.append("Warning: the workbook is not indexed whole — \(indexed.plainDigits) sheets of \(total.plainDigits) are mapped. Rows from unmapped sheets are not in the base, and no total may be built on this answer.")
         }
 
         if payloads.contains(where: { ($0.text?.count ?? 0) > limits.documentCharacters }) {
-            notes.append(String(
-                localized: "Длинные документы обрезаны до \(limits.documentCharacters.plainDigits) \(RussianCount.word(limits.documentCharacters, "символа", "символов", "символов")) — полный текст берётся через get_documents по id."
-            ))
+            notes.append("Long documents are cut to \(limits.documentCharacters.plainDigits) characters — take the full text with get_documents by id.")
         }
 
         return Output(
