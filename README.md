@@ -1,6 +1,6 @@
 <img src="docs/app-icon-1024.png" width="128" alt="ChromaDB Manager" align="left">
 
-ChromaDB Manager
+##**ChromaDB Manager**
 
 <br>
 <br>
