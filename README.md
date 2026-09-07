@@ -2,7 +2,9 @@
 
 # ChromaDB Manager
 
-
+<br>
+<br>
+<br>
 
 A native macOS application (Swift + SwiftUI) for working with
 [ChromaDB](https://www.trychroma.com/) without a terminal: installing and updating the engine,
