@@ -154,6 +154,50 @@ final class TextLinguisticsTests: XCTestCase {
         XCTAssertFalse(line?.contains("[") ?? true, "в метаданных ChromaDB списков не бывает — только строка")
         XCTAssertNil(TextLinguistics.keywordLine(in: ""))
     }
+    // MARK: - Слова приложения не решают, на каком языке документ
+
+    /// Живой случай: большое ТЗ, почти два миллиона знаков русского текста,
+    /// и три строки «Колонтитул:» с номером страницы или названием
+    /// приложения — полсотни знаков, вписанных самим приложением. На полном тексте
+    /// `NLLanguageRecognizer` отвечал `bg` с уверенностью 1.00, и агент
+    /// читал «language bg» о русском документе.
+    ///
+    /// Проверяется **свойство**, а не конкретный код языка: вписанное
+    /// приложением не должно менять ответ. Так проверка переживёт и то, что
+    /// система однажды станет отвечать иначе.
+    func testWordsTheApplicationInsertedDoNotDecideTheLanguage() {
+        let body = String(
+            repeating: "Исполнитель обязан обеспечить круглосуточную работу сервиса "
+                + "и уведомлять заказчика обо всех инцидентах в течение часа. ",
+            count: 40
+        )
+        let marked = """
+        \(String(localized: "Колонтитул: \("52")"))
+        \(String(localized: "Колонтитул: \("602")"))
+        \(String(localized: "Колонтитул: \("Приложение № 1")"))
+
+        \(body)
+        """
+        XCTAssertEqual(
+            TextLinguistics.documentLanguage(of: marked),
+            TextLinguistics.language(of: body),
+            "язык документа определяется по его собственному тексту"
+        )
+    }
+
+    /// Убирается приставка, а не строка: за «Комментарий: » идёт настоящий
+    /// текст человека, и он остаётся в тексте.
+    func testOnlyThePrefixIsDroppedAndNotTheContentBehindIt() {
+        let line = String(localized: "Комментарий: \("срок сдвинут на март")")
+        let cleaned = TextLinguistics.withoutInsertedMarkers(line)
+        XCTAssertEqual(cleaned, "срок сдвинут на март")
+    }
+
+    func testOrdinaryLinesAreLeftAlone() {
+        let text = "Первая строка\nВторая строка"
+        XCTAssertEqual(TextLinguistics.withoutInsertedMarkers(text), text)
+    }
+
 }
 
 /// Контекстный префикс: строка «Документ → Раздел» уходит в модель, но не
@@ -213,4 +257,5 @@ final class ContextPrefixTests: XCTestCase {
     func testTheOptionIsOffByDefault() {
         XCTAssertFalse(ChunkingConfiguration().contextPrefix)
     }
+
 }

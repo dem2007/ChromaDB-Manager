@@ -84,6 +84,27 @@ struct ClientsView: View {
             withAnimation { scroll.scrollTo(Self.agentAnchor(opened), anchor: .top) }
         }
         .task { await model.refresh(app) }
+        // Подтверждение висит на **корне экрана**, а не на кнопках.
+        //
+        // Раньше `.alert` стоял на `agentButtons(_:)` — представлении, которое
+        // при отсутствии агентов не создаётся вовсе. SwiftUI такой alert не
+        // показывает: живая проверка в собранном приложении показала, что
+        // кнопка не делает ничего — ни диалога, ни записи.
+        .alert(
+            model.pendingAgentAction?.question ?? "",
+            isPresented: Binding(
+                get: { model.pendingAgentAction != nil },
+                set: { shown in if !shown { model.pendingAgentAction = nil } }
+            ),
+            presenting: model.pendingAgentAction
+        ) { action in
+            Button(String(localized: "Записать")) { model.confirmAgentAction(action) }
+            Button(String(localized: "Отмена"), role: .cancel) {
+                model.pendingAgentAction = nil
+            }
+        } message: { action in
+            Text(action.explanation)
+        }
         }
     }
 
@@ -263,7 +284,7 @@ struct ClientsView: View {
 
     // MARK: - The key, shown once
 
-    private func freshKeyCard(_ fresh: (clientName: String, key: String)) -> some View {
+    private func freshKeyCard(_ fresh: (clientID: UUID, clientName: String, key: String)) -> some View {
         SectionCard(
             title: String(localized: "Ключ клиента «\(fresh.clientName)»"),
             subtitle: String(localized: "Показывается один раз. Приложение хранит только его хеш и не сможет показать ключ снова — забытый ключ можно лишь перевыпустить.")
@@ -405,7 +426,7 @@ struct ClientsView: View {
     private func connectionCard(_ client: ExternalClient) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(String(localized: "Подключение агента (MCP)")).font(Theme.Font.body).bold()
-            Text(String(localized: "Вставьте это в настройки агентского приложения — в macOS это \(MCPConnectionConfig.desktopConfigPath) — и перезапустите его."))
+            Text(String(localized: "Вставьте это в настройки агентского приложения и перезапустите его. Файл у каждого свой: \(MCPConnectionConfig.configPaths.joined(separator: "; "))."))
                 .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -420,6 +441,8 @@ struct ClientsView: View {
             }
 
             codeBlock(String(localized: "Или одной командой в терминале"), model.agentCommandLine(for: client))
+
+            agentButtons(client)
 
             HStack(spacing: 8) {
                 Button(String(localized: "Скопировать конфигурацию")) {
@@ -461,6 +484,71 @@ struct ClientsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.top, 2)
+            }
+        }
+    }
+
+    /// Настроить агента, найденного на этой машине, — вместо переписывания
+    /// путей и ключа руками.
+    @ViewBuilder
+    private func agentButtons(_ client: ExternalClient) -> some View {
+        let agents = model.installedAgents
+        if !agents.isEmpty {
+            Divider().padding(.vertical, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                // Сеткой, а не шириной в точках: подпись «Прописать сервер
+                // в агента» подходит к 190 вплотную, английская — ближе, и
+                // первая же правка формулировки обрезала бы её многоточием.
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                    GridRow {
+                        Text(String(localized: "Прописать сервер в агента"))
+                            .font(Theme.Font.caption)
+                            .gridColumnAlignment(.leading)
+                        ForEach(agents, id: \.self) { agent in
+                            Button(agent.title) { model.installServer(agent, for: client) }
+                                .disabled(!model.hasKeyAtHand(client))
+                        }
+                    }
+                    if !model.hasKeyAtHand(client) {
+                        // Кнопка не нажимается не из вредности: подставить в
+                        // настройку нечего, а настройка без ключа выглядит
+                        // готовой и не работает. Пояснение стоит **под своей**
+                        // строкой, а не под следующей.
+                        GridRow {
+                            // Пояснение занимает **всю** ширину сетки, включая
+                            // колонку подписей. Загнанное в колонки кнопок, оно
+                            // сворачивалось в узкий столбик знаков по полтораста
+                            // точек шириной — а перенесли его сюда ровно затем,
+                            // чтобы оно читалось под своей строкой.
+                            Text(String(localized: "Кнопки ждут ключ: он есть на руках только сразу после выпуска. Перевыпустите — и настройка запишется вместе с ним."))
+                                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .gridCellColumns(agents.count + 1)
+                                // Ширина этой ячейки не участвует в расчёте
+                                // колонок: длинная строка, растянутая на все,
+                                // раздвигала колонку подписей и оставляла
+                                // между подписью и кнопками пустое поле.
+                                .gridCellUnsizedAxes(.horizontal)
+                        }
+                    }
+                    GridRow {
+                        Text(String(localized: "Положить агенту SKILL.md"))
+                            .font(Theme.Font.caption)
+                        ForEach(agents, id: \.self) { agent in
+                            Button(agent.title) { model.installSkill(agent) }
+                        }
+                    }
+                    GridRow {
+                        Text(String(localized: "Положить скилл из папки"))
+                            .font(Theme.Font.caption)
+                        ForEach(agents, id: \.self) { agent in
+                            Button(agent.title) { model.installSkillFromFolder(agent) }
+                        }
+                    }
+                }
+                Text(String(localized: "Первая кнопка ставит английский скилл приложения — на этом языке отвечает и сам сервер. Русский вариант лежит рядом, Contents/Resources/Skills/chromadb-manager/SKILL.ru.md. Вторая берёт любой скилл из его папки и кладёт её агенту целиком, вместе с references и scripts: имя берётся из шапки SKILL.md, служебное (.git, .DS_Store) не едет. Прежние файлы агента сохраняются снимком."))
+                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

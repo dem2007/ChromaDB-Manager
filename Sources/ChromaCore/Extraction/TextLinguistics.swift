@@ -23,6 +23,53 @@ public enum TextLinguistics {
     /// достаётся от документа, а не выдумывается по двум буквам.
     public static let minimumLettersForLanguage = 12
 
+    /// Приставки, которые в текст документа вписывает **само приложение**.
+    ///
+    /// Берутся из тех же строк, которыми их и вписывают, — с пустой
+    /// подстановкой вместо содержимого. Второй список тех же слов разошёлся
+    /// бы с первым при первом же переводе: по-английски это «Header: »
+    /// и «Comment: ».
+    static var insertedPrefixes: [String] {
+        [String(localized: "Колонтитул: \("")"), String(localized: "Комментарий: \("")")]
+    }
+
+    /// Текст без слов, которые приложение вписало в него само.
+    ///
+    /// Замерено на большом русском ТЗ: почти два миллиона знаков, из них
+    /// **три строки и полсотни знаков** — «Колонтитул:» с номером страницы
+    /// или названием приложения. `NLLanguageRecognizer` на полном тексте
+    /// отвечает `bg` с уверенностью 1.00; стоит убрать одно слово
+    /// «Колонтитул», оставив номера и названия, — и он отвечает `ru` с той же
+    /// уверенностью.
+    /// Пятьдесят пять знаков нашего собственного словаря решали, на каком
+    /// языке документ, и агент читал «language bg» о русском ТЗ.
+    ///
+    /// Убирается **приставка**, а не строка: за «Комментарий: » идёт
+    /// настоящий текст человека, и выбрасывать его вместе с меткой значило
+    /// бы чинить одно, ломая другое.
+    public static func withoutInsertedMarkers(_ text: String) -> String {
+        let prefixes = insertedPrefixes.filter { !$0.isEmpty }
+        guard !prefixes.isEmpty else { return text }
+        // Вставок в тексте обычно нет вовсе — у PDF и текстовых файлов их
+        // не бывает. Полтора мегабайта чужого текста незачем перекладывать
+        // ради ответа «ничего не изменилось».
+        guard prefixes.contains(where: { text.contains($0) }) else { return text }
+        return text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                for prefix in prefixes where line.hasPrefix(prefix) {
+                    return line.dropFirst(prefix.count)
+                }
+                return line
+            }
+            .joined(separator: "\n")
+    }
+
+    /// Язык документа целиком — по его собственному тексту.
+    public static func documentLanguage(of text: String) -> String? {
+        language(of: withoutInsertedMarkers(text))
+    }
+
     /// Код языка (`ru`, `en`, …) или `nil`, если сказать нечего.
     public static func language(of text: String) -> String? {
         guard letterCount(text) >= minimumLettersForLanguage else { return nil }

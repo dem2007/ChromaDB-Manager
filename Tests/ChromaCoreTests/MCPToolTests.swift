@@ -264,6 +264,11 @@ final class MCPToolTests: XCTestCase {
     }
 
     /// Объявив `outputSchema`, сервер **обязан** возвращать `structuredContent`.
+    ///
+    /// Здесь проверяется только его наличие, и одного этого мало: карта файла
+    /// возвращала `structuredContent`, расходившийся со своей же схемой, и
+    /// клиент выбрасывал ответ целиком. Согласие ответа со схемой — на каждой
+    /// ветке каждого инструмента — стережёт `MCPOutputSchemaTests`.
     func testToolsThatDeclareAnOutputSchemaReturnStructuredContent() async throws {
         // Ключ с записью: инструменты записи иначе ответят отказом, и проверять
         // было бы нечего.
@@ -851,10 +856,10 @@ final class MCPToolTests: XCTestCase {
         // Перечню отведена половина ответа: иначе сотня путей вытеснит из него
         // сами образцы, ради которых вызов и делался.
         XCTAssertLessThanOrEqual(listing.count, MCPOutputLimits.defaultResponseCharacters / 2)
-        // Допуск — на заголовки документов (id и подсказка про get_file):
-        // их render в бюджет не считает, и это его давнее правило, общее для
-        // всех инструментов. Без правки перечня ответ выходил за 35 000.
-        XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters + 2000)
+        // Допуска нет: рендер считает и заголовки документов, и
+        // обвязку, которую инструмент приписывает после него. Прежний «+2 000»
+        // прикрывал ровно ту дыру, что закрыта, — и прикрывал бы следующую.
+        XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters)
         XCTAssertTrue(text.contains("The list was trimmed"), String(text.prefix(400)))
     }
 
@@ -1686,6 +1691,28 @@ final class MCPConnectionConfigTests: XCTestCase {
             helperPath: "/Applications/ChromaDB Manager.app/Contents/MacOS/chromadb-mcp", key: "k"
         )
         XCTAssertTrue(line.contains("\"/Applications/ChromaDB Manager.app/Contents/MacOS/chromadb-mcp\""), line)
+    }
+
+    /// Команда зовёт то, что на машине есть.
+    ///
+    /// Стояло `claude mcp add` — CLI Claude Code, которого может не быть
+    /// вовсе; на этой машине его и нет. Ключи взяты у живого
+    /// `hermes mcp add --help`, а не придуманы.
+    func testTheCommandLineCallsAnAgentThatIsActuallyInstalled() {
+        let line = MCPConnectionConfig.commandLine(helperPath: "/tmp/mcp", key: "k")
+        XCTAssertTrue(line.hasPrefix("hermes mcp add chromadb-manager"), line)
+        XCTAssertFalse(line.contains("claude"), line)
+        XCTAssertTrue(line.contains("--command \"/tmp/mcp\""), line)
+        XCTAssertTrue(line.contains("--env CHROMADB_MCP_KEY=k"), line)
+    }
+
+    /// Адрес конфигурации называется у каждого агента свой: один путь на всех
+    /// посылает не туда всех, кроме одного.
+    func testTheConfigurationPathsNameEveryAgentTheButtonsTouch() {
+        let joined = MCPConnectionConfig.configPaths.joined(separator: " ")
+        XCTAssertTrue(joined.contains("~/.hermes/config.yaml"), joined)
+        XCTAssertTrue(joined.contains("~/.lmstudio/mcp.json"), joined)
+        XCTAssertTrue(joined.contains("claude_desktop_config.json"), joined)
     }
 
     /// Ключа нет — вместо него заметная заглушка, а не пустая строка: пустую

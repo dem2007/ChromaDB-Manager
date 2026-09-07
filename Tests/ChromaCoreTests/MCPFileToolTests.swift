@@ -121,7 +121,15 @@ final class MCPFileToolTests: XCTestCase {
     private func call(
         _ service: MCPToolService, _ arguments: [String: JSONValue]
     ) async throws -> JSONValue {
-        try await service.call(
+        // Ветка кусков называется явно: с этой правки умолчание
+        // `get_file` — сплошной текст, а проверки ниже написаны про страницы
+        // чанков. Подставляется только там, где вызов сам не назвал «as» и не
+        // просит карту, — иначе проверка умолчания проверяла бы подстановку.
+        var arguments = arguments
+        if arguments["as"] == nil, arguments["outline"] == nil {
+            arguments["as"] = .string("chunks")
+        }
+        return try await service.call(
             name: MCPToolCatalogue.getFile.name, arguments: .object(arguments), key: key
         ).get()
     }
@@ -160,6 +168,107 @@ final class MCPFileToolTests: XCTestCase {
         XCTAssertEqual(request?.filter?.conditions.count, 1)
         XCTAssertEqual(request?.filter?.conditions.first?.field, "source_file")
         XCTAssertEqual(request?.filter?.conditions.first?.value, "папка/файл.md")
+    }
+
+    /// Смещение за концом файла — это смещение, а не пропавший файл.
+    ///
+    /// Раньше ответ гласил «в коллекции нет чанков с этим file_id» и советовал
+    /// сменить отпечаток на путь: агент шёл чинить беду, которой нет, а в том
+    /// же ответе стоял `total`. Чтение по разделу это говорит правильно
+    /// с.
+    func testAnOffsetPastTheEndSaysSoInsteadOfClaimingTheFileIsMissing() async throws {
+        let backend = Backend(chunks: (0..<4).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"),
+            "limit": .int(3), "offset": .int(40),
+        ])
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("past its end"), text)
+        XCTAssertFalse(text.contains("has no documents"), "файл на месте, и говорить обратное нельзя")
+        XCTAssertFalse(text.contains("no chunks with file_id"), text)
+        XCTAssertEqual(result["structuredContent"]?["total"]?.intValue, 4)
+        XCTAssertEqual(result["structuredContent"]?["documents"]?.arrayValue?.count, 0)
+    }
+
+    /// «Влезает в один ответ» значит «весь файл здесь», а не «читать недорого».
+    ///
+    /// Поле стояло в `true` всюду, где приговор молчал, — а молчит он, пока
+    /// вызовов меньше десяти. Файл на двадцать кусков, показанный по четыре,
+    /// отвечал клиенту «влезает целиком», и `callsToReadWhole` не ставилось
+    /// вовсе: узнать правду по структуре было неоткуда.
+    func testAFileReadInSeveralCallsIsNotCalledWholeInOne() async throws {
+        let backend = Backend(chunks: (0..<20).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"), "limit": .int(4),
+        ])
+        XCTAssertEqual(result["structuredContent"]?["fitsInOneAnswer"], .bool(false))
+        XCTAssertEqual(result["structuredContent"]?["callsToFinish"], .int(4), "с нулевого смещения показано 4 из 20, дочитывать 16 — четыре вызова")
+    }
+
+    /// А когда весь файл действительно в ответе — `true`, и цены нет.
+    func testAFileThatFitsWholeSaysSo() async throws {
+        let backend = Backend(chunks: (0..<3).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"), "limit": .int(5),
+        ])
+        XCTAssertEqual(result["structuredContent"]?["fitsInOneAnswer"], .bool(true))
+        XCTAssertNil(result["structuredContent"]?["callsToFinish"])
+    }
+
+    /// Пропавшему файлу «влезает целиком» не говорится вовсе: `0 >= 0` —
+    /// правда, но о файле, которого в коллекции нет, она не значит ничего.
+    func testAMissingFileIsNotCalledWholeEither() async throws {
+        let service = await service(Backend(chunks: []))
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("нет/такого.md"),
+        ])
+        XCTAssertNil(result["structuredContent"]?["fitsInOneAnswer"])
+    }
+
+    /// Смещение за концом не делает файл влезающим: страница пуста, а в файле
+    /// как была тысяча кусков, так и осталась.
+    func testAnOffsetPastTheEndDoesNotCallTheFileSmall() async throws {
+        let backend = Backend(chunks: (0..<20).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"),
+            "limit": .int(4), "offset": .int(40),
+        ])
+        XCTAssertEqual(result["structuredContent"]?["fitsInOneAnswer"], .bool(false))
+    }
+
+    /// На последней странице приговор молчит: «читать так — двести пятьдесят
+    /// семь вызовов» тому, кто дочитал тысячу двести семьдесят шесть, — это
+    /// неправда о его положении, да ещё первой строкой. закрыл это
+    /// у раздела и не перенёс сюда.
+    func testTheLastPageOfAFileIsNotToldToGiveUp() async throws {
+        let backend = Backend(chunks: (0..<200).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"),
+            "limit": .int(4), "offset": .int(196),
+        ])
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertFalse(text.contains("does not fit in one answer"), text)
+        XCTAssertEqual(result["structuredContent"]?["hasMore"], .bool(false))
+        XCTAssertNil(result["structuredContent"]?["callsToFinish"])
+    }
+
+    /// А с начала большого файла — говорит, и числом оставшегося.
+    func testTheFirstPageOfALongFileStillWarns() async throws {
+        let backend = Backend(chunks: (0..<200).map { (number: Int) in chunk("id-\(number)", index: number) })
+        let service = await service(backend)
+        let result = try await call(service, [
+            "collection": .string("заметки"), "file": .string("папка/файл.md"),
+            "limit": .int(4),
+        ])
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.hasPrefix("This file does not fit in one answer as chunks"), text)
+        XCTAssertTrue(text.contains("196 still unread"), text)
+        XCTAssertEqual(result["structuredContent"]?["callsToFinish"], .int(49))
     }
 
     func testTheLastPageSaysTheFileIsFinished() async throws {

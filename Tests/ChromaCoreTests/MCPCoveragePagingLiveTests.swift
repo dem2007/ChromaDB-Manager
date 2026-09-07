@@ -147,7 +147,8 @@ final class MCPCoveragePagingLiveTests: XCTestCase {
         XCTAssertFalse(files.isEmpty)
         XCTAssertEqual(result["isError"]?.boolValue ?? false, false)
         // Ответ обязан помещаться в бюджет: ради этого всё и затевалось.
-        XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters + 4000)
+        // Без допуска: прежний «+4 000» скрывал бы возврат той же дыры.
+        XCTAssertLessThanOrEqual(text.count, MCPOutputLimits.defaultResponseCharacters)
     }
 
     /// Минимальная подложка: инструменту нужен только обход коллекции.

@@ -1342,7 +1342,7 @@ final class CollectionsViewModel: ObservableObject {
                         Task {
                             await context.report(
                                 progress: update.fraction,
-                                detail: "\(update.stage): \(update.processed) из \(update.total)"
+                                detail: String(localized: "\(update.stage): \(update.processed) из \(update.total)")
                             )
                         }
                     }

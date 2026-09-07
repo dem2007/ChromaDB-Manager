@@ -165,6 +165,107 @@ final class StringCatalogueTests: XCTestCase {
         )
     }
 
+    /// Каждая строка из кода лежит в каталоге.
+    ///
+    /// Прежние проверки сверяли каталог **с каталогом**: у каждого русского
+    /// ключа есть английская строка. Обе половины при этом могли отставать от
+    /// исходника одинаково — и отставали. Пять сообщений ветки не лежали ни
+    /// в одном каталоге, и англоязычный человек видел русскую фразу, а
+    /// проверка «ключи совпадают» это прошла и отчиталась «всё в порядке»
+    ///.
+    ///
+    /// Сверять надо каталог с **исходником**. `build-strings.py --check`
+    /// это умеет, но зовёт `swift build` — из теста его не запустить, там
+    /// замок сборки уже занят. Поэтому сверка здесь своя и нарочно грубая:
+    /// у строки с подстановками берутся её постоянные куски, и ключ обязан
+    /// содержать их все по порядку. Точное совпадение спецификаторов —
+    /// забота скрипта; здесь ловится то, чего в каталоге **нет вовсе**.
+    func testEveryStringInTheCodeIsInTheCatalogue() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let keys = Self.entries(in: try String(contentsOf: Self.catalogueURL, encoding: .utf8))
+            .map(\.key)
+        var missing: [String] = []
+        var checked = 0
+
+        let sources = FileManager.default.enumerator(
+            at: root.appendingPathComponent("Sources"), includingPropertiesForKeys: nil
+        )
+        while let url = sources?.nextObject() as? URL {
+            guard url.pathExtension == "swift" else { continue }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for literal in Self.localizedLiterals(in: text) {
+                checked += 1
+                // Постоянные куски — то, что не подстановка. Короткие
+                // отбрасываются: «: » и «, » стоят в половине каталога.
+                let parts = literal.components(separatedBy: "\u{1}").filter { $0.count >= 4 }
+                guard !parts.isEmpty else { continue }
+                let found = keys.contains { key in
+                    var rest = Substring(key)
+                    for part in parts {
+                        guard let hit = rest.range(of: part) else { return false }
+                        rest = rest[hit.upperBound...]
+                    }
+                    return true
+                }
+                if !found {
+                    missing.append("\(url.lastPathComponent): \(literal.replacingOccurrences(of: "\u{1}", with: "…"))")
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(checked, 1000, "разбор не нашёл строк — сторож сторожит пустоту")
+        XCTAssertEqual(
+            missing.count, 0,
+            "нет в каталоге — запустите python3 Scripts/build-strings.py и допишите английский:\n"
+                + missing.prefix(10).joined(separator: "\n")
+        )
+    }
+
+    /// Литералы из `String(localized: "…")`; подстановка отмечена \u{1}.
+    static func localizedLiterals(in text: String) -> [String] {
+        var result: [String] = []
+        var index = text.startIndex
+        let opening = "String(localized: \""
+        while let found = text.range(of: opening, range: index..<text.endIndex) {
+            index = found.upperBound
+            var cursor = found.upperBound
+            var literal = ""
+            var ok = false
+            while cursor < text.endIndex {
+                let character = text[cursor]
+                if character == "\\" {
+                    let next = text.index(after: cursor)
+                    guard next < text.endIndex else { break }
+                    if text[next] == "(" {
+                        // Подстановка: пропускаем до парной скобки.
+                        var depth = 0
+                        var scan = next
+                        while scan < text.endIndex {
+                            if text[scan] == "(" { depth += 1 }
+                            if text[scan] == ")" { depth -= 1; if depth == 0 { break } }
+                            scan = text.index(after: scan)
+                        }
+                        guard scan < text.endIndex else { break }
+                        literal.append("\u{1}")
+                        cursor = text.index(after: scan)
+                        continue
+                    }
+                    literal.append(text[next])
+                    cursor = text.index(after: next)
+                    continue
+                }
+                if character == "\"" { ok = true; break }
+                if character == "\n" { break }
+                literal.append(character)
+                cursor = text.index(after: cursor)
+            }
+            if ok, !literal.isEmpty { result.append(literal) }
+        }
+        return result
+    }
+
     /// Та же проверка подстановок, что и для русского: перевод, потерявший
     /// `%@`, теряет подставленное значение.
     func testEveryEnglishTranslationKeepsItsPlaceholders() throws {

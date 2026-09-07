@@ -107,6 +107,69 @@ final class AccessRateLimitTests: XCTestCase {
         XCTAssertGreaterThan(allowed, 0)
     }
 
+    /// Отказ называет то число, которое кончилось.
+    ///
+    /// Разбор журнала: 9 августа агент получил 16 отказов подряд с текстом
+    /// «разрешено 120 в минуту», сделав за ту минуту 29 вызовов. Кончился
+    /// запас всплеска — 20; предел в минуту, который назывался, не был
+    /// достигнут и близко. Названное число обязано быть тем, из-за которого
+    /// отказали, иначе читатель ищет причину не там.
+    func testTheRefusalNamesTheBurstThatRanOut() async {
+        let (controller, key, _) = await makeController(
+            ClientPermissions(collections: ["notes"], requestsPerMinute: 120, burst: 3)
+        )
+        for _ in 0..<3 { _ = await controller.decide(key: key, route: readRoute, body: Data()) }
+
+        guard case .reject(_, let message, _, _) = await controller.decide(
+            key: key, route: readRoute, body: Data()
+        ) else {
+            return XCTFail("четвёртый запрос сверх всплеска")
+        }
+        XCTAssertTrue(message.contains("3"), "кончился запас в 3 — его и называем: \(message)")
+        XCTAssertTrue(message.contains("120"), "скорость восполнения тоже нужна: \(message)")
+    }
+
+    /// То же самое агенту — и на его языке.
+    func testTheToolRefusalNamesTheBurstToo() async {
+        let (controller, key, _) = await makeController(
+            ClientPermissions(collections: ["notes"], requestsPerMinute: 120, burst: 3)
+        )
+        for _ in 0..<3 {
+            _ = await controller.decideTool(
+                key: key, permission: .read, collection: "notes", isReadOnlyServer: false
+            )
+        }
+        let refused = await controller.decideTool(
+            key: key, permission: .read, collection: "notes", isReadOnlyServer: false
+        )
+        let message = try? XCTUnwrap(refused.refusal)
+        XCTAssertTrue(message?.contains("3") ?? false, "запас всплеска: \(message ?? "")")
+        XCTAssertTrue(message?.contains("120") ?? false, "скорость восполнения: \(message ?? "")")
+    }
+
+    /// Запас на запись — половина общего, и в отказе стоит он, а не общий.
+    ///
+    /// Считается в одном месте на оба: пока число считалось дважды, в тексте
+    /// стояло не то, что в ведре.
+    func testTheWriteRefusalNamesTheWriteBurst() async {
+        let (controller, key, _) = await makeController(
+            ClientPermissions(collections: ["notes"], allowsWrite: true,
+                              requestsPerMinute: 600, burst: 8, writesPerMinute: 60)
+        )
+        let body = Data(#"{"ids":["a"],"documents":["текст"]}"#.utf8)
+        var refusal: String?
+        for _ in 0..<10 {
+            if case .reject(_, let message, _, _) = await controller.decide(
+                key: key, route: writeRoute, body: body
+            ) {
+                refusal = message
+                break
+            }
+        }
+        let message = try? XCTUnwrap(refusal)
+        XCTAssertTrue(message?.contains("4") ?? false, "половина от 8 — это 4: \(message ?? "")")
+    }
+
     /// A client that stays inside its limits is never touched.
     func testAWellBehavedClientIsNotThrottled() async {
         let (controller, key, _) = await makeController(

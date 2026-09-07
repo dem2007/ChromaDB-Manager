@@ -142,8 +142,16 @@ public final class GuardedJSONFile<Value: Codable>: @unchecked Sendable {
             rescued = url.deletingLastPathComponent().appendingPathComponent(
                 url.deletingPathExtension().lastPathComponent + ".unreadable-\(stamp).json"
             )
-            try? data.write(to: rescued, options: .atomic)
-            saidWhere = String(localized: "Копия сохранена как \(rescued.lastPathComponent)")
+            // Обещание проверяется, а не выдаётся авансом: `try?` здесь
+            // молчал о неудаче, и человек шёл искать снимок, которого нет
+            //. Тот же класс ошибки, что в, — «не получилось»
+            // и «получилось» приходили одним значением.
+            do {
+                try data.write(to: rescued, options: .atomic)
+                saidWhere = String(localized: "Копия сохранена как \(rescued.lastPathComponent)")
+            } catch {
+                saidWhere = String(localized: "Копию сохранить не удалось (\(error.localizedDescription)), и содержимое осталось только в самом файле")
+            }
         }
 
         problem = String(localized: "\(url.lastPathComponent) не разбирается: \(Self.tidy(reason)) \(saidWhere); ничего не сохраняем, чтобы не затереть оригинал.")

@@ -68,6 +68,36 @@ final class GuardedFileTests: XCTestCase {
         XCTAssertEqual(rescued.count, 1)
     }
 
+    /// Обещание про снимок проверяется, а не выдаётся авансом.
+    ///
+    /// Запись снимка шла через `try?`, и текст «Копия сохранена как …»
+    /// печатался, даже когда копия не сохранилась. В журнале приложения так
+    /// и вышло: девять сообщений о сохранённых копиях `metrics.unreadable-*`
+    /// и `benchmarks.unreadable-*` — и ни одного такого файла на диске.
+    func testTheMessageDoesNotPromiseACopyThatCouldNotBeWritten() throws {
+        let file = self.file()
+        try Data("не json".utf8).write(to: file.url)
+        // Каталог только для чтения: сам файл читается, а положить рядом
+        // новый нельзя — ровно то, обо что спотыкается запись снимка.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: root.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+        }
+
+        guard case .unreadable = file.read() else { return XCTFail("должно быть «не прочитан»") }
+        let problem = try XCTUnwrap(file.problem)
+        XCTAssertFalse(
+            problem.contains("Копия сохранена"),
+            "копии нет — обещать её нельзя: \(problem)"
+        )
+        XCTAssertTrue(problem.contains("не удалось"), problem)
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .filter { $0.hasPrefix("данные.unreadable-") }.isEmpty,
+            "проверка сама себе противоречит, если снимок всё-таки лёг"
+        )
+    }
+
     func testReloadingUnblocksWhenTheCauseIsGone() throws {
         let file = self.file()
         XCTAssertTrue(file.write(["один"]))

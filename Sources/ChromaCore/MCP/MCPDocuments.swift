@@ -299,123 +299,86 @@ public enum MCPDocumentRendering {
     /// символов — немного, но обещание либо держится, либо нет.
     static let envelopeReserve = 1024
 
-    public static func render(
-        _ payloads: [MCPDocumentPayload],
-        limits: MCPOutputLimits,
-        metric: String? = nil,
-        fields: [String]? = nil,
-        budget: Int? = nil
-    ) -> Output {
-        var documents: [JSONValue] = []
-        var lines: [String] = []
-        var notes: [String] = []
-        var budget = max(1, (budget ?? limits.responseCharacters) - Self.envelopeReserve)
-        // Множество собирается один раз на весь ответ: полей у документа
-        // бывает под две сотни, а искать каждое из них по списку — это работа
-        // на ровном месте.
-        let wanted: Set<String>? = fields.flatMap { $0.isEmpty ? nil : Set($0) }
+    /// Словарь вызывающего: чем листают его выдачу и как её называть.
+    ///
+    /// Рендер один на пять инструментов, а имена у них разные: `search`
+    /// уменьшают «n_results», остальных — «limit». Пометка об урезании
+    /// печаталась одна на всех и называла «n_results» там, где такого
+    /// параметра нет вовсе: четыре инструмента из пяти советовали агенту
+    /// невыполнимое. Знать своё имя может только вызывающий — он его и
+    /// передаёт.
+    public struct Vocabulary: Sendable, Hashable {
+        /// Как назвать показанное. У поиска это документы, у файла — куски,
+        /// у сбора упоминаний — образцы: там урезаются именно они, а перечень
+        /// файлов приходит целым, и «the list was cut» рядом с полным
+        /// перечнем читается как пропавший файл.
+        public let items: String
+        /// То же в единственном числе.
+        ///
+        /// Полем, а не отрезанием последней буквы у `items`: приём
+        /// работает ровно на тех трёх словах, что здесь лежат, и на первом же
+        /// «entries» даёт «entrie». В этом файле для единственного и
+        /// множественного уже есть свой способ — `EnglishCount.grouped`,
+        /// которому оба слова передают целиком.
+        public let item: String
+        /// Что сделать, чтобы влезло, — целой фразой.
+        ///
+        /// Фразой, а не одним именем параметра: у выборки по идентификаторам
+        /// «limit» не действует вовсе — двенадцать идентификаторов с limit 12,
+        /// 3 и 1 дают побайтно один и тот же ответ, — и совет «попроси
+        /// меньше» там означает «передай меньше ids», а не «уменьши limit»
+        ///.
+        public let advice: String
 
-        for (index, payload) in payloads.enumerated() {
-            let full = payload.text ?? ""
-            // Метаданные считаются вместе с текстом: у документа из настоящей
-            // коллекции их набирается на полтора килобайта, и бюджет, который
-            // их не видит, ограничивает ответ только на бумаге.
-            let visible = Self.projected(payload.metadata, to: wanted)
-            let metadataLine = Self.metadataLine(visible)
-            let room = budget - metadataLine.count
-
-            // Первый документ отдаётся всегда, даже если он один съедает весь
-            // бюджет: ответ без единого результата хуже, чем ответ с одним.
-            // Дальше список обрывается, не дожидаясь нуля: результат, которому
-            // осталось полста символов текста, — это не результат, а шум.
-            if index > 0, room < minimumUsefulText {
-                notes.append("The list was cut by total answer size: \(index.plainDigits) of \(payloads.count.plainDigits) shown. For the rest use get_documents by id, or call again with a smaller n_results.")
-                break
-            }
-
-            // Место делится на двоих: текст уедет ещё раз зеркалом в
-            // `structuredContent`, и зеркало не легче. Брать под текст весь
-            // остаток значило обещать 24 000 и отдавать 24 581 — а ключу с
-            // малым потолком и вовсе 8 190 вместо 2 000.
-            let shareOfRoom = max(0, room) / 2
-            let allowance = index == 0
-                // Первый документ отдаётся всегда: ответ без единого
-                // результата хуже урезанного. Но и он теперь считается — не
-                // больше того, что влезет вдвоём с зеркалом.
-                ? min(limits.documentCharacters, max(Self.minimumUsefulText, shareOfRoom))
-                : min(limits.documentCharacters, shareOfRoom)
-            let shownText = full.count > allowance ? String(full.prefix(allowance)) : full
-            let wasCut = shownText.count < full.count
-            var object: [String: JSONValue] = ["id": .string(payload.id)]
-            // Отпечаток файла отдельным полем, а не только среди трёх десятков
-            // метаданных: им агент просит документ целиком, и увидеть
-            // его он должен сразу, а не вычитывать из общей строки.
-            if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
-                object["fileId"] = .string(fileID)
-            }
-            // Из какой коллекции результат. Без этого агент, искавший
-            // по трём, не сможет ни дочитать документ, ни сказать человеку,
-            // откуда он это взял.
-            if let collection = payload.collection { object["collection"] = .string(collection) }
-            if payload.text != nil { object["text"] = .string(shownText) }
-            if let metadata = visible, !metadata.isEmpty {
-                object["metadata"] = .object(metadata.mapValues(\.json))
-            }
-            if let distance = payload.distance { object["distance"] = .double(distance) }
-            if let metric { object["metric"] = .string(metric) }
-            if payload.role == .context { object["role"] = .string("context") }
-            if let note = payload.note { object["note"] = .string(note) }
-            if wasCut {
-                // Пометка не только словами: клиент, читающий структурированный
-                // ответ, слов не увидит вовсе.
-                object["truncated"] = .bool(true)
-                object["textCharacters"] = .int(full.count)
-                object["shownCharacters"] = .int(shownText.count)
-            }
-            // Зеркало уезжает агенту наравне с текстом, значит и платит из
-            // того же бюджета. Раньше бюджет видел только текст, и обещанные
-            // «24 000 символов на ответ» превращались в 42 281 — модель
-            // планировала по одному числу, а получала вдвое больше и
-            // выталкивала ответ из контекста.
-            let mirror = JSONValue.object(object)
-            documents.append(mirror)
-
-            var header = payload.role == .context
-                ? "— context, id «\(payload.id)»"
-                : "\((index + 1).plainDigits). id «\(payload.id)»"
-            // То же, что и в структурированном ответе, и по той же причине:
-            // модель читает текст, а в строке метаданных отпечаток теряется
-            // среди трёх десятков полей.
-            if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
-                header += ", whole file — get_file with file_id \(fileID)"
-            }
-            if let distance = payload.distance {
-                let value = String(format: "%.4f", distance)
-                header += metric.map { ", distance \(value) (\($0))" }
-                    ?? ", distance \(value)"
-            }
-            if let collection = payload.collection {
-                header += ", collection «\(collection)»"
-            }
-            if let note = payload.note { header += ", \(note)" }
-            if !metadataLine.isEmpty { header += "\n   " + metadataLine }
-            var body = header
-            if payload.text != nil {
-                body += "\n" + shownText
-                if wasCut {
-                    body += "\n" + "[text cut: \(shownText.count.plainDigits) of \(full.count.plainDigits) characters shown; the whole document — get_documents with id «\(payload.id)»]"
-                }
-            }
-            lines.append(body)
-            // С бюджета списывается **всё, что уезжает**: готовая строка со
-            // своей обвязкой — заголовком, отпечатком, расстоянием, пометкой
-            // об обрезке — и зеркало в `structuredContent`. Считать один голый
-            // текст было мало: обещанные «24 000 символов на ответ»
-            // оборачивались 42 281, и агент планировал по числу вдвое меньше
-            // правды.
-            budget -= body.count + 1 + mirror.deliveredSize
+        public init(items: String, item: String, advice: String) {
+            self.items = items
+            self.item = item
+            self.advice = advice
         }
 
+        public static let documents = Vocabulary(
+            items: "documents",
+            item: "document",
+            advice: "For the rest use get_documents by id, or call again with a smaller «limit»."
+        )
+        public static let searchResults = Vocabulary(
+            items: "documents",
+            item: "document",
+            advice: "For the rest use get_documents by id, or call again with a smaller «n_results»."
+        )
+        public static let chunks = Vocabulary(
+            items: "chunks",
+            item: "chunk",
+            advice: "For the rest use get_documents by id, or call again with a smaller «limit»."
+        )
+        public static let mentionSamples = Vocabulary(
+            items: "samples",
+            item: "sample",
+            advice: "For the rest use get_documents by id, or call again with a smaller «limit»."
+        )
+        /// Выборка по идентификаторам: «limit» на неё не действует.
+        public static let identifiedDocuments = Vocabulary(
+            items: "documents",
+            item: "document",
+            advice: "Ask for fewer «ids» at a time — «limit» does not apply to a call by identifiers."
+        )
+    }
+
+    /// Пометка об урезании списка — одной сборкой на оба места, где она
+    /// нужна: в оплате наперёд и в самом ответе.
+    static func cutNote(shown: Int, total: Int, vocabulary: Vocabulary) -> String {
+        "The list of \(vocabulary.items) was cut by total answer size: "
+            + "\(shown.plainDigits) of \(total.plainDigits) shown. \(vocabulary.advice)"
+    }
+
+    /// Пометки, которые зависят только от пришедшего, а не от поместившегося.
+    ///
+    /// Собраны до цикла — тогда их можно оплатить наравне с документами
+    ///. Порядок сохранён: он читается сверху вниз.
+    static func tailNotes(
+        _ payloads: [MCPDocumentPayload], limits: MCPOutputLimits, fields: [String]?
+    ) -> [String] {
+        var collected: [String] = []
         // Имя поля, которого нет ни у одного документа, называется вслух
         //: агент берёт его из describe_collection, и опечатка иначе
         // выглядит как «в базе про это пусто» — то есть как ответ, а не как
@@ -430,7 +393,7 @@ public enum MCPDocumentRendering {
             }
             let missing = fields.filter { !present.contains($0) }
             if !missing.isEmpty {
-                notes.append(String(
+                collected.append(String(
                     "Not one document in this answer carries the requested fields: \(missing.joined(separator: ", ")). The exact names are in describe_collection."
                 ))
             }
@@ -444,7 +407,7 @@ public enum MCPDocumentRendering {
             if case .bool(true)? = document.metadata?["tables_flat"] { return true }
             return false
         }) {
-            notes.append("Warning: in some of these fragments the table stayed flat text — its columns are not separated. Numbers from there must not be assigned to columns or summed; check against the source file.")
+            collected.append("Warning: in some of these fragments the table stayed flat text — its columns are not separated. Numbers from there must not be assigned to columns or summed; check against the source file.")
         }
 
         // Книга попала в базу не целиком: у строки записано, сколько
@@ -459,12 +422,203 @@ public enum MCPDocumentRendering {
             return (indexed, total)
         }
         if let (indexed, total) = partial.first {
-            notes.append("Warning: the workbook is not indexed whole — \(indexed.plainDigits) sheets of \(total.plainDigits) are mapped. Rows from unmapped sheets are not in the base, and no total may be built on this answer.")
+            collected.append("Warning: the workbook is not indexed whole — \(indexed.plainDigits) sheets of \(total.plainDigits) are mapped. Rows from unmapped sheets are not in the base, and no total may be built on this answer.")
         }
 
         if payloads.contains(where: { ($0.text?.count ?? 0) > limits.documentCharacters }) {
-            notes.append("Long documents are cut to \(limits.documentCharacters.plainDigits) characters — take the full text with get_documents by id.")
+            collected.append("Long documents are cut to \(limits.documentCharacters.plainDigits) characters — take the full text with get_documents by id.")
         }
+
+        return collected
+    }
+
+    /// Во что обойдётся обвязка ответа: заголовок, пометки и их зеркало.
+    ///
+    /// Считается по готовым строкам, а не плоским запасом: запас
+    /// в тысячу знаков «на конверт» покрывал обвязку, пока она была короткой,
+    /// и переставал, когда у карты появилась третья пометка. Вызывающий
+    /// собирает свою шапку и свои пометки до рендера и передаёт их цену сюда.
+    public static func overhead(header: String, notes: [String]) -> Int {
+        var size = header.isEmpty ? 0 : header.count + 1
+        size += notes.reduce(0) { $0 + $1.count + 1 }
+        if !notes.isEmpty {
+            size += JSONValue.array(notes.map(JSONValue.string)).deliveredSize
+        }
+        return size
+    }
+
+    public static func render(
+        _ payloads: [MCPDocumentPayload],
+        limits: MCPOutputLimits,
+        metric: String? = nil,
+        fields: [String]? = nil,
+        budget: Int? = nil,
+        reserve: Int = 0,
+        vocabulary: Vocabulary = .documents
+    ) -> Output {
+        var documents: [JSONValue] = []
+        var lines: [String] = []
+        // Пометки самого рендера собираются **до** цикла: они зависят только
+        // от того, что пришло, а не от того, сколько поместилось, — и потому
+        // могут быть оплачены наравне со всем остальным.
+        let tailNotes = Self.tailNotes(payloads, limits: limits, fields: fields)
+        // Пометка об урезании — по верхней оценке: чисел в ней два, и оба
+        // не длиннее общего счёта.
+        let cutNote = Self.cutNote(shown: payloads.count, total: payloads.count, vocabulary: vocabulary)
+        var notes: [String] = []
+        /// Сколько занял первый документ, если ответ из-за него вышел
+        /// за объявленный потолок.
+        var overflowed: Int?
+        var budget = max(
+            1,
+            (budget ?? limits.responseCharacters)
+                - Self.envelopeReserve
+                - reserve
+                - Self.overhead(header: "", notes: tailNotes + [cutNote])
+        )
+        // Множество собирается один раз на весь ответ: полей у документа
+        // бывает под две сотни, а искать каждое из них по списку — это работа
+        // на ровном месте.
+        let wanted: Set<String>? = fields.flatMap { $0.isEmpty ? nil : Set($0) }
+
+        for (index, payload) in payloads.enumerated() {
+            let full = payload.text ?? ""
+            // Метаданные считаются вместе с текстом: у документа из настоящей
+            // коллекции их набирается на полтора килобайта, и бюджет, который
+            // их не видит, ограничивает ответ только на бумаге.
+            let visible = Self.projected(payload.metadata, to: wanted)
+            let metadataLine = Self.metadataLine(visible)
+
+            /// Готовый документ — строкой и зеркалом сразу.
+            ///
+            /// Одна сборка на оба вида, и зовётся она дважды: сперва с пустым
+            /// текстом, чтобы узнать постоянную часть, потом с настоящим.
+            /// Прежде допуск вычитал метаданные **один** раз, а списание шло
+            /// за два — строкой и зеркалом, — и последний впущенный документ
+            /// переваливал за бюджет примерно на свой же блок метаданных
+            ///.
+            func assemble(_ shownText: String) -> (body: String, mirror: JSONValue) {
+                let wasCut = shownText.count < full.count
+                var object: [String: JSONValue] = ["id": .string(payload.id)]
+                // Отпечаток файла отдельным полем, а не только среди трёх десятков
+                // метаданных: им агент просит документ целиком, и увидеть
+                // его он должен сразу, а не вычитывать из общей строки.
+                if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
+                    object["fileId"] = .string(fileID)
+                }
+                // Из какой коллекции результат. Без этого агент, искавший
+                // по трём, не сможет ни дочитать документ, ни сказать человеку,
+                // откуда он это взял.
+                if let collection = payload.collection { object["collection"] = .string(collection) }
+                if payload.text != nil { object["text"] = .string(shownText) }
+                if let metadata = visible, !metadata.isEmpty {
+                    object["metadata"] = .object(metadata.mapValues(\.json))
+                }
+                if let distance = payload.distance { object["distance"] = .double(distance) }
+                if let metric { object["metric"] = .string(metric) }
+                if payload.role == .context { object["role"] = .string("context") }
+                if let note = payload.note { object["note"] = .string(note) }
+                if wasCut {
+                    // Пометка не только словами: клиент, читающий структурированный
+                    // ответ, слов не увидит вовсе.
+                    object["truncated"] = .bool(true)
+                    object["textCharacters"] = .int(full.count)
+                    object["shownCharacters"] = .int(shownText.count)
+                }
+                var header = payload.role == .context
+                    ? "— context, id «\(payload.id)»"
+                    : "\((index + 1).plainDigits). id «\(payload.id)»"
+                // То же, что и в структурированном ответе, и по той же причине:
+                // модель читает текст, а в строке метаданных отпечаток теряется
+                // среди трёх десятков полей.
+                if case .string(let fileID)? = payload.metadata?["file_id"], !fileID.isEmpty {
+                    header += ", whole file — get_file with file_id \(fileID)"
+                }
+                if let distance = payload.distance {
+                    let value = String(format: "%.4f", distance)
+                    header += metric.map { ", distance \(value) (\($0))" }
+                        ?? ", distance \(value)"
+                }
+                if let collection = payload.collection {
+                    header += ", collection «\(collection)»"
+                }
+                if let note = payload.note { header += ", \(note)" }
+                if !metadataLine.isEmpty { header += "\n   " + metadataLine }
+                var body = header
+                if payload.text != nil {
+                    body += "\n" + shownText
+                    if wasCut {
+                        body += "\n" + "[text cut: \(shownText.count.plainDigits) of \(full.count.plainDigits) characters shown; the whole document — get_documents with id «\(payload.id)»]"
+                    }
+                }
+                return (body, .object(object))
+            }
+            // С бюджета списывается **всё, что уезжает**: готовая строка со
+            // своей обвязкой — заголовком, отпечатком, расстоянием, пометкой
+            // об обрезке — и зеркало в `structuredContent`. Считать один голый
+            // текст было мало: обещанные «24 000 символов на ответ»
+            // оборачивались 42 281, и агент планировал по числу вдвое меньше
+            // правды.
+            func cost(_ piece: (body: String, mirror: JSONValue)) -> Int {
+                piece.body.count + 1 + piece.mirror.deliveredSize
+            }
+
+            // Постоянная часть — всё, кроме самого текста. Место под текст
+            // делится надвое: он уезжает и строкой, и зеркалом.
+            let room = budget - cost(assemble(""))
+
+            // Первый документ отдаётся всегда, даже если он один съедает весь
+            // бюджет: ответ без единого результата хуже, чем ответ с одним.
+            // Дальше список обрывается, не дожидаясь нуля: результат, которому
+            // осталось полста символов текста, — это не результат, а шум.
+            if index > 0, room < 2 * Self.minimumUsefulText {
+                notes.append(Self.cutNote(shown: index, total: payloads.count, vocabulary: vocabulary))
+                break
+            }
+
+            let shareOfRoom = max(0, room) / 2
+            let allowance = index == 0
+                // Первый документ отдаётся всегда: ответ без единого
+                // результата хуже урезанного. Но и он теперь считается — не
+                // больше того, что влезет вдвоём с зеркалом.
+                ? min(limits.documentCharacters, max(Self.minimumUsefulText, shareOfRoom))
+                : min(limits.documentCharacters, shareOfRoom)
+            let shownText = full.count > allowance ? String(full.prefix(allowance)) : full
+            let piece = assemble(shownText)
+            let spend = cost(piece)
+            // Проверка по **готовому**, а не по оценке: экранирование в JSON
+            // добавляет знаков — кавычка и перевод строки уезжают двумя, — и
+            // на тексте, богатом ими, оценка промахнулась бы в большую сторону.
+            if index > 0, spend > budget {
+                notes.append(Self.cutNote(shown: index, total: payloads.count, vocabulary: vocabulary))
+                break
+            }
+            // Первый документ мог не влезть и всё равно уехать — это
+            // обещанное поведение, но молчать о нём нельзя: у ключа
+            // с малым потолком метаданные одного куска бывают больше всего
+            // бюджета, и ответ выходит за объявленное. Сплошной текст про
+            // такой случай говорит с; список — не говорил.
+            //
+            //
+            // Сравнение с рабочим остатком, а не с потолком, — не описка
+            //. Место под текст первого документа выводится из того же
+            // остатка, так что перевалить через него он может **только**
+            // когда остатка почти нет, а тогда и потолок уже пройден: два
+            // сравнения совпадают всюду, где вообще срабатывают. Отдельная
+            // проверка держит соседний случай — ответ, который уложился,
+            // не должен утверждать обратное.
+            if index == 0, spend > budget {
+                overflowed = spend
+            }
+            documents.append(piece.mirror)
+            lines.append(piece.body)
+            budget -= spend
+        }
+        if let overflowed {
+            notes.append("This answer is longer than the key's ceiling of \(limits.responseCharacters.plainDigits) characters: the first \(vocabulary.item) alone takes \(overflowed.plainDigits) with its metadata, and an answer with nothing in it would be useless. Ask for a key with a larger ceiling, or name fewer fields in «fields».")
+        }
+
+        notes += tailNotes
 
         return Output(
             documents: documents, lines: lines, notes: notes,

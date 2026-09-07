@@ -145,7 +145,21 @@ public actor AccessController {
     private var writeBuckets: [UUID: TokenBucket] = [:]
     private var throttled: [UUID: Int] = [:]
     static let globalRequestsPerMinute = 600
-    private var globalBucket = TokenBucket(perMinute: AccessController.globalRequestsPerMinute, burst: 100)
+    /// Запас всплеска прокси. Стоит рядом со скоростью, потому что в отказе
+    /// называются оба числа, а число, зашитое прямо в вызов, в текст отказа
+    /// не попадает — и человек читает лимит, которого не достигал.
+    static let globalBurst = 100
+    private var globalBucket = TokenBucket(
+        perMinute: AccessController.globalRequestsPerMinute, burst: AccessController.globalBurst
+    )
+
+    /// Запас всплеска на запись — половина общего.
+    ///
+    /// Считается здесь, а не на месте, по той же причине: это число называется
+    /// в отказе, и посчитанное дважды оно однажды разойдётся.
+    static func writeBurst(for client: ExternalClient) -> Int {
+        max(1, client.permissions.burst / 2)
+    }
     private var usageDay: Date = Calendar.current.startOfDay(for: Date())
     private var catalogLoader: (@Sendable () async -> [CollectionSnapshot])?
     /// References already confirmed absent, with an expiry. Without this a
@@ -416,7 +430,7 @@ public actor AccessController {
         buckets[client.id] = bucket
         guard general.allowed else {
             throttled[client.id, default: 0] += 1
-            return .reject("Too many requests: the client «\(client.name)» is allowed \(client.permissions.requestsPerMinute.plainDigits) per minute. Retry in \(general.retryAfterSeconds.plainDigits) s.", clientName: client.name)
+            return .reject("Too many requests at once: the client «\(client.name)» may send \(client.permissions.burst.plainDigits) in a burst, and the burst refills at \(client.permissions.requestsPerMinute.plainDigits) per minute. Retry in \(general.retryAfterSeconds.plainDigits) s.", clientName: client.name)
         }
 
         if permission != .read {
@@ -432,13 +446,14 @@ public actor AccessController {
             if permission == .delete, !client.permissions.allowsDelete {
                 return .reject("The client «\(client.name)» may write but not delete — that is a right of its own, and it has not been granted.", clientName: client.name)
             }
+            let writeBurst = Self.writeBurst(for: client)
             var writeBucket = writeBuckets[client.id]
-                ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: max(1, client.permissions.burst / 2))
+                ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: writeBurst)
             let write = writeBucket.take()
             writeBuckets[client.id] = writeBucket
             guard write.allowed else {
                 throttled[client.id, default: 0] += 1
-                return .reject("Too many write operations: the client «\(client.name)» is allowed \(client.permissions.writesPerMinute.plainDigits) per minute.", clientName: client.name)
+                return .reject("Too many write operations at once: the client «\(client.name)» may write \(writeBurst.plainDigits) in a burst, and the burst refills at \(client.permissions.writesPerMinute.plainDigits) per minute.", clientName: client.name)
             }
         }
 
@@ -483,22 +498,23 @@ public actor AccessController {
             throttled[client.id, default: 0] += 1
             return .reject(
                 status: 429,
-                message: String(localized: "Слишком много запросов: клиенту «\(client.name)» разрешено \(client.permissions.requestsPerMinute.plainDigits) в минуту."),
+                message: String(localized: "Слишком много запросов подряд: клиенту «\(client.name)» разрешено \(client.permissions.burst.plainDigits) за раз, дальше запас восполняется со скоростью \(client.permissions.requestsPerMinute.plainDigits) в минуту."),
                 clientName: client.name,
                 retryAfterSeconds: general.retryAfterSeconds
             )
         }
 
         if route.access.changesData {
+            let writeBurst = Self.writeBurst(for: client)
             var writeBucket = writeBuckets[client.id]
-                ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: max(1, client.permissions.burst / 2))
+                ?? TokenBucket(perMinute: client.permissions.writesPerMinute, burst: writeBurst)
             let write = writeBucket.take()
             writeBuckets[client.id] = writeBucket
             guard write.allowed else {
                 throttled[client.id, default: 0] += 1
                 return .reject(
                     status: 429,
-                    message: String(localized: "Слишком много операций записи: клиенту «\(client.name)» разрешено \(client.permissions.writesPerMinute.plainDigits) в минуту."),
+                    message: String(localized: "Слишком много операций записи подряд: клиенту «\(client.name)» разрешено \(writeBurst.plainDigits) за раз, дальше запас восполняется со скоростью \(client.permissions.writesPerMinute.plainDigits) в минуту."),
                     clientName: client.name,
                     retryAfterSeconds: write.retryAfterSeconds
                 )
@@ -510,7 +526,7 @@ public actor AccessController {
             throttled[client.id, default: 0] += 1
             return .reject(
                 status: 429,
-                message: String(localized: "Прокси перегружен: суммарный лимит \(Self.globalRequestsPerMinute.plainDigits) запросов в минуту."),
+                message: String(localized: "Прокси перегружен: всеми ключами вместе разрешено \(Self.globalBurst.plainDigits) запросов за раз, дальше запас восполняется со скоростью \(Self.globalRequestsPerMinute.plainDigits) в минуту."),
                 clientName: client.name,
                 retryAfterSeconds: global.retryAfterSeconds
             )

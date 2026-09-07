@@ -268,7 +268,7 @@ struct ReembeddingProgressCard: View {
     @ObservedObject var model: ReembeddingViewModel
 
     var body: some View {
-        SectionCard(title: "Пересчёт векторов идёт") {
+        SectionCard(title: String(localized: "Пересчёт векторов идёт")) {
             VStack(alignment: .leading, spacing: 8) {
                 if let request = model.runningRequest {
                     Text("«\(request.collection.name)» → \(request.targetModel) · \(request.scenario.title)")
@@ -302,7 +302,7 @@ struct ReembeddingReportCard: View {
     let report: ReembeddingReport
 
     var body: some View {
-        SectionCard(title: "Результат пересчёта") {
+        SectionCard(title: String(localized: "Результат пересчёта")) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(report.line).font(Theme.Font.body)
                     .fixedSize(horizontal: false, vertical: true)

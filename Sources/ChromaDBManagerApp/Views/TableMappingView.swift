@@ -63,7 +63,7 @@ struct TableMappingSheet: View {
     @ViewBuilder
     private var filesCard: some View {
         SectionCard(
-            title: "Таблицы источника",
+            title: String(localized: "Таблицы источника"),
             subtitle: model.isScanning
                 ? String(localized: "Ищем таблицы в папке источника…")
                 : String(localized: "Файлы, которые этот источник отдаст табличному конвейеру. Выберите любой — он только читается.")
@@ -138,7 +138,7 @@ struct TableMappingSheet: View {
     // MARK: - Sheets
 
     private var sheetPicker: some View {
-        SectionCard(title: "Листы", subtitle: model.fileName ?? "") {
+        SectionCard(title: String(localized: "Листы"), subtitle: model.fileName ?? "") {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(model.sheets) { preview in
                     HStack(spacing: 8) {
@@ -184,7 +184,7 @@ struct TableMappingSheet: View {
     /// The first rows, coloured by what each column is for —'s «с
     /// подсветкой ролей колонок».
     private func sheetCard(_ preview: TableMappingViewModel.SheetPreview) -> some View {
-        SectionCard(title: "Первые строки", subtitle: "Как их прочитало приложение: текст, число, дата или пусто.") {
+        SectionCard(title: String(localized: "Первые строки"), subtitle: String(localized: "Как их прочитало приложение: текст, число, дата или пусто.")) {
             let mapping = model.draft ?? TableMapping(sheetName: preview.sheet.name)
             let width = max(mapping.columns.count, (preview.rows.map { $0.lastColumn + 1 }.max() ?? 0))
             VStack(alignment: .leading, spacing: 6) {
@@ -373,8 +373,8 @@ struct TableMappingSheet: View {
 
     private func rolesCard(_ preview: TableMappingViewModel.SheetPreview) -> some View {
         SectionCard(
-            title: "Колонки",
-            subtitle: "Текст уходит в документ и участвует в поиске по смыслу; метаданные — в фильтры. Артикул в тексте это шум в векторе."
+            title: String(localized: "Колонки"),
+            subtitle: String(localized: "Текст уходит в документ и участвует в поиске по смыслу; метаданные — в фильтры. Артикул в тексте это шум в векторе.")
         ) {
             let binding = model.binding(for: preview.sheet.name)
             VStack(alignment: .leading, spacing: 6) {
@@ -522,8 +522,8 @@ struct TableMappingSheet: View {
         // нигде: закрыли экран, и следа не осталось.
         if model.selectedSheetAwaitsWrite {
             SectionCard(
-                title: "Лист ждёт записи",
-                subtitle: "Лист очищен под переиндексацию: его строк в коллекции сейчас нет, и поиск по ним ничего не находит."
+                title: String(localized: "Лист ждёт записи"),
+                subtitle: String(localized: "Лист очищен под переиндексацию: его строк в коллекции сейчас нет, и поиск по ним ничего не находит.")
             ) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Запишет их обычная синхронизация источника — по нынешней разметке. Пока она не прошла, лист в базе пуст.")
@@ -541,7 +541,7 @@ struct TableMappingSheet: View {
             }
         } else if let state = model.reindexState() {
             SectionCard(
-                title: "Переиндексация листа",
+                title: String(localized: "Переиндексация листа"),
                 subtitle: state.changed
                     ? String(localized: "Разметка изменилась с той, которой лист записан. Пока лист не переиндексирован, в коллекции лежат строки, собранные прежним рецептом.")
                     : String(localized: "Лист записан нынешней разметкой. Переиндексация нужна только после её изменения.")
@@ -582,8 +582,8 @@ struct TableMappingSheet: View {
 
     private var documentCard: some View {
         SectionCard(
-            title: "Что получится из строки",
-            subtitle: "Из этого текста считается вектор — от него прямо зависит поиск. Поэтому он показан до запуска, а не подбирается переиндексациями."
+            title: String(localized: "Что получится из строки"),
+            subtitle: String(localized: "Из этого текста считается вектор — от него прямо зависит поиск. Поэтому он показан до запуска, а не подбирается переиндексациями.")
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 if let binding = model.preview.map({ model.binding(for: $0.sheet.name) }),
@@ -654,8 +654,8 @@ struct TableMappingSheet: View {
 
     private var profileCard: some View {
         SectionCard(
-            title: "Профиль сопоставления",
-            subtitle: "Применяется к файлам с тем же набором колонок. Файл с другим набором не индексируется наполовину — он попадёт в «требуют решения»."
+            title: String(localized: "Профиль сопоставления"),
+            subtitle: String(localized: "Применяется к файлам с тем же набором колонок. Файл с другим набором не индексируется наполовину — он попадёт в «требуют решения».")
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Название профиля", text: $model.profileName)

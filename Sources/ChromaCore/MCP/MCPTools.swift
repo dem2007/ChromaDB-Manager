@@ -276,6 +276,14 @@ public struct MCPDocumentsRequest: Sendable {
     public let filter: DocumentFilter?
     public let limit: Int
     public let offset: Int
+    /// Тексты не нужны — нужны только метаданные.
+    ///
+    /// Оглавление строится по `heading_path` и `chunk_index`, а сами тексты
+    /// в нём не участвуют вовсе. Без этого карта файла на тысячу кусков
+    /// тянула из базы весь его текст — мегабайты ради того, чтобы их
+    /// выбросить, и ровно та цена, от которой оглавление и спасает.
+    public let needsText: Bool
+
     /// Отдавать чанки в порядке файла, а не как придётся.
     ///
     /// Просит `get_file`. Обычный `get_documents` этого не просит и получает
@@ -289,7 +297,8 @@ public struct MCPDocumentsRequest: Sendable {
         filter: DocumentFilter?,
         limit: Int,
         offset: Int,
-        orderedByChunkIndex: Bool = false
+        orderedByChunkIndex: Bool = false,
+        needsText: Bool = true
     ) {
         self.collection = collection
         self.ids = ids
@@ -297,6 +306,7 @@ public struct MCPDocumentsRequest: Sendable {
         self.limit = limit
         self.offset = offset
         self.orderedByChunkIndex = orderedByChunkIndex
+        self.needsText = needsText
     }
 }
 
@@ -439,6 +449,22 @@ public struct MCPWritePayload: Sendable, Hashable {
     }
 }
 
+/// Где документ лежит на диске — и сколько он весит там.
+///
+/// Агент работает на той же машине, что и приложение: путь к файлу — это
+/// самый дешёвый способ отдать ему документ целиком. Ноль вызовов на чтение,
+/// ноль знаков в контексте, и текст берётся из первоисточника, а не
+/// собирается обратно из кусков.
+public struct MCPFileOnDisk: Sendable, Hashable {
+    public let path: String
+    public let bytes: Int?
+
+    public init(path: String, bytes: Int?) {
+        self.path = path
+        self.bytes = bytes
+    }
+}
+
 /// Что инструментам нужно от приложения.
 ///
 /// Протокол, а не прямые вызовы клиента ChromaDB: инструменты живут в ядре и
@@ -459,6 +485,17 @@ public protocol MCPToolBackend: Sendable {
     func add(_ request: MCPAddRequest) async throws -> MCPAddAnswer
     /// Удаление по явному списку идентификаторов.
     func delete(_ request: MCPDeleteRequest) async throws -> MCPDeleteAnswer
+
+    /// Где лежит исходный файл этого куска, если он есть и доступен.
+    ///
+    /// `nil` — документ пришёл не из файла (записан агентом, взят из веба)
+    /// или файла на месте больше нет. Подложки, которым это неизвестно,
+    /// молчат: умолчание ниже.
+    func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk?
+}
+
+public extension MCPToolBackend {
+    func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk? { nil }
 }
 
 /// Реестр инструментов этапа 7.
@@ -550,9 +587,12 @@ public enum MCPToolCatalogue {
         "description": .string("""
         Metadata filter in ChromaDB syntax: {"field": {"$eq": value}}. \
         Supported: $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, and $and / $or with a \
-        list of conditions. Take field names and their types from \
-        describe_collection: comparing against the number 2024 and against the \
-        string «2024» are different conditions, and the second returns nothing.
+        list of conditions. There is no substring operator here — «$regex» is \
+        refused and «$contains» matches nothing at all on metadata; use the \
+        «contains» parameter, which searches the text of documents. Take field \
+        names and their types from describe_collection: comparing against the \
+        number 2024 and against the string «2024» are different conditions, and \
+        the second returns nothing.
         """),
     ])
 
@@ -615,6 +655,10 @@ public enum MCPToolCatalogue {
         A result may carry its parent section marked as context: it does not take \
         one of the requested places. Long documents are cut with an explicit note — \
         take the full text with get_file or get_documents by the same id. \
+        **Search inside one file** by filtering on it: `{"file_id": {"$eq": "…"}}` \
+        with the fingerprint from any of its chunks. On a document of a thousand \
+        chunks this is the way to find what a question is about — reading it \
+        whole is not possible. \
         You can search **several collections at once**: pass them as a list in \
         «collections» instead of «collection». The query vector is computed once, \
         each result says which collection it came from, and the merged list is \
@@ -758,8 +802,14 @@ public enum MCPToolCatalogue {
         name: "get_file",
         title: "Whole file",
         description: """
-        Returns every chunk of one file **in order** — the order the file was cut \
-        into. Use it when search found a fragment but the whole document is needed. \
+        Returns one file: as continuous text, as a map of its sections, or as \
+        its chunks **in order** — the order the file was cut into. \
+        **To get a whole document**, ask with «as»: "text" and page it with the \
+        «offset» the answer gives you; every answer also carries «sourcePath», \
+        the document's place on this machine's disk — if you can read files \
+        there, that is the whole document in one step and costs nothing. \
+        To work with a large document without reading it whole, ask for \
+        «outline» first and then the section you need by «heading». \
         Ask by file_id: a short fingerprint carried in the metadata of any result. \
         A path is accepted too, but it is easy to spoil when retyped. The order is \
         guaranteed by this tool and only by it: get_documents by filter returns an \
@@ -798,12 +848,75 @@ public enum MCPToolCatalogue {
                 "limit": .object([
                     "type": .string("integer"),
                     "minimum": .int(1),
-                    "description": .string("How many chunks to return at once. Default 5; the ceiling belongs to the key."),
+                    "description": .string("How many chunks to return at once. Unset, a page of text fills the answer budget and a page of chunks holds 5; the ceiling belongs to the key. Ignored with «outline», where chunks are not counted at all."),
                 ]),
                 "offset": .object([
                     "type": .string("integer"),
                     "minimum": .int(0),
-                    "description": .string("Which chunk to continue from — the number given by the previous answer."),
+                    "description": .string("Which chunk to continue from — the number given by the previous answer. With «heading» it counts inside that section, so a section too big for one answer is read on. Ignored with «outline»; with «as»: \"text\" it works and counts chunks."),
+                ]),
+                "as": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("chunks"), .string("text")]),
+                    "description": .string("""
+                    «text» returns the document as continuous text instead of \
+                    a list of chunks: no ids, no metadata, no mirror in \
+                    structuredContent — the text travels once. Measured on \
+                    answers of the same size: 4 640 characters of the document \
+                    as chunks against 20 880 as text. The document is described \
+                    once, on the first page («document» in the structured \
+                    answer: size, language, sections, extraction warnings); \
+                    after that the answer is text alone, carrying only \
+                    «[chunk N]» marks — and «[chunk N · section]» where the \
+                    section changes — so you always know where you are and \
+                    what to quote. Strip the marks before quoting. This is the \
+                    way to **read a whole file**: page it with «offset», which \
+                    the answer gives you, or take «sourcePath» from the answer \
+                    and open the original file directly if you can reach this \
+                    machine's disk. Overlapping chunks are joined without the \
+                    repeats. **This is the default** — ask for «chunks» when \
+                    you need the ids to fetch with get_documents, or the \
+                    metadata of each chunk; passing «fields» selects chunks on \
+                    its own, since text has no metadata to project.
+                    """),
+                ]),
+                "outline": .object([
+                    "type": .string("boolean"),
+                    "description": .string("""
+                    Return the structure of the file instead of its text: its \
+                    sections, the chunks each one spans and roughly how many \
+                    tokens it weighs. **Ask for this first on any file you have \
+                    not read.** A specification of a thousand chunks will not \
+                    fit in one answer nor in your context — reading it by \
+                    offset takes hundreds of calls — but its outline fits in \
+                    one, and from it you choose the section you actually need.
+                    """),
+                ]),
+                "outline_depth": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "description": .string("""
+                    How deep the outline goes. Default 1 — the top level only, \
+                    which is what a map is for: a specification of a thousand \
+                    chunks has hundreds of sub-headings, and listing them all \
+                    gives a wall, not a map. Go deeper inside one section by \
+                    passing «heading» together with «outline».
+                    """),
+                ]),
+                "heading": .object([
+                    "type": .string("string"),
+                    "description": .string("""
+                    Read one section instead of a page: the value of \
+                    «heading_path» from the outline. Subsections come with it: \
+                    a heading brings everything whose path starts with it, so \
+                    asking for a chapter gives the chapter and its parts. \
+                    Whitespace is matched loosely — a name copied from the \
+                    outline works even where it holds a line break or a \
+                    non-breaking space — and a miss answers with the nearest \
+                    section names, so you need not ask for the map again. A \
+                    section is a unit you can reason about and name to a person; \
+                    «chunks 200 to 203» is neither.
+                    """),
                 ]),
                 "fields": fieldsProperty,
             ]),
@@ -812,17 +925,54 @@ public enum MCPToolCatalogue {
             "required": .array([.string("collection")]),
             "additionalProperties": .bool(false),
         ]),
+        // Схема описывает **все три** вида ответа: страницу по порядку,
+        // карту файла и раздел. Обязательна одна коллекция: карта отдаёт
+        // «sections» и не отдаёт «documents», и клиент, сверяющий выдачу со
+        // схемой, выбрасывал её целиком.
         outputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "collection": .object(["type": .string("string")]),
                 "file": .object(["type": .string("string")]),
                 "fileId": .object(["type": .string("string")]),
+                "notes": .object(["type": .string("array")]),
+                // Чтение по порядку.
                 "documents": .object(["type": .string("array")]),
                 "total": .object(["type": .string("integer")]),
+                "offset": .object(["type": .string("integer")]),
+                "nextOffset": .object(["type": .string("integer")]),
                 "hasMore": .object(["type": .string("boolean")]),
+                "fitsInOneAnswer": .object(["type": .string("boolean")]),
+                "callsToFinish": .object(["type": .string("integer")]),
+                "similarFiles": .object(["type": .string("array")]),
+                // Карта файла.
+                "outline": .object(["type": .string("boolean")]),
+                "sections": .object(["type": .string("array")]),
+                "totalSections": .object(["type": .string("integer")]),
+                "totalChunks": .object(["type": .string("integer")]),
+                "estimatedTokens": .object(["type": .string("integer")]),
+                // Чтение по разделу.
+                "heading": .object(["type": .string("string")]),
+                "chunksInSection": .object(["type": .string("integer")]),
+                "estimatedTokensInSection": .object(["type": .string("integer")]),
+                "sectionFitsInOneAnswer": .object(["type": .string("boolean")]),
+                // Документ текстом и файл на диске.
+                "as": .object(["type": .string("string")]),
+                "characters": .object(["type": .string("integer")]),
+                "chunksShown": .object(["type": .string("integer")]),
+                "sourcePath": .object(["type": .string("string")]),
+                "sourceBytes": .object(["type": .string("integer")]),
+                "document": .object(["type": .string("object")]),
+                "callsToFinishSection": .object(["type": .string("integer")]),
+                "nearestSections": .object(["type": .string("array")]),
+                // Метаданные, одинаковые у всех кусков ответа: один раз
+                // здесь вместо повтора на каждом.
+                "sharedMetadata": .object(["type": .string("object")]),
+                // Цена чтения целиком, посчитанная картой.
+                "charactersEstimate": .object(["type": .string("integer")]),
+                "callsToReadWhole": .object(["type": .string("integer")]),
             ]),
-            "required": .array([.string("collection"), .string("documents")]),
+            "required": .array([.string("collection")]),
         ]),
         permission: .read
     )
@@ -1540,6 +1690,30 @@ public struct MCPToolService: Sendable {
         let request: MCPDocumentsRequest
         let limitNote: String?
         let fields: [String]?
+        /// Спросили не текст, а устройство файла: разделы и их размеры.
+        let wantsOutline: Bool
+        /// Спросили **документ текстом**, а не список кусков.
+        let wantsWholeText: Bool
+        /// Просил ли агент «limit» явно. Нужно, чтобы сказать вслух, что
+        /// в режиме сплошного текста он не действует: молча выбросить
+        /// переданный параметр хуже, чем урезать его (правило 3
+        /// приложения 5).
+        let askedLimit: Int?
+        /// Читать не с начала, а раздел — тот, чей `heading_path` назван.
+        let heading: String?
+        /// Смещение **внутри раздела**, когда он не поместился целиком.
+        let sectionOffset: Int
+        /// Сколько кусков раздела показать за раз.
+        ///
+        /// Отдельно от `request.limit`: у запроса к базе он подменён на весь
+        /// файл — границы раздела иначе не найти, — и просьба агента там
+        /// не сохраняется. Хранить её надо здесь, иначе «limit» с «heading»
+        /// перестаёт работать, как обещано в схеме.
+        let sectionLimit: Int
+        /// До какого уровня сворачивать оглавление. Не меньше единицы:
+        /// несвёрнутая карта на живом ТЗ давала 596 «разделов» и переставала
+        /// быть картой, поэтому такого случая нет вовсе.
+        let outlineDepth: Int
     }
 
     /// Имена параметров, которыми агент попытался бы передать вектор.
@@ -1547,6 +1721,61 @@ public struct MCPToolService: Sendable {
         guard let object = arguments?.objectValue else { return nil }
         let forbidden = ["embedding", "embeddings", "vector", "query_embedding", "query_embeddings"]
         return forbidden.first { object[$0] != nil }
+    }
+
+    /// Операторы, которые ChromaDB понимает в фильтре по метаданным.
+    ///
+    /// Список снят с живой базы (chroma 1.4.4), а не с документации: каждый
+    /// проверен запросом, и в нём нет ни одного, про который «должно
+    /// работать».
+    private static let metadataOperators: Set<String> = [
+        "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$and", "$or",
+    ]
+
+    /// Операторы поиска подстроки. ChromaDB принимает их **в фильтре по
+    /// метаданным тоже** — и не находит по ним ничего.
+    ///
+    /// Замерено на живой базе: у 1699 документов `doc_type` начинается с
+    /// «ГК ПР10», а `{"doc_type": {"$contains": "ПР10"}}` возвращает ноль,
+    /// без ошибки. Отказ здесь — не строгость ради строгости: молчаливый
+    /// пустой ответ агент читает как «в базе этого нет» и уходит искать
+    /// в другое место, тогда как ошибку он читает и исправляет.
+    private static let textOnlyOperators: Set<String> = ["$contains", "$not_contains"]
+
+    /// Первый оператор фильтра, который база не поймёт, — вместе с тем, что
+    /// делать вместо него.
+    ///
+    /// Проверяется до отправки, потому что своим ответом база объясняет
+    /// ровно ничего: на `$regex` она отвечает «Invalid where clause», не
+    /// называя ни поля, ни оператора. В журнале это видно трижды подряд —
+    /// агент повторил один и тот же неисправимый вызов.
+    private static func unsupportedOperator(in value: JSONValue) -> String? {
+        if let object = value.objectValue {
+            for (key, nested) in object.sorted(by: { $0.key < $1.key }) {
+                if key.hasPrefix("$") {
+                    if textOnlyOperators.contains(key) {
+                        return "The «\(key)» operator works on the text of documents, not on metadata: "
+                            + "ChromaDB accepts it in a metadata filter and then matches nothing at all. "
+                            + "To search the text use the «contains» parameter; to match a metadata field "
+                            + "use «$eq» with a value taken from describe_collection."
+                    }
+                    guard metadataOperators.contains(key) else {
+                        return "The «\(key)» operator is not supported in «filter». "
+                            + "Supported: \(metadataOperators.sorted().joined(separator: ", ")). "
+                            + "For a substring use the «contains» parameter — it searches the text of "
+                            + "documents; for a section use get_file with «heading»."
+                    }
+                }
+                if let problem = unsupportedOperator(in: nested) { return problem }
+            }
+            return nil
+        }
+        if let array = value.arrayValue {
+            for nested in array {
+                if let problem = unsupportedOperator(in: nested) { return problem }
+            }
+        }
+        return nil
     }
 
     /// Фильтр по метаданным и по тексту из параметров вызова.
@@ -1568,6 +1797,9 @@ public struct MCPToolService: Sendable {
                 return .failure(.invalidParams("The «filter» parameter must be an object: {\"field\": {\"$eq\": value}}."))
             }
             if !object.isEmpty {
+                if let problem = unsupportedOperator(in: raw) {
+                    return .failure(.invalidParams(problem))
+                }
                 guard let text = raw.jsonString else {
                     return .failure(.invalidParams("The «filter» parameter could not be read as JSON."))
                 }
@@ -1922,16 +2154,80 @@ public struct MCPToolService: Sendable {
         case .success(let value): fields = value
         }
 
+        let outline = arguments?["outline"]?.boolValue ?? false
+        // «as»: «chunks» — как было, «text» — сплошной текст документа.
+        // Незнакомое значение — отказ, а не молчаливое «как было»: агент,
+        // написавший «full», должен узнать об этом сразу, а не по тому, что
+        // ответ выглядит не так.
+        let shape = argument("as")?.lowercased()
+        if let shape, shape != "text", shape != "chunks" {
+            return .failure(.invalidParams("The «as» parameter takes «text» — the document as continuous text — or «chunks», the default."))
+        }
+        // Умолчание — **сплошной текст**, а не куски.
+        //
+        // Замер по журналу: 183 вызова `get_file` живыми агентами, из них
+        // текстом — ноль. Режим описан в скилле пять раз, в схеме — с
+        // замером «4 640 против 20 880», и всё равно не выбирается: агент
+        // решает по заметкам в ответе, а не по описанию параметра. Совет как
+        // средство здесь исчерпан, остаётся умолчание.
+        //
+        // Куски остаются там, где их спросили: явным «as»: "chunks" — и там,
+        // где передан «fields». Проекция полей относится к метаданным куска,
+        // а у сплошного текста метаданных нет вовсе: молча переключить такой
+        // вызов в режим, где его параметр не значит ничего, хуже, чем
+        // оставить как было. Тех и других в замере 8 из 183.
+        let wholeText: Bool
+        if let shape {
+            wholeText = shape == "text"
+        } else {
+            wholeText = !outline && fields == nil
+        }
+        let heading = argument("heading")
+        // Умолчание — верхний уровень: карта нужна обозримой, а подробности
+        // берутся тем же вызовом с «heading».
+        let depth: Int
+        switch integer(arguments, "outline_depth") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): depth = max(1, value ?? 1)
+        }
         return .success(ParsedFile(
             path: path ?? "",
             fingerprint: fingerprint,
             request: MCPDocumentsRequest(
                 collection: collection, ids: [],
                 filter: fingerprint.map { fingerprintFilter($0) } ?? fileFilter(path ?? ""),
-                limit: resolved.count, offset: offset, orderedByChunkIndex: true
+                // Оглавление строится по всему файлу сразу: половину разделов
+                // показать хуже, чем не показать вовсе.
+                // Раздел, как и оглавление, отбирается из всего файла: его
+                // границы неизвестны заранее, а брать страницу и надеяться,
+                // что раздел в неё попал, — то же гадание, от которого уходим.
+                limit: (outline || wholeText || heading != nil) ? MCPFileChunks.maximumOrdered : resolved.count,
+                offset: (outline || wholeText || heading != nil) ? 0 : offset,
+                orderedByChunkIndex: true,
+                // Ни карте, ни поиску границ раздела текст не нужен: обе
+                // работают по заголовкам и номерам, а окно у них — весь файл.
+                // Тексты раздела добираются отдельно, по идентификаторам
+                // страницы.
+                needsText: !(outline || wholeText || heading != nil)
             ),
-            limitNote: resolved.note,
-            fields: fields
+            // У раздела «limit» работает, значит и про его урезание
+            // потолком ключа нужно сказать. Молчит только оглавление: там
+            // число кусков ни на что не влияет.
+            // Ни карта, ни сплошной текст «limit» не читают: у первой куски
+            // не считаются вовсе, у второго счёт идёт знаками бюджета.
+            // Ни карта «limit» не читает — у неё куски не считаются вовсе.
+            // Сплошной текст читает: с он стал умолчанием, и параметр,
+            // переданный в режим, который человек не выбирал, обязан
+            // работать, а не пропадать в пометке «проигнорировано».
+            limitNote: outline ? nil : resolved.note,
+            fields: fields,
+            wantsOutline: outline,
+            wantsWholeText: wholeText,
+            askedLimit: requested,
+            heading: heading,
+            sectionOffset: offset,
+            sectionLimit: resolved.count,
+            outlineDepth: depth
         ))
     }
 
@@ -2117,7 +2413,8 @@ public struct MCPToolService: Sendable {
     private func search(_ parsed: ParsedSearch, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.search(parsed.request)
         let rendered = MCPDocumentRendering.render(
-            answer.documents, limits: limits, metric: answer.metric, fields: parsed.fields
+            answer.documents, limits: limits, metric: answer.metric, fields: parsed.fields,
+            vocabulary: .searchResults
         )
 
         var structured: [String: JSONValue] = [
@@ -2171,7 +2468,10 @@ public struct MCPToolService: Sendable {
     private func documents(_ parsed: ParsedDocuments, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.documents(parsed.request)
         let rendered = MCPDocumentRendering.render(
-            answer.documents, limits: limits, fields: parsed.fields
+            answer.documents, limits: limits, fields: parsed.fields,
+            // Выборку по идентификаторам «limit» не режет: советовать его
+            // уменьшить значит советовать бездействие.
+            vocabulary: parsed.request.ids.isEmpty ? .documents : .identifiedDocuments
         )
 
         var structured: [String: JSONValue] = [
@@ -2342,7 +2642,8 @@ public struct MCPToolService: Sendable {
         }
         let rendered = MCPDocumentRendering.render(
             samples, limits: limits, fields: parsed.fields,
-            budget: max(1, limits.responseCharacters - listingSize)
+            budget: max(1, limits.responseCharacters - listingSize),
+            vocabulary: .mentionSamples
         )
         notes += rendered.notes
 
@@ -2361,16 +2662,1498 @@ public struct MCPToolService: Sendable {
         return answered([header] + listing + [""] + rendered.lines)
     }
 
+    /// Во сколько вызовов уложится чтение файла целиком — и стоит ли браться.
+    ///
+    /// Порог не из головы: десять вызовов агент делает, тридцать — уже нет,
+    /// а триста не сделает никто. Живой случай: ТЗ на 1281 кусок, в ответ
+    /// помещается четыре — агент прочитал двадцать три куска из тысячи с
+    /// лишним и написал по ним «критический разбор», не заметив, что видел
+    /// один процент.
+    static let wholeFileCallBudget = 10
+
+    /// Потолок числа кусков за одну ходку в режиме сплошного текста.
+    static let wholeTextBatch = 64
+
+    /// Первая ходка — короткая, пока о длине кусков ничего не известно.
+    ///
+    /// Порция в тридцать два куска при живой длине в 1150 знаков и бюджете
+    /// в 21 000 давала восемнадцать кусков в ответ и четырнадцать —
+    /// в мусор: сорок четыре процента лишнего чтения на каждой странице.
+    /// После первой ходки длина известна точно, и порция считается под
+    /// остаток бюджета.
+    static let wholeTextBatchFirst = 12
+    /// Сколько таких ходок на один ответ.
+    ///
+    /// Ограничение от зацикливания, а не от объёма: набор идёт, пока есть
+    /// бюджет. Четырёх ходок хватало на куски обычной длины, но у коллекции,
+    /// нарезанной по сотне знаков, они дают 12 800 знаков при бюджете в
+    /// 23 000 — ответ наполовину пуст, и агент платит вдвое больше вызовов
+    /// ровно там, где режим и придуман их сокращать.
+    static let wholeTextRoundLimit = 64
+
+    /// Запас под пометки ответа — **по замеру**, а не круглым числом
+    /// (правило 4 приложения 5).
+    ///
+    /// Семь пометок могут встретиться в одном ответе; их постоянные части
+    /// с подставленными самыми длинными числами дают 872 знака плюс семь
+    /// переводов строки. Путь на диске в них не входит — он считается
+    /// отдельно, потому что длины у него нет.
+    ///
+    /// Число это **устаревает**: прошлый замер был на шести пометках, и
+    /// следующий же коммит добавил седьмую и удлинил другую, не пересчитав
+    /// запас. Поэтому его держит проверка
+    /// `testEveryNoteAtOnceStaysInsideTheCeiling`: она собирает ответ, где
+    /// срабатывают все пометки сразу, и падает, как только они перестают
+    /// помещаться.
+    static let wholeTextNotesReserve = 900
+
+    /// Запас под заголовок ответа и зеркало пути.
+    ///
+    /// Путь уезжает трижды — строкой заголовка, полем `file` и пометкой про
+    /// диск, — а оплачивался один раз. У `collect_mentions` пути по четыреста
+    /// знаков проверяются тестом, то есть случай живой.
+    static let wholeTextHeaderReserve = 120
+    /// Меньше этого ответ текстом не имеет смысла.
+    static let minimumWholeTextAnswer = 2_000
+
+    /// Как называется всё, что лежит до первого заголовка файла.
+    ///
+    /// Одна метка на оглавление и на отбор: если карта называет раздел, его
+    /// обязано быть можно спросить. Иначе выходит место на карте, куда сама
+    /// карта не ведёт.
+    static let beforeFirstHeading = "(before the first heading)"
+
+    /// Имя раздела в том виде, в каком его можно набрать обратно.
+    ///
+    /// Ключ раздела — строка, которую агент перепечатывает с карты руками.
+    /// В `heading_path` живого ТЗ нашлись **неразрывный пробел** и **перевод
+    /// строки**: на экране они неотличимы от обычного пробела. Агент набрал
+    /// обычный, сравнение шло знак в знак — и он получил «в файле нет такого
+    /// раздела» про раздел, который карта назвала строкой выше. Цена той
+    /// невидимой закорючки: 352 куска и 101 067 токенов — пятая часть
+    /// документа, — не прочитанные и без объяснения почему.
+    ///
+    /// Поэтому пробельное приводится к одному виду и на карте, и в отборе:
+    /// печатается ровно то, что потом сработает. Ключ, который нельзя
+    /// набрать, — не ключ.
+    static func typeableHeading(_ value: String) -> String {
+        value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// Каким разделом считается каждый кусок — одним правилом.
+    ///
+    /// Правило одно на карту и на отбор нарочно. Кусок без заголовка —
+    /// таблица, врезка, продолжение абзаца — принадлежит разделу, внутри
+    /// которого лежит; карта так и считала, а отбор по «heading» считал иначе
+    /// и такие куски терял. Раздел, который карта называет, обязан выдаваться
+    /// целиком: иначе на карте есть место, куда сама карта не ведёт.
+    static func effectiveHeadings(of documents: [MCPDocumentPayload]) -> [String] {
+        var carried: String?
+        return documents.map { payload in
+            if case .string(let value)? = payload.metadata?["heading_path"] {
+                let name = Self.typeableHeading(value)
+                if !name.isEmpty {
+                    carried = name
+                    return name
+                }
+            }
+            return carried ?? Self.beforeFirstHeading
+        }
+    }
+
+    /// Слова имени раздела для счёта совпадений.
+    ///
+    /// Один разбор на спрошенное имя и на кандидатов: две копии разошлись бы
+    /// при первой же правке, и счёт тихо перестал бы совпадать.
+    static func headingWords(_ value: String) -> Set<String> {
+        Set(
+            value.lowercased()
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+        )
+    }
+
+    /// Пометка о том, что передали и что не сработало.
+    ///
+    /// Одна на все ветки: молча выбросить переданный параметр хуже, чем
+    /// урезать его (правило 3 приложения 5), и правило это одинаково верно
+    /// для каждого вида ответа. Первый раз пометка была написана только
+    /// для сплошного текста, и карта осталась без неё.
+    static func ignoredNote(_ names: [String], mode: String, because reason: String) -> String? {
+        guard !names.isEmpty else { return nil }
+        let list = names.joined(separator: " and ")
+        let verb = names.count == 1 ? "does" : "do"
+        return "\(list) \(verb) not apply to \(mode) — \(reason)"
+    }
+
+    /// Ответ на промах по имени раздела — один на все три ветки `get_file`.
+    ///
+    /// Третья копия этого места родилась уже без последней строки — той,
+    /// что говорит, **что делать дальше**, — и промах снова упирался в
+    /// тупик, ради ухода от которого блок и писался.
+    static func sectionNotFound(
+        file: String, heading: String, among headings: [String]
+    ) -> (lines: [String], nearest: [String]) {
+        let nearest = nearestSections(to: heading, among: headings)
+        var lines = ["The file «\(file)» has no section «\(heading)»."]
+        guard !nearest.isEmpty else {
+            lines.append("Call get_file with «outline»: true and no «heading» to see the sections it does have.")
+            return (lines, [])
+        }
+        lines.append("Its sections closest to that name are:")
+        lines += nearest.map { "• \($0)" }
+        lines.append("Ask for one of these by «heading», or call get_file with «outline»: true and no «heading» for the whole map.")
+        return (lines, nearest)
+    }
+
+    /// Разделы файла, похожие на спрошенный, — подсказка на промах.
+    ///
+    /// «В файле нет такого раздела. Позови outline» — совет в пустоту: имя
+    /// агент оттуда и взял. Промах по имени лечится тем же, чем промах по
+    /// пути, — показать то, что есть, и не заставлять ходить второй раз.
+    ///
+    /// Кандидаты берутся **на той глубине, на какой спросили**. Иначе агент,
+    /// опечатавшийся в имени подраздела на шесть кусков, получал в ответ
+    /// главу на триста пятьдесят — и уходил читать её девяноста вызовами.
+    static func nearestSections(to heading: String, among headings: [String], limit: Int = 5) -> [String] {
+        // Глубина спрошенного имени: спросили главу — предлагаем главы,
+        // спросили подраздел — подразделы.
+        let depth = max(1, typeableHeading(heading).components(separatedBy: " > ").count)
+        var names: [String] = []
+        let trimmed = headings.map { name -> String in
+            let parts = name.components(separatedBy: " > ")
+            return parts.count > depth ? parts.prefix(depth).joined(separator: " > ") : name
+        }
+        for name in trimmed where names.last != name {
+            if !names.contains(name) { names.append(name) }
+        }
+        // Ничего похожего — лучше промолчать, чем назвать «ближайшими»
+        // первые пять разделов файла: у настоящего ТЗ это титульный лист
+        // и содержание, то есть самое бесполезное из всего документа.
+        let asked = headingWords(typeableHeading(heading)).filter { $0.count > 2 }
+        guard !asked.isEmpty else { return [] }
+        // Счёт по общим словам: опечатка в одном слове не должна прятать
+        // раздел, совпавший остальными пятью.
+        //
+        // При равном счёте порядок закрепляется местом в файле: `sorted`
+        // в Swift не устойчива, и восемь одинаково подошедших «Требований
+        // к оказанию услуг…» возвращались бы каждый раз в своём порядке —
+        // агент не смог бы понять, есть нужный раздел в списке или нет.
+        // Та же оговорка, что у перечня файлов в collect_mentions.
+        struct Candidate { let order: Int; let name: String; let score: Int }
+        var matched: [Candidate] = []
+        for (order, name) in names.enumerated() {
+            let score = asked.intersection(headingWords(name)).count
+            if score > 0 { matched.append(Candidate(order: order, name: name, score: score)) }
+        }
+        guard !matched.isEmpty else { return [] }
+        matched.sort { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+        return matched.prefix(limit).map(\.name)
+    }
+
+    /// Раздел оглавления в том виде, в каком он уедет в `structuredContent`.
+    static func outlineSectionMirror(
+        heading: String, first: Int, last: Int, tokens: Int
+    ) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "heading": .string(heading),
+            "firstChunk": .int(first),
+            "lastChunk": .int(last),
+        ]
+        if tokens > 0 { object["estimatedTokens"] = .int(tokens) }
+        return .object(object)
+    }
+
+    /// Что сказать, когда файла в коллекции не нашлось.
+    ///
+    /// Одно объяснение на все три ветки `get_file`. Карту велено спрашивать
+    /// первой — значит и промахиваются по пути чаще всего на ней, — а
+    /// отвечала она одной строкой без единой подсказки, тогда как чтение по
+    /// порядку предлагало похожие пути. Чтение по разделу отвечало хуже
+    /// обоих: «в файле нет такого раздела», причём имя файла в этой пометке
+    /// пустое, потому что взять его неоткуда.
+    private func fileNotFound(_ parsed: ParsedFile) async -> (lines: [String], similar: [String]) {
+        // Отпечаток испортить нечем, поэтому промах по нему значит одно из
+        // двух: коллекция не та или файла в ней нет. Отдельная беда —
+        // коллекции прежних сборок, где поля file_id ещё нет; о ней говорится
+        // прямо, иначе агент будет повторять тот же вызов.
+        guard parsed.fingerprint == nil else {
+            return ([
+                "The collection «\(parsed.request.collection)» has no chunks with file_id «\(parsed.fingerprint ?? "")».",
+                "If the collection was filled by earlier builds it has no file_id field yet — call get_file with the «file» parameter, taking the path from the source_file field of a document you found.",
+            ], [])
+        }
+        var lines = ["The collection «\(parsed.request.collection)» has no documents of the file «\(parsed.path)»."]
+        // Что делать дальше, а не только чем ошибся: файл с этим именем
+        // почти всегда в коллекции есть — агент потерял верхние папки
+        // пути. Живой случай: спросили «000001/Документ/…», а лежит
+        // «Ведомство Б/ЦОД/000001/Документ/…», и агент бросил читать.
+        let similar = await similarFiles(to: parsed.path, in: parsed.request.collection)
+        if similar.isEmpty {
+            lines.append("Take the path from the source_file field of a document you found, whole — not the file name and not an absolute path.")
+        } else {
+            lines.append("A file with that name is in the collection — its whole path differs. Call get_file with one of these:")
+            lines += similar.map { "• \($0)" }
+        }
+        return (lines, similar)
+    }
+
+    /// Устройство файла: разделы, их границы и вес.
+    ///
+    /// Отвечает на вопрос, который у «прочитай документ целиком» стоит первым,
+    /// а задаётся последним: из чего этот документ состоит. Метаданные без
+    /// текста — оглавление документа на тысячу кусков само помещается в один
+    /// ответ, а чтение такого документа подряд не помещается никуда.
+    private func fileOutline(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        let found = try await fileChunks(parsed)
+        let documents = found.answer.documents
+        let path = found.path.isEmpty ? Self.storedPath(of: documents) : found.path
+        let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: documents)
+
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.request.collection),
+            "file": .string(path),
+            "outline": .bool(true),
+        ]
+        if let fingerprint { structured["fileId"] = .string(fingerprint) }
+
+        guard !documents.isEmpty else {
+            structured["sections"] = .array([])
+            if path.isEmpty { structured["file"] = .string(parsed.path) }
+            let missing = await fileNotFound(parsed)
+            if !missing.similar.isEmpty {
+                structured["similarFiles"] = .array(missing.similar.map(JSONValue.string))
+            }
+            return MCPToolOutcome(
+                text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+            )
+        }
+
+        // Карта одного раздела, когда назван «heading»: схема это обещает —
+        // «go deeper inside one section by passing heading together with
+        // outline», — и это единственный выход, когда карта целого файла
+        // не поместилась. Правило принадлежности то же самое.
+        let all = Self.effectiveHeadings(of: documents)
+        // Номер куска считается по **всему файлу**, а не по обрезку. Без
+        // «chunk_index» запасной отсчёт по месту в массиве дал бы у раздела,
+        // начинающегося с двухсотого куска, «firstChunk: 0», и продолжение
+        // по этому числу увело бы агента в начало файла.
+        let positions = documents.enumerated().map { index, payload -> Int in
+            if case .int(let value)? = payload.metadata?[MCPFileChunks.orderKey] { return value }
+            return index
+        }
+        var inScope = Array(documents.indices)
+        if let requested = parsed.heading, !requested.isEmpty {
+            // То же приведение имени, что и у отбора: карта раздела не должна
+            // спотыкаться о неразрывный пробел, которого агенту не видно.
+            let scope = Self.typeableHeading(requested)
+            inScope = inScope.filter { all[$0] == scope || all[$0].hasPrefix(scope + " > ") }
+            structured["heading"] = .string(scope)
+            guard !inScope.isEmpty else {
+                structured["sections"] = .array([])
+                // Размер файла известен, раз файл найден.
+                structured["totalChunks"] = .int(documents.count)
+                let missing = Self.sectionNotFound(file: path, heading: scope, among: all)
+                if !missing.nearest.isEmpty {
+                    structured["nearestSections"] = .array(missing.nearest.map(JSONValue.string))
+                }
+                return MCPToolOutcome(
+                    text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+                )
+            }
+        }
+        // Глубина отсчитывается **от запрошенного раздела**, а не от корня:
+        // иначе карта раздела «Требования» при умолчании 1 сворачивалась в
+        // одну строку — сам этот раздел, — и указанный схемой выход из
+        // урезанной карты не давал ни одной подробности ( обещал его,
+        // но мерил глубину не оттуда).
+        let scopeDepth = parsed.heading.flatMap {
+            $0.isEmpty ? nil : Self.typeableHeading($0).components(separatedBy: " > ").count
+        } ?? 0
+
+        // Разделы идут подряд: соседние куски одного раздела — это он и есть.
+        // Складывать по имени нельзя — один заголовок встречается в документе
+        // не раз, и «Общие положения» из начала и из приложения слиплись бы.
+        struct Section { var heading: String; var first: Int; var last: Int; var tokens: Int }
+        var sections: [Section] = []
+        // Кусок без заголовка принадлежит тому разделу, внутри которого лежит:
+        // правило общее с отбором по «heading».
+        for index in inScope {
+            // Принадлежность посчитана один раз по всему файлу: считать её
+            // заново по обрезку значит зависеть от того, попал ли в обрезок
+            // носитель заголовка.
+            var heading = all[index]
+            // Свёртка до запрошенной глубины. Без неё карта перестаёт быть
+            // картой: на живом ТЗ вышло 596 «разделов», больше половины по
+            // одному куску, и в ответ поместилась восьмая часть. Верхний
+            // уровень даёт десятки строк — по ним и выбирают, куда идти,
+            // а подробности берут тем же вызовом с «heading».
+            let parts = heading.components(separatedBy: " > ")
+            let allowed = scopeDepth + parsed.outlineDepth
+            if parts.count > allowed {
+                heading = parts.prefix(allowed).joined(separator: " > ")
+            }
+            let position = positions[index]
+            var tokens = 0
+            if case .int(let value)? = documents[index].metadata?["chunk_estimated_tokens"] { tokens = value }
+            if var last = sections.last, last.heading == heading {
+                last.last = position
+                last.tokens += tokens
+                sections[sections.count - 1] = last
+            } else {
+                sections.append(Section(heading: heading, first: position, last: position, tokens: tokens))
+            }
+        }
+
+        let totalTokens = sections.reduce(0) { $0 + $1.tokens }
+        // Вес целого — по всему файлу, а не по разделу: пара с `totalChunks`,
+        // и по ней тоже решают, читается ли документ целиком. Сложенный по
+        // одному разделу, он выдавал бы ТЗ на 600 токенов вместо 500 625 —
+        // ровно та подмена, что чинилась у счёта кусков.
+        let fileTokens = documents.reduce(0) { sum, payload in
+            if case .int(let value)? = payload.metadata?["chunk_estimated_tokens"] { return sum + value }
+            return sum
+        }
+        var header = parsed.heading.map { "Outline of «\(path)», section «\($0)»: " } ?? "Outline of «\(path)»: "
+        header += EnglishCount.grouped(inScope.count, "chunk", "chunks")
+        if totalTokens > 0 { header += ", about \(totalTokens.plainDigits) tokens" }
+        header += ", \(EnglishCount.grouped(sections.count, "section", "sections"))."
+
+        var lines: [String] = []
+        var mirrors: [JSONValue] = []
+        var shown = 0
+        var size = 0
+        // Пометки собираются **до** цикла, потому что из этого же бюджета
+        // и платят.
+        //
+        // Комментарий ниже обещал «за вычетом конверта, заголовка и пометок»
+        // с самого начала, а вычитались только первые два: пометки уезжали
+        // сверх — и текстом, и зеркалом. Пока их было две, запас конверта
+        // это скрывал; третья (цена чтения целиком) вынесла ответ
+        // за объявленный потолок — 24 290 против 24 000 на замере.
+        let (headNotes, tailNotes, trimReserve) = await outlineNotes(
+            parsed: parsed, path: path, fingerprint: fingerprint,
+            sectionCount: sections.count,
+            onlySectionHeading: sections.count == 1 ? sections[0].heading : nil,
+            documents: documents, fileTokens: fileTokens, limits: limits,
+            orderUnavailable: found.answer.orderUnavailable, structured: &structured
+        )
+        // Бюджет — весь ответ за вычетом конверта, заголовка и пометок.
+        // Половина, как у collect_mentions, здесь не за что: там вторую
+        // половину съедают тексты образцов, а у карты второго плательщика
+        // нет — и урезанная зря карта стоит агенту лишнего вызова.
+        let notesCost = MCPDocumentRendering.overhead(header: "", notes: headNotes + tailNotes) + trimReserve
+        let budget = max(
+            1,
+            limits.responseCharacters - MCPDocumentRendering.envelopeReserve - header.count - notesCost
+        )
+        for (index, section) in sections.enumerated() {
+            let range = section.first == section.last
+                ? "chunk \(section.first.plainDigits)"
+                : "chunks \(section.first.plainDigits)–\(section.last.plainDigits)"
+            var line = "\((index + 1).plainDigits). \(section.heading) — \(range)"
+            if section.tokens > 0 { line += ", ~\(section.tokens.plainDigits) tokens" }
+            // Зеркало раздела уезжает наравне со строкой и платит из того же
+            // бюджета. Без этого ответ вышел на 27 923 символа при
+            // обещанных 24 000 — та же дыра, что чинили у перечня файлов.
+            let mirror = Self.outlineSectionMirror(
+                heading: section.heading, first: section.first, last: section.last, tokens: section.tokens
+            )
+            let cost = line.count + 1 + mirror.deliveredSize
+            if index > 0, size + cost > budget { break }
+            lines.append(line)
+            mirrors.append(mirror)
+            size += cost
+            shown += 1
+        }
+
+        // Пометки уже собраны — остаётся вставить ту, что зависит от цикла.
+        var notes = headNotes
+        if shown < sections.count {
+            notes.append("The outline was trimmed by answer size: \(shown.plainDigits) of the \(sections.count.plainDigits) sections are shown. Ask for one section of it — «outline» together with «heading» — and the rest fits.")
+        }
+        notes += tailNotes
+
+        // Ровно те зеркала, что оплачены выше: вторая сборка разошлась бы
+        // с бюджетом при первой же правке.
+        structured["sections"] = .array(mirrors)
+        structured["totalSections"] = .int(sections.count)
+        // «Всего кусков» — у файла, даже когда спрошен один раздел: по этому
+        // полю решают, читается ли документ целиком, и раздел на сорок кусков
+        // под этим именем выдавал бы ТЗ на 1281 кусок за небольшой файл.
+        structured["totalChunks"] = .int(documents.count)
+        if parsed.heading != nil { structured["chunksInSection"] = .int(inScope.count) }
+        if fileTokens > 0 { structured["estimatedTokens"] = .int(fileTokens) }
+        // Вес спрошенного раздела — своим полем, как и его размер: в строке
+        // заголовка стоит именно он, и читающему структуру нужно то же число.
+        if parsed.heading != nil, totalTokens > 0 {
+            structured["estimatedTokensInSection"] = .int(totalTokens)
+        }
+        structured["notes"] = .array(notes.map(JSONValue.string))
+
+        return MCPToolOutcome(
+            text: ([header] + lines + notes).joined(separator: "\n"), structured: .object(structured)
+        )
+    }
+
+    /// Сколько знаков конца `left` повторяются началом `right`.
+    ///
+    /// Нарезка по умолчанию перекрывает куски на 15 %. Склеенные встык, они
+    /// дадут документ с повтором на каждом шве — а для разбора требований
+    /// это не косметика: повторённый пункт читается как отдельный.
+    ///
+    /// Перекрытие ищется **по данным**, а не по настройке: настройка могла
+    /// меняться между прогонами, а куски в базе — те, что есть. Берётся зачин
+    /// `right`, ищется в хвосте `left`, и найденное место проверяется целиком:
+    /// совпасть обязан **весь** остаток `left`, а не только зачин.
+    ///
+    /// Зонд короче настоящего перекрытия — иначе его не найти вовсе, — но не
+    /// настолько, чтобы срезать случайное совпадение. Тридцать два знака:
+    /// перекрытие при умолчании нарезки составляет около ста восьмидесяти,
+    /// а случайно совпасть хвостом и зачином на тридцать два знака подряд
+    /// два соседних куска документа практически не могут. Ошибка здесь
+    /// дороже повтора: лишний срез **удаляет текст документа**.
+    static let overlapProbe = 32
+
+    /// Больше половины куска перекрытием не считается.
+    ///
+    /// Не осторожность ради осторожности: два **одинаковых** соседних куска —
+    /// шапка таблицы, повторённая в каждой строке, бланк, боилерплейт — дают
+    /// «перекрытие» во весь кусок, и срез удалил бы его целиком. Первый же
+    /// замер на такой подложке это и показал: двести кусков схлопнулись в
+    /// один. Повтор в тексте агент увидит и переживёт, пропажу — нет,
+    /// поэтому предел выбран в пользу повтора.
+    static let overlapShare = 0.5
+
+    static func overlapLength(_ left: String, _ right: String, cap: Int = 4000) -> Int {
+        guard left.count >= overlapProbe, right.count >= overlapProbe else { return 0 }
+        let ceiling = Int(Double(min(left.count, right.count)) * overlapShare)
+        guard ceiling >= overlapProbe else { return 0 }
+        let tail = left.count > cap ? String(left.suffix(cap)) : left
+        let head = String(right.prefix(overlapProbe))
+        var from = tail.startIndex
+        while let found = tail.range(of: head, range: from..<tail.endIndex) {
+            let candidate = tail[found.lowerBound...]
+            if candidate.count <= ceiling, right.hasPrefix(candidate) { return candidate.count }
+            from = tail.index(after: found.lowerBound)
+        }
+        return 0
+    }
+
+    /// Куски — в сплошной текст документа, без повторов на швах.
+    static func joinedText(_ parts: [String]) -> (text: String, trimmed: Int) {
+        let joined = joinedText(parts.map { (mark: nil, text: $0) })
+        return (joined.text, joined.trimmed)
+    }
+
+    /// То же, но с метками последовательности перед кусками.
+    ///
+    /// Шов ищется по **исходным** кускам, а не по собранному тексту: метка,
+    /// попавшая между ними, разорвала бы совпадение, и перекрытие перестало
+    /// бы находиться.
+    ///
+    /// `after` — текст куска, стоящего перед первым: шов **между страницами**
+    /// иначе не срезается вовсе. Внутри страницы повторы убирались, между
+    /// страницами оставались, а пометка обещала агенту, что текст читается
+    /// как документ: на семидесяти страницах это шестьдесят девять швов и
+    /// около двенадцати тысяч повторённых знаков.
+    static func joinedText(
+        _ parts: [(mark: String?, text: String)], after: String = ""
+    ) -> (text: String, trimmed: Int, atPageStart: Int) {
+        var text = ""
+        var previous = after
+        var trimmed = 0
+        // Шов **на границе страницы** считается отдельно: пометка о нём
+        // иначе не может отличить сделанную работу от несделанной и
+        // обещает её на коллекции без перекрытия вовсе.
+        var atPageStart = 0
+        for part in parts where !part.text.isEmpty {
+            var body = part.text
+            var overlap = 0
+            if !previous.isEmpty {
+                overlap = overlapLength(previous, body)
+                trimmed += overlap
+                if text.isEmpty { atPageStart = overlap }
+                if overlap > 0 { body = String(body.dropFirst(overlap)) }
+            }
+            previous = part.text
+            guard !text.isEmpty else {
+                text = part.mark.map { $0 + "\n" } ?? ""
+                text += body
+                continue
+            }
+            if let mark = part.mark {
+                text += "\n" + mark + "\n" + body
+            } else {
+                // Без перекрытия куски — соседние куски документа, и
+                // разделитель между ними свой: перевод строки. С перекрытием
+                // он уже внутри.
+                text += overlap > 0 ? body : "\n" + body
+            }
+        }
+        return (text, trimmed, atPageStart)
+    }
+
+    /// Сколько знаков пометок извлечения показывается в строке описания.
+    static let warningsInLine = 160
+
+    /// Приговор странице — одной сборкой на оба места, как и у раздела.
+    static func pageVerdict(
+        total: Int, shown: Int, left: Int, calls: Int, onDiskPath: String?
+    ) -> [String] {
+        // Ни слова о токенах: по пяти прочитанным кускам их не сосчитать —
+        // на титульных страницах они мелкие, и оценка разошлась с точной на
+        // треть (342 027 против 500 625). Число чанков и вызовов известно
+        // точно, его и называем, а вес отдаёт оглавление.
+        var verdict = [
+            "This file does not fit in one answer as chunks: \(total.plainDigits) chunks, \(shown.plainDigits) here and \(left.plainDigits) still unread"
+                + ". Finishing it this way would take about \(calls.plainDigits) more calls.",
+        ]
+        // Приговор называет **выходы**, а не отговаривает. Задача «получить
+        // документ целиком» законна, и приложение обязано дать способ,
+        // а не объяснять, почему не стоит.
+        if let onDiskPath {
+            verdict.append("The whole document is on this machine at \(onDiskPath) — open it there, in one step.")
+            verdict.append("Through this channel: get_file with «as»: \"text\" carries about five times more of the document per call; «outline»: true gives the structure if you only need a part.")
+        } else {
+            verdict.append("Ask for it with «as»: \"text\" — the same file as continuous text, about five times more of the document per call. Or take its structure first with «outline»: true and read only the section you need.")
+        }
+        return verdict
+    }
+
+    static func pageHeader(path: String, shown: Int, from: Int, total: Int?) -> String {
+        var header = "File «\(path)»: \(EnglishCount.grouped(shown, "chunk", "chunks")) starting at \(from.plainDigits)"
+        if let total { header += ", \(total.plainDigits) in total" }
+        return header
+    }
+
+    /// Пометки о непредсказуемом порядке — по одной сборке на оба места,
+    /// где они нужны: в оплате наперёд и в самом ответе.
+    static var unorderedPageNote: String {
+        "The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — the application does not return that many in an arbitrary order; assemble them by the chunk_index field."
+    }
+    static var unorderedSectionNote: String {
+        "The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — they came back in an arbitrary order, so this section may be incomplete."
+    }
+
+    static func pageContinueNote(next: Int) -> String {
+        "The file was not read whole: continue with offset \(next.plainDigits)."
+    }
+
+    /// Приговор разделу — одной сборкой на оба места: на оплату наперёд
+    /// и на сам ответ.
+    static func sectionVerdict(
+        section: Int, shown: Int, left: Int, calls: Int, hasSubsections: Bool
+    ) -> [String] {
+        var verdict = [
+            "This section does not fit in one answer: \(section.plainDigits) chunks, \(shown.plainDigits) here and \(left.plainDigits) still unread. Finishing it would take about \(calls.plainDigits) more calls.",
+            // Первым — самый дешёвый маршрут, а не самый привычный.
+            // Куски эту страницу везут вместе с метаданными и зеркалом;
+            // тот же раздел сплошным текстом идёт вчетверо плотнее, и до
+            // этой правки о нём не говорила ни одна заметка — при том что
+            // на него же переключается умолчание инструмента.
+            "The same section as text costs fewer calls: get_file with this «heading» and «as»: \"text\" — that is what this tool returns unless «chunks» is asked for.",
+        ]
+        // Совет обязан быть исполним: у раздела без подразделов карта
+        // вернёт его же одной строкой, и звать её оттуда некуда — тот же
+        // дефект, что и. Тогда остаётся «offset» и поиск
+        // с фильтром по файлу.
+        verdict.append(hasSubsections
+            ? "Or take its structure first — call get_file with «outline»: true and this same «heading» — then read the part you need, or find it with search and a filter on this file."
+            : "Or read it on with «offset», or find what you need with search and a filter on this file.")
+        return verdict
+    }
+
+    static func sectionHeader(path: String, heading: String, shown: Int, section: Int, from: Int) -> String {
+        "File «\(path)», section «\(heading)»: \(EnglishCount.grouped(shown, "chunk", "chunks")) of \(section.plainDigits), starting at \(from.plainDigits)"
+    }
+
+    static func sectionContinueNote(section: Int, shown: Int, from: Int, next: Int) -> String {
+        "The section holds \(EnglishCount.grouped(section, "chunk", "chunks")) and did not fit whole: \(shown.plainDigits) shown from \(from.plainDigits). Continue in this same section with offset \(next.plainDigits)."
+    }
+
+    /// Пометки карты — и запас под ту единственную, что зависит от того,
+    /// сколько разделов поместилось.
+    ///
+    /// Собираются до цикла, чтобы их можно было оплатить из бюджета: пометка,
+    /// приписанная после подсчёта, уезжает сверх обещанного потолка.
+    /// Заодно кладёт в структурированный ответ поля, которые сопровождают эти
+    /// же пометки, — путь на диске и цену чтения целиком: одно без другого
+    /// разошлось бы при первой же правке.
+    private func outlineNotes(
+        parsed: ParsedFile,
+        path: String,
+        fingerprint: String?,
+        sectionCount: Int,
+        // Единственный заголовок файла — когда он единственный: по нему
+        // видно, что заголовков в файле нет вовсе. Тип разделов живёт внутри
+        // самой карты, и тащить его сюда значило бы вынести наружу подробность
+        // ради одной проверки.
+        onlySectionHeading: String?,
+        documents: [MCPDocumentPayload],
+        fileTokens: Int,
+        limits: MCPOutputLimits,
+        orderUnavailable: Bool,
+        structured: inout [String: JSONValue]
+    ) async -> (head: [String], tail: [String], trimReserve: Int) {
+        var head: [String] = []
+        if orderUnavailable {
+            head.append("The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — they came back in an arbitrary order, so the boundaries below are not to be trusted.")
+        }
+        // Запас под пометку об урезании: её текст известен заранее с точностью
+        // до числа показанных разделов, и берётся верхняя оценка — столько же
+        // цифр, сколько в общем счёте.
+        let trimNote = "The outline was trimmed by answer size: \(sectionCount.plainDigits) of the \(sectionCount.plainDigits) sections are shown. Ask for one section of it — «outline» together with «heading» — and the rest fits."
+        let trimReserve = MCPDocumentRendering.overhead(header: "", notes: [trimNote])
+
+        var tail: [String] = []
+        // Переданное и не сработавшее называется вслух — и на карте тоже.
+        // «outline» побеждает «as» молча, и агент, написавший оба, получал
+        // не тот вид ответа без единого слова о причине.
+        var ignored: [String] = []
+        if parsed.wantsWholeText { ignored.append("«as»: \"text\"") }
+        if parsed.askedLimit != nil { ignored.append("«limit»") }
+        if parsed.fields != nil { ignored.append("«fields»") }
+        if let note = Self.ignoredNote(
+            ignored, mode: "«outline»: true",
+            because: "the outline is metadata about the file, not its text. Ask again without «outline» for the text form."
+        ) {
+            tail.append(note)
+        }
+        // Заголовков в файле нет вовсе — и карта обязана это сказать, а не
+        // выдавать один придуманный раздел на весь документ за устройство.
+        // Поле heading_path пишется не всякому источнику, а карту велено
+        // спрашивать первой.
+        if parsed.heading == nil, onlySectionHeading == Self.beforeFirstHeading {
+            tail.append("This file carries no headings at all — what is shown is the whole of it, not a chapter. Read it in pages with «offset», or find what you need with search and a filter on this file.")
+        }
+        // Отпечаток подставляется только настоящий: у коллекций прежних
+        // сборок поля file_id нет, и совет с пустым значением — это фильтр,
+        // который не найдёт ничего.
+        if let fingerprint {
+            tail.append("Read a section with get_file and the «heading» parameter, or find what you need with search and a filter on this file: {\"file_id\": {\"$eq\": \"\(fingerprint)\"}}.")
+        } else {
+            tail.append("Read a section with get_file and the «heading» parameter, or find what you need with search and a filter on this file: {\"source_file\": {\"$eq\": \"\(path)\"}} — this collection carries no file_id field.")
+        }
+        // Путь на диске — и здесь. Карту велено спрашивать **первой**, и
+        // именно из неё агент должен узнать, что весь документ лежит рядом
+        // файлом: без этого он тратит второй вызов ровно на то, ради чего
+        // поле и заведено.
+        let onDisk = await backend.fileOnDisk(metadata: documents.first?.metadata)
+        if let onDisk {
+            structured["sourcePath"] = .string(onDisk.path)
+            if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
+            tail.append("The whole document is on this machine at \(onDisk.path) — if you can read files there, that is all of it in one step.")
+        }
+        // Цена маршрута — в карте, где маршрут и выбирают.
+        //
+        // Разбор живого сеанса: агент взял карту, увидел 37 разделов и пошёл
+        // читать их по одному — стратегия разумная, но он не знал, что этот
+        // маршрут отдаёт четыре куска за вызов, а соседний пятнадцать. Ни
+        // одна заметка цены не называла, и выбор был вслепую. Число считается
+        // той же формулой, по которой потом наполняется страница, — иначе
+        // карта звала бы в маршрут по цене, которой у него нет.
+        if let price = Self.callsToReadWhole(
+            estimatedTokens: fileTokens, limits: limits, path: path, onDiskPath: onDisk?.path
+        ) {
+            structured["charactersEstimate"] = .int(price.characters)
+            structured["callsToReadWhole"] = .int(price.calls)
+            tail.append("Reading it whole: about \(price.characters.plainDigits) characters, which is \(price.calls.plainDigits) calls at this key's answer size **at best** — a page stops at the last chunk that fits whole, so expect up to a fifth more. get_file returns text by default; page it with «offset». One section is one call when it fits; the chunk counts above say which do.")
+        }
+        return (head, tail, trimReserve)
+    }
+
+    /// Во что обходится общий блок: зеркало плюс объясняющая его пометка.
+    static func sharedMetadataCost(
+        _ projection: (fields: [String]?, shared: ChromaMetadata, note: String?)
+    ) -> Int {
+        guard !projection.shared.isEmpty else { return 0 }
+        return JSONValue.object(projection.shared.mapValues(\.json)).deliveredSize
+            + (projection.note?.count ?? 0)
+    }
+
+    /// Проекция, которая не повторяет общий блок, — и то, что о ней сказать.
+    ///
+    /// Возвращает то, что показывать у каждого куска, что вынести один раз
+    /// и чем это объяснить. Спрошенную агентом проекцию не трогает: он назвал
+    /// поля сам, и подменять его выбор — та же молчаливая подмена, от которой
+    /// уходим.
+    static func withoutRepeatedMetadata(
+        _ payloads: [MCPDocumentPayload], asked: [String]?
+    ) -> (fields: [String]?, shared: ChromaMetadata, note: String?) {
+        guard asked == nil else { return (asked, [:], nil) }
+        let shared = sharedMetadata(of: payloads)
+        guard !shared.isEmpty else { return (nil, [:], nil) }
+        let all = Set(payloads.compactMap(\.metadata).flatMap(\.keys))
+        let varying = all.subtracting(shared.keys).sorted()
+        // Ничего не меняется от куска к куску — прятать нечего: пустой
+        // список полей рендер читает как «показать все», и вынос обернулся
+        // бы удвоением вместо экономии.
+        guard !varying.isEmpty else { return (nil, [:], nil) }
+        // Сэкономленное считается, а не объявляется: столько знаков этот
+        // ответ вёз бы повтором.
+        let saved = MCPDocumentRendering.metadataLine(shared).count * (payloads.count - 1)
+        let note = """
+        Metadata identical on every chunk here is in «sharedMetadata» once \
+        instead of on each: \(shared.count.plainDigits) fields, \
+        \(saved.plainDigits) characters that went to text instead. Name the \
+        fields you want per chunk with «fields».
+        """
+        return (varying, shared, note)
+    }
+
+    /// Всё, что уезжает **вместе** со сплошным текстом и потому вычитается
+    /// из его бюджета: конверт, заголовок, пометки, путь.
+    ///
+    /// Считается в одном месте на двоих: по этой же формуле карта
+    /// обещает «около N вызовов», и обещание должно совпадать с тем, что
+    /// человек потом получит. Разойдись они — карта звала бы в маршрут по
+    /// цене, которой у него нет.
+    static func wholeTextOverhead(path: String, onDiskPath: String?) -> Int {
+        MCPDocumentRendering.envelopeReserve
+            + (onDiskPath?.count ?? 0)
+            // Путь уезжает трижды: строкой заголовка, полем `file` и пометкой
+            // про диск.
+            + path.count * 2
+            + wholeTextHeaderReserve
+            + wholeTextNotesReserve
+    }
+
+    /// Во сколько страниц сплошного текста укладывается документ.
+    ///
+    /// Знаки — из оценки токенов, той же, что карта показывает по разделам;
+    /// отсюда «около». На живом ТЗ оценка сошлась с правдой: 500 625 токенов
+    /// против 1 752 182 знаков — это 3,50 знака на токен при
+    /// `TokenEstimator.charactersPerToken` 3,5.
+    ///
+    /// А вот **число вызовов** — оценка снизу, и сказано об этом вслух
+    ///. Она делит знаки на бюджет страницы, то есть считает укладку
+    /// идеальной; на деле страница обрывается на последнем куске, который
+    /// влез целиком, и остаток пропадает.
+    ///
+    /// Насколько — замерено на трёх живых файлах, а не на одном:
+    /// большое ТЗ, 1281 кусок — обещан 81 вызов, вышло 96 (+19 %);
+    /// ТЗ поменьше в PDF, 1004 куска — 59 против 62 (+5 %);
+    /// положение на 338 кусков — 21 против 23 (+10 %). Отсюда
+    /// «до пятой части», а не «на пятую часть»: у файла с крупными кусками
+    /// на границе страницы пропадает больше.
+    static func callsToReadWhole(
+        estimatedTokens: Int, limits: MCPOutputLimits, path: String, onDiskPath: String?
+    ) -> (characters: Int, calls: Int)? {
+        guard estimatedTokens > 0 else { return nil }
+        let characters = TokenEstimator.characters(forTokens: estimatedTokens)
+        let page = max(
+            minimumWholeTextAnswer,
+            limits.responseCharacters - wholeTextOverhead(path: path, onDiskPath: onDiskPath)
+        )
+        return (characters, max(1, (characters + page - 1) / page))
+    }
+
+    /// Метаданные, одинаковые у всех показанных кусков.
+    ///
+    /// Замерено на ТЗ в 1281 кусок: метаданных 1 158 знаков на кусок, из них
+    /// 802 (69 %) байт в байт одинаковы у **всех** — двадцать пять полей:
+    /// имя файла, размер, хеш содержимого, пометки извлечения, тип документа.
+    /// Ответ на четыре куска нёс их четырежды, при том что файл назван в его
+    /// же шапке. На четыре куска это 3 208 знаков из 20 669 — место текста,
+    /// отданное под повтор.
+    ///
+    /// Считается по показанному, и говорится ровно так же — «одинаковое
+    /// у кусков в этом ответе». Обещать «одинаковое у всего файла» можно
+    /// только там, где весь файл в руках; у страницы его нет, и разница
+    /// не словесная: `page_number`, совпавший на одной странице, свойством
+    /// файла от этого не становится.
+    static func sharedMetadata(of payloads: [MCPDocumentPayload]) -> ChromaMetadata {
+        // На одном куске повторять нечего: вынести его метаданные в общий
+        // блок значило бы отнять их у единственного куска, ничего не сэкономив.
+        guard payloads.count > 1, let first = payloads.first?.metadata else { return [:] }
+        var shared = first
+        for payload in payloads.dropFirst() {
+            guard let metadata = payload.metadata else { return [:] }
+            shared = shared.filter { metadata[$0.key] == $0.value }
+            if shared.isEmpty { break }
+        }
+        return shared
+    }
+
+    /// Сколько в файле разделов — тем же счётом, что и у карты.
+    ///
+    /// Считалось по полным путям заголовков, и на живом ТЗ описание файла
+    /// говорило «571 section» там, где карта того же файла в том же сеансе
+    /// говорила «37 sections». Слово одно, числа разные, и агенту неоткуда
+    /// узнать, какое из них про что. Разошлись они потому, что карта режет
+    /// заголовок до верхнего уровня, а описание брало его целиком — вместе
+    /// со всеми подразделами.
+    ///
+    /// Пока сплошной текст просили явным «as», описание видели немногие;
+    /// с оно уезжает на первой странице каждого чтения, и расхождение
+    /// стало видно сразу.
+    static func topLevelSectionCount(of headings: [String]) -> Int {
+        var count = 0
+        var previous: String?
+        for heading in headings {
+            let top = heading.components(separatedBy: " > ").first ?? heading
+            if top != previous {
+                count += 1
+                previous = top
+            }
+        }
+        return count
+    }
+
+    /// Описание документа — то, что агент обязан получить **один раз**.
+    ///
+    /// Метаданные лежат у каждого куска, и на странице из сорока кусков они
+    /// уезжали бы сорок раз: 1 223 знака на кусок против 1 180 знаков самого
+    /// текста (замер). Здесь они собраны один раз и отдаются с первой
+    /// страницей — дальше в ответе только текст с метками.
+    ///
+    /// Ничего не выдумывается: поля берутся из метаданных, каких нет — тех
+    /// нет и в описании.
+    static func documentDescription(
+        of documents: [MCPDocumentPayload], sections: Int, onDisk: MCPFileOnDisk?
+    ) -> (fields: [String: JSONValue], line: String) {
+        // Числа, у которых уже есть имя в ответе, здесь не повторяются:
+        // «всего кусков» уезжает полем `totalChunks` на каждой странице, и
+        // второе имя для того же значения заставляло бы клиента гадать,
+        // одно ли это (тот же довод, что и у пути на диске).
+        var fields: [String: JSONValue] = [:]
+        var parts = [EnglishCount.grouped(documents.count, "chunk", "chunks")]
+        if sections > 0 {
+            fields["sections"] = .int(sections)
+            parts.append(EnglishCount.grouped(sections, "section", "sections"))
+        }
+        // Поля ищутся по всем кускам, а не у первого: язык определяется не
+        // всегда, а титульная страница коротка — на ней его может не быть,
+        // тогда как у соседнего куска он есть. Тем же правилом, что у
+        // `storedPath` и `storedFingerprint` строкой выше.
+        func string(_ key: String) -> String? {
+            for payload in documents {
+                if case .string(let value)? = payload.metadata?[key], !value.isEmpty { return value }
+            }
+            return nil
+        }
+        func integer(_ key: String) -> Int? {
+            for payload in documents {
+                if case .int(let value)? = payload.metadata?[key] { return value }
+            }
+            return nil
+        }
+        var tokens = 0
+        for payload in documents {
+            if case .int(let value)? = payload.metadata?["chunk_estimated_tokens"] { tokens += value }
+        }
+        if tokens > 0 {
+            fields["estimatedTokens"] = .int(tokens)
+            parts.append("about \(tokens.plainDigits) tokens")
+        }
+        if let pages = integer("page_count") {
+            fields["pages"] = .int(pages)
+            parts.append(EnglishCount.grouped(pages, "page", "pages"))
+        }
+        if let bytes = integer("file_size") ?? onDisk?.bytes {
+            fields["bytes"] = .int(bytes)
+            parts.append("\(bytes.plainDigits) bytes")
+        }
+        if let modified = string("file_mtime") {
+            fields["modified"] = .string(modified)
+            parts.append("modified \(modified)")
+        }
+        if let language = string("document_language") ?? string("language") {
+            fields["language"] = .string(language)
+            parts.append("language \(language)")
+        }
+        if let sourceID = string("source_id") { fields["sourceId"] = .string(sourceID) }
+        // Пометки извлечения — часть описания, а не мелочь: «таблица пришла
+        // плоским текстом» меняет то, что по этому документу можно считать.
+        if let warnings = string("extraction_warnings") {
+            fields["warnings"] = .string(warnings)
+            // У пометок извлечения длины нет: это строка из метаданных, и
+            // целиком она уедет полем. В строке описания — начало, иначе
+            // одна такая пометка вынесла бы ответ за потолок.
+            let shown = warnings.count > warningsInLine
+                ? String(warnings.prefix(warningsInLine)) + "…"
+                : warnings
+            parts.append("extraction warnings: \(shown)")
+        }
+        // Путь на диске здесь не повторяется: он уезжает полем `sourcePath`
+        // на **каждой** странице, а описание — только на первой. Два имени
+        // для одного значения заставляли бы клиента гадать, одно ли это.
+        return (fields, parts.joined(separator: ", "))
+    }
+
+    /// Тексты для готовой страницы — вторым запросом, по идентификаторам.
+    ///
+    /// Порядок восстанавливается по списку id: выдача `get` по
+    /// идентификаторам его не обещает, как и всякая другая.
+    static func textsRestored(
+        for page: [MCPDocumentPayload],
+        request: MCPDocumentsRequest,
+        backend: any MCPToolBackend
+    ) async throws -> [MCPDocumentPayload] {
+        // Решает флаг запроса, а не осмотр кусков: подложка вправе отдать
+        // текст и там, где его не просили, и гадать по содержимому значит
+        // получать разное поведение от разных баз.
+        guard !page.isEmpty, !request.needsText else { return page }
+        let ids = page.map(\.id)
+        let answer = try await backend.documents(MCPDocumentsRequest(
+            collection: request.collection, ids: ids, filter: nil,
+            limit: ids.count, offset: 0
+        ))
+        let byID = Dictionary(answer.documents.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // Кусок, за которым сходили и не нашли, отдаётся как был: пустой
+        // текст лучше пропавшего результата.
+        return page.map { byID[$0.id] ?? $0 }
+    }
+
+    /// Документ **текстом**, а не списком кусков.
+    ///
+    /// Замер на живом ответе чтения по разделу: 19 942 знака ответа несли
+    /// 4 590 знаков документа — 23 %. Остальное — текст, уехавший **дважды**
+    /// (строкой модели и зеркалом в `structuredContent`), и метаданные,
+    /// которых агент не просил: 1 223 знака на кусок против 1 180 знаков
+    /// самого текста. Отсюда и цена «прочитать целиком»: ТЗ на 1281 кусок —
+    /// около трёхсот вызовов.
+    ///
+    /// Здесь текст уезжает **один раз** и без обвязки: ни идентификаторов,
+    /// ни метаданных, ни зеркала. Замер на ответах одного размера: 4 640
+    /// знаков документа кусками против 20 880 текстом — и это уже не «сотни
+    /// вызовов», а десятки.
+    ///
+    /// Куски склеиваются с проверкой шва: нарезка по умолчанию перекрывает
+    /// их на 15 %, и склейка встык дала бы документ с повторами.
+    private func fileWholeText(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        let found = try await fileChunks(parsed)
+        let documents = found.answer.documents
+        let path = found.path.isEmpty ? Self.storedPath(of: documents) : found.path
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.request.collection),
+            "file": .string(path),
+            "as": .string("text"),
+        ]
+        if let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: documents) {
+            structured["fileId"] = .string(fingerprint)
+        }
+        guard !documents.isEmpty else {
+            if path.isEmpty { structured["file"] = .string(parsed.path) }
+            let missing = await fileNotFound(parsed)
+            if !missing.similar.isEmpty {
+                structured["similarFiles"] = .array(missing.similar.map(JSONValue.string))
+            }
+            return MCPToolOutcome(
+                text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+            )
+        }
+        structured["totalChunks"] = .int(documents.count)
+
+        // Отбор в раздел — тем же правилом, что везде. Заголовки нужны и
+        // дальше: по ним ставятся метки разделов внутри текста.
+        let all = Self.effectiveHeadings(of: documents)
+        // Номер куска — **по файлу**, а не по обрезку: пометка обещает
+        // агенту, что в метках стоит нумерация документа, и у коллекций без
+        // `chunk_index` запасной отсчёт обязан считать то же самое. Та же
+        // подмена, что чинилась у карты в.
+        var numbering: [String: Int] = [:]
+        for (index, payload) in documents.enumerated() {
+            if case .int(let value)? = payload.metadata?[MCPFileChunks.orderKey] {
+                numbering[payload.id] = value
+            } else {
+                numbering[payload.id] = index
+            }
+        }
+        let scope: [(payload: MCPDocumentPayload, heading: String)]
+        if let heading = parsed.heading, !heading.isEmpty {
+            let asked = Self.typeableHeading(heading)
+            scope = zip(documents, all)
+                .filter { $0.1 == asked || $0.1.hasPrefix(asked + " > ") }
+                .map { (payload: $0.0, heading: $0.1) }
+            structured["heading"] = .string(asked)
+            guard !scope.isEmpty else {
+                let missing = Self.sectionNotFound(file: path, heading: asked, among: all)
+                if !missing.nearest.isEmpty {
+                    structured["nearestSections"] = .array(missing.nearest.map(JSONValue.string))
+                }
+                return MCPToolOutcome(
+                    text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+                )
+            }
+            structured["chunksInSection"] = .int(scope.count)
+        } else {
+            scope = zip(documents, all).map { (payload: $0.0, heading: $0.1) }
+        }
+
+        let from = max(0, min(parsed.sectionOffset, scope.count))
+
+        // Где документ лежит целиком. Считается до всех выходов: тот, кто
+        // промахнулся смещением, — первый, кому путь и нужен, а ответ
+        // «за концом» его не нёс.
+        let onDisk = await backend.fileOnDisk(metadata: documents.first?.metadata)
+        if let onDisk {
+            structured["sourcePath"] = .string(onDisk.path)
+            if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
+        }
+
+        // Смещение за концом — это смещение, а не конец документа. «hasMore:
+        // false» без объяснения агент читает как «дочитал», и это та же беда,
+        // что чинилась у чтения кусками и у раздела; третья
+        // ветка ту фразу не получила.
+        guard from < scope.count else {
+            structured["offset"] = .int(from)
+            structured["chunksShown"] = .int(0)
+            structured["characters"] = .int(0)
+            structured["hasMore"] = .bool(false)
+            let what = parsed.heading.map { "The section «\(Self.typeableHeading($0))» of «\(path)»" }
+                ?? "The file «\(path)»"
+            return MCPToolOutcome(
+                text: "\(what) holds \(EnglishCount.grouped(scope.count, "chunk", "chunks")), and offset \(from.plainDigits) is already past its end.",
+                structured: .object(structured)
+            )
+        }
+
+        // Описание файла — **один раз**, с первой страницей. На семидесяти
+        // страницах повторённое описание съело бы больше целого ответа,
+        // а нового не сказало бы ничего.
+        //
+        // Считается до набора текста, потому что платит из того же бюджета:
+        // у пометок извлечения длины нет вовсе, и одна такая строка вынесла
+        // бы ответ за объявленный потолок молча.
+        var describing: String?
+        // Зеркало описания уезжает наравне со строкой и платит из того же
+        // бюджета: у `extraction_warnings` длины нет, и одно такое
+        // поле вынесло ответ за потолок на 857 знаков в первом же замере.
+        var describingCost = 0
+        if from == 0 {
+            // Описывается **файл**, а не спрошенный раздел: под словом
+            // «Document» раздел на сорок кусков выдавал бы ТЗ на 1281 за
+            // небольшой файл — та же подмена, что чинилась у `totalChunks`
+            // и у `estimatedTokens`.
+            let description = Self.documentDescription(
+                of: documents, sections: Self.topLevelSectionCount(of: all), onDisk: onDisk
+            )
+            let mirror = JSONValue.object(description.fields)
+            structured["document"] = mirror
+            describing = "Document: \(description.line)."
+            describingCost = mirror.deliveredSize + (describing?.count ?? 0)
+        }
+
+        // Бюджет — весь ответ за вычетом конверта, описания и запаса под
+        // пометки: текста в зеркале нет, платить дважды не за что, но за
+        // всё, что **уезжает вместе с текстом**, платить обязано.
+        // Путь уезжает трижды: строкой заголовка, полем `file` и пометкой
+        // про диск. Считать его один раз значило обещать потолок и выдавать
+        // больше — на путях по четыреста знаков это восемьсот сверх.
+        let overhead = Self.wholeTextOverhead(path: path, onDiskPath: onDisk?.path)
+            + describingCost
+        // Пол бюджета выше потолка ключа — это превышение обещанного, и
+        // молчать о нём нельзя: человек ставил число под контекст своей
+        // модели. Правило 3 приложения 5 в обратную сторону.
+        let room = limits.responseCharacters - overhead
+        let budget = max(Self.minimumWholeTextAnswer, room)
+        let ceilingRaised = budget > room
+        // Хвост предыдущей страницы: без него шов между страницами не
+        // срезается вовсе, а пометка обещает, что текст читается как документ.
+        // Едет вместе с первой порцией, а не отдельной ходкой: на семидесяти
+        // страницах отдельная ходка — это шестьдесят девять лишних запросов
+        // к базе ради одного куска.
+        var precedingText = ""
+        var pieces: [(mark: String?, text: String)] = []
+        var size = 0
+        var cursor = from
+        var rounds = 0
+        // Метка ставится у каждого куска: агент, читающий сплошной текст,
+        // иначе не знает, где он в документе, и не может ни продолжить с
+        // нужного места, ни назвать источник цитаты. Имя раздела в метке —
+        // только там, где раздел сменился: в каждой строке оно было бы
+        // не меткой, а шумом.
+        var lastHeading: String?
+        // Потолок по числу кусков — тот, что попросили.
+        //
+        // Пока текст выбирали явным «as», молчаливое «limit здесь не
+        // действует» было честным: человек знал, куда идёт. С умолчанием он
+        // этого не знает, и параметр, переданный в режим, который он не
+        // выбирал, обязан значить то же, что значил бы в другом. Потолок
+        // ключа уже применён: `sectionLimit` — это `resolved.count`.
+        let chunkCap = parsed.askedLimit == nil ? Int.max : max(1, parsed.sectionLimit)
+        // Сколько кусков влезет, заранее неизвестно: длины лежат в текстах,
+        // а тексты и есть то, за чем идём. Поэтому — порциями, пока не полно.
+        while cursor < scope.count, size < budget, pieces.count < chunkCap,
+              rounds < Self.wholeTextRoundLimit {
+            // Порция берётся под остаток бюджета, а не круглым числом:
+            // средняя длина куска после первой ходки известна точно.
+            let wanted: Int
+            if pieces.isEmpty {
+                wanted = Self.wholeTextBatchFirst
+            } else {
+                let average = max(1, size / pieces.count)
+                wanted = max(1, min(Self.wholeTextBatch, (budget - size) / average + 2))
+            }
+            // Первая ходка прихватывает и предшествующий кусок — тот, по
+            // которому ищется шов границы. В ответе он не участвует.
+            let seed = (rounds == 0 && from > 0) ? [scope[from - 1].payload] : []
+            let slice = Array(scope[cursor..<min(scope.count, cursor + wanted)])
+            var filled = try await Self.textsRestored(
+                for: seed + slice.map(\.payload), request: parsed.request, backend: backend
+            )
+            if !seed.isEmpty {
+                precedingText = filled.first?.text ?? ""
+                filled = Array(filled.dropFirst())
+            }
+            var stopped = false
+            for (offsetInSlice, payload) in filled.enumerated() {
+                // Первый кусок отдаётся всегда, даже если он один больше
+                // бюджета: ответ без текста хуже урезанного.
+                let text = payload.text ?? ""
+                let number = numbering[payload.id] ?? cursor
+                let heading = offsetInSlice < slice.count ? slice[offsetInSlice].heading : ""
+                let mark = heading != lastHeading && !heading.isEmpty
+                    ? "[chunk \(number.plainDigits) · \(heading)]"
+                    : "[chunk \(number.plainDigits)]"
+                // Столько кусков, сколько попросили, — раньше бюджета.
+                if pieces.count >= chunkCap {
+                    stopped = true
+                    break
+                }
+                // Метка уезжает наравне с текстом и платит из того же
+                // бюджета: у заголовка длиной в девяносто знаков сорок таких
+                // меток — это лишние три тысячи знаков сверх обещанного
+                // потолка — та же дыра, что у зеркал.
+                if !pieces.isEmpty, size + text.count + mark.count + 2 > budget {
+                    stopped = true
+                    break
+                }
+                lastHeading = heading
+                pieces.append((mark: mark, text: text))
+                size += text.count + mark.count + 2
+                cursor += 1
+            }
+            rounds += 1
+            if stopped { break }
+        }
+
+        var joined = Self.joinedText(pieces, after: precedingText)
+        let hasMore = cursor < scope.count
+        // Конец назван концом: агент, дочитавший семидесятую страницу из
+        // семидесяти, не должен выяснять это вычитанием.
+        if !hasMore, !joined.text.isEmpty {
+            joined.text += parsed.heading.map { "\n[end of section «\(Self.typeableHeading($0))»]" }
+                ?? "\n[end of document]"
+        }
+        structured["offset"] = .int(from)
+        structured["chunksShown"] = .int(cursor - from)
+        structured["characters"] = .int(joined.text.count)
+        structured["hasMore"] = .bool(hasMore)
+        if hasMore { structured["nextOffset"] = .int(cursor) }
+
+        var notes: [String] = []
+        if found.answer.orderUnavailable {
+            notes.append("The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — they came back in an arbitrary order, so this text is not the document's order.")
+        }
+        if joined.trimmed > 0 {
+            notes.append("The chunks of this collection overlap: \(joined.trimmed.plainDigits) repeated characters were trimmed at the seams, so the text reads as the document does.")
+        }
+        // Пометка говорит о сделанном, а не о возможном: на коллекции без
+        // перекрытия срезать на границе нечего, и обещать работу там нельзя.
+        if joined.atPageStart > 0 {
+            notes.append("Of those, \(joined.atPageStart.plainDigits) were at the seam with the previous page — paste the pages together as they are.")
+        }
+        if hasMore {
+            // Сколько ещё ходок — по тому, сколько унесла эта.
+            // Считать нечего, если страница не унесла ни куска: там свой
+            // разговор, и деление было бы на ноль.
+            let onThisPage = cursor - from
+            let left = onThisPage > 0
+                ? " About \(max(1, (scope.count - cursor + onThisPage - 1) / onThisPage).plainDigits) more pages at this rate."
+                : ""
+            notes.append("Chunks \(from.plainDigits) to \((cursor - 1).plainDigits) of \(scope.count.plainDigits) are here — continue with «offset»: \(cursor.plainDigits).\(left)")
+        }
+        if parsed.heading != nil {
+            notes.append("«offset» counts chunks inside this section; the numbers in the [chunk N] marks are the document's own, so the two do not match here.")
+        }
+        if ceilingRaised {
+            notes.append("This answer is longer than the key's ceiling of \(limits.responseCharacters.plainDigits) characters: what surrounds the text — the file description, the notes, the path — already fills it, and an answer with no text at all would be useless. Ask for a key with a larger ceiling, or read the file at «sourcePath».")
+        }
+        // Переданное и не сработавшее называется вслух: молча выбросить
+        // параметр хуже, чем урезать его (правило 3 приложения 5).
+        var ignored: [String] = []
+        if parsed.fields != nil { ignored.append("«fields»") }
+        if let note = Self.ignoredNote(
+            ignored, mode: "«as»: \"text\"",
+            because: "the text carries no metadata to project. Ask for «as»: \"chunks\" if you need the fields."
+        ) {
+            notes.append(note)
+        }
+        // Сделанное называется вслух ровно так же, как несделанное: страница
+        // на пять кусков вместо пятнадцати выглядит как упёршаяся в бюджет,
+        // и без этой строки агент решил бы, что дальше читать нечем.
+        if parsed.askedLimit != nil, cursor - from >= chunkCap, hasMore {
+            notes.append("The page stopped at the \(chunkCap.plainDigits) chunks you asked for, not at the answer budget — ask for more with «limit» to fill the answer.")
+        }
+        // Совет читать файл на диске — только пока листать ещё есть что:
+        // тому, кто дочитал до конца, он предлагает переделать сделанное.
+        if hasMore, let onDisk {
+            // Читающему раздел файл на диске даёт больше, чем он просил, —
+            // и сказать об этом надо, иначе совет выглядит равноценной
+            // заменой, а он не она.
+            notes.append(parsed.heading == nil
+                ? "The rest of this document is on this machine at \(onDisk.path) — read it there in one step instead of paging it through this channel."
+                : "The whole document — not just this section — is on this machine at \(onDisk.path); reading it there is one step instead of paging this section through the channel.")
+        }
+        if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
+
+        // Границы включительные: «0–6 of 6» читается как семь кусков из
+        // шести, и первая же сверка с метками «[chunk 5]» выглядит расхождением.
+        var header = "File «\(path)» as text: \(joined.text.count.plainDigits) characters"
+        header += cursor > from
+            ? ", chunks \(from.plainDigits)–\((cursor - 1).plainDigits) of \(scope.count.plainDigits)."
+            : ", nothing to show at offset \(from.plainDigits) of \(scope.count.plainDigits)."
+        // Текст уезжает **один раз** — только строкой. Зеркало его не несёт
+        // нарочно: ради этого режим и сделан.
+        let preamble = [header] + (describing.map { [$0] } ?? []) + notes
+        return MCPToolOutcome(
+            text: (preamble + ["", joined.text]).joined(separator: "\n"),
+            structured: .object(structured)
+        )
+    }
+
+    /// Раздел файла целиком, а не страница неизвестно чего.
+    ///
+    /// Смещения — мерка машинная: агент, читающий «куски 200–203», не знает,
+    /// что именно прочитал и кончилась ли мысль. Раздел — единица, о которой
+    /// можно рассуждать и которую можно назвать человеку.
+    private func fileSection(
+        _ parsed: ParsedFile, heading: String, limits: MCPOutputLimits
+    ) async throws -> MCPToolOutcome {
+        let found = try await fileChunks(parsed)
+        let path = found.path.isEmpty ? Self.storedPath(of: found.answer.documents) : found.path
+        // Совпадение по началу пути: «Общие положения» берёт и свои
+        // подразделы, а полный путь — только их.
+        // Тем же правилом, что и карта: кусок без заголовка идёт
+        // в раздел, внутри которого лежит, а не в «до первого заголовка».
+        // Иначе карта обещает раздел из шести кусков, а отбор отдаёт пять.
+        let headings = Self.effectiveHeadings(of: found.answer.documents)
+        // Спрошенное имя приводится к тому же виду, что и имена на карте:
+        // неразрывный пробел и перевод строки внутри заголовка агенту с
+        // экрана не видны, и перепечатанное имя не совпадало знак в знак
+        // с разделом, который карта только что назвала.
+        let asked = Self.typeableHeading(heading)
+        let picked = zip(found.answer.documents, headings)
+            .filter { $0.1 == asked || $0.1.hasPrefix(asked + " > ") }
+        let wanted = picked.map(\.0)
+        // Есть ли внутри что делить: у раздела, где все куски под одним
+        // заголовком, карта вернёт его же одной строкой, и звать её оттуда
+        // некуда.
+        let hasSubsections = picked.contains { $0.1 != asked }
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.request.collection),
+            "file": .string(path),
+            "heading": .string(asked),
+        ]
+        // Отпечаток — как у чтения по порядку и у карты: раздел читается
+        // страницами, и продолжение не должно зависеть от того, сумел ли
+        // агент правильно перепечатать путь.
+        if let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: found.answer.documents) {
+            structured["fileId"] = .string(fingerprint)
+        }
+        // Файла нет вовсе — и сказать надо это. «В файле нет такого раздела»
+        // уводит агента искать имя раздела, когда испорчен путь, а имя файла
+        // в этой пометке ещё и пустое: взять его неоткуда.
+        guard !found.answer.documents.isEmpty else {
+            structured["documents"] = .array([])
+            if path.isEmpty { structured["file"] = .string(parsed.path) }
+            let missing = await fileNotFound(parsed)
+            if !missing.similar.isEmpty {
+                structured["similarFiles"] = .array(missing.similar.map(JSONValue.string))
+            }
+            return MCPToolOutcome(
+                text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+            )
+        }
+        // Размер файла известен, как только файл найден, — значит стоит во
+        // всех ветках: клиент не должен гадать, значит ли отсутствие поля
+        // «не посчитали».
+        if let total = found.answer.total { structured["totalChunks"] = .int(total) }
+        // Где документ лежит целиком — до всех выходов, включая «смещение
+        // за концом»: тот, кто промахнулся, первым и нуждается в этом пути.
+        // Но не раньше, чем файл найден: искать путь для несуществующего
+        // файла — ход на главный поток впустую.
+        if let onDisk = await backend.fileOnDisk(metadata: found.answer.documents.first?.metadata) {
+            structured["sourcePath"] = .string(onDisk.path)
+            if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
+        }
+        guard !wanted.isEmpty else {
+            structured["documents"] = .array([])
+            // Совет «позови outline» здесь был советом в пустоту: имя агент
+            // оттуда и взял. Показываем ближайшие имена — как похожие пути
+            // на промах по файлу.
+            let missing = Self.sectionNotFound(file: path, heading: asked, among: headings)
+            if !missing.nearest.isEmpty {
+                structured["nearestSections"] = .array(missing.nearest.map(JSONValue.string))
+            }
+            return MCPToolOutcome(
+                text: missing.lines.joined(separator: "\n"), structured: .object(structured)
+            )
+        }
+        // Смещение считается **внутри раздела**, а не в файле: раздел на
+        // тридцать семь кусков в ответ не влезает, и без этого дочитать его
+        // было нечем — ответ советовал «возьмите остальное», а параметра для
+        // этого не было ни одного, и повторный вызов отдавал те же куски.
+        let within = parsed.sectionOffset
+        // Окно — то же, что у чтения по порядку: схема обещает, что «limit»
+        // с «heading» работает, и обещание должно исполняться.
+        let page = within >= wanted.count
+            ? []
+            : Array(wanted.dropFirst(within).prefix(parsed.sectionLimit))
+        guard !page.isEmpty else {
+            structured["documents"] = .array([])
+            structured["chunksInSection"] = .int(wanted.count)
+            structured["offset"] = .int(within)
+            structured["hasMore"] = .bool(false)
+            structured["sectionFitsInOneAnswer"] = .bool(false)
+            return MCPToolOutcome(
+                text: "The section «\(asked)» of «\(path)» holds \(EnglishCount.grouped(wanted.count, "chunk", "chunks")), and offset \(within.plainDigits) is already past its end.",
+                structured: .object(structured)
+            )
+        }
+        // Тексты — только у страницы. Обход ради границ раздела шёл
+        // без них: тянуть текст всего файла ради пяти кусков — та же цена,
+        // от которой спасает оглавление.
+        let withText = try await Self.textsRestored(
+            for: page, request: parsed.request, backend: backend
+        )
+        // Общие метаданные — один раз на ответ, а не на каждый кусок.
+        // Блок уезжает вместе с текстом, значит и платит из того же бюджета:
+        // вынести повтор и не заплатить за вынесенное — это не экономия,
+        // а та же дыра, что у зеркал.
+        let projection = Self.withoutRepeatedMetadata(withText, asked: parsed.fields)
+        // Приговор, заголовок и пометки уезжают вместе с кусками и платят из
+        // того же бюджета. Числа в них взяты по верхней оценке: они
+        // могут стать только короче, а строки — те же самые, собранные теми
+        // же строителями, что и в самом ответе.
+        let overhead = MCPDocumentRendering.overhead(
+            header: (Self.sectionVerdict(
+                section: wanted.count, shown: page.count,
+                left: wanted.count, calls: wanted.count, hasSubsections: true
+            ) + [Self.sectionHeader(
+                path: path, heading: asked, shown: page.count,
+                section: wanted.count, from: within
+            )]).joined(separator: "\n"),
+            notes: [Self.sectionContinueNote(
+                section: wanted.count, shown: page.count, from: within, next: wanted.count
+            )]
+                + (projection.note.map { [$0] } ?? [])
+                + (parsed.limitNote.map { [$0] } ?? [])
+                // Пометка о непредсказуемом порядке — тоже обвязка, и условие
+                // её известно до рендера. Без неё файл длиннее
+                // предела упорядочивания вёз ~300 знаков мимо бюджета.
+                + (found.answer.orderUnavailable ? [Self.unorderedSectionNote] : [])
+        )
+        let rendered = MCPDocumentRendering.render(
+            withText, limits: limits, fields: projection.fields,
+            budget: max(1, limits.responseCharacters - Self.sharedMetadataCost(projection)),
+            reserve: overhead,
+            vocabulary: .chunks
+        )
+        if !projection.shared.isEmpty {
+            structured["sharedMetadata"] = .object(projection.shared.mapValues(\.json))
+        }
+        var notes = rendered.notes
+        if let note = projection.note { notes.append(note) }
+        if found.answer.orderUnavailable { notes.append(Self.unorderedSectionNote) }
+        if let limitNote = parsed.limitNote { notes.insert(limitNote, at: 0) }
+        let readSoFar = within + rendered.shown
+        if readSoFar < wanted.count {
+            notes.append(Self.sectionContinueNote(
+                section: wanted.count, shown: rendered.shown, from: within, next: readSoFar
+            ))
+            structured["nextOffset"] = .int(readSoFar)
+            structured["hasMore"] = .bool(true)
+        } else {
+            structured["hasMore"] = .bool(false)
+        }
+        structured["documents"] = .array(rendered.documents)
+        structured["chunksInSection"] = .int(wanted.count)
+        structured["offset"] = .int(within)
+
+        // Приговор и разделу, а не только файлу целиком.
+        //
+        // Живой случай: раздел «Общие положения» — 47 кусков, в ответ влезло
+        // четыре, и пометка «did not fit whole» лежала внизу среди прочих.
+        // Агент прочитал восемь кусков из сорока семи и пошёл дальше; так
+        // двенадцать разделов подряд — 48 кусков из 1281, и по ним разбор
+        // требований. У чтения по порядку на этот случай приговор первой
+        // строкой стоит с; до раздела его не довели.
+        var verdict: [String] = []
+        // Считается **оставшееся**, а не весь раздел. Иначе на последней
+        // странице из сорока семи ответ открывался бы словами «читать целиком
+        // — шестнадцать вызовов» тому, кто дочитал сорок четыре, и стоял бы
+        // этот приговор первой строкой — громче, чем «hasMore: false» в том
+        // же ответе.
+        let leftToRead = max(0, wanted.count - readSoFar)
+        let callsToFinish = rendered.shown > 0
+            ? (leftToRead + rendered.shown - 1) / rendered.shown
+            : 0
+        structured["sectionFitsInOneAnswer"] = .bool(rendered.shown >= wanted.count)
+        if callsToFinish > 0 { structured["callsToFinishSection"] = .int(callsToFinish) }
+        if callsToFinish >= Self.wholeFileCallBudget {
+            verdict += Self.sectionVerdict(
+                section: wanted.count, shown: rendered.shown, left: leftToRead,
+                calls: callsToFinish, hasSubsections: hasSubsections
+            )
+        }
+        if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
+        let header = Self.sectionHeader(
+            path: path, heading: asked, shown: rendered.shown,
+            section: wanted.count, from: within
+        )
+        return MCPToolOutcome(
+            text: (verdict + [header] + rendered.lines + notes).joined(separator: "\n"),
+            structured: .object(structured)
+        )
+    }
+
     /// `get_file` — чанки одного файла по порядку.
     private func file(_ parsed: ParsedFile, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        if parsed.wantsOutline { return try await fileOutline(parsed, limits: limits) }
+        if parsed.wantsWholeText { return try await fileWholeText(parsed, limits: limits) }
+        if let heading = parsed.heading {
+            return try await fileSection(parsed, heading: heading, limits: limits)
+        }
         let found = try await fileChunks(parsed)
         let answer = found.answer
         // Файл, спрошенный отпечатком, называется в ответе путём: агент
         // покажет человеку документ, а не шестнадцать знаков.
         let path = found.path.isEmpty ? Self.storedPath(of: answer.documents) : found.path
         let fingerprint = parsed.fingerprint ?? Self.storedFingerprint(of: answer.documents)
+        // То же, что и у раздела: повтор одного и того же блока метаданных
+        // на каждом куске — место, отнятое у текста.
+        let projection = Self.withoutRepeatedMetadata(answer.documents, asked: parsed.fields)
+        // Путь на диске нужен **до** рендера: он уезжает в приговоре, и
+        // приговор платит из того же бюджета, что и куски. На живом
+        // пути в сто знаков он уходит туда дважды.
+        let onDisk = await backend.fileOnDisk(metadata: answer.documents.first?.metadata)
+        // Обвязка ответа — приговор, заголовок и пометки — по верхней оценке
+        // чисел: короче они стать могут, длиннее нет.
+        let pageOverhead = MCPDocumentRendering.overhead(
+            header: (Self.pageVerdict(
+                total: answer.total ?? answer.documents.count,
+                shown: answer.documents.count,
+                left: answer.total ?? answer.documents.count,
+                calls: answer.total ?? answer.documents.count,
+                onDiskPath: onDisk?.path
+            ) + [Self.pageHeader(
+                path: path, shown: answer.documents.count,
+                from: parsed.request.offset, total: answer.total
+            )]).joined(separator: "\n"),
+            notes: [Self.pageContinueNote(next: answer.total ?? answer.documents.count)]
+                + (projection.note.map { [$0] } ?? [])
+                + (parsed.limitNote.map { [$0] } ?? [])
+                + (answer.orderUnavailable ? [Self.unorderedPageNote] : [])
+        )
         let rendered = MCPDocumentRendering.render(
-            answer.documents, limits: limits, fields: parsed.fields
+            answer.documents, limits: limits, fields: projection.fields,
+            budget: max(1, limits.responseCharacters - Self.sharedMetadataCost(projection)),
+            reserve: pageOverhead,
+            vocabulary: .chunks
         )
         // Показано меньше, чем отдала база (сработал потолок объёма ответа), —
         // значит следующая страница начинается там, где оборвался показ,
@@ -2395,49 +4178,100 @@ public struct MCPToolService: Sendable {
         if let total = answer.total { structured["total"] = .int(total) }
         if more { structured["nextOffset"] = .int(next) }
 
-        var notes = rendered.notes
-        if let limitNote = parsed.limitNote { notes.insert(limitNote, at: 0) }
-        if answer.orderUnavailable {
-            notes.append("The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — the application does not return that many in an arbitrary order; assemble them by the chunk_index field.")
+        if !projection.shared.isEmpty {
+            structured["sharedMetadata"] = .object(projection.shared.mapValues(\.json))
         }
+        var notes = rendered.notes
+        if let note = projection.note { notes.append(note) }
+        if let limitNote = parsed.limitNote { notes.insert(limitNote, at: 0) }
+        if answer.orderUnavailable { notes.append(Self.unorderedPageNote) }
         if more {
-            notes.append("The file was not read whole: continue with offset \(next.plainDigits).")
+            notes.append(Self.pageContinueNote(next: next))
         }
         if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
 
+        // «4 chunks starting at 0, 1281 in total» — это правда, поданная как
+        // справка, и агент читает её как успех. Живой случай: прочитал
+        // двадцать три куска из 1281 и написал по ним разбор требований, не
+        // заметив, что видел один процент. Сказать «столько не поместится»
+        // обязано приложение: полагаться на то, что агент сам поделит одно
+        // число на другое, значит полагаться на случай.
+        if let onDisk {
+            structured["sourcePath"] = .string(onDisk.path)
+            if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
+        }
+
+        var verdict: [String] = []
+        // Поле ставится всегда, когда о полном размере известно: клиент,
+        // читающий структурированный ответ, не должен гадать, значит ли
+        // отсутствие поля «влезает» или «не посчитали».
+        //
+        // И значит оно ровно то, что обещает именем: **весь файл в этом
+        // ответе**, а не «читать недорого». Прежде в ветке «вызовов меньше
+        // десяти» стояло `true` — то есть файл на двадцать кусков, показанный
+        // по четыре, отвечал клиенту «влезает целиком», приговор при этом
+        // молчал, и число вызовов не ставилось вовсе. Порог решает, надо
+        // ли говорить вслух, а не известна ли цена.
+        // Пропавшему файлу поле не ставится вовсе: `0 >= 0` — правда, но
+        // «весь файл в этом ответе» о файле, которого в коллекции нет, —
+        // не правда ни в каком смысле. Смещение за концом — другое дело:
+        // там `total` известен и больше нуля, и ответ честно говорит «нет».
+        if let total = answer.total, total > 0 {
+            let whole = rendered.shown >= total
+            structured["fitsInOneAnswer"] = .bool(whole)
+            // Считается **оставшееся**, а не весь файл. закрыл это у
+            // раздела и не перенёс сюда: на последней странице из 1281 куска
+            // ответ открывался словами «читать так — двести пятьдесят семь
+            // вызовов» тому, кто дочитал 1276, и советовал начать заново.
+            let readSoFar = parsed.request.offset + rendered.shown
+            let leftToRead = max(0, total - readSoFar)
+            let callsToFinish = rendered.shown > 0
+                ? (leftToRead + rendered.shown - 1) / rendered.shown
+                : 0
+            if callsToFinish > 0 { structured["callsToFinish"] = .int(callsToFinish) }
+            if !whole, rendered.shown > 0 {
+                if callsToFinish >= Self.wholeFileCallBudget {
+                    // Ни слова о токенах: по пяти прочитанным кускам их не
+                    // сосчитать — на титульных страницах они мелкие, и оценка
+                    // разошлась с точной на треть (342 027 против 500 625).
+                    // Число чанков и вызовов известно точно, его и называем,
+                    // а вес отдаёт оглавление, где сложены все куски.
+                    verdict += Self.pageVerdict(
+                        total: total, shown: rendered.shown, left: leftToRead,
+                        calls: callsToFinish, onDiskPath: onDisk?.path
+                    )
+                }
+            }
+        }
+
         guard !answer.documents.isEmpty else {
-            guard parsed.fingerprint == nil else {
-                // Отпечаток испортить нечем, поэтому промах по нему значит
-                // одно из двух: коллекция не та или файла в ней нет.
-                // Отдельная беда — коллекции прежних сборок, где поля file_id
-                // ещё нет; о ней говорится прямо, иначе агент будет повторять
-                // тот же вызов.
+            // Файл есть, а страница пуста — значит смещение ушло за конец.
+            // Сказать тут «файла нет» неверно вдвойне: в том же ответе стоит
+            // total, а совет сменить отпечаток на путь уводит агента чинить
+            // несуществующую беду. Чтение по разделу это говорит правильно
+            // с, чтение по порядку молчало.
+            if let total = answer.total, total > 0, parsed.request.offset >= total {
+                let named = path.isEmpty ? (fingerprint ?? parsed.path) : path
                 let lines = [
-                    "The collection «\(parsed.request.collection)» has no chunks with file_id «\(parsed.fingerprint ?? "")».",
-                    "If the collection was filled by earlier builds it has no file_id field yet — call get_file with the «file» parameter, taking the path from the source_file field of a document you found.",
+                    "The file «\(named)» holds \(EnglishCount.grouped(total, "chunk", "chunks")), and offset \(parsed.request.offset.plainDigits) is already past its end.",
                 ] + notes
                 return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
             }
-            var lines = ["The collection «\(parsed.request.collection)» has no documents of the file «\(parsed.path)»."]
-            // Что делать дальше, а не только чем ошибся: файл с этим именем
-            // почти всегда в коллекции есть — агент потерял верхние папки
-            // пути. Живой случай: спросили «000001/Документ/…», а лежит
-            // «Ведомство Б/ЦОД/000001/Документ/…», и агент бросил читать.
-            let similar = await similarFiles(to: parsed.path, in: parsed.request.collection)
-            if similar.isEmpty {
-                lines.append("Take the path from the source_file field of a document you found, whole — not the file name and not an absolute path.")
-            } else {
-                lines.append("A file with that name is in the collection — its whole path differs. Call get_file with one of these:")
-                lines += similar.map { "• \($0)" }
-                structured["similarFiles"] = .array(similar.map(JSONValue.string))
+            let missing = await fileNotFound(parsed)
+            if !missing.similar.isEmpty {
+                structured["similarFiles"] = .array(missing.similar.map(JSONValue.string))
             }
-            lines += notes
-            return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
+            return MCPToolOutcome(
+                text: (missing.lines + notes).joined(separator: "\n"), structured: .object(structured)
+            )
         }
 
-        var header = "File «\(path)»: \(EnglishCount.grouped(rendered.shown, "chunk", "chunks")) starting at \(parsed.request.offset.plainDigits)"
-        if let total = answer.total { header += ", \(total.plainDigits) in total" }
-        let text = ([header] + rendered.lines + notes).joined(separator: "\n")
+        let header = Self.pageHeader(
+            path: path, shown: rendered.shown, from: parsed.request.offset, total: answer.total
+        )
+
+        // Приговор идёт первой строкой, а не пометкой внизу.
+        let text = (verdict + [header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
     }
 
@@ -2460,7 +4294,8 @@ public struct MCPToolService: Sendable {
                 filter: Self.fileFilter(variant),
                 limit: parsed.request.limit,
                 offset: parsed.request.offset,
-                orderedByChunkIndex: parsed.request.orderedByChunkIndex
+                orderedByChunkIndex: parsed.request.orderedByChunkIndex,
+                needsText: parsed.request.needsText
             )
             let answer = try await backend.documents(retry)
             if !answer.documents.isEmpty { return (answer, variant) }

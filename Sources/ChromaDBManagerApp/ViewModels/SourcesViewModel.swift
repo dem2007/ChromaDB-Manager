@@ -233,7 +233,7 @@ final class SourcesViewModel: ObservableObject {
 
     func addSource(_ app: AppEnvironment) {
         guard let url = ConnectionViewModel.chooseDirectory(
-            title: "Выберите папку с документами",
+            title: String(localized: "Выберите папку с документами"),
             message: "Файлы из этой папки будут разбиты на чанки и проиндексированы в коллекцию."
         ) else { return }
 
@@ -262,7 +262,7 @@ final class SourcesViewModel: ObservableObject {
     /// рассказать больше — поэтому и выбирается она так же.
     func addGitSource(_ app: AppEnvironment) {
         guard let url = ConnectionViewModel.chooseDirectory(
-            title: "Выберите рабочую копию репозитория",
+            title: String(localized: "Выберите рабочую копию репозитория"),
             message: "Список файлов даст git: в индекс не попадут ни .git, ни то, что перечислено в .gitignore."
         ) else { return }
 

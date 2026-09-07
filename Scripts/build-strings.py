@@ -175,7 +175,21 @@ def main() -> int:
         print(f"  − {key[:70]}")
 
     if check_only:
-        return 1 if (added or retired) else 0
+        # Отказ — только на **новых**: строка есть в коде, а в каталоге её нет,
+        # и англоязычный человек увидит русскую фразу. Это дефект.
+        #
+        # «Исчезло из кода» — не дефект: такие ключи `render` в файле
+        # оставляет, они никому не мешают, и их в каталоге накопилось под три
+        # сотни. Роняя проверку и на них, её нельзя было бы включить сторожем
+        # ни в один прогон — а без сторожа она и осталась ручной, из-за чего
+        # пять строк ветки и уехали без перевода.
+        if added:
+            print(
+                "каталог отстал от кода: запустите python3 Scripts/build-strings.py"
+                " и допишите английский в Resources/en.lproj/Localizable.strings"
+            )
+            return 1
+        return 0
 
     CATALOGUE.parent.mkdir(parents=True, exist_ok=True)
     CATALOGUE.write_text(text, encoding="utf-8")

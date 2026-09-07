@@ -111,7 +111,7 @@ final class TestBenchViewModel: ObservableObject {
 
     func loadFileForPreview(_ app: AppEnvironment) {
         guard let url = ConnectionViewModel.chooseFile(
-            title: "Файл для предпросмотра извлечения",
+            title: String(localized: "Файл для предпросмотра извлечения"),
             message: "Файл только читается: ничего не индексируется и не записывается."
         ) else { return }
 

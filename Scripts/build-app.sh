@@ -49,6 +49,16 @@ cp "$ROOT/Resources/Info.plist" "$BUNDLE/Contents/Info.plist"
 cp "$ICON" "$BUNDLE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 
+# Скилл агента внутри бандла. Две причины держать его здесь, а не
+# только в репозитории: кнопка «поставить скилл» ставит именно этот файл, и
+# человек, которому кнопка не подошла, находит его руками — Contents/
+# Resources/Skills/chromadb-manager/. Русский вариант лежит рядом.
+SKILL_DIR="$BUNDLE/Contents/Resources/Skills/chromadb-manager"
+mkdir -p "$SKILL_DIR"
+cp "$ROOT/docs/hermes/chromadb-manager-SKILL.md" "$SKILL_DIR/SKILL.md"
+cp "$ROOT/docs/hermes/chromadb-manager-SKILL.ru.md" "$SKILL_DIR/SKILL.ru.md"
+echo "==> скилл агента: $(wc -l < "$SKILL_DIR/SKILL.md" | tr -d ' ') строк"
+
 # Каталог текстов. Кладётся в бандл приложения, а не в ресурсы пакета:
 # `String(localized:)` и надписи SwiftUI ищут в главном бандле, и это ровно
 # бандл приложения — что для кода из ChromaCore, что для кода экранов.

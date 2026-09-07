@@ -469,6 +469,44 @@ final class SourceSyncPlanTests: XCTestCase {
         }
     }
 
+    /// Папка, которую система читать не даёт, — ошибка, а не «изменений нет».
+    ///
+    /// Живой случай: папка, созданная в «Загрузках» другой программой.
+    /// macOS помечает такие своим происхождением и чужому приложению их не
+    /// показывает; `enumerator` при этом не бросает ничего — просто не выдаёт
+    /// ни одного элемента. Прогон заканчивался бодрым «изменений нет (файлов
+    /// без изменений 0)», и человек шёл искать ошибку в настройках источника.
+    func testAFolderThatCannotBeListedIsAnErrorAndNotAnEmptyRun() async throws {
+        var source = makeSource()
+        let closed = root.appendingPathComponent("закрытая")
+        try FileManager.default.createDirectory(at: closed, withIntermediateDirectories: true)
+        try "текст".write(to: closed.appendingPathComponent("файл.md"), atomically: true, encoding: .utf8)
+        // Права снимаются с самой папки: файл внутри остаётся на месте, но
+        // перечислить содержимое нельзя — ровно как у «чужой» папки в macOS.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: closed.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: closed.path
+            )
+        }
+        source.path = closed.path
+        source.recursive = true
+        do {
+            _ = try await service.plan(source: source, embeddingModel: "m")
+            XCTFail("ожидалась ошибка о нечитаемой папке, а не пустой прогон")
+        } catch let error as SyncError {
+            guard case .folderUnreadable = error else {
+                return XCTFail("ожидалась folderUnreadable, получено \(error)")
+            }
+            XCTAssertTrue(
+                (error.errorDescription ?? "").contains("не удалось прочитать"),
+                "ошибка обязана называть причину: \(error.errorDescription ?? "")"
+            )
+        }
+    }
+
     func testManifestRoundTrip() throws {
         let id = UUID()
         var manifest = SourceManifest(sourceID: id)

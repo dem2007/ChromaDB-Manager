@@ -316,9 +316,17 @@ final class MCPService: ObservableObject {
     collect_mentions: search by meaning does not give coverage, and the \
     measurement on a live base is chunks of three files out of thirteen at any \
     number of results. \
-    A whole document — get_file; only it keeps the order of the chunks. \
-    The documents are in Russian: pass stems for «contains» and table column \
-    names in Russian, and answer the user in the language the user wrote in. \
+    A whole document — get_file: it returns continuous text, and you page it \
+    with the «offset» the answer gives you. Every answer also names \
+    «sourcePath», where the document sits on this machine's disk — if you can \
+    read files there, that is the whole document in one step. To work with a \
+    large document without reading it whole, ask get_file for «outline» \
+    first — it says what the file costs to read whole and which section you \
+    want — then that section by «heading». \
+    The documents are in whatever language the corpus is in — and so are the \
+    stems for «contains» and the names of table columns: they are literal \
+    substrings of the corpus, pass them in its language. Answer the user in \
+    the language the user wrote in. \
     If the answer holds table rows, their columns are the filter fields; ask \
     for only the ones you need in «fields», or the row brings all of its \
     columns and the answer is cut off by size. \
@@ -674,6 +682,17 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
             )
         }
 
+        // Оглавлению текст не нужен вовсе: оно строится по заголовкам
+        // и номерам, а окно у него — весь файл. Ходить за текстами тысячи
+        // кусков, чтобы их выбросить, — это ровно та цена, ради ухода от
+        // которой оглавление и сделано.
+        guard request.needsText else {
+            return MCPDocumentsAnswer(
+                documents: window.page, hasMore: window.hasMore,
+                total: ordered.count, orderUnavailable: overflowed
+            )
+        }
+
         // Тексты — только у окна. Порядок восстанавливается по списку id:
         // выдача `get` по идентификаторам тоже не обязана его сохранять.
         let ids = window.page.map(\.id)
@@ -788,6 +807,22 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
             ids: records.map(\.id), model: model,
             note: warnings.isEmpty ? nil : warnings.joined(separator: " ")
         )
+    }
+
+    /// Где лежит исходный файл — тем же разбором, каким его открывает
+    /// просмотрщик.
+    ///
+    /// Агент работает на той же машине: назвать путь дешевле любого чтения
+    /// через канал вызовов. Своего разбора здесь нет нарочно — второй способ
+    /// собрать путь означал бы второй набор ошибок.
+    func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk? {
+        guard let app = try? await environment() else { return nil }
+        let sources = await MainActor.run { app.settings.configuration.dataSources }
+        guard case .found(let url, _, _) = DocumentLocator.resolve(
+            metadata: metadata, sources: sources
+        ) else { return nil }
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int
+        return MCPFileOnDisk(path: url.path, bytes: bytes)
     }
 
     func delete(_ request: MCPDeleteRequest) async throws -> MCPDeleteAnswer {

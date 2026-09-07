@@ -711,8 +711,8 @@ struct SourcesSection: View {
             .count
 
         return SectionCard(
-            title: "План синхронизации «\(plan.sourceName)»",
-            subtitle: "Сравнение папки с манифестом. Ничего не записано и не посчитано — это только предпросмотр."
+            title: String(localized: "План синхронизации «\(plan.sourceName)»"),
+            subtitle: String(localized: "Сравнение папки с манифестом. Ничего не записано и не посчитано — это только предпросмотр.")
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 if isPending {
@@ -874,7 +874,7 @@ struct SourcesSection: View {
     // MARK: - Summary
 
     private func summaryCard(_ summary: SyncSummary) -> some View {
-        SectionCard(title: "Результат синхронизации «\(summary.sourceName)»") {
+        SectionCard(title: String(localized: "Результат синхронизации «\(summary.sourceName)»")) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(summary.line).font(Theme.Font.body)
                 Text("модель: \(summary.embeddingModel)\(summary.dimension.map { " · размерность \($0)" } ?? "") · время \(SecondsText.line(summary.duration))")
@@ -943,8 +943,8 @@ struct SourcesSection: View {
 
         if !pairs.isEmpty || !rowPairs.isEmpty {
             SectionCard(
-                title: "Требуют решения",
-                subtitle: "Файлы и строки таблиц исчезли из источника. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет."
+                title: String(localized: "Требуют решения"),
+                subtitle: String(localized: "Файлы и строки таблиц исчезли из источника. Документы остаются в базе, пока вы не решите иначе — автоматически приложение ничего не удаляет.")
             ) {
                 VStack(alignment: .leading, spacing: 14) {
                     // Разбор идёт файл за файлом и на девяноста файлах длится

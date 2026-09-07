@@ -186,7 +186,7 @@ struct TransferSheet: View {
         }
 
         if let report = model.lastImport {
-            SectionCard(title: "Отчёт импорта", subtitle: report.line) {
+            SectionCard(title: String(localized: "Отчёт импорта"), subtitle: report.line) {
                 VStack(alignment: .leading, spacing: 4) {
                     if !report.brokenLines.isEmpty {
                         Text("Строки, которые не разобрались: \(report.brokenLines.prefix(20).map(\.description).joined(separator: ", "))")
@@ -205,7 +205,7 @@ struct TransferSheet: View {
     }
 
     private func manifestCard(_ manifest: CollectionExportManifest) -> some View {
-        SectionCard(title: "Пакет", subtitle: manifest.collectionName) {
+        SectionCard(title: String(localized: "Пакет"), subtitle: manifest.collectionName) {
             VStack(alignment: .leading, spacing: 3) {
                 row("Документов", manifest.documentCount.plainDigits)
                 row("Векторы", manifest.includesEmbeddings ? String(localized: "включены") : String(localized: "не включены"))

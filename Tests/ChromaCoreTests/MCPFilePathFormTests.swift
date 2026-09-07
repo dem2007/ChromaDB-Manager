@@ -96,9 +96,13 @@ final class MCPFilePathFormTests: XCTestCase {
     }
 
     private func call(_ service: MCPToolService, file: String) async throws -> JSONValue {
+        // Ветка кусков названа явно: эти проверки считают запросы к базе, а
+        // сплошной текст — умолчание с — ходит за текстами отдельно.
         try await service.call(
             name: MCPToolCatalogue.getFile.name,
-            arguments: .object(["collection": .string("заметки"), "file": .string(file)]),
+            arguments: .object([
+                "collection": .string("заметки"), "file": .string(file), "as": .string("chunks"),
+            ]),
             key: key
         ).get()
     }
@@ -259,7 +263,9 @@ final class MCPFileFingerprintTests: XCTestCase {
     private func call(_ service: MCPToolService, _ arguments: [String: JSONValue]) async throws -> JSONValue {
         try await service.call(
             name: MCPToolCatalogue.getFile.name,
-            arguments: .object(arguments.merging(["collection": .string("заметки")]) { left, _ in left }),
+            arguments: .object(arguments.merging([
+                "collection": .string("заметки"), "as": .string("chunks"),
+            ]) { left, _ in left }),
             key: key
         ).get()
     }

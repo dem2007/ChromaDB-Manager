@@ -459,6 +459,8 @@ public struct SyncSummary {
 
 public enum SyncError: LocalizedError {
     case folderMissing(String)
+    /// Папка на месте, но прочитать её содержимое система не даёт.
+    case folderUnreadable(String, String)
     /// Том источника не тот, что был раньше: `/Volumes/Backup`
     /// сегодня и вчера бывает разными дисками.
     case volumeChanged(expected: String, found: String?)
@@ -490,6 +492,8 @@ public enum SyncError: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
+        case .folderUnreadable(let path, let reason):
+            return String(localized: "Папку \(path) не удалось прочитать: \(reason). Скорее всего macOS не пускает приложение в неё: откройте «Настройки → Конфиденциальность и безопасность → Доступ к диску» и добавьте ChromaDB Manager, либо пересоздайте папку в Finder. Ничего не индексировалось.")
         case .folderMissing(let path):
             return String(localized: "Папка источника не найдена: \(path)")
         case .volumeChanged(let expected, let found):
@@ -1078,6 +1082,24 @@ public actor SourceSyncService {
 
         var files: [URL] = []
         if source.recursive {
+            // Читаемость корня проверяется **до** обхода.
+            //
+            // `enumerator` на папке, которую система читать не даёт, не
+            // бросает ничего: он просто не выдаёт ни одного элемента, и
+            // прогон заканчивается бодрым «изменений нет (файлов без
+            // изменений 0)». Живой случай: папка, созданная другой
+            // программой в «Загрузках», — macOS помечает такие своим
+            // происхождением и чужому приложению их не показывает.
+            // Пустая папка и папка, которую не пустили, — разные вещи,
+            // и говорить о второй как о первой значит отправить человека
+            // искать несуществующую ошибку в настройках источника.
+            do {
+                _ = try fileManager.contentsOfDirectory(atPath: root.path)
+            } catch {
+                log(.error, "Источники",
+                    "Источник «\(source.name)»: папку \(root.path) не удалось прочитать — \(error.localizedDescription)")
+                throw SyncError.folderUnreadable(root.path, error.localizedDescription)
+            }
             guard let enumerator = fileManager.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isRegularFileKey],
@@ -2998,7 +3020,10 @@ public actor SourceSyncService {
         // separator, not a list.
         // Язык документа целиком: короткому чанку он достаётся
         // отсюда, а фильтр «все документы на английском» строится по нему.
-        if let language = TextLinguistics.language(of: text) {
+        // По собственному тексту документа, без слов, вписанных приложением
+        //: три строки «Колонтитул: …» на 1,75 млн знаков переводили
+        // определитель с `ru` на `bg` — и уверенность у него была 1.00.
+        if let language = TextLinguistics.documentLanguage(of: text) {
             metadata["document_language"] = .string(language)
         }
         if !extracted.warnings.isEmpty {

@@ -24,9 +24,24 @@ public enum MCPConnectionConfig {
     /// в конфигурацию — и подставляет заметную заглушку вместо тихого пропуска.
     public static let keyPlaceholder = "СЮДА-КЛЮЧ-КЛИЕНТА"
 
-    /// Где агентское приложение держит эту конфигурацию.
-    public static let desktopConfigPath =
-        "~/Library/Application Support/Claude/claude_desktop_config.json"
+    /// Где агенты держат эту конфигурацию.
+    ///
+    /// Файл у каждого свой, и назвать один — значит послать не туда всех
+    /// остальных. Раньше здесь стоял только путь Claude Desktop, а кнопки
+    /// на той же карточке пишут в Hermes и Bionic.
+    /// Пути агентов берутся у `AgentKind` — того же места, куда пишут кнопки.
+    /// Второй список тех же файлов разошёлся бы с первой правкой, и карточка
+    /// послала бы человека править файл, которого приложение не трогает.
+    /// Считается один раз: пути не меняются, пока приложение работает, а
+    /// читается это из тела экрана — то есть на каждой перерисовке.
+    public static let configPaths: [String] =
+        AgentKind.allCases.map {
+            "\($0.title) — \(($0.configuration.path as NSString).abbreviatingWithTildeInPath)"
+        } + [
+            // Claude Desktop кнопками не настраивается — его путь и остаётся
+            // единственным, записанным здесь.
+            "Claude Desktop — ~/Library/Application Support/Claude/claude_desktop_config.json",
+        ]
 
     /// Фрагмент JSON целиком, с подставленными путём и ключом.
     public static func json(helperPath: String, key: String?) -> String {
@@ -48,8 +63,13 @@ public enum MCPConnectionConfig {
 
     /// Та же настройка одной командой — для тех, кто правит конфигурацию не
     /// руками. Путь берётся в кавычки: в имени бандла есть пробел.
+    ///
+    /// Команда — от **Hermes**, а не от Claude Code: `claude` на машине может
+    /// не стоять вовсе, и совет, который некому выполнить, — это не совет.
+    /// Ключи взяты у живого `hermes mcp add --help`, а не придуманы: `--env`
+    /// принимает `КЛЮЧ=ЗНАЧЕНИЕ`, стоит после `--command`.
     public static func commandLine(helperPath: String, key: String?) -> String {
-        "claude mcp add \(serverName) --env CHROMADB_MCP_KEY=\(key ?? keyPlaceholder) -- \"\(helperPath)\""
+        "hermes mcp add \(serverName) --command \"\(helperPath)\" --env CHROMADB_MCP_KEY=\(key ?? keyPlaceholder)"
     }
 }
 

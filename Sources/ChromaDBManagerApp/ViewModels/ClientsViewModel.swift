@@ -7,9 +7,16 @@ import ChromaCore
 /// proxy, to which collections, and with what limits.
 @MainActor
 final class ClientsViewModel: ObservableObject {
-    /// The key of a client that has just been created or reissued. Shown once
-    /// and then gone for good — the app stores only its hash.
-    @Published var freshKey: (clientName: String, key: String)?
+    /// Ключ, выпущенный **сейчас**, и чей он.
+    ///
+    /// Показывается один раз и пропадает навсегда: приложение хранит только
+    /// хеш.
+    ///
+    /// По идентификатору, а не по имени: имена клиентов не уникальны —
+    /// создание требует лишь непустого. Двум клиентам с именем «агент» ключ
+    /// первого показывался на карточке второго, а с появлением кнопок ушёл
+    /// бы в конфигурацию агента как рабочий.
+    @Published var freshKey: (clientID: UUID, clientName: String, key: String)?
     @Published var draftName = ""
     @Published var statusMessage: String?
     @Published var errorMessage: String?
@@ -51,7 +58,7 @@ final class ClientsViewModel: ObservableObject {
         app.settings.configuration.externalClients.append(client)
         app.refreshAccessRules()
         draftName = ""
-        freshKey = (client.name, key)
+        freshKey = (client.id, client.name, key)
         app.log.record(.info, "Доступ", "Создан клиент «\(client.name)» (\(client.keyPrefix)…)")
     }
 
@@ -60,7 +67,7 @@ final class ClientsViewModel: ObservableObject {
         app.settings.configuration.updateClient(id: client.id) { key = $0.reissue() }
         guard let key else { return }
         app.refreshAccessRules()
-        freshKey = (client.name, key)
+        freshKey = (client.id, client.name, key)
         app.log.record(.warning, "Доступ", "Ключ клиента «\(client.name)» перевыпущен — прежний больше не действует")
     }
 
@@ -169,19 +176,19 @@ final class ClientsViewModel: ObservableObject {
     func agentConfiguration(for client: ExternalClient) -> String {
         MCPConnectionConfig.json(
             helperPath: MCPConnectionTester.helperPath,
-            key: freshKey?.clientName == client.name ? freshKey?.key : nil
+            key: freshKey?.clientID == client.id ? freshKey?.key : nil
         )
     }
 
     func agentCommandLine(for client: ExternalClient) -> String {
         MCPConnectionConfig.commandLine(
             helperPath: MCPConnectionTester.helperPath,
-            key: freshKey?.clientName == client.name ? freshKey?.key : nil
+            key: freshKey?.clientID == client.id ? freshKey?.key : nil
         )
     }
 
     func hasKeyAtHand(_ client: ExternalClient) -> Bool {
-        freshKey?.clientName == client.name
+        freshKey?.clientID == client.id
     }
 
     func copyAgentConfiguration(for client: ExternalClient) {
@@ -190,6 +197,206 @@ final class ClientsViewModel: ObservableObject {
         statusMessage = hasKeyAtHand(client)
             ? String(localized: "Конфигурация с ключом скопирована — вставьте её в настройки агента.")
             : String(localized: "Конфигурация скопирована. Ключ подставьте сами: приложение его не хранит.")
+    }
+
+    // MARK: - Настроить агента одной кнопкой
+
+    /// Агенты, найденные на этой машине. Кнопки для ненайденного не рисуются:
+    /// предложить настроить то, чего нет, — это отказ, поданный как действие.
+    /// Считается один раз: агентов не ставят и не сносят при открытом окне,
+    /// а свойство читается из тела экрана — то есть на каждой перерисовке.
+    private(set) lazy var installedAgents: [AgentKind] = AgentKind.allCases.filter(\.isInstalled)
+
+    /// Файл скилла внутри бандла. Он же лежит в
+    /// `Contents/Resources/Skills/chromadb-manager/` — для тех, кому кнопка
+    /// не подошла и кто ставит руками.
+    static var bundledSkill: URL? {
+        Bundle.main.resourceURL?
+            .appendingPathComponent("Skills/\(AgentIntegration.skillName)/SKILL.md")
+    }
+
+    /// Прописать сервер в конфигурацию агента — вместе с ключом.
+    ///
+    /// Ключ подставляется, только когда он **сейчас** на руках: приложение
+    /// хранит хеш, и достать ключ из него нельзя (7.4). Без ключа кнопка не
+    /// нажимается вовсе — конфигурация с заглушкой не «почти работает»,
+    /// она не работает, а выглядит настроенной.
+    func installServer(_ kind: AgentKind, for client: ExternalClient) {
+        guard let key = freshKey?.clientID == client.id ? freshKey?.key : nil else {
+            statusMessage = String(localized: "Ключа нет на руках: перевыпустите его — и кнопка впишет настройку вместе с ним.")
+            return
+        }
+        // Спрашиваем прежде, чем править чужой файл. Правило 4 приложения 5
+        // требует показать план и дождаться согласия у массовой записи; здесь
+        // запись одна, но в **чужом** документе, который человек ведёт руками
+        // и в котором лежат его ключи к другим сервисам.
+        pendingAgentAction = AgentAction(
+            kind: kind, target: .server(clientID: client.id, key: key),
+            path: kind.configuration.path
+        )
+    }
+
+    /// Что подтверждает человек и над чем.
+    struct AgentAction: Identifiable {
+        enum Target {
+            case server(clientID: UUID, key: String)
+            /// Откуда берётся скилл: файл в бандле или папка, выбранная
+            /// человеком. Источник едет **вместе с намерением**: между
+            /// вопросом и согласием он не должен меняться.
+            case skill(source: URL)
+        }
+        let id = UUID()
+        let kind: AgentKind
+        let target: Target
+        let path: String
+
+        var question: String {
+            switch target {
+            case .server: return String(localized: "Прописать сервер в \(kind.title)?")
+            case .skill: return String(localized: "Положить скилл в \(kind.title)?")
+            }
+        }
+        var explanation: String {
+            switch target {
+            case .server:
+                return String(localized: "Будет изменён файл \(path). Прежний сохранится рядом снимком.")
+            case .skill(let source):
+                return String(localized: "Из \(source.path) будет собрана папка \(path). Прежняя сохранится снимком.")
+            }
+        }
+    }
+
+    @Published var pendingAgentAction: AgentAction?
+
+    /// Согласие принимает **само намерение**, а не читает его из состояния.
+    ///
+    /// Окно закрывается той же связкой `isPresented`, что обнуляет
+    /// `pendingAgentAction`. Пока SwiftUI успевает выполнить действие кнопки
+    /// до закрытия, чтение из состояния работает — но это порядок, которого
+    /// нам никто не обещал: случись он обратным, `guard` молча проглотил бы
+    /// всю работу, и кнопка снова не делала бы ничего.
+    func confirmAgentAction(_ action: AgentAction) {
+        pendingAgentAction = nil
+        switch action.target {
+        case .server(_, let key): performInstallServer(action.kind, key: key)
+        case .skill(let source): performInstallSkill(action.kind, from: source)
+        }
+    }
+
+    private func performInstallServer(_ kind: AgentKind, key: String) {
+        let helper = MCPConnectionTester.helperPath
+        // Запись уходит с главного потока: четыре обращения к файловой
+        // системе на сетевой домашней папке — это застывшее окно.
+        Task {
+            let result = await Task.detached {
+                Result { try AgentIntegration.installServer(kind, key: key, helperPath: helper) }
+            }.value
+            self.reportServer(kind, result)
+        }
+    }
+
+    private func reportServer(_ kind: AgentKind, _ result: Result<AgentInstallOutcome, Error>) {
+        switch result {
+        case .failure(let error):
+            statusMessage = error.localizedDescription
+        case .success(let outcome):
+            var text = outcome.changedNothing
+                ? String(localized: "\(kind.title): настройка уже была такой — файл \(outcome.path) не тронут.")
+                : (outcome.replacedExisting
+                    ? String(localized: "\(kind.title): настройка сервера обновлена в \(outcome.path).")
+                    : String(localized: "\(kind.title): сервер добавлен в \(outcome.path)."))
+            if outcome.rewroteFromTemplate {
+                text += " " + String(localized: "Блок собран заново: если вы правили его руками, сверьтесь со снимком.")
+            }
+            if let backup = outcome.backup {
+                text += " " + String(localized: "Прежний файл сохранён: \(backup).")
+            }
+            text += " " + String(localized: "Перезапустите агента.")
+            statusMessage = text
+        }
+    }
+
+    /// Положить `SKILL.md` туда, где агент его читает.
+    func installSkill(_ kind: AgentKind) {
+        guard let source = Self.bundledSkill else {
+            statusMessage = AgentIntegrationError.skillMissing.localizedDescription
+            return
+        }
+        pendingAgentAction = AgentAction(
+            kind: kind, target: .skill(source: source),
+            path: kind.skillFolder(named: AgentIntegration.skillName)
+                .appendingPathComponent("SKILL.md").path
+        )
+    }
+
+    /// Положить агенту скилл из его папки — целиком, со вложенными.
+    ///
+    /// Скилл живёт в своём хранилище и правится там; кнопка, умеющая только
+    /// файл из бандла, к нему не дотягивается вовсе, а копия, собранная
+    /// руками, отстаёт молча — и агент читает вчерашние правила, считая их
+    /// сегодняшними.
+    func installSkillFromFolder(_ kind: AgentKind) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        // Файлы тоже: человек, зашедший в папку скилла, видит там SKILL.md
+        // и выбирает его — папкой будет та, в которой он лежит.
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.message = String(localized: "Выберите папку скилла — ту, в которой лежит SKILL.md")
+        guard panel.runModal() == .OK, let chosen = panel.url else { return }
+        let isDirectory = (try? chosen.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+        let folder = isDirectory ? chosen : chosen.deletingLastPathComponent()
+        let manifest = folder.appendingPathComponent("SKILL.md")
+        guard FileManager.default.fileExists(atPath: manifest.path) else {
+            statusMessage = AgentIntegrationError.notASkillFolder(folder.path).localizedDescription
+            return
+        }
+        // Имя — из шапки: по нему скилл опознаёт агент, и по нему же
+        // находится папка, если скилл у агента уже есть. Правило то же, что
+        // у службы: иначе в вопросе окажется один путь, а записан будет
+        // другой.
+        guard let name = AgentIntegration.skillName(forFolderAt: folder) else {
+            statusMessage = AgentIntegrationError.badSkillName(
+                AgentIntegration.declaredSkillName(in: manifest) ?? folder.lastPathComponent
+            ).localizedDescription
+            return
+        }
+        pendingAgentAction = AgentAction(
+            kind: kind, target: .skill(source: folder),
+            path: kind.skillFolder(named: name).path
+        )
+    }
+
+    private func performInstallSkill(_ kind: AgentKind, from source: URL) {
+        Task {
+            let result = await Task.detached {
+                Result { try AgentIntegration.installSkill(kind, from: source) }
+            }.value
+            self.reportSkill(kind, result)
+        }
+    }
+
+    private func reportSkill(_ kind: AgentKind, _ result: Result<AgentInstallOutcome, Error>) {
+        switch result {
+        case .failure(let error):
+            statusMessage = error.localizedDescription
+        case .success(let outcome):
+            var text = outcome.changedNothing
+                ? String(localized: "\(kind.title): скилл уже был таким — файл \(outcome.path) не тронут.")
+                : (outcome.replacedExisting
+                    ? String(localized: "\(kind.title): скилл обновлён в \(outcome.path).")
+                    : String(localized: "\(kind.title): скилл добавлен в \(outcome.path)."))
+            // Сколько файлов доехало — не украшение: скилл ставится папкой,
+            // и «обновлён» без числа не отличает целую копию от одного
+            // переписанного файла.
+            if let written = outcome.filesWritten, written > 0 {
+                text += " " + String(localized: "Файлов записано: \(written).")
+            }
+            if let backup = outcome.backup {
+                text += " " + String(localized: "Прежний файл сохранён: \(backup).")
+            }
+            statusMessage = text
+        }
     }
 
     /// Тестовый вызов через тот же транспорт, которым пойдёт агент.

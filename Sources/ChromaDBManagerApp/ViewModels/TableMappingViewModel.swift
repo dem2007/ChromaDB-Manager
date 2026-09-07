@@ -230,7 +230,7 @@ final class TableMappingViewModel: ObservableObject {
 
     func chooseFile(_ app: AppEnvironment, source: DataSource) {
         guard let url = ConnectionViewModel.chooseFile(
-            title: "Файл таблицы для предпросмотра",
+            title: String(localized: "Файл таблицы для предпросмотра"),
             message: "Файл только читается: ничего не индексируется и не записывается."
         ) else { return }
         open(url, app: app, source: source)
