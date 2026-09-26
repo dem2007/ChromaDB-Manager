@@ -46,7 +46,7 @@ final class SheetCoverageMetadataTests: XCTestCase {
     func testAPartialWorkbookIsRecordedOnTheRow() throws {
         let fields = RowMapper.metadataAndTruncations(
             for: row(2), mapping: mapping, layout: layout,
-            sourceFile: "смета.xlsx", rowKey: nil,
+            sourceFile: "смета.xlsx", sourceID: nil, rowKey: nil,
             coverage: SheetCoverage(indexed: 5, total: 14)
         )
         XCTAssertEqual(fields.metadata["sheets_indexed"], .int(5))
@@ -58,7 +58,7 @@ final class SheetCoverageMetadataTests: XCTestCase {
     func testAFullyMappedWorkbookCarriesNoSuchFields() throws {
         let fields = RowMapper.metadataAndTruncations(
             for: row(2), mapping: mapping, layout: layout,
-            sourceFile: "смета.xlsx", rowKey: nil,
+            sourceFile: "смета.xlsx", sourceID: nil, rowKey: nil,
             coverage: SheetCoverage(indexed: 14, total: 14)
         )
         XCTAssertNil(fields.metadata["sheets_indexed"])

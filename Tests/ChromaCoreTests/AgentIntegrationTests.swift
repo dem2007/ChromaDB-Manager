@@ -574,6 +574,197 @@ final class AgentIntegrationTests: XCTestCase {
         XCTAssertTrue(written.contains(key), "настоящий файл остался со старым содержимым")
     }
 
+    // MARK: - Куда ложится копия скилла
+
+    /// Снимок скилла не лежит внутри папки скиллов — ни у одного агента.
+    ///
+    /// Это условие работы, а не порядок ради порядка. Hermes обходит дерево
+    /// скиллов через `os.walk` (`agent/skill_utils.py`,
+    /// `iter_skill_index_files`), и точка в начале имени папки его не
+    /// останавливает: пропускаются только перечисленные поимённо в
+    /// `EXCLUDED_SKILL_DIRS` — `.git`, `.hub`, `.archive` и **своя** папка
+    /// копий `.curator_backups`. Чужой там нет и не будет.
+    ///
+    /// Снимок, положенный внутрь `skills/`, становится вторым скиллом с тем
+    /// же именем, и `_locate_skill` отвечает «Ambiguous skill name … Refusing
+    /// to guess», не загружая **ни одного** из двух. Копия, сделанная ради
+    /// безопасности, ломала то, что берегла.
+    func testSkillBackupsLiveOutsideTheSkillsTree() {
+        for kind in AgentKind.allCases {
+            let skills = kind.home.appendingPathComponent("skills").pathComponents
+            let backups = kind.skillBackups.pathComponents
+            // Сравнение **по составляющим пути**, а не по началу строки:
+            // «skills-backups» начинается со «skills», и проверка на префикс
+            // объявила бы верный путь нарушением.
+            XCTAssertFalse(
+                backups.count > skills.count && Array(backups.prefix(skills.count)) == skills,
+                "\(kind.title): снимки лежат в дереве скиллов — \(kind.skillBackups.path)"
+            )
+            XCTAssertTrue(
+                kind.skillBackups.pathComponents.contains("skills-backups"),
+                "\(kind.title): \(kind.skillBackups.path)"
+            )
+        }
+    }
+
+    /// Проверка предыдущего теста ловит именно вложенность, а не имя.
+    ///
+    /// Путь «skills-backups» начинается со «skills»: сравнение по началу
+    /// строки прошло бы мимо настоящей вложенности и споткнулось бы
+    /// о правильный путь. Здесь обе стороны проверены нарочно.
+    func testTheNestingCheckTellsSkillsBackupsFromSkills() {
+        let home = URL(fileURLWithPath: "/tmp/дом")
+        func nested(_ path: String) -> Bool {
+            let skills = home.appendingPathComponent("skills").pathComponents
+            let candidate = home.appendingPathComponent(path).pathComponents
+            return candidate.count > skills.count
+                && Array(candidate.prefix(skills.count)) == skills
+        }
+        XCTAssertTrue(nested("skills/.chromadb-manager-backups"), "вложенность не замечена")
+        XCTAssertTrue(nested("skills/research/chromadb-manager"), "вложенность не замечена")
+        XCTAssertFalse(nested("skills-backups/chromadb-manager"), "соседняя папка принята за вложенную")
+        XCTAssertFalse(nested("skills"), "сама папка скиллов — не вложенность в себя")
+    }
+
+    /// Снимки, положенные прежними сборками внутрь `skills/`, переезжают.
+    ///
+    /// Смена папки снимков не убирала уже положенных: каждый оставался вторым
+    /// скиллом с тем же именем. Занятое имя на новом месте не затирается.
+    func testSnapshotsLeftInsideTheSkillsTreeMoveOut() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let legacy = home.appendingPathComponent("skills/.chromadb-manager-backups")
+        let backups = home.appendingPathComponent("skills-backups/chromadb-manager")
+        for folder in [legacy, backups] {
+            let snapshot = folder.appendingPathComponent("chromadb-manager-20260831-101500")
+            try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+            try "---\nname: chromadb-manager\n---\n\(folder.lastPathComponent)".write(
+                to: snapshot.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8
+            )
+        }
+
+        AgentIntegration.moveSnapshots(from: legacy, to: backups, fileManager: .default)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path), "старая папка осталась в дереве скиллов")
+        XCTAssertEqual(
+            try String(
+                contentsOf: backups.appendingPathComponent("chromadb-manager-20260831-101500-2/SKILL.md"),
+                encoding: .utf8
+            ),
+            "---\nname: chromadb-manager\n---\n.chromadb-manager-backups"
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: backups.appendingPathComponent("chromadb-manager-20260831-101500/SKILL.md"),
+                encoding: .utf8
+            ),
+            "---\nname: chromadb-manager\n---\nchromadb-manager",
+            "снимок на новом месте затёрт переехавшим"
+        )
+    }
+
+    /// Снимок — папка целиком, а не один `SKILL.md`.
+    ///
+    /// Рядом с манифестом лежат `references/`, `scripts/` и прочее. По копии
+    /// одного файла прежнее состояние не вернуть, а прежний `backUp` клал
+    /// рядом с оригиналом именно файл — и тот оседал внутри пакета скилла.
+    func testTheSnapshotKeepsTheWholeSkillFolder() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let installed = home.appendingPathComponent("skills/research/chromadb-manager")
+        let references = installed.appendingPathComponent("references")
+        try FileManager.default.createDirectory(at: references, withIntermediateDirectories: true)
+        try "---\nname: chromadb-manager\n---\nпрежний".write(
+            to: installed.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8
+        )
+        try "таблица подстановок".write(
+            to: references.appendingPathComponent("tables.md"), atomically: true, encoding: .utf8
+        )
+
+        let backups = home.appendingPathComponent("skills-backups/chromadb-manager")
+        let path = try AgentIntegration.snapshotFolder(
+            installed, named: "chromadb-manager", in: backups, fileManager: .default
+        )
+
+        let snapshot = URL(fileURLWithPath: path)
+        XCTAssertEqual(
+            try String(contentsOf: snapshot.appendingPathComponent("SKILL.md"), encoding: .utf8),
+            "---\nname: chromadb-manager\n---\nпрежний"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: snapshot.appendingPathComponent("references/tables.md"), encoding: .utf8),
+            "таблица подстановок",
+            "вложенная папка в снимок не попала — вернуть прежнее состояние нечем"
+        )
+        // И в самой папке скилла копия не осела.
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: installed.path)
+            .filter { $0.contains(".bak-") }
+        XCTAssertEqual(leftovers, [], "копия осталась внутри пакета скилла: \(leftovers)")
+    }
+
+    /// Список без отступа — тоже список.
+    ///
+    /// Элемент последовательности YAML разрешает писать на том же отступе,
+    /// что и ключ над ним, и `- name: other` в первом столбце печатает по
+    /// умолчанию PyYAML. Проверка считала отступ ноль выходом из отображения,
+    /// список не узнавала — и вписывала в него ключ, то есть делала ровно то,
+    /// ради чего заведена. Прежняя проверка знала только отступленную запись.
+    func testAnIndentlessSequenceIsRefusedToo() {
+        for text in [
+            "mcp_servers:\n- name: other\n  command: /x\n",
+            "mcp_servers:\n-\n  name: other\n",
+            "mcp_servers:\n\n# заметка\n- name: other\n",
+        ] {
+            XCTAssertThrowsError(
+                try AgentIntegration.hermesConfiguration(
+                    merging: text, helperPath: helper, key: key
+                ),
+                "список без отступа принят за отображение"
+            ) { error in
+                guard case AgentIntegrationError.handEditedConfiguration = error else {
+                    return XCTFail("ожидался отказ, пришло: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Пустое отображение под ключом — по-прежнему не список.
+    func testAnEmptyMappingUnderTheRootStillTakesTheBlock() throws {
+        let made = try AgentIntegration.hermesConfiguration(
+            merging: "mcp_servers:\nmodels:\n  gpt: on\n", helperPath: helper, key: key
+        )
+        XCTAssertTrue(made.text.contains(AgentIntegration.serverName + ":"), "блок не вписан")
+        XCTAssertTrue(made.text.contains("models:"), "чужой ключ потерян")
+    }
+
+    /// Корневой ключ в кавычках — тот же ключ.
+    func testAQuotedRootKeyIsRecognised() throws {
+        let made = try AgentIntegration.hermesConfiguration(
+            merging: "\"mcp_servers\":\n  other:\n    command: /x\n",
+            helperPath: helper, key: key
+        )
+        let roots = made.text.components(separatedBy: "\n").filter {
+            let bare = $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return bare.hasPrefix("mcp_servers") && $0.hasPrefix("\"") || $0.hasPrefix("mcp_servers")
+        }
+        XCTAssertEqual(roots.count, 1, "корневой ключ задвоился: \(roots)")
+        XCTAssertTrue(made.text.contains("  other:"), "чужой сервер потерян")
+    }
+
+    /// Шапка скилла с концами CRLF читается.
+    ///
+    /// `\r` не входит в `CharacterSet.whitespaces`: первая строка читалась
+    /// как «---\r», имя не находилось, и скилл ставился под именем папки —
+    /// которого агент по шапке не узнаёт.
+    func testASkillHeaderWithWindowsLineEndingsIsRead() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let manifest = home.appendingPathComponent("SKILL.md")
+        try "---\r\nname: it-doc-expertise\r\nversion: 1.0.0\r\n---\r\n\r\nтекст\r\n"
+            .write(to: manifest, atomically: true, encoding: .utf8)
+        XCTAssertEqual(AgentIntegration.declaredSkillName(in: manifest), "it-doc-expertise")
+    }
+
     /// Комментарий при пустой записи — заметка человека, а не «ничего».
     func testUnfoldingAnEmptyInlineMappingKeepsItsComment() throws {
         let made = try AgentIntegration.hermesConfiguration(

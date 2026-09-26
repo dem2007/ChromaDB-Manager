@@ -112,7 +112,12 @@ public struct InspectionComparison: Sendable, Hashable {
     /// `nil`, если сравнивать не с чем: первый прогон — это не «стало лучше».
     public static func between(_ report: InspectionReport, and previous: InspectionReport?) -> InspectionComparison? {
         guard let previous else { return nil }
-        let categories = Set(report.findings.map(\.category)).union(previous.findings.map(\.category))
+        var categories = Set(report.findings.map(\.category)).union(previous.findings.map(\.category))
+        // Похожие документы ищутся только по запросу. Если один из прогонов
+        // их не искал, «стало меньше» значит «не смотрели», а не «стало лучше».
+        if report.nearDuplicatesChecked != previous.nearDuplicatesChecked {
+            categories.remove(.nearDuplicates)
+        }
         let changes = categories.sorted { $0.rawValue < $1.rawValue }.map {
             Change(category: $0, now: report.count(of: $0), before: previous.count(of: $0))
         }
@@ -155,9 +160,11 @@ public enum InspectionExport {
         }
         lines.append("")
 
-        guard !report.findings.isEmpty else {
+        // Без находок сравнение всё равно нужно: «было двенадцать, стало ноль»
+        // — ровно то, ради чего прогон повторяют.
+        if report.findings.isEmpty {
             lines.append("Находок нет.")
-            return lines.joined(separator: "\n") + "\n"
+            lines.append("")
         }
 
         for category in report.categoriesWithFindings {

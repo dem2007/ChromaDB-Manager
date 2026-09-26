@@ -314,3 +314,37 @@ private final class Counter: @unchecked Sendable {
         return value
     }
 }
+
+/// Оборванная строка стоит себя, а не всего файла (разбор 24.09).
+///
+/// Дозапись построчного файла прерывается выключением питания или падением,
+/// и последняя строка остаётся неполной. Если обрыв пришёлся **внутрь**
+/// многобайтового знака — а пути в этом приложении кириллические, — файл
+/// перестаёт быть годным UTF-8 целиком. Прежде разбор возвращал пустой
+/// список, и приложение вело себя так, будто записей нет вовсе: у журнала
+/// синхронизации умирало восстановление после сбоя, у корзины следующая
+/// перезапись затирала непрочитанное.
+final class JSONLinesTests: XCTestCase {
+    func testATornLastLineCostsOnlyItself() throws {
+        var data = Data(#"{"a":1}"#.utf8)
+        data.append(UInt8(ascii: "\n"))
+        data.append(Data(#"{"путь":"Отчёты/Договор.pdf"}"#.utf8))
+        data.append(UInt8(ascii: "\n"))
+        // Обрыв внутри «ё»: первый байт двухбайтового знака без второго.
+        data.append(Data(#"{"путь":"Отч"#.utf8))
+        data.append(0xD1)
+
+        // Проверка не вырождена: файл действительно негоден как UTF-8.
+        XCTAssertNil(String(data: data, encoding: .utf8), "подложка годная — проверять нечего")
+
+        let lines = JSONLines.lines(in: data)
+        XCTAssertEqual(lines.count, 2, "целые строки потеряны вместе с оборванной")
+        XCTAssertEqual(lines.first, #"{"a":1}"#)
+        XCTAssertTrue(lines.last?.contains("Договор.pdf") == true)
+    }
+
+    func testAWholeFileOfValidLinesIsReadEntirely() {
+        let data = Data("{\"a\":1}\n{\"б\":2}\n\n{\"в\":3}\n".utf8)
+        XCTAssertEqual(JSONLines.lines(in: data), ["{\"a\":1}", "{\"б\":2}", "{\"в\":3}"])
+    }
+}

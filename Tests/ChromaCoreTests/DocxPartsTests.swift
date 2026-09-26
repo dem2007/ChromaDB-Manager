@@ -315,6 +315,43 @@ final class DocxPartsTests: XCTestCase {
         XCTAssertTrue(lines.last?.hasPrefix("Сноска 3") == true, "\(lines)")
     }
 
+    /// Концевая сноска — свой счёт, не общий с обычными: оба начинаются
+    /// с единицы, и концевая 1 получала текст обычной сноски 1.
+    func testEndnotesAreReadFromTheirOwnPart() async throws {
+        let url = root.appendingPathComponent("концевые.docx")
+        try DocxFixture(
+            body: "<w:p><w:r><w:t>Первый абзац.</w:t></w:r><w:r><w:footnoteReference w:id=\"1\"/></w:r></w:p>"
+                + "<w:p><w:r><w:t>Второй абзац.</w:t></w:r><w:r><w:endnoteReference w:id=\"1\"/></w:r></w:p>",
+            footnotes: ["1": "Обычная сноска."],
+            endnotes: ["1": "Концевая сноска про поставку."]
+        ).build().write(to: url)
+        let text = try await extract(url).plainText
+        XCTAssertTrue(text.contains("Сноска 1: Обычная сноска."), text)
+        XCTAssertTrue(text.contains("Концевая сноска 1: Концевая сноска про поставку."), text)
+    }
+
+    /// Перенесённый при включённых правках абзац — один раз, а прежний
+    /// стиль из `w:pPrChange` не затирает нынешний.
+    func testTrackedMovesAndOldPropertiesAreNotRead() async throws {
+        let url = try write(body:
+            "<w:moveFrom w:id=\"1\" w:author=\"А\"><w:r><w:t>Перенесённый текст.</w:t></w:r></w:moveFrom>"
+            + "<w:p><w:r><w:t>Обычный абзац.</w:t></w:r></w:p>"
+            + "<w:p><w:moveTo w:id=\"2\" w:author=\"А\"><w:r><w:t>Перенесённый текст.</w:t></w:r></w:moveTo></w:p>"
+            + "<w:p><w:pPr><w:pStyle w:val=\"Normal\"/><w:pPrChange w:id=\"3\" w:author=\"А\">"
+            + "<w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr></w:pPrChange></w:pPr>"
+            + "<w:r><w:t>Бывший заголовок.</w:t></w:r></w:p>"
+        )
+        let extracted = try await extract(url)
+        XCTAssertEqual(
+            extracted.plainText.components(separatedBy: "Перенесённый текст.").count - 1, 1,
+            extracted.plainText
+        )
+        XCTAssertFalse(
+            extracted.structure.contains { $0.title.contains("Бывший заголовок") },
+            "прежний стиль из pPrChange сделал абзац заголовком"
+        )
+    }
+
     /// Сноска, на которую в тексте нет ссылки, не приписывается документу:
     /// в `footnotes.xml` всегда лежат две служебные записи-разделителя.
     func testUnreferencedFootnotesAreLeftAlone() async throws {
@@ -430,6 +467,7 @@ struct DocxFixture {
     var footer: String?
     var footnotes: [String: String] = [:]
     var comments: [(id: String, author: String, text: String)] = []
+    var endnotes: [String: String] = [:]
 
     static let defaultStyles = """
     <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>\
@@ -538,6 +576,16 @@ struct DocxFixture {
             entries.append(("word/footnotes.xml", """
             <?xml version="1.0" encoding="UTF-8" standalone="yes"?>\
             <w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">\(notes)</w:footnotes>
+            """))
+        }
+
+        if !endnotes.isEmpty {
+            let notes = endnotes.map { id, text in
+                "<w:endnote w:id=\"\(id)\"><w:p><w:r><w:t>\(text)</w:t></w:r></w:p></w:endnote>"
+            }.joined()
+            entries.append(("word/endnotes.xml", """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>\
+            <w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">\(notes)</w:endnotes>
             """))
         }
 

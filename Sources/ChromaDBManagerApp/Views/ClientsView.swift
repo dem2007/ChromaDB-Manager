@@ -312,7 +312,9 @@ struct ClientsView: View {
                     }
                     // Настроить подключение агента проще всего **сейчас**:
                     // потом ключ подставить будет нечем (7.4).
-                    if let client = clients.first(where: { $0.name == fresh.clientName }) {
+                    // По идентификатору: имена клиентов повторяться могут,
+                    // и по имени кнопка настраивала бы старого тёзку.
+                    if let client = clients.first(where: { $0.id == fresh.clientID }) {
                         Button(String(localized: "Настроить подключение агента")) {
                             model.configuringClientID = client.id
                         }
@@ -697,25 +699,19 @@ struct ClientsView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(String(localized: "Разрешённые origin (CORS)")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                TextField(
+                CommaListField(
                     String(localized: "пусто — из браузера нельзя"),
-                    text: Binding(
-                        get: { permissions.wrappedValue.allowedOrigins.joined(separator: ", ") },
-                        set: { text in
-                            let parts = text.split(separator: ",")
-                                .map { $0.trimmingCharacters(in: .whitespaces) }
-                                .filter { !$0.isEmpty }
-                            if parts.contains("*"), !permissions.wrappedValue.allowsAnyOrigin {
-                                // Held back until confirmed: `*` means any page
-                                // the user opens can use this key.
-                                model.pendingWildcardClientID = client.id
-                                permissions.wrappedValue.allowedOrigins = parts.filter { $0 != "*" }
-                            } else {
-                                permissions.wrappedValue.allowedOrigins = parts
-                            }
-                        }
-                    )
-                )
+                    items: permissions.wrappedValue.allowedOrigins
+                ) { parts in
+                    if parts.contains("*"), !permissions.wrappedValue.allowsAnyOrigin {
+                        // Held back until confirmed: `*` means any page
+                        // the user opens can use this key.
+                        model.pendingWildcardClientID = client.id
+                        permissions.wrappedValue.allowedOrigins = parts.filter { $0 != "*" }
+                    } else {
+                        permissions.wrappedValue.allowedOrigins = parts
+                    }
+                }
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 320)
             }

@@ -66,11 +66,36 @@ public struct SheetManifest: Codable, Hashable, Sendable {
     /// documents no longer match their recipe.
     public var mappingSignature: String
     public var rows: [String: TableRowRecord]
+    /// Строка заголовков, как её нашли в этом файле при записи.
+    ///
+    /// Не то же, что строка в сопоставлении: та говорит, что колонки значат,
+    /// а файл — где они. Нужна просмотрщику: без неё он брал
+    /// заголовком первую непустую строку, и у отчёта с названием над таблицей
+    /// подписывал значения строки названием отчёта. `nil` — у манифестов,
+    /// записанных раньше, и у листов без заголовков.
+    public var headerRow: Int?
 
-    public init(sheetName: String, mappingSignature: String = "", rows: [String: TableRowRecord] = [:]) {
+    public init(
+        sheetName: String, mappingSignature: String = "",
+        rows: [String: TableRowRecord] = [:], headerRow: Int? = nil
+    ) {
         self.sheetName = sheetName
         self.mappingSignature = mappingSignature
         self.rows = rows
+        self.headerRow = headerRow
+    }
+
+    /// Строка заголовков для просмотра строки листа.
+    ///
+    /// У манифестов, записанных до `headerRow`, она берётся из подписи
+    /// сопоставления: строку, указанную руками, подпись хранит; а без неё
+    /// заголовок — первая непустая строка, что просмотрщик и так делает.
+    public var viewerHeaderRow: Int? {
+        if let headerRow { return headerRow }
+        for part in mappingSignature.split(separator: ";") where part.hasPrefix("header:") {
+            return Int(part.dropFirst("header:".count))
+        }
+        return nil
     }
 
     public var rowCount: Int { rows.count }
@@ -164,6 +189,8 @@ public struct SheetSyncPlan: Sendable {
     /// Set when the mapping itself changed: every row in the sheet is now
     /// written by a different recipe, and that is a re-index, not a sync.
     public var mappingChanged: Bool = false
+    /// Строка заголовков этого файла — чтобы манифест её запомнил.
+    public var headerRow: Int?
 
     public var writes: Int { added.count + reembedded.count + metadataOnly.count }
     public var embeddings: Int { added.count + reembedded.count }
@@ -248,6 +275,7 @@ public enum TableSyncPlanner {
         // report with a title line above it puts the headers on row 3, and
         // trusting the profile would embed the header row as a record.
         let headerRow = layout.headerRow
+        plan.headerRow = headerRow
         // Записи начинаются под заголовком. Пока заголовком была первая
         // непустая строка, выше неё ничего и не было; со строкой, указанной
         // руками, шапка отчёта — название, дата, подпись — иначе стала бы
@@ -390,6 +418,7 @@ public enum TableSyncPlanner {
     public static func applying(_ plan: SheetSyncPlan, to manifest: SheetManifest, mapping: TableMapping) -> SheetManifest {
         var result = manifest
         result.mappingSignature = mapping.signature
+        result.headerRow = plan.headerRow
         // Прежние ключи сдвинувшихся строк — до записи новых: строка
         // одна, и оставить её под двумя ключами значило бы объявить один
         // из них исчезнувшим на следующем прогоне.

@@ -43,10 +43,10 @@ struct TasksView: View {
                : String(localized: "Пауза")) {
             let next = !isPaused
             isPaused = next
-            app.setQueuePaused(next)
             // The same pause the «Источники» screen shows: one state, two
-            // places to reach it.
-            settings.configuration.automaticSyncPaused = next
+            // places to reach it. Через координатор — он ставит на
+            // паузу очередь и перестраивает таймеры и слежение.
+            app.autoSync.setPaused(next, app: app)
         }
         .buttonStyle(isPaused ? .chromaPrimary : .chromaNormal)
     }

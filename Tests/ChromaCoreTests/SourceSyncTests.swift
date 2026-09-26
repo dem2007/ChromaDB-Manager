@@ -291,7 +291,7 @@ final class SourceSyncPlanTests: XCTestCase {
             contentHash: SourceSyncService.contentHash(of: text),
             modifiedAt: (attributes[.modificationDate] as? Date) ?? Date(),
             size: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
-            chunkIDs: [SourceSyncService.documentID(relativePath: name, chunkIndex: 0)],
+            chunkIDs: [SourceSyncService.documentID(relativePath: name, chunkIndex: 0, sourceID: nil)],
             collectionName: "docs_col",
             chunkingSignature: source.chunking.signature,
             embeddingModel: model
@@ -650,5 +650,80 @@ final class SourceSchemaCoverageTests: XCTestCase {
         )
         XCTAssertEqual(draft.fields.map(\.trimmedKey), ["department"])
         XCTAssertEqual(draft.fields.first?.defaultValue, "legal")
+    }
+}
+
+/// Отпечаток файла считается от пары «источник + путь» (П6.16).
+///
+/// Путь сам по себе файл не называет: два источника в одной коллекции —
+/// настройка поддерживаемая, и у обоих бывает `README.md`. Пока отпечаток
+/// считался от одного пути, у таких файлов совпадали и `file_id`, и
+/// идентификаторы чанков.
+final class FingerprintScopeTests: XCTestCase {
+    private let a = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+    private let b = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+    private let path = "docs/README.md"
+
+    /// Главное: два источника с одним путём больше не сталкиваются.
+    func testTwoSourcesWithOneRelativePathNoLongerCollide() {
+        XCTAssertNotEqual(
+            SourceSyncService.fileFingerprint(path, sourceID: a),
+            SourceSyncService.fileFingerprint(path, sourceID: b),
+            "file_id совпал — get_file отдаст выборку из двух файлов вперемешку"
+        )
+        for index in 0..<4 {
+            XCTAssertNotEqual(
+                SourceSyncService.documentID(relativePath: path, chunkIndex: index, sourceID: a),
+                SourceSyncService.documentID(relativePath: path, chunkIndex: index, sourceID: b),
+                "идентификатор чанка \(index) совпал — запись одного источника затрёт другой"
+            )
+        }
+    }
+
+    /// Свой источник и свой путь — значение устойчиво: переиндексация
+    /// по-прежнему **заменяет** чанки, а не удваивает их.
+    func testTheSameSourceAndPathAlwaysGiveTheSameValue() {
+        XCTAssertEqual(
+            SourceSyncService.documentID(relativePath: path, chunkIndex: 7, sourceID: a),
+            SourceSyncService.documentID(relativePath: path, chunkIndex: 7, sourceID: a)
+        )
+        // И форма записи пути по-прежнему не влияет.
+        XCTAssertEqual(
+            SourceSyncService.fileFingerprint(path, sourceID: a),
+            SourceSyncService.fileFingerprint(
+                path.decomposedStringWithCanonicalMapping, sourceID: a
+            )
+        )
+    }
+
+    /// Без источника — **в точности** прежнее значение.
+    ///
+    /// На этом держится вся совместимость: записи, которым источник не
+    /// проставляли, сохраняют свои идентификаторы, и смена формулы ничего
+    /// не ломает задним числом. Значение закреплено числом, а не пересчётом
+    /// той же формулой: иначе проверка согласится с любой новой. Число
+    /// получено **независимо** от приложения:
+    /// `sha256(NFC("docs/README.md"))[:16] = 0b5ca119d2be595a`.
+    func testWithoutASourceTheHistoricValueIsKept() {
+        XCTAssertEqual(
+            SourceSyncService.fileFingerprint("docs/README.md", sourceID: nil),
+            "0b5ca119d2be595a"
+        )
+        XCTAssertEqual(
+            SourceSyncService.documentID(relativePath: "docs/README.md", chunkIndex: 3, sourceID: nil),
+            "0b5ca119d2be595a-3"
+        )
+    }
+
+    /// Разделитель не даёт склеить разные пары в одну строку.
+    ///
+    /// Если бы источник и путь просто сцеплялись, пара («…-1111», «a/b»)
+    /// и пара («…-1111a», «/b») дали бы одну строку. Перевода строки в UUID
+    /// не бывает — на этом и держится.
+    func testTheSeparatorKeepsPairsApart() {
+        XCTAssertNotEqual(
+            SourceSyncService.fileFingerprint("b", sourceID: a),
+            SourceSyncService.fileFingerprint("/b", sourceID: a)
+        )
     }
 }

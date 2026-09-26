@@ -316,13 +316,15 @@ public final class AuditLog: ObservableObject {
     }
 
     private static func load(from url: URL, limit: Int) -> [AuditEntry] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         // A truncated last line is normal after a crash and must not cost the
         // whole file, so lines are decoded one by one and failures skipped.
-        return text
-            .split(separator: "\n")
+        //
+        // Раскодирование тоже построчное: обрыв внутри многобайтового знака
+        // прежде делал негодным весь файл, и правило, объявленное строкой
+        // выше, до конца не выполнялось.
+        return JSONLines.read(at: url)
             .suffix(limit)
             .compactMap { try? decoder.decode(AuditEntry.self, from: Data($0.utf8)) }
             .reversed()

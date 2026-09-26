@@ -1211,13 +1211,22 @@ final class SourcesViewModel: ObservableObject {
                 // Валидаторы запоминаются только после удачной записи: иначе
                 // прерванный запуск научил бы приложение отвечать «не менялось»
                 // о странице, которой в базе нет.
+                //
+                // Удачной — по каждому файлу, а не по прогону в целом: прогон,
+                // пропустивший файл, кончается нормально. Пропущенное и снятое
+                // с прогона руками в базу не попало, и запомнить о нём «уже
+                // видели» значило бы не увидеть его больше никогда.
+                let unfinished = Set(summary.skipped.map(\.file)).union(excludedPaths)
                 if let preparation {
-                    webSync.saveHistory(preparation.records, sourceID: source.id)
+                    webSync.saveHistory(
+                        WebSyncService.forgettingValidators(of: unfinished, in: preparation.records),
+                        sourceID: source.id
+                    )
                 }
                 // Коммит и ветка запоминаются только после удачной записи:
                 // иначе следующий запуск посчитал бы уже проиндексированным то,
                 // что в базу не попало.
-                if let git { gitSync.save(git.state, sourceID: source.id) }
+                if let git { gitSync.save(git.state.revisiting(unfinished), sourceID: source.id) }
                 return summary
             }
             lastSummary = summary
@@ -1230,13 +1239,19 @@ final class SourcesViewModel: ObservableObject {
             //. Если прогон ничего не записал, беспокоить незачем.
             if !summary.wroteNothing { app.collectionsMayHaveChanged() }
             staleExtraction[source.id] = summary.staleExtraction.isEmpty ? nil : summary.staleExtraction
-            var updated = source
-            updated.lastSyncedAt = Date()
-            // Том запоминается по удачному прогону: именно он и есть
-            // «тот самый диск», с которым потом сверяются. У источника,
-            // заведённого прежней сборкой, он появится здесь же.
-            if let volume = SourceVolume.of(source.url) { updated.volume = volume }
-            app.settings.upsert(source: updated)
+            // Источник перечитывается из настроек, а не берётся копией
+            // с начала прогона: за минуты синхронизации его могли убрать
+            // из списка, исключить файл, включить OCR — и сохранение копии
+            // вернуло бы убранный источник и откатило правки. Меняются
+            // только отметки прогона; убранный источник не воскрешается.
+            if var updated = app.settings.configuration.dataSources.first(where: { $0.id == source.id }) {
+                updated.lastSyncedAt = Date()
+                // Том запоминается по удачному прогону: именно он
+                // и есть «тот самый диск», с которым потом сверяются.
+                // У источника, заведённого прежней сборкой, он появится здесь же.
+                if let volume = SourceVolume.of(source.url) { updated.volume = volume }
+                app.settings.upsert(source: updated)
+            }
             if reason.isAutomatic {
                 // An automatic run must never be invisible: it lands in the log
                 // even when it changed nothing.
@@ -1247,7 +1262,7 @@ final class SourcesViewModel: ObservableObject {
                 )
             }
             app.notify(summary.notice)
-        } catch is CancellationError {
+        } catch let error where AppEnvironment.isCancellation(error) {
             app.log.record(.warning, "Источники", "Синхронизация «\(source.name)» отменена")
         } catch SyncError.massDisappearance(let missing, let known) {
             // Не просто ошибка: у неё есть ответ, и спрашивать его надо
@@ -1461,7 +1476,7 @@ final class SourcesViewModel: ObservableObject {
                         app.log.record(.warning, "Источники", "Поля не обновлены у \(failure.file): \(failure.reason)")
                     }
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 app.log.record(.warning, "Источники", "Обновление полей «\(source.name)» отменено")
             } catch {
                 await MainActor.run { self?.errorMessage = app.describe(error) }
@@ -1525,12 +1540,16 @@ final class SourcesViewModel: ObservableObject {
 
         case .server:
             guard let chroma = app.client else { throw ChromaError.notConfigured }
+            // Все коллекции, в которые пишет источник, а не первая: операция
+            // переписывает их все. Пропавшая коллекция — не повод отказаться
+            // копировать остальные: в ней переписывать уже нечего.
             let manifest = await app.syncService.manifest(for: source.id)
-            guard let name = manifest.collections.first,
-                  let collection = try? await chroma.collection(named: name) else {
-                throw ChromaError.notConfigured
+            let existing = try await chroma.listCollections(withCounts: false)
+            let collections = existing.filter { manifest.collections.contains($0.name) }
+            guard !collections.isEmpty else {
+                throw ChromaError.collectionNotFound(manifest.collections.joined(separator: ", "))
             }
-            return try await app.backupService.exportCollection(collection, from: chroma, note: note)
+            return try await app.backupService.exportCollections(collections, from: chroma, note: note)
         }
     }
 

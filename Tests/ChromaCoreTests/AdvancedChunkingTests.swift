@@ -185,7 +185,7 @@ final class HierarchicalChunkingTests: XCTestCase {
         let chunks = HierarchicalChunker(configuration: configuration).chunks(from: text(6))
         XCTAssertEqual(Set(chunks.map(\.index)).count, chunks.count)
 
-        let ids = chunks.map { SourceSyncService.documentID(relativePath: "a.md", chunkIndex: $0.index) }
+        let ids = chunks.map { SourceSyncService.documentID(relativePath: "a.md", chunkIndex: $0.index, sourceID: nil) }
         XCTAssertEqual(Set(ids).count, ids.count, "родители и дети живут в одной коллекции — ID обязаны не совпадать")
     }
 

@@ -6,6 +6,16 @@ import ChromaCore
 /// bind a model, add / edit / delete documents, filter, query, import, reset.
 @MainActor
 final class CollectionsViewModel: ObservableObject {
+    /// Слово подтверждения, набранное человеком, — на языке интерфейса.
+    ///
+    /// Подсказка переведена («Type RESET»), а сверка шла с русским словом,
+    /// и в английском интерфейсе кнопка не включалась никогда. Русское слово
+    /// принимается тоже: человек, привыкший к нему, не должен споткнуться.
+    static func confirms(_ typed: String, word: String, russian: String) -> Bool {
+        let text = typed.trimmingCharacters(in: .whitespaces)
+        return text == word || text == russian
+    }
+
     // List
     @Published var collections: [ChromaCollection] = []
     /// Строка поиска по имени. Не сохраняется между запусками: это не
@@ -27,6 +37,9 @@ final class CollectionsViewModel: ObservableObject {
     /// Коллекция, которую попросили открыть извне, — по имени:
     /// идентификатора у просьбы нет, а список мог ещё не загрузиться.
     @Published var pendingSelectionName: String?
+    /// Просьба извне была поиском — экран обязан открыть вкладку поиска:
+    /// иначе подставленный запрос ложится на невидимую вкладку.
+    @Published var pendingSearchTab = false
     /// Текст, который попросили добавить документом («Службы», интент — H3).
     @Published var pendingImportText: String?
     /// Файлы, которые перетащили и попросили добавить документами.
@@ -220,13 +233,25 @@ final class CollectionsViewModel: ObservableObject {
     /// пришедшая до загрузки списка, дождётся её — поле не обнуляется, пока
     /// коллекция не нашлась.
     func applyPendingRequest(_ app: AppEnvironment) {
+        // Коллекция открывается тем же `select`, что и нажатием в списке:
+        // одна запись `selectedID` оставляла документы, профили, фильтры и
+        // соседние коллекции прежней — правка строки из списка шла бы в новую
+        // коллекцию с чужими идентификаторами. Файлы ждут, пока коллекция
+        // откроется, и только в неё.
         if let name = pendingSelectionName {
-            if let match = collections.first(where: { $0.name == name }) {
-                selectedID = match.id
-                pendingSelectionName = nil
+            guard let match = collections.first(where: { $0.name == name }) else {
+                // Коллекции в списке ещё нет — ждём. Файлы, пришедшие для неё,
+                // в открытую сейчас не уезжают.
+                return
             }
-        }
-        if !pendingFileImport.isEmpty, selected != nil {
+            pendingSelectionName = nil
+            let urls = pendingFileImport
+            pendingFileImport = []
+            Task {
+                if selectedID != match.id || documents.isEmpty { await select(match, app: app) }
+                if !urls.isEmpty { await importDroppedFiles(urls, app: app) }
+            }
+        } else if !pendingFileImport.isEmpty, selected != nil {
             let urls = pendingFileImport
             pendingFileImport = []
             Task { await importDroppedFiles(urls, app: app) }
@@ -368,6 +393,10 @@ final class CollectionsViewModel: ObservableObject {
         searchReports = []
         searchSummary = nil
         vectorPreviews = [:]
+        // Документы прежней коллекции не остаются в списке новой на время
+        // загрузки: действия над строкой адресуются выбранной коллекции.
+        documents = []
+        canLoadMore = false
         refreshSavedFilters(app)
         reloadProfiles(app)
         await loadDocuments(app, reset: true)
@@ -375,11 +404,24 @@ final class CollectionsViewModel: ObservableObject {
 
     /// Pages of 100 through `limit`/`offset`, so a collection of any size never
     /// arrives in one lump.
+    /// Номер последнего запроса списка. Ответ приходит когда придёт: клик
+    /// по A, затем по B — и если ответ по A опоздал, он клал документы A
+    /// в список при выбранной B, а «Удалить документ» на такой строке
+    /// удалял одноимённый документ из B. Кладётся только ответ на последний
+    /// запрос и только пока выбрана та же коллекция.
+    private var documentsRequest = 0
+
+    private func isCurrent(_ request: Int, _ collection: ChromaCollection) -> Bool {
+        request == documentsRequest && selected?.id == collection.id
+    }
+
     func loadDocuments(_ app: AppEnvironment, reset: Bool) async {
         guard let client = app.client, let collection = selected else { return }
+        documentsRequest += 1
+        let request = documentsRequest
         isLoadingDocuments = true
         errorMessage = nil
-        defer { isLoadingDocuments = false }
+        defer { if request == documentsRequest { isLoadingDocuments = false } }
 
         let offset = reset ? 0 : documents.count
         do {
@@ -389,6 +431,7 @@ final class CollectionsViewModel: ObservableObject {
                 offset: offset,
                 filter: filter.isEmpty ? nil : filter
             )
+            guard isCurrent(request, collection) else { return }
             if reset {
                 documents = page
                 vectorPreviews = [:]
@@ -399,6 +442,7 @@ final class CollectionsViewModel: ObservableObject {
             canLoadMore = page.count == Self.pageSize
             await noteCollectionSize(client, collection: collection, reset: reset)
         } catch {
+            guard isCurrent(request, collection) else { return }
             if reset { documents = [] }
             errorMessage = app.describe(error)
             app.report(error, category: "Коллекции")
@@ -426,8 +470,10 @@ final class CollectionsViewModel: ObservableObject {
     func reloadCurrentPage(_ app: AppEnvironment) async {
         guard let client = app.client, let collection = selected else { return }
         let span = max(documents.count, Self.pageSize)
+        documentsRequest += 1
+        let request = documentsRequest
         isLoadingDocuments = true
-        defer { isLoadingDocuments = false }
+        defer { if request == documentsRequest { isLoadingDocuments = false } }
         do {
             let page = try await client.getDocuments(
                 collectionID: collection.id,
@@ -435,12 +481,14 @@ final class CollectionsViewModel: ObservableObject {
                 offset: 0,
                 filter: filter.isEmpty ? nil : filter
             )
+            guard isCurrent(request, collection) else { return }
             documents = page
             vectorPreviews = [:]
             canLoadMore = page.count == span
             contentChangedNotice = nil
             countWhenPageLoaded = try? await client.count(collectionID: collection.id)
         } catch {
+            guard isCurrent(request, collection) else { return }
             errorMessage = app.describe(error)
             app.report(error, category: "Коллекции")
         }
@@ -453,6 +501,7 @@ final class CollectionsViewModel: ObservableObject {
         do {
             // Fails fast on broken raw JSON instead of sending it to the server.
             _ = try filter.whereClause()
+            _ = try filter.whereDocumentClause()
         } catch {
             filterErrorMessage = app.describe(error)
             return
@@ -727,6 +776,11 @@ final class CollectionsViewModel: ObservableObject {
 
     func beginEditingSchema(_ app: AppEnvironment) {
         guard let collection = selected else { return }
+        // Вкладка «Правила» зовёт это при каждом появлении, а не только при
+        // смене коллекции: сходил на «Документы» проверить значение —
+        // и несохранённые поля схемы молча заменялись сохранёнными.
+        // Черновик своей коллекции остаётся как есть.
+        guard schemaDraft.collectionName != collection.name else { return }
         schemaDraft = app.schemaStore.schema(for: collection.name)
             ?? MetadataSchema(collectionName: collection.name)
         schemaIssues = []
@@ -844,7 +898,7 @@ final class CollectionsViewModel: ObservableObject {
                         "Проверка «\(collection.name)»: просмотрено \(report.checked), не соответствуют \(report.offending)"
                     )
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run { self?.statusMessage = String(localized: "Проверка отменена.") }
             } catch {
                 await MainActor.run { self?.errorMessage = app.describe(error) }
@@ -1354,7 +1408,7 @@ final class CollectionsViewModel: ObservableObject {
                 }
                 await self.refresh(app)
                 await self.loadDocuments(app, reset: true)
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run {
                     self.statusMessage = String(localized: "Импорт отменён. Уже записанные документы остались в коллекции.")
                 }
@@ -1574,7 +1628,7 @@ final class CollectionsViewModel: ObservableObject {
                         text: query,
                         collectionID: target.collectionID,
                         collectionName: target.collectionName,
-                        nResults: requested,
+                        nResults: target.results(forRequested: requested),
                         filter: queryFilter,
                         metric: target.metric
                     ),
@@ -1804,7 +1858,7 @@ final class CollectionsViewModel: ObservableObject {
 
     func resetDatabase(_ app: AppEnvironment) async {
         guard let client = app.client else { return }
-        guard resetConfirmationText == "СБРОС" else {
+        guard Self.confirms(resetConfirmationText, word: String(localized: "СБРОС"), russian: "СБРОС") else {
             errorMessage = String(localized: "Введите СБРОС заглавными буквами для подтверждения.")
             return
         }

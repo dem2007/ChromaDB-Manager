@@ -235,6 +235,32 @@ final class EPUBExtractionTests: XCTestCase {
         }
     }
 
+    /// `encryption.xml` без DRM: книга лишь объявляет обфускацию шрифтов.
+    /// Такую книгу читают целиком, и защищённой она не является.
+    @MainActor
+    func testFontObfuscationAloneIsNotDRM() async throws {
+        let url = try epub3("fonts.epub", extraEntries: [
+            ("META-INF/encryption.xml", """
+            <encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" \
+            xmlns:enc="http://www.w3.org/2001/04/xmlenc#"><enc:EncryptedData>\
+            <enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>\
+            <enc:CipherData><enc:CipherReference URI="fonts/body.otf"/></enc:CipherData>\
+            </enc:EncryptedData></encryption>
+            """),
+        ])
+        let extracted = try await EPUBExtractor().extract(from: url, options: ExtractionOptions())
+        XCTAssertFalse(extracted.plainText.isEmpty)
+    }
+
+    func testRealEncryptionStillCountsAsDRM() {
+        XCTAssertTrue(EPUBExtractor.declaresProtection(
+            "<enc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>"
+        ))
+        XCTAssertFalse(EPUBExtractor.declaresProtection(
+            "<enc:EncryptionMethod Algorithm=\"http://ns.adobe.com/pdf/enc#RC\"/>"
+        ))
+    }
+
     @MainActor
     func testARightsFileAlsoCountsAsDRM() async throws {
         let url = try epub3("rights.epub", extraEntries: [("META-INF/rights.xml", "<rights/>")])

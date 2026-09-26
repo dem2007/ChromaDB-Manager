@@ -335,20 +335,36 @@ public actor TableSyncService {
             }
             let (reader, temporary) = try await NumbersReader()
                 .workbook(at: url, allowApplicationExport: allowApplicationExport)
-            return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], temporary)
+            return (try Self.readExported(reader, temporary: temporary, limits: limits), [], temporary)
 
         // `.numbers` читается только так: формат закрыт, и открывает его
         // приложение, которому он принадлежит.
         case .numbers:
             let (reader, temporary) = try await NumbersReader()
                 .workbook(at: url, allowApplicationExport: allowApplicationExport)
-            return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], temporary)
+            return (try Self.readExported(reader, temporary: temporary, limits: limits), [], temporary)
 
         case .legacyBinary:
             throw TabularError.legacyBinaryFormat(url.pathExtension.lowercased())
 
         case nil:
             throw ExtractionError.unsupportedFormat(url.pathExtension)
+        }
+    }
+
+    /// Листы книги, выгруженной из Numbers во временный `.xlsx`.
+    ///
+    /// Временный файл убирает вызывающий — но только если путь до него
+    /// дошёл. Сбой разбора бросал ошибку раньше, и файл оставался в папке
+    /// временных файлов навсегда; здесь он убирается и в этом случае.
+    private static func readExported(
+        _ reader: XLSXReader, temporary: URL, limits: XLSXReader.Limits
+    ) throws -> [(sheet: SheetInfo, rows: [SheetRow])] {
+        do {
+            return try collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
         }
     }
 
@@ -387,9 +403,17 @@ public actor TableSyncService {
                 profiles: context.profiles, assigned: context.assignedProfile
             )
         }
+        // Пустой или скрытый лист, которому никто не назначил разметку,
+        // пропускается по правилу, а не по недосмотру, — и в счёт «сколько
+        // листов книги в базе» он не входит. Иначе каждая строка обычной
+        // книги с пустым «Лист2» сообщала агенту, что книга неполная.
+        let skipped = Set(zip(sheets, claims).compactMap { entry, claim in
+            claim.match.mapping == nil && claim.shape.mode == .skip ? entry.sheet.name : nil
+        })
         let coverage = SheetCoverage(
             indexed: claims.filter { $0.match.mapping != nil }.count,
-            total: sheets.count
+            total: sheets.count - skipped.count,
+            skipped: skipped
         )
 
         for (index, entry) in sheets.enumerated() {
@@ -435,12 +459,18 @@ public actor TableSyncService {
             // file's, in this file's order. The profile only says what the
             // columns mean.
             let layout = SheetLayout(shape: shape)
-            let missing = layout.missing(from: mapping.columns)
+            // Проверяются только текст и ключ — ровно то, что требует подбор
+            // (`requiredColumns`). Назначенный профиль принимает лист и без
+            // части колонок метаданных, о чём выше сказано предупреждением;
+            // проверка всех колонок профиля отбрасывала такой лист следом,
+            // и послабление не работало ни разу. Недостающие метаданные
+            // `RowMapper` просто не пишет.
+            let required = mapping.textColumns + (mapping.keyColumn.map { [$0] } ?? [])
+            let missing = layout.missing(from: required)
             guard missing.isEmpty else {
-                // Unreachable while matching is by header set, and checked all
-                // the same: reading a column that is not there yields an empty
-                // field, and an empty field is invisible until somebody's filter
-                // returns nothing.
+                // Unreachable while matching demands the same columns, and
+                // checked all the same: reading a text or key column that is
+                // not there yields an empty document or a wrong identity.
                 problems.append(SheetProblem(
                     relativePath: context.relativePath, sheetName: entry.sheet.name,
                     reason: String(localized: "профиль ссылается на колонки, которых нет в файле: \(missing.joined(separator: ", "))")
@@ -558,12 +588,64 @@ public actor TableSyncService {
             // unchanged, so the stored embedding still describes them.
             // Through `updateDocuments`, never through an upsert with an empty
             // vector — that would replace the embedding with nothing.
+            //
+            // Две оговорки, обе про то, что `update` у ChromaDB умеет и чего нет.
+            //
+            // Метаданные он **сливает**: ключ, которого у строки больше нет
+            // (очищенная ячейка, пометка о неполной книге), остался бы в базе
+            // навсегда — а манифест запомнил бы новый хеш и не вернулся к нему.
+            // Поэтому замена целиком, с явным снятием исчезнувших ключей.
+            //
+            // И записей он **не создаёт**. У листа без колонки-ключа
+            // идентификатор строки считается от её значений, и правка одной
+            // лишь цены меняет его: `update` по новому идентификатору молча
+            // не делал ничего, прежний документ удалялся ниже как заменённый,
+            // и строка пропадала из коллекции насовсем. Такая строка
+            // переезжает под новый идентификатор со своим прежним вектором —
+            // текст тот же, считать его заново незачем.
             if !sheetPlan.metadataOnly.isEmpty {
-                let updates = sheetPlan.metadataOnly.map { document, _ in
-                    DocumentUpdate(id: document.id, metadata: enriched(document.metadata, context: context))
+                let previousIDs = sheetPlan.metadataOnly.map(\.previousID)
+                let stored = Dictionary(
+                    try await chroma.documents(collectionID: context.collectionID, ids: previousIDs)
+                        .map { ($0.id, $0.metadata) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                let movedIDs = sheetPlan.metadataOnly.filter { $0.previousID != $0.document.id }.map(\.previousID)
+                let vectors = movedIDs.isEmpty
+                    ? [:]
+                    : try await chroma.embeddings(collectionID: context.collectionID, ids: movedIDs)
+
+                var updates: [DocumentUpdate] = []
+                var moved: [EmbeddedRecord] = []
+                var reembed: [(TableRowDocument, String?)] = []
+                for (document, previousID) in sheetPlan.metadataOnly {
+                    let metadata = enriched(document.metadata, context: context)
+                    if previousID == document.id {
+                        updates.append(.replacingMetadata(
+                            id: document.id, metadata: metadata, previous: stored[previousID] ?? nil
+                        ))
+                    } else if let vector = vectors[previousID], !vector.isEmpty {
+                        moved.append(EmbeddedRecord(
+                            id: document.id, document: document.text, embedding: vector, metadata: metadata
+                        ))
+                    } else {
+                        // Прежнего вектора нет — строка считается заново.
+                        reembed.append((document, previousID))
+                    }
                 }
-                try await chroma.updateDocuments(collectionID: context.collectionID, updates: updates)
-                written += updates.count
+                if !updates.isEmpty {
+                    try await chroma.updateDocuments(collectionID: context.collectionID, updates: updates)
+                }
+                if !moved.isEmpty {
+                    try await chroma.upsert(collectionID: context.collectionID, records: moved)
+                }
+                for batch in stride(from: 0, to: reembed.count, by: context.batchSize).map({
+                    Array(reembed[$0..<min($0 + context.batchSize, reembed.count)])
+                }) {
+                    try Task.checkCancellation()
+                    try await write(batch, context: context, chroma: chroma, embeddings: embeddings)
+                }
+                written += sheetPlan.metadataOnly.count
                 progress(written, total)
             }
 
@@ -643,7 +725,8 @@ public actor TableSyncService {
             .union(plans.map(\.sheet))
             .union(report.sheetsSkipped)
             .union(report.sheetsNeedingReindex)
-        report.sheetsWithoutMapping = sheets.map(\.sheet.name).filter { !touched.contains($0) }
+        report.sheetsWithoutMapping = sheets.map(\.sheet.name)
+            .filter { !touched.contains($0) && !coverage.skipped.contains($0) }
         if !report.sheetsWithoutMapping.isEmpty {
             log(.warning, "Таблицы",
                 "Файл \(context.relativePath): листов без разметки \(report.sheetsWithoutMapping.count.plainDigits) из \(sheets.count.plainDigits) — их строки в базу не попали: \(report.sheetsWithoutMapping.joined(separator: ", "))")
@@ -847,6 +930,7 @@ extension TableSyncService {
         var sheetManifest = manifest.sheets[entry.sheet.name] ?? SheetManifest(sheetName: entry.sheet.name)
         var added = 0, reembedded = 0, unchanged = 0
         var pending: [(TableRowDocument, String?)] = []
+        var metadataOnly: [TableRowDocument] = []
         var records: [String: TableRowRecord] = [:]
 
         for chunk in chunks {
@@ -882,10 +966,34 @@ extension TableSyncService {
 
             if let previous = sheetManifest.rows[identity], previous.textHash == record.textHash {
                 unchanged += 1
+                // Текст тот же, а метаданные — нет: книга стала полной или
+                // неполной, у куска сменилась пометка. Вектор не нужен, а
+                // обновление — нужно: манифест ниже запомнит новый хеш, и
+                // без записи в базу к этому чанку уже никто не вернулся бы.
+                if previous.metadataHash != record.metadataHash { metadataOnly.append(document) }
                 continue
             }
             if sheetManifest.rows[identity] == nil { added += 1 } else { reembedded += 1 }
             pending.append((document, nil))
+        }
+
+        if !metadataOnly.isEmpty {
+            // Целиком, со снятием исчезнувших ключей: `update` у ChromaDB
+            // метаданные сливает, и пометка о неполной книге иначе осталась бы.
+            let stored = Dictionary(
+                try await chroma.documents(collectionID: context.collectionID, ids: metadataOnly.map(\.id))
+                    .map { ($0.id, $0.metadata) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            try await chroma.updateDocuments(
+                collectionID: context.collectionID,
+                updates: metadataOnly.map { document in
+                    .replacingMetadata(
+                        id: document.id, metadata: enriched(document.metadata, context: context),
+                        previous: stored[document.id] ?? nil
+                    )
+                }
+            )
         }
 
         for batch in stride(from: 0, to: pending.count, by: context.batchSize).map({
@@ -904,6 +1012,7 @@ extension TableSyncService {
 
         sheetManifest.rows = records
         sheetManifest.mappingSignature = mapping.signature
+        sheetManifest.headerRow = layout.headerRow
         manifest.sheets[entry.sheet.name] = sheetManifest
         return (added, reembedded, unchanged)
     }

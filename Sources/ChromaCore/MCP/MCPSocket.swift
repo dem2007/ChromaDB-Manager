@@ -14,9 +14,42 @@ public final class MCPChannel: @unchecked Sendable {
     private let lock = NSLock()
 
     /// Пришло целое сообщение.
-    public var onMessage: (@Sendable (Data) -> Void)?
+    ///
+    /// Обработчики хранятся под замком: ставит их вызывающий поток сразу
+    /// после `connect`, а читает и снимает очередь соединения — и ровно
+    /// в тот промежуток, ради которого опоздавшее закрытие и доставляется.
+    /// Замыкание — два машинных слова; прочитанное наполовину без замка
+    /// вызвало бы чужое.
+    public var onMessage: (@Sendable (Data) -> Void)? {
+        get { lock.withLock { messageHandler } }
+        set { lock.withLock { messageHandler = newValue } }
+    }
     /// Канал закрылся — по-хорошему или нет.
-    public var onClose: (@Sendable (Error?) -> Void)?
+    ///
+    /// Обработчик может опоздать: `connect` возвращает уже запущенный канал,
+    /// и между возвратом и этой строкой связь успевает оборваться. Закрытие
+    /// в этот промежуток некому было доложить — мост держал мёртвый канал
+    /// и не переподключался больше никогда, потому что переподключение
+    /// заводится только на `channel == nil`.
+    ///
+    /// Решение «доставить сейчас или сохранить» принимается под тем же
+    /// замком, что и `finish`: иначе оба могли увидеть обработчик и вызвать
+    /// его дважды — два переподключения и два ответа за приложение.
+    public var onClose: (@Sendable (Error?) -> Void)? {
+        get { lock.withLock { closeHandler } }
+        set {
+            let late: (@Sendable (Error?) -> Void, Error?)? = lock.withLock {
+                guard finished, let newValue else {
+                    closeHandler = newValue
+                    return nil
+                }
+                return (newValue, closeError)
+            }
+            if let late { late.0(late.1) }
+        }
+    }
+    private var messageHandler: (@Sendable (Data) -> Void)?
+    private var closeHandler: (@Sendable (Error?) -> Void)?
 
     init(connection: NWConnection, queue: DispatchQueue) {
         self.connection = connection
@@ -104,13 +137,22 @@ public final class MCPChannel: @unchecked Sendable {
     }
 
     private var finished = false
+    private var closeError: Error?
     private func finish(_ error: Error?) {
-        let shouldReport: Bool = lock.withLock {
-            guard !finished else { return false }
+        // Обработчики снимаются до вызова: они держат канал (замыкание моста
+        // и замыкание приложения захватывают его сильно), а канал держит их —
+        // и каждое закрытое соединение оставалось в памяти до конца работы
+        // вместе с отменённым NWConnection и его буфером.
+        let handler: (@Sendable (Error?) -> Void)? = lock.withLock {
+            guard !finished else { return nil }
             finished = true
-            return true
+            closeError = error
+            let handler = closeHandler
+            closeHandler = nil
+            messageHandler = nil
+            return handler
         }
-        if shouldReport { onClose?(error) }
+        handler?(error)
     }
 }
 

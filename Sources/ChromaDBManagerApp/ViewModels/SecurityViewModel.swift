@@ -32,6 +32,7 @@ final class SecurityViewModel: ObservableObject {
 
     private func apply(_ exposure: NetworkExposure, app: AppEnvironment) {
         let wasRunning = app.proxy.state.isRunning
+        let previous = app.settings.configuration.proxyExposure
         app.settings.configuration.proxyExposure = exposure
         app.settings.saveNow()
         errorMessage = nil
@@ -52,9 +53,14 @@ final class SecurityViewModel: ObservableObject {
         } catch {
             // Rolled back, because leaving the setting on «наружу» with a dead
             // listener would show an exposure that does not exist.
-            app.settings.configuration.proxyExposure = .loopback
+            //
+            // Откат — к прежнему режиму, и прокси поднимается обратно, как
+            // у переключения шифрования: иначе неудачная попытка роняла
+            // работавший прокси насовсем.
+            app.settings.configuration.proxyExposure = previous
             app.settings.saveNow()
             errorMessage = app.describe(error)
+            restart(app, after: error)
         }
     }
 

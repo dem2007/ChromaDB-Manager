@@ -378,8 +378,8 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         strategy: ChunkStrategy = .recursive,
         chunkSize: Int = 512,
         sizeUnit: SizeUnit = .tokens,
-        overlapPercent: Double = 15,
-        separators: [String] = ["\n\n", "\n", ". ", " "],
+        overlapPercent: Double = ChunkingConfiguration.defaultOverlapPercent,
+        separators: [String] = ChunkingConfiguration.defaultSeparators,
         contextPrefix: Bool = false,
         contextEnrichment: Bool = false,
         enrichmentModel: String? = nil,
@@ -569,7 +569,7 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
             ]
         case .semantic:
             parts += [
-                "th:\(thresholdMode.rawValue)\(Int(thresholdValue.rounded()))",
+                "th:\(thresholdMode.rawValue)\(thresholdSignature)",
                 "buf\(sentenceBuffer)",
                 "min\(minChunkSize)\(unit)", "max\(maxChunkSize)\(unit)",
                 "sm:\(sentenceEmbeddingModel ?? "source")",
@@ -594,7 +594,43 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
                 "prompt:\(Self.shortHash(effectivePrompt))",
             ]
         }
+        // Разделители и перекрытие, которыми режут и эти стратегии, — через
+        // запасную или вложенную рекурсивную нарезку. Их правка в форме
+        // меняет чанки, а подпись о ней не знала: неизменённые файлы не
+        // перенарезались, и коллекция молча становилась смешанной.
+        //
+        // Дописываются **только отличные от умолчания**: иначе подпись
+        // сменилась бы у каждого такого источника разом, и обновление
+        // приложения перенарезало бы всё, где ничего не меняли.
+        let customSeparators = separators != Self.defaultSeparators
+        let customOverlap = overlapPercent.rounded() != Self.defaultOverlapPercent.rounded()
+        switch strategy {
+        case .hierarchical, .adaptive:
+            if customSeparators { parts.append("sep:" + separators.joined(separator: "|")) }
+        case .llmBased:
+            if customSeparators { parts.append("sep:" + separators.joined(separator: "|")) }
+            if customOverlap { parts.append("ov\(Int(overlapPercent.rounded()))") }
+        case .documentBased:
+            if customOverlap { parts.append("ov\(Int(overlapPercent.rounded()))") }
+        case .fixed, .recursive, .semantic:
+            break
+        }
         return parts.joined(separator: "/")
+    }
+
+    public static let defaultSeparators = ["\n\n", "\n", ". ", " "]
+    public static let defaultOverlapPercent: Double = 15
+
+    /// Порог семантической нарезки в подписи.
+    ///
+    /// Перцентиль и отклонения — целые числа, и их запись осталась прежней.
+    /// Абсолютное расстояние лежит между нулём и единицей: округлённое
+    /// до целого, оно давало «0» и для 0.20, и для 0.40 — смена порога
+    /// подпись не меняла.
+    var thresholdSignature: String {
+        thresholdMode == .absolute
+            ? String(format: "%.3f", thresholdValue)
+            : "\(Int(thresholdValue.rounded()))"
     }
 
     /// Short digest for parts of the signature that would otherwise be long.

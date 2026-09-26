@@ -21,12 +21,8 @@
 """
 
 import json
-import os
-import re
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,75 +30,78 @@ CATALOGUE = ROOT / "Resources" / "ru.lproj" / "Localizable.strings"
 RETIRED_HEADER = "// ─── этих строк в коде больше нет ───"
 
 
+# Своя папка сборки и постоянный путь выгрузки. Сборка в общей `.build`
+# с флагами, которых там нет, и с новым путём каждый раз перекомпилировала
+# весь пакет — и следующий обычный `swift build` перекомпилировал его ещё
+# раз, потому что флаги вернулись обратно.
+SCRATCH = ROOT / ".build" / "strings"
+OUTPUT = SCRATCH / "localized"
+
+
 def extract() -> dict[str, list[tuple[str, int]]]:
     """Ключ → где он встречается (файл относительно корня, строка)."""
-    output = Path(tempfile.mkdtemp(prefix="cdbm-strings-"))
-    try:
-        build = subprocess.run(
-            [
-                "swift", "build",
-                "-Xswiftc", "-emit-localized-strings",
-                "-Xswiftc", "-emit-localized-strings-path",
-                "-Xswiftc", str(output),
-            ],
-            cwd=ROOT, capture_output=True, text=True,
-        )
-        if build.returncode != 0:
-            sys.stderr.write(build.stderr[-2000:])
-            raise SystemExit("сборка не прошла — каталог не собран")
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    build = subprocess.run(
+        [
+            "swift", "build", "--scratch-path", str(SCRATCH),
+            "-Xswiftc", "-emit-localized-strings",
+            "-Xswiftc", "-emit-localized-strings-path",
+            "-Xswiftc", str(OUTPUT),
+        ],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if build.returncode != 0:
+        sys.stderr.write(build.stderr[-2000:])
+        raise SystemExit("сборка не прошла — каталог не собран")
 
-        found: dict[str, list[tuple[str, int]]] = {}
-        for path in sorted(output.glob("*.stringsdata")):
-            data = json.loads(path.read_text(encoding="utf-8"))
-            source = data.get("source", "")
-            try:
-                source = str(Path(source).relative_to(ROOT))
-            except ValueError:
-                pass
-            for entry in data.get("tables", {}).get("Localizable", []):
-                key = entry["key"]
-                # Пустые и пробельные ключи — это `Text("")` и разделители
-                # вроде «\n». Переводить в них нечего, а в каталоге они только
-                # мешают глазу.
-                if not key.strip():
-                    continue
-                line = entry.get("location", {}).get("startingLine", 0)
-                found.setdefault(key, []).append((source, line))
-        return found
-    finally:
-        shutil.rmtree(output, ignore_errors=True)
+    found: dict[str, list[tuple[str, int]]] = {}
+    for path in sorted(OUTPUT.glob("*.stringsdata")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        source = data.get("source", "")
+        # Выгрузка копится между запусками: сборка пересобирает только
+        # изменённое, и выгрузка остальных файлов нужна как есть. Файл,
+        # которого больше нет, оставил бы свои строки навсегда.
+        if source and not Path(source).exists():
+            continue
+        try:
+            source = str(Path(source).relative_to(ROOT))
+        except ValueError:
+            pass
+        for entry in data.get("tables", {}).get("Localizable", []):
+            key = entry["key"]
+            # Пустые и пробельные ключи — это `Text("")` и разделители
+            # вроде «\n». Переводить в них нечего, а в каталоге они только
+            # мешают глазу.
+            if not key.strip():
+                continue
+            line = entry.get("location", {}).get("startingLine", 0)
+            found.setdefault(key, []).append((source, line))
+    return found
 
 
 def escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def unescape(text: str) -> str:
-    out, index = [], 0
-    while index < len(text):
-        char = text[index]
-        if char == "\\" and index + 1 < len(text):
-            nxt = text[index + 1]
-            out.append({"n": "\n", "t": "\t", '"': '"', "\\": "\\"}.get(nxt, nxt))
-            index += 2
-        else:
-            out.append(char)
-            index += 1
-    return "".join(out)
-
-
-LINE = re.compile(r'^\s*"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"\s*;\s*$')
-
-
 def read_existing() -> dict[str, str]:
+    """Переводы из каталога — разобранные тем же `plutil`, что проверяет файл.
+
+    Не построчным образцом: законная запись бывает и с комментарием в конце
+    строки, и со значением на две строки, и образец такие просто не узнавал —
+    а `render` затем переписывал перевод человека ключом. Раз «правки
+    сохраняются», файл, который не разобрался, не перезаписывается вовсе.
+    """
     if not CATALOGUE.exists():
         return {}
-    translations: dict[str, str] = {}
-    for raw in CATALOGUE.read_text(encoding="utf-8").splitlines():
-        match = LINE.match(raw)
-        if match:
-            translations[unescape(match.group(1))] = unescape(match.group(2))
-    return translations
+    parsed = subprocess.run(
+        ["plutil", "-convert", "json", "-o", "-", str(CATALOGUE)],
+        capture_output=True, text=True,
+    )
+    if parsed.returncode != 0:
+        sys.stderr.write(parsed.stderr)
+        raise SystemExit(f"{CATALOGUE.relative_to(ROOT)} не разобран — исправьте синтаксис, файл не тронут")
+    data = json.loads(parsed.stdout)
+    return {str(key): str(value) for key, value in data.items()}
 
 
 def render(found: dict[str, list[tuple[str, int]]], existing: dict[str, str]) -> str:

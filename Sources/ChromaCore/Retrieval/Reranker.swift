@@ -261,7 +261,11 @@ public enum Reranker {
         var seen: Set<Int> = []
         var result: [Verdict] = []
         for row in rows {
-            guard let index = (row["index"] as? Int) ?? (row["index"] as? Double).map(Int.init),
+            // `Int(exactly:)`, не `Int(_:)`: номер присылает модель, и
+            // «1e20» или бесконечность в `Int(_:)` — ловушка, роняющая
+            // приложение целиком посреди поиска, до всякой проверки
+            // диапазона. Дробный номер — тоже не номер.
+            guard let index = (row["index"] as? Int) ?? (row["index"] as? Double).flatMap({ Int(exactly: $0) }),
                   index >= 1, index <= count, !seen.contains(index) else { continue }
             let score = (row["score"] as? Double) ?? (row["score"] as? Int).map(Double.init) ?? 0
             seen.insert(index)

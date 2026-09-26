@@ -280,6 +280,12 @@ struct EvaluationView: View {
             Text("Промпт оценки").togglesDisclosure($showingJudgePrompt)
         }
         .font(Theme.Font.body)
+        // Промпт входит в отпечаток оценки: правленый — это новые вызовы.
+        // Без пересчёта стоимость оставалась прежней («оценивать нечего»),
+        // и кнопка «Оценить моделью» не включалась после правки промпта.
+        .onChange(of: app.settings.configuration.modelJudgePrompt.fingerprint) { _, _ in
+            Task { await model.updateJudgeCost(app) }
+        }
 
         if let cost = model.judgeCost {
             VStack(alignment: .leading, spacing: 4) {

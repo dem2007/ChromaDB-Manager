@@ -429,11 +429,18 @@ final class EvaluationViewModel: ObservableObject {
                     // по контексту, давал бы на стенде метрику не той настройки,
                     // которую он описывает, — а стенд ради сравнения настроек
                     // и существует.
-                    let rerankContext: Int? = variant.profile.rerankEnabled
-                        && !variant.profile.rerankModel.isEmpty
+                    let reranks = variant.profile.rerankEnabled && !variant.profile.rerankModel.isEmpty
+                    let rerankContext: Int? = reranks
                         ? await binding.loadedContextLength(
                             of: variant.profile.rerankModel, lmStudio: lmStudio
                         )
+                        : nil
+                    // И то же измеренное «символов на токен», что
+                    // у `makeRerankStage`: без него бюджет промпта считался
+                    // по умолчанию, и на русском тексте стенд обрезал
+                    // кандидатов иначе, чем настоящий поиск.
+                    let rerankCharacters: Double? = reranks
+                        ? await lmStudio.charactersPerToken(of: variant.profile.rerankModel)
                         : nil
                     // The one search path in the app. The vector is
                     // already computed — that is the whole point — so the
@@ -468,6 +475,7 @@ final class EvaluationViewModel: ObservableObject {
                             }
                         },
                         rerankContextTokens: rerankContext,
+                        rerankCharactersPerToken: rerankCharacters,
                         log: logHandler
                     )
                     return try await pipeline.run(
@@ -819,7 +827,7 @@ final class EvaluationViewModel: ObservableObject {
                 self.judgements = produced
                 self.statusMessage = produced.line
                 await self.updateJudgeCost(app)
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 // Отмена — не ошибка: полученные оценки уже сохранены самим
                 // прогоном, и красная плашка про них соврала бы.
                 self.judgements = app.modelJudgements.set(for: run.id)

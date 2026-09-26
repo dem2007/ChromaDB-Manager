@@ -65,7 +65,21 @@ final class InspectorViewModel: ObservableObject {
     private let topics = TopicReportStore()
     private var task: Task<Void, Never>?
 
+    /// Коллекция, которая сейчас открыта на экране.
+    ///
+    /// Модель одна на все коллекции, а прогон не отменяется сменой коллекции.
+    /// Закончившийся позже прогон по A клал свой отчёт поверх открытой B,
+    /// и «Удалить выбранные» удаляло идентификаторы A из B — а они между
+    /// коллекциями повторяются. Результат показывается, только если он про
+    /// открытую коллекцию; в историю он записывается в любом случае.
+    private var shownCollectionID: String?
+
+    private func isShown(_ collection: ChromaCollection) -> Bool {
+        shownCollectionID == collection.id
+    }
+
     func prepare(for collection: ChromaCollection) {
+        shownCollectionID = collection.id
         history = store.reports(for: collection.name)
         report = history.first
         comparison = InspectionComparison.between(history.first ?? InspectionReport(collectionName: collection.name), and: history.dropFirst().first)
@@ -213,14 +227,15 @@ final class InspectorViewModel: ObservableObject {
                 }
                 self.store.record(produced)
                 await MainActor.run {
+                    self.isRunning = false
+                    self.stage = nil
+                    guard self.isShown(collection) else { return }
                     self.report = produced
                     self.comparison = InspectionComparison.between(produced, and: previous)
                     self.history = self.store.reports(for: collection.name)
                     self.statusMessage = produced.line
-                    self.isRunning = false
-                    self.stage = nil
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run { self.isRunning = false; self.stage = nil }
             } catch {
                 await MainActor.run {
@@ -274,11 +289,12 @@ final class InspectorViewModel: ObservableObject {
                     )
                 }
                 await MainActor.run {
-                    self.overview = built
                     self.isRunning = false
                     self.stage = nil
+                    guard self.isShown(collection) else { return }
+                    self.overview = built
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run { self.isRunning = false; self.stage = nil }
             } catch {
                 await MainActor.run {
@@ -371,13 +387,14 @@ final class InspectorViewModel: ObservableObject {
                 }
                 self.topics.record(produced)
                 await MainActor.run {
+                    self.isRunning = false
+                    self.stage = nil
+                    guard self.isShown(collection) else { return }
                     self.topicReport = produced
                     self.topicHistory = self.topics.reports(for: collection.name)
                     self.statusMessage = produced.line
-                    self.isRunning = false
-                    self.stage = nil
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run { self.isRunning = false; self.stage = nil }
             } catch {
                 await MainActor.run {
@@ -470,6 +487,11 @@ final class InspectorViewModel: ObservableObject {
     /// Удаление — с копией в корзину, как и всякое ручное удаление
     /// документа в этом приложении.
     func deleteSelected(collection: ChromaCollection, app: AppEnvironment) {
+        // Отчёт обязан быть про ту коллекцию, из которой удаляем.
+        guard report?.collectionName == collection.name else {
+            errorMessage = String(localized: "Отчёт на экране — про другую коллекцию. Прогоните инспектор заново.")
+            return
+        }
         let ids = selectedDocumentIDs()
         guard !ids.isEmpty, let client = app.client else { return }
         isRunning = true
@@ -592,7 +614,7 @@ final class InspectorViewModel: ObservableObject {
 
     /// «Это не дубли» — пара больше не всплывает.
     func acknowledgeSelectedPairs(collection: ChromaCollection) {
-        guard let report else { return }
+        guard let report, report.collectionName == collection.name else { return }
         let pairs = report.findings
             .filter { selectedFindings.contains($0.id) && $0.category == .nearDuplicates }
             .map(\.subject)
@@ -610,11 +632,15 @@ final class InspectorViewModel: ObservableObject {
     /// Разрывы в нумерации чинит синхронизация: файл забывается в манифесте,
     /// и следующий прогон источника записывает его заново. Базу это не трогает
     /// вовсе — меняется только наша собственная запись о том, что уже сделано.
-    func forgetInManifest(file: String, app: AppEnvironment) {
+    ///
+    /// Только в источниках, которые пишут в эту коллекцию: один и тот же
+    /// относительный путь бывает у разных источников, и забыть файл
+    /// у первого попавшегося значило переиндексировать не тот.
+    func forgetInManifest(file: String, collection: ChromaCollection, app: AppEnvironment) {
         task = Task { [weak self] in
             for source in app.settings.configuration.dataSources {
                 var manifest = await app.syncService.manifest(for: source.id)
-                guard manifest.entries[file] != nil else { continue }
+                guard let entry = manifest.entries[file], entry.collectionName == collection.name else { continue }
                 manifest.forget(relativePath: file)
                 await app.syncService.save(manifest: manifest)
                 await MainActor.run {

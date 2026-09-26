@@ -46,4 +46,23 @@ final class QueueMirror: ObservableObject {
     func tasks(titledWith prefix: String) -> [QueuedTaskInfo] {
         tasks.filter { $0.title.hasPrefix(prefix) }
     }
+
+    /// Начала названий задач — **переведённые**, как и сами названия.
+    ///
+    /// Названия строятся через `String(localized:)`, а экраны искали их по
+    /// русскому началу: в английском интерфейсе «Syncing “X”» не начинается
+    /// с «Синхронизация», и строки прогресса синхронизации, импорта и
+    /// пересчёта не находили своих задач вовсе. Начало берётся из того же
+    /// шаблона: вместо имени подставляется метка, и всё после неё отрезается.
+    enum TitlePrefix {
+        static var sync: String { prefix { String(localized: "Синхронизация «\($0)»") } }
+        static var `import`: String { prefix { String(localized: "Импорт в «\($0)»") } }
+        static var recompute: String { prefix { String(localized: "Пересчёт коллекции «\($0)»") } }
+
+        private static let marker = "\u{1}"
+        private static func prefix(_ template: (String) -> String) -> String {
+            let title = template(marker)
+            return title.range(of: marker).map { String(title[..<$0.lowerBound]) } ?? title
+        }
+    }
 }

@@ -227,6 +227,23 @@ final class SchemaInferenceTests: XCTestCase {
         XCTAssertEqual(schema.field(for: "mixed")?.type, .string)
     }
 
+    /// Целые вперемешку с дробными — дробное: строка не приняла бы ни одно
+    /// из значений, и черновик схемы отвергал бы собственные документы.
+    func testIntegersMixedWithDoublesBecomeNumber() {
+        let documents = [
+            document("1", ["rating": .int(5), "note": .null]),
+            document("2", ["rating": .double(4.5), "note": .string("x")]),
+        ]
+        let schema = MetadataSchema.inferred(collectionName: "demo", from: documents)
+        XCTAssertEqual(schema.field(for: "rating")?.type, .number)
+        XCTAssertEqual(schema.field(for: "note")?.type, .string, "пустое значение не делает поле строкой и не мешает")
+        XCTAssertEqual(schema.field(for: "note")?.isRequired, false)
+        let validator = MetadataSchemaValidator()
+        for item in documents {
+            XCTAssertTrue(validator.validate(item.metadata ?? [:], against: schema).violations.isEmpty)
+        }
+    }
+
     func testAppFieldsAreNotPartOfTheDraft() {
         let schema = MetadataSchema.inferred(collectionName: "demo", from: [
             document("1", ["_cdbm_model": .string("m"), "real": .string("x")])

@@ -197,6 +197,24 @@ public final class GitSyncService {
             touched = []
         }
 
+        // Чего `git diff` не видит (см. `GitSourceState.revisit`): недоделанное
+        // прошлым прогоном и рабочая копия, отличная от коммита, — включая
+        // неотслеживаемые файлы. Нынешние отличия запоминаются для следующего
+        // раза: откаченная к коммиту правка тоже должна быть перечитана.
+        var workingCopy: Set<String> = []
+        if settings.indexesWorkingCopy {
+            if let head = commit, let changes = try? await repository.changes(since: head, includeWorkingCopy: true) {
+                workingCopy.formUnion(changes.map(\.path))
+            }
+            if let tracked = try? await repository.listFiles(includeUntracked: false) {
+                workingCopy.formUnion(Set(listed).subtracting(tracked))
+            }
+        }
+        if touched != nil {
+            touched?.formUnion(previous.revisit ?? [])
+            touched?.formUnion(workingCopy)
+        }
+
         let signature = source.chunking.signature
         let extractionSignature = source.extractionSignature
         var items: [SyncPlanItem] = []
@@ -309,7 +327,10 @@ public final class GitSyncService {
         log(.info, "Git", "Источник «\(source.name)» (\(branch)): файлов \(files.count.plainDigits), к записи \(plan.writeItems.count.plainDigits), переименований \(renames.count.plainDigits)")
         return Preparation(
             plan: plan,
-            state: GitSourceState(commit: commit, branch: branch, syncedAt: Date()),
+            state: GitSourceState(
+                commit: commit, branch: branch, syncedAt: Date(),
+                revisit: workingCopy.isEmpty ? nil : workingCopy.sorted()
+            ),
             status: status,
             renames: renames,
             degradedReason: nil

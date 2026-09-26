@@ -904,9 +904,17 @@ public actor RetrievalPipeline {
         // переключателем. Человек, который специально включил галочку и не
         // увидел разницы, вправе считать её сломанной; правило 2 требует
         // назвать причину, а не оставлять его гадать.
+        // Запрос, ушедший в базу иначе, чем ушёл бы обычный поиск, — уже
+        // изменение, даже если ни одна стадия после не тронула список:
+        // приставка меняет сам вектор, а текстовая стадия находит то, чего
+        // вектор не видит. Сказать про такой профиль «ничего не изменил»
+        // и посоветовать включить текстовый поиск значило бы посоветовать
+        // то, что выдачу и дало.
+        let queryDiffers = textStageApplies
+            || !profile.queryPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         diagnostics.unchangedByProfile = Self.profileChangedNothing(
             stages: diagnostics.stages, requested: profile.requestedStages,
-            lengthChangedSomething: lengthChangedSomething
+            lengthChangedSomething: lengthChangedSomething || queryDiffers
         )
         diagnostics.totalDuration = Date().timeIntervalSince(started)
         log(.debug, "Поиск",
@@ -944,7 +952,8 @@ public actor RetrievalPipeline {
         // и у выбора уровня иерархии).
         guard !pinnedFilter.usesRawJSON else { return [] }
         pinnedFilter = pinnedFilter.adding(MetadataCondition(
-            field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
+            field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue,
+            valueIsText: true
         ))
         let known = Set(hits.map(\.id))
         let found = try await database.documents(
@@ -1153,13 +1162,16 @@ public actor RetrievalPipeline {
             return (hits, String(localized: "родительские чанки не найдены в коллекции — возвращены дочерние"))
         }
 
-        var missing = 0
+        // Счёт — в одних единицах: поднятые **результаты** и ненайденные
+        // **родители**. Прежде промахи считались по результатам, а вычитались
+        // из числа родителей, и пометка выходила неверной, вплоть до
+        // отрицательной: один пропавший родитель трёх детей давал «−2».
+        let missing = Set(parentIDs).subtracting(parents.keys).count
+        var raised = 0
         let result = hits.map { hit -> RetrievalHit in
             guard let parentID = hit.parentChunkID else { return hit }
-            guard let parent = parents[parentID] else {
-                missing += 1
-                return hit
-            }
+            guard let parent = parents[parentID] else { return hit }
+            raised += 1
             switch mode {
             case .child:
                 return hit
@@ -1185,10 +1197,20 @@ public actor RetrievalPipeline {
                 return promoted
             }
         }
+        // Два ребёнка одного родителя — или сам родитель и его ребёнок при
+        // поиске по всем уровням — после подъёма становятся **одним**
+        // документом. Без свёртки он стоял в выдаче дважды, занимая чужое
+        // место, а полнота на стенде считала его дважды. Остаётся первое
+        // вхождение: у него лучшее место.
+        var deduplicated = result
+        if mode == .parent {
+            var seen: Set<String> = []
+            deduplicated = result.filter { seen.insert($0.id).inserted }
+        }
         let note = mode == .both
-            ? String(localized: "родитель добавлен как контекст к \(parentIDs.count - missing) результатам")
-            : String(localized: "поднято к родителю: \(parentIDs.count - missing)")
-        return (result, missing > 0 ? note + String(localized: ", не найдено родителей: \(missing)") : note)
+            ? String(localized: "родитель добавлен как контекст к \(raised) результатам")
+            : String(localized: "поднято к родителю: \(raised)")
+        return (deduplicated, missing > 0 ? note + String(localized: ", не найдено родителей: \(missing)") : note)
     }
 
     // MARK: - Stage 1: the text source
@@ -1232,7 +1254,7 @@ public actor RetrievalPipeline {
         // это слово»), — ограничение, а не подсказка. Дописать варианты запроса
         // в тот же список значило бы соединить их с ним через `$or` и вернуть
         // документы, которые чужого условия не выполняют вовсе.
-        let existing = textFilter.whereDocumentClause()
+        let existing = try textFilter.whereDocumentClause()
         let ownClause: [String: Any]
         if usesRegex {
             ownClause = [TextRelevance.regexOperator: pattern]
@@ -1260,10 +1282,13 @@ public actor RetrievalPipeline {
             textFilter.textConditions = []
             textFilter.rawWhereDocumentJSON = json
         } else if let existing {
+            // То же правило, что выше: не собралось — стадия молчит. Пустая
+            // строка здесь снимала условие человека вместе с запросом.
+            guard let json = Self.json(of: [FilterLogic.and.rawValue: [existing, ownClause]]) else {
+                return ([], String(localized: "текстовый поиск: условие не собралось"))
+            }
             textFilter.textConditions = []
-            textFilter.rawWhereDocumentJSON = Self.json(
-                of: [FilterLogic.and.rawValue: [existing, ownClause]]
-            ) ?? ""
+            textFilter.rawWhereDocumentJSON = json
         } else {
             textFilter.textConditions += variants.map { DocumentTextCondition(op: .contains, text: $0) }
             // Several words are looked for with `$or`: a document containing every
@@ -1492,7 +1517,7 @@ public actor RetrievalPipeline {
 
         let branches = wanted.sorted { $0.key < $1.key }.map { file, indices in
             FilterNode.group(.and, [
-                .leaf(MetadataCondition(field: "source_file", op: .equals, value: file)),
+                .leaf(MetadataCondition(field: "source_file", op: .equals, value: file, valueIsText: true)),
                 .leaf(MetadataCondition(
                     field: "chunk_index", op: .inList,
                     value: indices.sorted().map(String.init).joined(separator: ", ")

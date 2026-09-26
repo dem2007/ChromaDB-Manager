@@ -64,9 +64,14 @@ struct MenuBarView: View {
             }
             // Глобальная пауза (8.4) — прямо здесь: ради неё в строку меню
             // и заглядывают, когда LM Studio занята чем-то другим.
+            //
+            // Через координатор, а не записью флага: пауза — это ещё и пауза
+            // очереди, и таймеры со слежением. Один флаг оставлял очередь
+            // стоять после «продолжить» — агент и ручные синхронизации ждали
+            // вечно, — а расписание не перестраивалось.
             Toggle(isOn: Binding(
                 get: { settings.configuration.automaticSyncPaused },
-                set: { settings.configuration.automaticSyncPaused = $0 }
+                set: { app.autoSync.setPaused($0, app: app) }
             )) {
                 Text("Пауза автоматической синхронизации").font(Theme.Font.caption)
             }

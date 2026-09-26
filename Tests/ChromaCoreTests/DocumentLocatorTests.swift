@@ -104,6 +104,26 @@ final class DocumentLocatorTests: XCTestCase {
         XCTAssertTrue(resolution.problem?.contains("вручную") == true)
     }
 
+    /// Страница сайта — не пропавший файл: переносить источник незачем.
+    func testAWebPageIsNotAMissingFile() {
+        let resolution = DocumentLocator.resolve(
+            metadata: [
+                "source_id": .string(UUID().uuidString),
+                "source_file": .string("example.com/about"),
+                "source_url": .string("https://example.com/about"),
+            ],
+            sources: [source()], fileExists: { _ in false }
+        )
+        XCTAssertEqual(resolution, .webPage(URL(string: "https://example.com/about")!))
+    }
+
+    /// Дробное вне диапазона Int роняло приложение.
+    func testAnOutOfRangeDoubleIsNotANumber() {
+        XCTAssertNil(DocumentLocator.int(["page_number": .double(1e300)], "page_number"))
+        XCTAssertNil(DocumentLocator.int(["page_number": .double(.nan)], "page_number"))
+        XCTAssertEqual(DocumentLocator.int(["page_number": .double(7)], "page_number"), 7)
+    }
+
     // MARK: - Куда внутри документа
 
     func testThePageWinsOverEverythingElse() {

@@ -738,7 +738,10 @@ public struct AppConfiguration: Codable, Sendable {
         mcpOverHTTP = ((try? container.decodeIfPresent(Bool.self, forKey: .mcpOverHTTP)) ?? nil) ?? false
         notificationsEnabled = try container.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? false
         operationNotifications = ((try? container.decodeIfPresent(OperationNotificationPolicy.self, forKey: .operationNotifications)) ?? nil) ?? .problemsOnly
-        externalClients = ((try? container.decodeIfPresent([ExternalClient].self, forKey: .externalClients)) ?? nil) ?? []
+        // Поэлементно, как источники: одна нечитаемая запись клиента уносила
+        // весь список, следующее сохранение записывало пустой — и все выданные
+        // ключи начинали получать 401.
+        externalClients = AppConfiguration.decodeLeniently(container, forKey: .externalClients)
         timeouts = ((try? container.decodeIfPresent(TimeoutSettings.self, forKey: .timeouts)) ?? nil) ?? TimeoutSettings()
         logRetention = ((try? container.decodeIfPresent(LogRetention.self, forKey: .logRetention)) ?? nil) ?? LogRetention()
         trashEnabled = try container.decodeIfPresent(Bool.self, forKey: .trashEnabled) ?? true

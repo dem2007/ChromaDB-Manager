@@ -10,38 +10,27 @@
     python3 Scripts/score-evaluation.py 61F82624   # прогон по началу идентификатора
     python3 Scripts/score-evaluation.py --list     # какие прогоны есть
 
-Разметка берётся из набора запросов, а не из прогона: эталон живёт в наборе
-и работает для всех прогонов сразу. Совпадение фрагмента с текстом результата
-считается так же, как в приложении, — по приведённому виду (пробелы схлопнуты,
-регистр и диакритика сняты).
+Эталон — как у экрана (`EvaluationMetrics.groundTruth`): нынешняя разметка
+набора поверх снимка запросов в самом прогоне, так что удалённый набор не
+стирает прогону его чисел. Оценка результата — по фрагменту текста, а если
+ни один не совпал, по идентификатору документа. Ячейки, где поиск упал или
+которых нет, в счёт не идут. Правила общие для скриптов оценки и лежат
+в `evaluation_common.py`.
 """
 
 # Аннотации не вычисляются: на системном python 3.9 «str | None» иначе падает.
 from __future__ import annotations
 
-import json
 import sys
-import unicodedata
 from pathlib import Path
 
-SUPPORT = Path.home() / "Library/Application Support/ChromaDBManager"
-RUNS = SUPPORT / "evaluation-runs"
-SETS = SUPPORT / "query-sets.json"
+from evaluation_common import (
+    RUNS, ground_truth, grader, has_relevant, is_answerable, is_marked, load, succeeded,
+)
 
-# Насколько «сильна» оценка: у фрагмента, совпавшего дважды, побеждает старшая.
-STRENGTH = {"relevant": 2, "partial": 1, "irrelevant": 0}
 SYMBOL = {"relevant": "Р", "partial": "ч", "irrelevant": "·", None: "?"}
 # Ниже этой длины чанк считается коротким — та самая проверка «мера сработала?».
 SHORT = 150
-
-
-def normalised(text: str) -> str:
-    """То же приведение, что у эталона в приложении (`QuerySet.normalised`)."""
-    collapsed = " ".join((text or "").split()).lower()
-    return "".join(
-        c for c in unicodedata.normalize("NFD", collapsed)
-        if unicodedata.category(c) != "Mn"
-    )
 
 
 def runs() -> list[Path]:
@@ -58,17 +47,6 @@ def pick(argument: str | None) -> Path:
         if path.stem.lower().startswith(argument.lower()):
             return path
     raise SystemExit(f"прогон «{argument}» не найден; посмотрите --list")
-
-
-def query_set(run: dict) -> dict:
-    if not SETS.exists():
-        return {"queries": []}
-    data = json.loads(SETS.read_text(encoding="utf-8"))
-    sets = data if isinstance(data, list) else data.get("sets", [])
-    for candidate in sets:
-        if candidate.get("id") == run.get("querySetID"):
-            return candidate
-    return {"queries": []}
 
 
 def names(run: dict) -> dict:
@@ -113,11 +91,13 @@ def pairwise(titles: dict, variants: dict, ranks: dict, base_id: str) -> None:
         for query_id in titles:
             was = ranks.get((query_id, base_id))
             now = ranks.get((query_id, variant_id))
-            if was is None and now is None:
+            # Сравнивать есть что, только когда ответили оба: сбой одной
+            # стороны — не «лучше» и не «хуже».
+            if was is None or now is None:
                 continue
-            if (now or 0) > (was or 0):
+            if now > was:
                 better.append(query_id)
-            elif (now or 0) < (was or 0):
+            elif now < was:
                 worse.append(query_id)
             else:
                 same += 1
@@ -129,33 +109,25 @@ def pairwise(titles: dict, variants: dict, ranks: dict, base_id: str) -> None:
 
 
 def report(path: Path) -> None:
-    run = json.loads(path.read_text(encoding="utf-8"))
-    marks = {
-        # Отметка с незнакомой градацией отбрасывается, а не роняет разбор:
-        # иначе один странный фрагмент уносит с собой весь отчёт по прогону.
-        query["id"]: [
-            (normalised(f["fragment"]), f.get("grade"))
-            for f in query.get("fragments", [])
-            if f.get("fragment") and f.get("grade") in STRENGTH
-        ]
-        for query in query_set(run).get("queries", [])
-    }
+    run = load(path)
+    truth = ground_truth(run)
     titles = {q["id"]: q.get("text", "") for q in run.get("queries", [])}
     variants = names(run)
 
-    def grade(text: str, query_id: str) -> str | None:
-        document = normalised(text)
-        best = None
-        for fragment, value in marks.get(query_id, []):
-            if fragment in document and (best is None or STRENGTH[value] > STRENGTH[best]):
-                best = value
-        return best
-
+    # Только ячейки, где поиск ответил. Упавшая ячейка — не «ничего не
+    # нашёл»: считать её промахом значило бы объявить вариант хуже там, где
+    # он просто не отвечал. Ячейка, которой нет (прогон остановили), не
+    # считается тем более.
     rows: dict[tuple[str, str], list] = {}
     lengths: dict[tuple[str, str], list] = {}
+    failed: set[tuple[str, str]] = set()
     for result in run.get("results", []):
         key = (result["queryID"], result["variantID"])
-        rows[key] = [grade(hit.get("text") or "", result["queryID"]) for hit in result["hits"]]
+        if not succeeded(result):
+            failed.add(key)
+            continue
+        grade = grader(truth.get(result["queryID"]))
+        rows[key] = [grade(hit) for hit in result["hits"]]
         lengths[key] = [len(hit.get("text") or "") for hit in result["hits"]]
 
     print(f"### {run.get('name')} — набор «{run.get('querySetName')}»")
@@ -164,67 +136,85 @@ def report(path: Path) -> None:
 
     width = max((len(name) for name in variants.values()), default=10)
     for query_id, title in titles.items():
-        marked = len(marks.get(query_id, []))
+        query = truth.get(query_id) or {}
+        marked = len(query.get("fragments", [])) + len(query.get("documents", []))
         print(f"«{title}» (отметок в эталоне: {marked})")
         for variant_id, name in variants.items():
-            grades = rows.get((query_id, variant_id), [])
+            key = (query_id, variant_id)
+            if key in failed:
+                print(f"   {name:<{width}}  поиск не ответил — вне счёта")
+                continue
+            if key not in rows:
+                print(f"   {name:<{width}}  ячейки нет — вне счёта")
+                continue
+            grades = rows[key]
             line = "".join(SYMBOL[g] for g in grades)
             first = next((i + 1 for i, g in enumerate(grades) if g == "relevant"), None)
-            short = sum(1 for length in lengths.get((query_id, variant_id), [])[:5] if length < SHORT)
+            short = sum(1 for length in lengths.get(key, [])[:5] if length < SHORT)
             print(f"   {name:<{width}}  {line}  первый релевантный: {first or '—':>2}  "
                   f"коротких в топ-5: {short}")
         print()
 
-    print(f"{'вариант':<{width}} {'MRR(Р)':>7} {'hit@1':>6} {'hit@3':>6} "
-          f"{'мусор@3':>8} {'коротких@5':>11} {'не размечено':>13}")
+    print(f"{'вариант':<{width}} {'MRR':>6} {'MRR(Р)':>7} {'hit@1':>6} {'hit@3':>6} "
+          f"{'мусор@3':>8} {'коротких@5':>11} {'не размечено':>13} {'сбоев':>6}")
     # Запрос, у которого весь эталон помечен «нерелевантен», — это вопрос,
     # ответа на который в базе нет. Такие заводятся нарочно: они проверяют,
     # умеет ли поиск отдать пустоту вместо правдоподобной ерунды. Попадание на
     # них невозможно по построению, и считать их промахом значило бы наказывать
     # поиск за разметку — приложение их из MRR и hit@k исключает, и здесь то же
     # правило. В «мусоре@3» они, наоборот, самое ценное, поэтому он по всем.
-    answerable = {
-        query_id for query_id, fragments in marks.items()
-        if any(grade != "irrelevant" for _, grade in fragments)
-    }
-    # Вклад каждого запроса — он же и есть материал для счёта «лучше/хуже».
+    #
+    # MRR — как на экране: первое место «релевантного» или «частичного».
+    # MRR(Р) — строже, только «релевантное», и по тому же правилу знаменатель —
+    # только запросы, где «релевантное» в эталоне вообще есть: запрос с одними
+    # «частично» не может в нём набрать ничего.
     ranks: dict = {}
     for variant_id, name in variants.items():
-        counted = scored = mrr = hit1 = hit3 = junk = short = unknown = 0
+        counted = scored = strict = mrr = mrr_strict = hit1 = hit3 = junk = short = unknown = 0
+        errors = sum(1 for key in failed if key[1] == variant_id)
         for query_id in titles:
-            if not marks.get(query_id):
-                continue  # запрос без единой отметки в счёт не идёт
-            grades = rows.get((query_id, variant_id), [])
+            query = truth.get(query_id)
+            key = (query_id, variant_id)
+            if not is_marked(query) or key not in rows:
+                continue  # запрос без отметок или без ответа в счёт не идёт
+            grades = rows[key]
             counted += 1
             junk += sum(1 for g in grades[:3] if g == "irrelevant")
-            short += sum(1 for length in lengths.get((query_id, variant_id), [])[:5] if length < SHORT)
+            short += sum(1 for length in lengths.get(key, [])[:5] if length < SHORT)
             unknown += sum(1 for g in grades if g is None)
-            if query_id not in answerable:
-                continue
-            scored += 1
-            first = next((i + 1 for i, g in enumerate(grades) if g == "relevant"), None)
-            ranks[(query_id, variant_id)] = 1 / first if first else 0
-            mrr += 1 / first if first else 0
-            hit1 += 1 if grades[:1] and grades[0] in ("relevant", "partial") else 0
-            hit3 += 1 if any(g in ("relevant", "partial") for g in grades[:3]) else 0
+            if is_answerable(query):
+                scored += 1
+                first = next((i + 1 for i, g in enumerate(grades) if g in ("relevant", "partial")), None)
+                mrr += 1 / first if first else 0
+                hit1 += 1 if grades[:1] and grades[0] in ("relevant", "partial") else 0
+                hit3 += 1 if any(g in ("relevant", "partial") for g in grades[:3]) else 0
+            if has_relevant(query):
+                strict += 1
+                first = next((i + 1 for i, g in enumerate(grades) if g == "relevant"), None)
+                ranks[key] = 1 / first if first else 0
+                mrr_strict += 1 / first if first else 0
         if counted == 0:
-            print(f"{name:<{width}}  — ни один запрос не размечен")
+            print(f"{name:<{width}}  — ни один запрос не размечен (сбоев: {errors})")
             continue
         if scored == 0:
-            print(f"{name:<{width}}  — ни у одного запроса нет релевантного эталона")
+            print(f"{name:<{width}}  — ни у одного запроса нет релевантного эталона (сбоев: {errors})")
             continue
-        print(f"{name:<{width}} {mrr / scored:7.3f} {hit1 / scored:6.2f} {hit3 / scored:6.2f} "
-              f"{junk / counted:8.2f} {short / counted:11.2f} {unknown / counted:13.1f}")
+        strict_text = f"{mrr_strict / strict:7.3f}" if strict else f"{'—':>7}"
+        print(f"{name:<{width}} {mrr / scored:6.3f} {strict_text} {hit1 / scored:6.2f} {hit3 / scored:6.2f} "
+              f"{junk / counted:8.2f} {short / counted:11.2f} {unknown / counted:13.1f} {errors:>6}")
 
     if len(variants) > 1:
         pairwise(titles, variants, ranks, next(iter(variants)))
 
-    unmarked = [titles[q] for q in titles if not marks.get(q)]
+    unmarked = [titles[q] for q in titles if not is_marked(truth.get(q))]
     if unmarked:
         print(f"\nбез единой отметки и потому вне счёта: {', '.join(unmarked)}")
-    noanswer = [titles[q] for q in titles if marks.get(q) and q not in answerable]
+    noanswer = [titles[q] for q in titles if is_marked(truth.get(q)) and not is_answerable(truth.get(q))]
     if noanswer:
         print(f"\nответа в базе нет — вне MRR и hit@k, но в «мусоре@3»: {', '.join(noanswer)}")
+    partial_only = [titles[q] for q in titles if is_answerable(truth.get(q)) and not has_relevant(truth.get(q))]
+    if partial_only:
+        print(f"\nв эталоне только «частично» — вне MRR(Р) и счёта по запросам: {', '.join(partial_only)}")
     print("\nСовпали ли списки двух вариантов до последнего идентификатора — "
           "значит мера не сработала, а не «не помогла» (docs/EVALUATION.md, раздел 6).")
 
@@ -233,7 +223,7 @@ def main() -> None:
     argument = sys.argv[1] if len(sys.argv) > 1 else None
     if argument == "--list":
         for path in runs():
-            run = json.loads(path.read_text(encoding="utf-8"))
+            run = load(path)
             print(f"{path.stem}  {run.get('name')}  — набор «{run.get('querySetName')}», "
                   f"вариантов {len(run.get('variants', []))}")
         return

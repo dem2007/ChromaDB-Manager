@@ -326,60 +326,61 @@ public struct VisionOCRExtractor: DocumentTextExtractor {
     /// The timeout is per page, as requires: a single unreadable page must
     /// not decide how long a two-hundred-page scan takes.
     static func recognise(_ image: CGImage, languages: [String], timeout: TimeInterval) async throws -> PageText {
-        try await withThrowingTaskGroup(of: PageText.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    let request = VNRecognizeTextRequest { request, error in
-                        if let error {
-                            continuation.resume(throwing: ExtractionError.corrupted(error.localizedDescription))
-                            return
-                        }
-                        let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
-                        var lines: [String] = []
-                        var words: [TableGeometry.Word] = []
-                        var weighted = 0.0
-                        var weight = 0.0
-                        for observation in observations {
-                            guard let candidate = observation.topCandidates(1).first else { continue }
-                            let line = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !line.isEmpty else { continue }
-                            lines.append(line)
-                            words.append(contentsOf: Self.words(of: candidate, in: image, fallback: observation))
-                            weighted += Double(candidate.confidence) * Double(line.count)
-                            weight += Double(line.count)
-                        }
-                        // Таблица на скане — не редкость, а типичный случай:
-                        // ведомость, смета, реестр. Vision отдаёт наблюдения
-                        // россыпью, и без координат строка таблицы теряется
-                        // ровно так же, как в текстовом слое PDF.
-                        let height = TableGeometry.medianHeight(of: words)
-                        let table = height > 0
-                            ? TableGeometry.text(of: TableGeometry.lines(from: words, height: height, separated: true))
-                            : nil
-                        continuation.resume(returning: PageText(
-                            text: lines.joined(separator: "\n"),
-                            confidence: weight > 0 ? weighted / weight : 0,
-                            table: table
-                        ))
+        // Срок — через `Deadline`, а не группу задач: `perform` синхронный,
+        // и группа ждала бы застрявшую страницу до конца, какой бы срок
+        // ни был назначен.
+        try await Deadline.race(
+            seconds: max(1, timeout),
+            timeoutError: { ExtractionError.timedOut(seconds: timeout) }
+        ) {
+            try await withCheckedThrowingContinuation { (checked: CheckedContinuation<PageText, Error>) in
+                // Ошибку Vision сообщает дважды: обработчику запроса и
+                // броском из `perform`. Возобновить продолжение второй
+                // раз — ловушка посреди прогона OCR.
+                let continuation = OnceContinuation(checked)
+                let request = VNRecognizeTextRequest { request, error in
+                    if let error {
+                        continuation.resume(with: .failure(ExtractionError.corrupted(error.localizedDescription)))
+                        return
                     }
-                    request.recognitionLevel = .accurate
-                    request.usesLanguageCorrection = true
-                    if !languages.isEmpty { request.recognitionLanguages = languages }
+                    let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
+                    var lines: [String] = []
+                    var words: [TableGeometry.Word] = []
+                    var weighted = 0.0
+                    var weight = 0.0
+                    for observation in observations {
+                        guard let candidate = observation.topCandidates(1).first else { continue }
+                        let line = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !line.isEmpty else { continue }
+                        lines.append(line)
+                        words.append(contentsOf: Self.words(of: candidate, in: image, fallback: observation))
+                        weighted += Double(candidate.confidence) * Double(line.count)
+                        weight += Double(line.count)
+                    }
+                    // Таблица на скане — не редкость, а типичный случай:
+                    // ведомость, смета, реестр. Vision отдаёт наблюдения
+                    // россыпью, и без координат строка таблицы теряется
+                    // ровно так же, как в текстовом слое PDF.
+                    let height = TableGeometry.medianHeight(of: words)
+                    let table = height > 0
+                        ? TableGeometry.text(of: TableGeometry.lines(from: words, height: height, separated: true))
+                        : nil
+                    continuation.resume(with: .success(PageText(
+                        text: lines.joined(separator: "\n"),
+                        confidence: weight > 0 ? weighted / weight : 0,
+                        table: table
+                    )))
+                }
+                request.recognitionLevel = .accurate
+                request.usesLanguageCorrection = true
+                if !languages.isEmpty { request.recognitionLanguages = languages }
 
-                    do {
-                        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-                    } catch {
-                        continuation.resume(throwing: ExtractionError.corrupted(error.localizedDescription))
-                    }
+                do {
+                    try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                } catch {
+                    continuation.resume(with: .failure(ExtractionError.corrupted(error.localizedDescription)))
                 }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(max(1, timeout) * 1_000_000_000))
-                throw ExtractionError.timedOut(seconds: timeout)
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw ExtractionError.empty }
-            return first
         }
     }
 }

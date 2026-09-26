@@ -146,17 +146,13 @@ public struct ExtractorRegistry: Sendable {
         _ seconds: TimeInterval,
         _ work: @escaping @Sendable () async throws -> ExtractedDocument
     ) async throws -> ExtractedDocument {
-        guard seconds > 0 else { return try await work() }
-        return try await withThrowingTaskGroup(of: ExtractedDocument.self) { group in
-            group.addTask { try await work() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw ExtractionError.timedOut(seconds: seconds)
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw ExtractionError.empty }
-            return first
-        }
+        // Не группа задач: она при выходе дожидается всех своих задач,
+        // и застрявший разбор держал бы прогон ровно так же, как без срока.
+        try await Deadline.race(
+            seconds: seconds,
+            timeoutError: { ExtractionError.timedOut(seconds: seconds) },
+            work
+        )
     }
 }
 
@@ -204,11 +200,21 @@ public struct PlainTextExtractor: DocumentTextExtractor {
         )
     }
 
+    /// Кодировка угадывается тем же правилом, что у CSV: метка BOM,
+    /// потом UTF-8, потом Windows-1251.
+    ///
+    /// Прежде вторым шёл UTF-16 без метки, а он принимает почти любую
+    /// последовательность чётной длины: русский текст в cp1251 становился
+    /// набором иероглифов, индексировался и не находился ни по одному
+    /// своему слову. Latin-1 — последним: он читает всё и ничего не
+    /// гарантирует.
     static func read(at url: URL) -> String? {
-        if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
-        if let text = try? String(contentsOf: url, encoding: .utf16) { return text }
-        if let text = try? String(contentsOf: url, encoding: .isoLatin1) { return text }
-        return nil
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        if let guess = DelimitedTableReader.detectEncoding(data),
+           let text = DelimitedTableReader.decode(data, as: guess) {
+            return text
+        }
+        return String(data: data, encoding: .isoLatin1)
     }
 
     /// Trims, and refuses anything that is clearly not text whatever its

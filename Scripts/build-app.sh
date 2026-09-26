@@ -97,49 +97,68 @@ PROTOCOLS="$TOOLCHAIN/usr/share/swift/SwiftConstantValues/AppIntents.json"
 APP_SOURCES="$ROOT/Sources/ChromaDBManagerApp"
 INTENTS_SOURCE="$APP_SOURCES/App/AppIntents.swift"
 
-if [[ -x "$PROCESSOR" && -f "$PROTOCOLS" ]]; then
-    echo "==> App Intents: сборка Metadata.appintents"
-    WORK="$(mktemp -d)"
-    SDK="$(xcrun --sdk macosx --show-sdk-path)"
-    MODULES="$(dirname "$BIN")/Modules"
-    # Обработчику нужен список протоколов простым массивом, а в тулчейне
-    # он лежит объектом с версией — перекладываем.
-    /usr/bin/python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1]))['constValueProtocols'], open(sys.argv[2],'w'))" \
-        "$PROTOCOLS" "$WORK/protocols.json"
+# Цель сборки — та же, что у SwiftPM выше: архитектура машины, а не
+# «arm64» из головы, и минимальная система из Info.plist (её с Package.swift
+# сверяет BundleManifestTests). С прибитыми числами на Intel-маке или после
+# подъёма минимальной версии модули пакета не импортировались, и приложение
+# уезжало без интентов под одно лишь предупреждение.
+ARCH="$(uname -m)"
+MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$ROOT/Resources/Info.plist" 2>/dev/null || echo 14.0)"
+TRIPLE="$ARCH-apple-macos$MIN_OS"
 
+# Шаг — «по возможности»: не вышло — предупреждение, и сборка идёт дальше
+# к подписи. Поэтому каждая команда, способная упасть, охраняется здесь
+# явно: под `set -e` любая из них иначе обрывала скрипт на полпути —
+# с пересобранным, но не подписанным бандлом.
+intents_warning() {
+    echo "warning: $1 — интентов в Shortcuts не будет" >&2
+}
+
+if [[ -x "$PROCESSOR" && -f "$PROTOCOLS" ]]; then
+    echo "==> App Intents: сборка Metadata.appintents ($TRIPLE)"
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
+    SDK="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+    MODULES="$(dirname "$BIN")/Modules"
     OTHER_SOURCES=()
     while IFS= read -r file; do OTHER_SOURCES+=("$file"); done \
         < <(find "$APP_SOURCES" -name '*.swift' ! -name 'AppIntents.swift')
 
-    if swiftc -frontend -c -primary-file "$INTENTS_SOURCE" "${OTHER_SOURCES[@]}" \
-        -module-name ChromaDBManagerApp -target arm64-apple-macos14.0 -sdk "$SDK" \
+    # Обработчику нужен список протоколов простым массивом, а в тулчейне
+    # он лежит объектом с версией — перекладываем.
+    if [[ -z "$SDK" ]]; then
+        intents_warning "не найден SDK macOS"
+    elif ! /usr/bin/python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1]))['constValueProtocols'], open(sys.argv[2],'w'))" \
+        "$PROTOCOLS" "$WORK/protocols.json" 2>"$WORK/python.log"; then
+        intents_warning "список протоколов в тулчейне другого вида ($(head -1 "$WORK/python.log"))"
+    elif ! swiftc -frontend -c -primary-file "$INTENTS_SOURCE" "${OTHER_SOURCES[@]}" \
+        -module-name ChromaDBManagerApp -target "$TRIPLE" -sdk "$SDK" \
         -I "$MODULES" \
         -emit-const-values-path "$WORK/consts.swiftconstvalues" \
         -const-gather-protocols-file "$WORK/protocols.json" \
         -o "$WORK/intents.o" >"$WORK/swiftc.log" 2>&1 \
-        && [[ -s "$WORK/consts.swiftconstvalues" ]]; then
+        || [[ ! -s "$WORK/consts.swiftconstvalues" ]]; then
+        intents_warning "не удалось извлечь константы интентов"
+        sed -n '1,5p' "$WORK/swiftc.log" >&2 || true
+    else
         echo "$INTENTS_SOURCE" > "$WORK/sources.txt"
         echo "$WORK/consts.swiftconstvalues" > "$WORK/consts.txt"
         mkdir -p "$WORK/out"
-        XCODE_BUILD="$(xcodebuild -version 2>/dev/null | sed -n 2p | awk '{print $3}')"
+        XCODE_BUILD="$( (xcodebuild -version 2>/dev/null || true) | sed -n 2p | awk '{print $3}')"
         if "$PROCESSOR" --output "$WORK/out" --toolchain-dir "$TOOLCHAIN" \
             --module-name ChromaDBManagerApp --sdk-root "$SDK" \
             --xcode-version "${XCODE_BUILD:-0}" \
-            --platform-family macOS --deployment-target 14.0 \
-            --target-triple arm64-apple-macos14.0 \
+            --platform-family macOS --deployment-target "$MIN_OS" \
+            --target-triple "$TRIPLE" \
             --source-file-list "$WORK/sources.txt" \
             --swift-const-vals-list "$WORK/consts.txt" --force >/dev/null 2>&1 \
             && [[ -d "$WORK/out/Metadata.appintents" ]]; then
             cp -R "$WORK/out/Metadata.appintents" "$BUNDLE/Contents/Resources/"
             echo "    интентов в бандле: $(ls "$BUNDLE/Contents/Resources/Metadata.appintents" | wc -l | tr -d ' ') файла"
         else
-            echo "warning: обработчик App Intents отработал вхолостую — интентов в Shortcuts не будет" >&2
+            intents_warning "обработчик App Intents отработал вхолостую"
         fi
-    else
-        echo "warning: не удалось извлечь константы интентов — интентов в Shortcuts не будет" >&2
-        sed -n '1,5p' "$WORK/swiftc.log" >&2 || true
     fi
-    rm -rf "$WORK"
 else
     echo "warning: Xcode не найден — приложение собрано без интентов Shortcuts" >&2
 fi

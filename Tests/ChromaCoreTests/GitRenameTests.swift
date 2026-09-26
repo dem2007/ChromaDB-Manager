@@ -73,7 +73,7 @@ final class GitRenameTests: XCTestCase {
         let database = Database()
         var ids: [String] = []
         for index in 0..<chunks {
-            let id = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: index)
+            let id = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: index, sourceID: nil)
             ids.append(id)
             database.seed(EmbeddedRecord(
                 id: id, document: "кусок \(index)",
@@ -104,7 +104,7 @@ final class GitRenameTests: XCTestCase {
         XCTAssertTrue(outcome.failed.isEmpty)
 
         for index in 0..<3 {
-            let newID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: index)
+            let newID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: index, sourceID: nil)
             let moved = try XCTUnwrap(database.records[newID])
             XCTAssertEqual(moved.embedding, [Double(index), 0.5, 0.25], "вектор обязан быть тем же самым")
             XCTAssertEqual(moved.document, "кусок \(index)")
@@ -141,7 +141,7 @@ final class GitRenameTests: XCTestCase {
         XCTAssertEqual(entry.contentHash, "хэш", "текст не менялся — хэш тоже")
         XCTAssertEqual(
             entry.chunkIDs,
-            (0..<2).map { SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: $0) }
+            (0..<2).map { SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: $0, sourceID: nil) }
         )
     }
 
@@ -167,8 +167,8 @@ final class GitRenameTests: XCTestCase {
     /// тоже производен от пути: не поправить — и ссылка повиснет.
     func testTheParentLinkIsRewrittenToo() async throws {
         let database = Database()
-        let parentID = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: 0)
-        let childID = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: 1)
+        let parentID = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: 0, sourceID: nil)
+        let childID = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: 1, sourceID: nil)
         database.seed(EmbeddedRecord(
             id: parentID, document: "родитель", embedding: [1, 0],
             metadata: ["source_file": .string("docs/guide.md"), "chunk_index": .int(0)]
@@ -187,8 +187,40 @@ final class GitRenameTests: XCTestCase {
             sourceID: sourceID, manifest: &manifest, chroma: database
         )
 
-        let newChildID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: 1)
-        let newParentID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: 0)
+        let newChildID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: 1, sourceID: nil)
+        let newParentID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: 0, sourceID: nil)
         XCTAssertEqual(database.records[newChildID]?.metadata["parent_chunk_id"], .string(newParentID))
+    }
+
+    /// Отпечаток файла переезжает вместе с путём.
+    ///
+    /// Он производен от пути и источника, как и идентификатор: оставленный
+    /// прежним, он отдавал агенту отпечаток старого имени, а уборка путей
+    /// объявляла каждый переименованный файл испорченным.
+    func testTheFileFingerprintFollowsTheNewName() async throws {
+        let database = Database()
+        let oldID = SourceSyncService.documentID(relativePath: "docs/guide.md", chunkIndex: 0, sourceID: sourceID)
+        database.seed(EmbeddedRecord(
+            id: oldID, document: "кусок", embedding: [1, 0],
+            metadata: [
+                "source_file": .string("docs/guide.md"), "chunk_index": .int(0),
+                "source_id": .string(sourceID.uuidString),
+                "file_id": .string(SourceSyncService.fileFingerprint("docs/guide.md", sourceID: sourceID)),
+            ]
+        ))
+        var manifest = manifest(chunkIDs: [oldID])
+
+        _ = await GitRenames.apply(
+            [(from: "docs/guide.md", to: "docs/manual.md")],
+            sourceID: sourceID, manifest: &manifest, chroma: database
+        )
+
+        let newID = SourceSyncService.documentID(relativePath: "docs/manual.md", chunkIndex: 0, sourceID: sourceID)
+        let metadata = database.records[newID]?.metadata
+        XCTAssertEqual(
+            metadata?["file_id"],
+            .string(SourceSyncService.fileFingerprint("docs/manual.md", sourceID: sourceID))
+        )
+        XCTAssertFalse(FilePathRepair.needsRepair(metadata), "переименованный файл принят за испорченный")
     }
 }

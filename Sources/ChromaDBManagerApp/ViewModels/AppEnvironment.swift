@@ -160,6 +160,7 @@ final class AppEnvironment: ObservableObject {
     /// синхронизации. Держится здесь, потому что живёт столько же,
     /// сколько само окружение.
     private var sharedTableProfilesWatch: AnyCancellable?
+    private var externalClientsWatch: AnyCancellable?
 
     enum ConnectionState: Equatable {
         case disconnected
@@ -284,6 +285,18 @@ final class AppEnvironment: ObservableObject {
             .removeDuplicates()
             .sink { profiles in
                 Task { await sync.adopt(sharedTableProfiles: profiles) }
+            }
+
+        // Права клиентов — тем же способом и по той же причине. Импорт
+        // настроек и «Перечитать настройки» меняли права и выключали клиентов,
+        // а прокси и MCP держали прежний список до следующего подключения:
+        // клиент, которому только что запретили запись, продолжал писать.
+        let clientAccess = proxy.access
+        externalClientsWatch = settings.$configuration
+            .map(\.externalClients)
+            .removeDuplicates()
+            .sink { clients in
+                Task { await clientAccess.setClients(clients) }
             }
 
         // The proxy checks permissions against collection names and vector
@@ -465,9 +478,41 @@ final class AppEnvironment: ObservableObject {
         processManager.refreshOrphans()
     }
 
+    /// Запуск приложения уже прошёл: подключение при старте, автоматика,
+    /// синхронизации «при запуске». Окно, открытое повторно, их не повторяет.
+    var didStartUp = false
+
+    /// Службы, которые живут столько же, сколько приложение, а не окно.
+    ///
+    /// Пока они были `@StateObject` главного окна, закрытие окна в режиме
+    /// «оставаться в строке меню» уносило их с собой: слежение за папками
+    /// и расписание останавливались молча, а строка меню продолжала
+    /// показывать автоиндексацию включённой. Новое окно заводило свежие
+    /// копии, но запуск второй раз не проходит (`didStartUp`), и их никто
+    /// не запускал — автоматика выключалась до перезапуска приложения.
+    /// Здесь же список моделей, который обновляется в фоне, и переэмбединг:
+    /// долгая работа не должна зависеть от того, открыто ли окно.
+    lazy var sourcesModel = SourcesViewModel()
+    lazy var autoSync = AutoSyncCoordinator()
+    lazy var embeddingsModel = EmbeddingsViewModel()
+    lazy var reembedding = ReembeddingViewModel()
+    /// Прокси работал, когда сервер гасили на перезапуск, — поднять его
+    /// после подключения.
+    private var resumeProxyAfterConnect = false
+
     func connect() async {
+        // Поверх живого подключения не подключаемся. Второй `connect()`
+        // у локальной базы гасил работающий сервер под идущей синхронизацией
+        // и поднимал новый на другом порту: задачи старого подключения
+        // выпадали из-под `disconnect()`, а прокси пересылал в мёртвый порт.
+        // Переподключение — это `reconnect()`: сначала отключиться.
+        if client != nil || connection == .connecting {
+            log.record(.info, "Подключение", "Подключение уже есть — повторный запуск пропущен")
+            return
+        }
         connection = .connecting
         lastError = nil
+        missingDatabase = nil
 
         do {
             let endpoint: ChromaEndpoint
@@ -524,6 +569,16 @@ final class AppEnvironment: ObservableObject {
                 log.record(.warning, "Подключение", "Подключение открыто только для чтения — любая запись будет отклонена")
             }
             writeLimits = await client.writeLimits()
+            if resumeProxyAfterConnect {
+                resumeProxyAfterConnect = false
+                do {
+                    try startProxy()
+                    log.record(.info, "Прокси", "Прокси снова запущен после перезапуска сервера")
+                } catch {
+                    lastError = String(localized: "Прокси не поднялся после перезапуска сервера: \(describe(error))")
+                    log.record(.error, "Прокси", "Прокси не поднялся после перезапуска сервера: \(describe(error))")
+                }
+            }
         } catch {
             client = nil
             endpoint = nil
@@ -571,6 +626,15 @@ final class AppEnvironment: ObservableObject {
         writeLimits = nil
         // The proxy forwards to a port that is about to disappear — a local
         // database gets a new one on every start.
+        //
+        // При перезапуске того же сервера (копия, обслуживание, восстановление,
+        // перерасчёт) прокси поднимается обратно после подключения: иначе
+        // внешние клиенты и MCP по HTTP молча отваливались до ручного
+        // запуска, и никто об этом не говорил.
+        switch reason {
+        case .serverRestart: if proxy.state.isRunning { resumeProxyAfterConnect = true }
+        case .leaving: resumeProxyAfterConnect = false
+        }
         proxy.stop()
         if processManager.isRunning {
             await processManager.stop()
@@ -738,8 +802,17 @@ final class AppEnvironment: ObservableObject {
     /// `CancellationError` бросает наш код; `URLError.cancelled` и
     /// `NSUserCancelledError` приходят от системы, когда вместе с задачей
     /// отменяется её сетевой запрос, — и это та же самая отмена.
+    ///
+    /// И отмены ядра своими именами: синхронизация, очередь, перерасчёт
+    /// и внешняя команда бросают собственное «отменено». Пока их здесь не
+    /// было, остановленная человеком синхронизация приходила красной
+    /// плашкой, уведомлением о сбое и ERROR в журнале.
     nonisolated static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError { return true }
+        if case SyncError.cancelled = error { return true }
+        if case QueueError.cancelled = error { return true }
+        if case ReembeddingError.cancelled = error { return true }
+        if case ShellError.cancelled = error { return true }
         if let url = error as? URLError, url.code == .cancelled { return true }
         let nsError = error as NSError
         return nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError

@@ -18,6 +18,13 @@ NAME="${1:-stable-$(date +%Y%m%d)}"
 STABLE_DIR="$ROOT/dist/stable/$NAME"
 BUNDLE="$ROOT/dist/ChromaDB Manager.app"
 
+# 0. Имя — до всего долгого: второй запуск за день с именем по умолчанию
+#    иначе тратил тесты и сборку, чтобы упасть на существующем теге.
+if git rev-parse "$NAME" > /dev/null 2>&1 || [ -e "$STABLE_DIR" ]; then
+    echo "!! метка $NAME уже есть — выберите другое имя" >&2
+    exit 1
+fi
+
 # 1. Незакоммиченные правки. Метка на грязное дерево — это метка, по которой
 #    нельзя вернуться: половина состояния останется только на этой машине.
 if [ -n "$(git status --porcelain)" ]; then
@@ -25,6 +32,11 @@ if [ -n "$(git status --porcelain)" ]; then
     git status --short >&2
     exit 1
 fi
+# Коммит запоминается **сейчас**: проверяется и собирается именно он.
+# Взятый после тестов и сборки, он мог оказаться коммитом, сделанным пока
+# они шли, — и тег объявил бы проверенным то, что никто не проверял.
+COMMIT="$(git rev-parse HEAD)"
+SHORT="$(git rev-parse --short HEAD)"
 
 # 2. Тесты. Стабильной называется сборка, о которой это проверено, а не
 #    объявлено.
@@ -53,26 +65,25 @@ echo "==> сборка"
 "$ROOT/Scripts/build-app.sh" > /dev/null
 [ -d "$BUNDLE" ] || { echo "!! приложение не собралось" >&2; exit 1; }
 
-COMMIT="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short HEAD)"
-
-# 4. Тег на код — аннотированный: у него есть дата, автор и текст.
-if git rev-parse "$NAME" > /dev/null 2>&1; then
-    echo "!! метка $NAME уже есть — выберите другое имя" >&2
+# 4. Пока шли тесты и сборка, код не должен был измениться: иначе в архив
+#    попали правки, которых тесты не видели, или HEAD уже другой.
+if [ "$(git rev-parse HEAD)" != "$COMMIT" ] || [ -n "$(git status --porcelain)" ]; then
+    echo "!! пока шли тесты и сборка, код изменился — метка не ставится" >&2
+    git status --short >&2
     exit 1
 fi
-git tag -a "$NAME" -m "Стабильная сборка $NAME
-
-Тесты пройдены, приложение собрано и проверено живьём.
-Архив собранного приложения: dist/stable/$NAME/"
 
 # 5. Архив приложения. В git он не идёт — 37 МБ двоичного кода в истории
 #    не нужны никому; лежит рядом, под dist/, который git не отслеживает.
+#    Пишется под временным именем: оборванный `tar` иначе оставлял бы под
+#    настоящим именем обрезанный архив, который restore взял бы первым.
 echo "==> архив приложения"
 mkdir -p "$STABLE_DIR"
-tar -czf "$STABLE_DIR/ChromaDB-Manager.app.tar.gz" -C "$ROOT/dist" "ChromaDB Manager.app"
+tar -czf "$STABLE_DIR/ChromaDB-Manager.app.tar.gz.partial" -C "$ROOT/dist" "ChromaDB Manager.app"
+mv "$STABLE_DIR/ChromaDB-Manager.app.tar.gz.partial" "$STABLE_DIR/ChromaDB-Manager.app.tar.gz"
 
 # 6. Отпечаток: по нему видно, та ли это сборка, не распаковывая архив.
+#    Он же — признак, что метка дописана: restore без него метку не берёт.
 {
     echo "метка:      $NAME"
     echo "коммит:     $COMMIT"
@@ -85,7 +96,16 @@ tar -czf "$STABLE_DIR/ChromaDB-Manager.app.tar.gz" -C "$ROOT/dist" "ChromaDB Man
     echo
     echo "Вернуть приложение:  Scripts/restore-stable.sh $NAME"
     echo "Вернуть код:         git switch --detach $NAME"
-} > "$STABLE_DIR/MANIFEST.txt"
+} > "$STABLE_DIR/MANIFEST.txt.partial"
+mv "$STABLE_DIR/MANIFEST.txt.partial" "$STABLE_DIR/MANIFEST.txt"
+
+# 7. Тег на код — последним: тег без архива мешал бы повторному запуску,
+#    а обещал бы архив, которого нет. Аннотированный: у него есть дата,
+#    автор и текст.
+git tag -a "$NAME" "$COMMIT" -m "Стабильная сборка $NAME
+
+Тесты пройдены, приложение собрано и проверено живьём.
+Архив собранного приложения: dist/stable/$NAME/"
 
 echo
 echo "Готово."

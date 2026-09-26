@@ -18,12 +18,10 @@ enum IntentSupport {
     /// Общая точка входа: интент работает с тем же окружением, что и окно.
     @MainActor
     static func environment() throws -> AppEnvironment {
-        guard let delegate = NSApp.delegate as? AppDelegate,
-              let environment = delegate.environment
-        else {
-            throw IntentProblem.notReady
-        }
-        return environment
+        // Общее окружение, а не ссылка через делегат: приведение
+        // `NSApp.delegate as? AppDelegate` у SwiftUI-приложения хрупкое
+        // (делегат обёрнут адаптером), а ссылка появлялась только с окном.
+        AppEnvironment.shared
     }
 }
 

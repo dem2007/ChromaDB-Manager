@@ -31,6 +31,15 @@ public struct MultiCollectionSearch: Sendable {
         /// Вес коллекции при слиянии. Единица у всех — пока человек
         /// не решил иначе.
         public let weight: Double
+        /// Сколько результатов взять из этой коллекции, если больше, чем
+        /// просит выдача. Ставит сам поиск — под пул переранжирования;
+        /// `nil` — сколько просили.
+        public private(set) var poolSize: Int?
+
+        /// Сколько результатов спрашивать у коллекции при просьбе `requested`.
+        public func results(forRequested requested: Int) -> Int {
+            max(requested, poolSize ?? 0)
+        }
 
         public init(
             collectionID: String,
@@ -54,13 +63,21 @@ public struct MultiCollectionSearch: Sendable {
         /// модель **после** слияния и один раз про всех. Снимается
         /// здесь, а не у вызывающего: гарантия «модель не спросят дважды»
         /// обязана жить в одном месте.
-        func withoutRerank() -> Target {
+        ///
+        /// И с пулом, если переранжирование спросят после слияния: коллекция,
+        /// обрезанная до `nResults`, не давала модели кандидатов глубже
+        /// выдачи — а треть выигрыша стадии приходит именно оттуда.
+        /// Одна коллекция с тем же профилем переранжирует пул в двадцать
+        /// пять, и несколько коллекций обязаны видеть не меньше.
+        func withoutRerank(pool: Int? = nil) -> Target {
             var stripped = profile
             stripped.rerankEnabled = false
-            return Target(
+            var target = Target(
                 collectionID: collectionID, collectionName: collectionName,
                 model: model, metric: metric, profile: stripped, weight: weight
             )
+            target.poolSize = pool
+            return target
         }
     }
 
@@ -201,6 +218,15 @@ public struct MultiCollectionSearch: Sendable {
         var reports: [CollectionReport] = []
         var lists: [(target: Target, hits: [RetrievalHit])] = []
 
+        // Пул под стадию 7 шире выдачи: модель должна увидеть тех кандидатов,
+        // до которых десятка не достаёт, — треть выигрыша приходит именно
+        // оттуда. Считается до поиска: каждая коллекция обязана
+        // отдать столько, иначе пул слитой выдачи был бы не шире её суммы.
+        let plan = Self.rerankPlan(targets: targets)
+        let poolLimit = plan.profile.map {
+            max(nResults, Reranker.candidateCount($0.rerankCandidates))
+        } ?? nResults
+
         for target in targets {
             let collectionStarted = Date()
             do {
@@ -219,7 +245,9 @@ public struct MultiCollectionSearch: Sendable {
                     calls += 1
                 }
                 // Без стадии 7: её спросят один раз после слияния.
-                let outcome = try await search(target.withoutRerank(), query, vector)
+                let outcome = try await search(
+                    target.withoutRerank(pool: plan.profile == nil ? nil : poolLimit), query, vector
+                )
                 lists.append((target, outcome.hits))
                 reports.append(CollectionReport(
                     name: target.collectionName, found: outcome.hits.count,
@@ -237,13 +265,6 @@ public struct MultiCollectionSearch: Sendable {
             }
         }
 
-        // Пул под стадию 7 шире выдачи: модель должна увидеть тех кандидатов,
-        // до которых десятка не достаёт, — треть выигрыша приходит именно
-        // оттуда.
-        let plan = Self.rerankPlan(targets: targets)
-        let poolLimit = plan.profile.map {
-            max(nResults, Reranker.candidateCount($0.rerankCandidates))
-        } ?? nResults
         var fused = Self.fuse(lists, k: fusionK, limit: poolLimit)
         var note = plan.note
 

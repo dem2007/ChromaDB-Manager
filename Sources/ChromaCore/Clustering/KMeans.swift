@@ -335,44 +335,38 @@ public enum KMeans {
         return centroids
     }
 
-    /// Раздача номеров: для каждой точки — ближайший центр и следующий за ним.
-    /// Второй нужен силуэту, и считать его отдельным проходом было бы вдвое
-    /// дороже на ровном месте.
+    /// Раздача номеров: для каждой точки — ближайший центр.
     static func assign(
         _ points: VectorSet, centroids: [Double], k: Int
-    ) -> (assignments: [Int], distances: [Double], second: [Double]) {
+    ) -> (assignments: [Int], distances: [Double]) {
         let dimension = points.dimension
         var assignments = [Int](repeating: 0, count: points.count)
         var distances = [Double](repeating: 0, count: points.count)
-        var second = [Double](repeating: 1, count: points.count)
 
         points.values.withUnsafeBufferPointer { buffer in
             centroids.withUnsafeBufferPointer { centres in
                 guard let base = buffer.baseAddress, let centreBase = centres.baseAddress else { return }
                 for index in 0..<points.count {
                     let point = base + index * dimension
-                    var bestDistance = Double.greatestFiniteMagnitude
-                    var runnerUp = Double.greatestFiniteMagnitude
+                    var bestDistance = Double.infinity
                     var bestCluster = 0
                     for cluster in 0..<k {
                         var similarity = 0.0
                         vDSP_dotprD(point, 1, centreBase + cluster * dimension, 1, &similarity, vDSP_Length(dimension))
                         let distance = max(0, 1 - similarity)
                         if distance < bestDistance {
-                            runnerUp = bestDistance
                             bestDistance = distance
                             bestCluster = cluster
-                        } else if distance < runnerUp {
-                            runnerUp = distance
                         }
                     }
                     assignments[index] = bestCluster
-                    distances[index] = bestDistance
-                    second[index] = runnerUp.isFinite ? runnerUp : bestDistance
+                    // Не нашлось ни одного центра (k = 0) — расстояние нулевое,
+                    // а не бесконечное: дальше оно идёт в суммы и пороги.
+                    distances[index] = bestDistance.isFinite ? bestDistance : 0
                 }
             }
         }
-        return (assignments, distances, second)
+        return (assignments, distances)
     }
 
     /// Новые центры — среднее своих точек, приведённое к единичной длине.
@@ -403,8 +397,13 @@ public enum KMeans {
             }
         }
 
-        var orphans = zip(distances.indices, distances).sorted { $0.1 > $1.1 }.map(\.0)
-        for cluster in 0..<k where counts[cluster] == 0 {
+        // Сортировать все расстояния на каждом шаге ради случая, когда кластер
+        // опустел, незачем: чаще всего пустых нет вовсе.
+        let emptied = (0..<k).filter { counts[$0] == 0 }
+        var orphans = emptied.isEmpty
+            ? []
+            : zip(distances.indices, distances).sorted { $0.1 > $1.1 }.map(\.0)
+        for cluster in emptied {
             guard let donor = orphans.first else { break }
             orphans.removeFirst()
             for offset in 0..<dimension {
@@ -479,7 +478,11 @@ public enum KMeans {
                 // стороны.
                 guard counts[mine] > 0 else { continue }
                 let inside = sums[mine] / Double(counts[mine])
-                var outside = Double.greatestFiniteMagnitude
+                // Бесконечность, а не наибольшее конечное: иначе точка, рядом
+                // с которой нет ни одной чужой темы, проходила проверку
+                // `isFinite` и давала силуэт ≈ 1 — «темы отделяются чётко»
+                // при единственной теме.
+                var outside = Double.infinity
                 for cluster in 0..<k where cluster != mine && counts[cluster] > 0 {
                     outside = min(outside, sums[cluster] / Double(counts[cluster]))
                 }

@@ -411,6 +411,11 @@ final class SheetParser: NSObject, XMLParserDelegate {
         case "row":
             cells = [:]
             rowNumber = attributes["r"].flatMap(Int.init) ?? (rowNumber + 1)
+            // Для ячеек без `r` колонка считается по порядку — и с нуля
+            // в каждой строке: прежний счёт начинался с единицы и тянулся
+            // из строки в строку, и лист от такого писателя читался со
+            // сдвигом, который рос строка за строкой.
+            columnIndex = -1
         case "c":
             // The column comes from the **reference**, never from the order the
             // cells appear in: empty cells are simply absent.

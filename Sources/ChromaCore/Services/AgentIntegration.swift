@@ -61,6 +61,34 @@ public enum AgentKind: String, CaseIterable, Sendable, Hashable {
         }
     }
 
+    /// Куда кладутся снимки прежнего скилла — **за пределами** папки скиллов.
+    ///
+    /// Это не вкусовщина, а условие работы. Hermes обходит дерево скиллов
+    /// через `os.walk`, и точка в начале имени папки его не останавливает:
+    /// пропускаются только те, что перечислены поимённо в
+    /// `EXCLUDED_SKILL_DIRS` (`agent/skill_utils.py`), — среди них `.git`,
+    /// `.hub` и **своя** папка копий `.curator_backups`, но чужих там нет
+    /// и быть не может. Снимок, положенный внутрь `skills/`, становится
+    /// вторым скиллом с тем же именем, и `_locate_skill` отвечает
+    /// «Ambiguous skill name … Refusing to guess», отказываясь грузить оба.
+    /// То есть копия, сделанная ради безопасности, ломает то, что берегла.
+    ///
+    /// Имя папки при этом обычное, без точки: прятать нечего, а найти
+    /// снимок человек должен без подсказки.
+    public var skillBackups: URL {
+        home.appendingPathComponent("skills-backups/\(AgentIntegration.skillName)")
+    }
+
+    /// Куда снимки клали сборки до — **внутрь** дерева скиллов.
+    ///
+    /// Переезд папки снимков не убирает уже положенных туда: каждый из них
+    /// остаётся вторым скиллом с тем же именем, и агент по-прежнему
+    /// отказывается грузить оба. Поэтому старое место помнится — чтобы
+    /// перенести оттуда то, что там уже лежит.
+    var legacySkillBackups: URL {
+        home.appendingPathComponent("skills/.chromadb-manager-backups")
+    }
+
     /// Приложение, по которому агент опознаётся. Папки мало: `~/.lmstudio`
     /// заводит и сам LM Studio, и кнопка с надписью «Bionic» появилась бы
     /// у того, у кого Bionic нет вовсе.
@@ -315,7 +343,13 @@ public enum AgentIntegration {
         while cursor < lines.count {
             let trimmed = lines[cursor].trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty || trimmed.hasPrefix("#") { cursor += 1; continue }
-            if lines[cursor].prefix(while: { $0 == " " }).count == 0 { return false }
+            // Черта списка ищется **до** всякого счёта отступов: элемент
+            // последовательности YAML разрешает писать на том же отступе,
+            // что и ключ над ним, и `- name: other` в первом столбце —
+            // обычная запись, какую по умолчанию печатает PyYAML. Прежде
+            // отступ ноль считался «вышли из отображения», список не
+            // узнавался, и в него вписывался ключ — то есть ровно то,
+            // ради чего эта проверка и заведена.
             return trimmed == "-" || trimmed.hasPrefix("- ")
         }
         return false
@@ -331,11 +365,15 @@ public enum AgentIntegration {
     /// «выигрывает последний» у PyYAML: чужие серверы исчезали молча,
     /// а человеку говорилось «сервер добавлен».
     static func rootRemainder(of line: String) -> String? {
-        guard line.hasPrefix("mcp_servers") else { return nil }
-        let after = line.dropFirst("mcp_servers".count)
-        let trimmed = after.drop { $0 == " " || $0 == "\t" }
-        guard trimmed.first == ":" else { return nil }
-        return String(trimmed.dropFirst())
+        // Ключ можно писать в кавычках — это тот же ключ. Узнавали только
+        // голый, и файл с `"mcp_servers":` получал **второй** такой же ключ
+        // в конец: та же беда, что была с именем сервера.
+        for spelling in ["mcp_servers", "\"mcp_servers\"", "'mcp_servers'"]
+        where line.hasPrefix(spelling) {
+            let after = line.dropFirst(spelling.count).drop { $0 == " " || $0 == "\t" }
+            if after.first == ":" { return String(after.dropFirst()) }
+        }
+        return nil
     }
 
     static func hermesRoot(in lines: [String]) -> HermesRoot? {
@@ -579,6 +617,7 @@ public enum AgentIntegration {
         _ kind: AgentKind, from source: URL, fileManager: FileManager = .default
     ) throws -> AgentInstallOutcome {
         guard kind.isInstalled else { throw AgentIntegrationError.notInstalled(kind) }
+        moveSnapshots(from: kind.legacySkillBackups, to: kind.skillBackups, fileManager: fileManager)
         var isFolder: ObjCBool = false
         guard fileManager.fileExists(atPath: source.path, isDirectory: &isFolder) else {
             throw AgentIntegrationError.skillMissing
@@ -600,7 +639,20 @@ public enum AgentIntegration {
                 path: target.path, backup: nil, replacedExisting: true, changedNothing: true
             )
         }
-        let backup = existing == nil ? nil : try backUp(target, contents: existing ?? "", fileManager: fileManager)
+        // Снимок — **за пределами** папки скиллов и папкой целиком.
+        //
+        // Прежде здесь звался `backUp`, а он кладёт копию рядом с оригиналом:
+        // в папке скилла оседали `SKILL.md.bak-…`, по одному на нажатие. Имя
+        // не `SKILL.md`, поэтому вторым скиллом такая копия не становится —
+        // но она остаётся **внутри пакета скилла** и уезжает агенту вместе
+        // с ним. А снимать надо не один файл: рядом с `SKILL.md` лежат
+        // `references/`, `scripts/` и прочее, и вернуть прежнее состояние
+        // по копии одного файла нельзя.
+        let backup = existing == nil
+            ? nil
+            : try snapshotFolder(
+                folder, named: skillName, in: kind.skillBackups, fileManager: fileManager
+            )
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         try text.write(to: target, atomically: true, encoding: .utf8)
         return AgentInstallOutcome(
@@ -627,7 +679,7 @@ public enum AgentIntegration {
             from: source,
             to: kind.skillFolder(named: name, fileManager: fileManager),
             named: name,
-            backupsIn: kind.home.appendingPathComponent("skills/.chromadb-manager-backups"),
+            backupsIn: kind.skillBackups,
             fileManager: fileManager
         )
     }
@@ -687,14 +739,20 @@ public enum AgentIntegration {
     /// а не имя папки, в которую мы собираемся писать.
     public static func declaredSkillName(in manifest: URL) -> String? {
         guard let text = try? String(contentsOf: manifest, encoding: .utf8) else { return nil }
-        var lines = text.components(separatedBy: "\n").drop(while: { $0.isEmpty })[...]
-        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else { return nil }
+        // Концы строк снимаются вместе с пробелами: `\r` не входит
+        // в `CharacterSet.whitespaces`, и у файла, правленного в Windows,
+        // первая строка шапки читалась как «---\r» — не «---». Имя не
+        // находилось, и скилл ставился под именем папки, которого агент
+        // по шапке не узнаёт.
+        var lines = text.components(separatedBy: "\n")
+            .drop(while: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })[...]
+        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" else { return nil }
         lines = lines.dropFirst()
         for line in lines {
-            if line.trimmingCharacters(in: .whitespaces) == "---" { return nil }
+            if line.trimmingCharacters(in: .whitespacesAndNewlines) == "---" { return nil }
             guard line.hasPrefix("name:") else { continue }
             let name = line.dropFirst("name:".count)
-                .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n\"'"))
             return name.isEmpty ? nil : name
         }
         return nil
@@ -809,6 +867,32 @@ public enum AgentIntegration {
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         try fileManager.copyItem(at: folder, to: target)
         return target.path
+    }
+
+    /// Переносит снимки со старого места на новое и убирает
+    /// опустевшую старую папку.
+    ///
+    /// Молча и без отказа: неудавшийся перенос не повод не ставить скилл,
+    /// а снимок, который не удалось перенести, остаётся где был — ничего
+    /// не удаляется, кроме пустой папки. Имя, уже занятое на новом месте,
+    /// получает номер: снимок нельзя затереть другим снимком.
+    static func moveSnapshots(from legacy: URL, to root: URL, fileManager: FileManager) {
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: legacy.path),
+              !entries.isEmpty
+        else { return }
+        try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        for entry in entries {
+            var target = root.appendingPathComponent(entry)
+            var attempt = 2
+            while fileManager.fileExists(atPath: target.path) {
+                target = root.appendingPathComponent("\(entry)-\(attempt)")
+                attempt += 1
+            }
+            try? fileManager.moveItem(at: legacy.appendingPathComponent(entry), to: target)
+        }
+        if (try? fileManager.contentsOfDirectory(atPath: legacy.path))?.isEmpty == true {
+            try? fileManager.removeItem(at: legacy)
+        }
     }
 
     // MARK: - Общее

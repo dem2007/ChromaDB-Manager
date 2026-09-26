@@ -23,7 +23,6 @@ struct LogsView: View {
     @EnvironmentObject private var app: AppEnvironment
     @EnvironmentObject private var audit: AuditLog
     @EnvironmentObject private var settings: SettingsStore
-    @EnvironmentObject private var processManager: ChromaProcessManager
     @ObservedObject var reembedding: ReembeddingViewModel
     /// Модель сервера — ради его собственного журнала, который переехал сюда
     /// с вкладки «Сервер»: вывод процесса читают там же, где остальные
@@ -405,7 +404,7 @@ struct LogsView: View {
             case 3:
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                        logCard
+                        ServerOutputCard(serverModel: serverModel)
                     }
                     .padding(.top, 4)
                     .pageContentPadding()
@@ -609,9 +608,15 @@ struct LogsView: View {
                                 // пяти тысяч строк и переиздаётся на каждую
                                 // новую, а группировка строила бы словарь дней
                                 // и копировала весь буфер при каждом проходе.
-                                ForEach(Array(entries.enumerated()), id: \.element.id) { position, entry in
+                                //
+                                // Отфильтрованный список — один раз на проход:
+                                // `entries` — вычисляемое свойство, и обращение
+                                // к соседу внутри строки фильтровало весь буфер
+                                // заново для каждой видимой строки.
+                                let shown = entries
+                                ForEach(Array(shown.enumerated()), id: \.element.id) { position, entry in
                                 if position == 0 || !Calendar.current.isDate(
-                                    entry.date, inSameDayAs: entries[position - 1].date
+                                    entry.date, inSameDayAs: shown[position - 1].date
                                 ) {
                                     Text("── \(Self.dayTitle(entry.date)) ──")
                                         .font(Theme.Font.mono)
@@ -672,8 +677,19 @@ struct LogsView: View {
             .padding(.vertical, 6)
         }
     }
+}
 
-    private var logCard: some View {
+/// «Вывод сервера» — отдельным видом, со своим наблюдением за процессом.
+///
+/// Экран журнала наблюдал `ChromaProcessManager` целиком, а тот каждую
+/// секунду публикует время работы сервера: весь журнал — до пяти тысяч
+/// строк с фильтром — перерисовывался раз в секунду ради одной карточки,
+/// которой это время даже не нужно. Теперь перерисовывается она одна.
+private struct ServerOutputCard: View {
+    @EnvironmentObject private var processManager: ChromaProcessManager
+    @ObservedObject var serverModel: ServerViewModel
+
+    var body: some View {
         SectionCard(
             title: String(localized: "Вывод сервера"),
             subtitle: String(localized: "То, что процесс chroma печатает сам.")

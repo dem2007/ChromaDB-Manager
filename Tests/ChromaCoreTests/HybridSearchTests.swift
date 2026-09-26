@@ -333,7 +333,7 @@ private actor ErrorCodeDatabase: RetrievalDatabase {
     func documents(
         collectionID: String, matching filter: DocumentFilter, limit: Int
     ) async throws -> [DocumentRecord] {
-        guard let clause = filter.whereDocumentClause() else { return [] }
+        guard let clause = try filter.whereDocumentClause() else { return [] }
         return records.filter { record in
             guard let document = record.document else { return false }
             return Self.matches(document, clause: clause)

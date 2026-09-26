@@ -340,7 +340,7 @@ struct InspectorTabs: View {
             Spacer(minLength: 4)
             if category == .chunkGaps {
                 Button(String(localized: "Забыть в манифесте")) {
-                    model.forgetInManifest(file: finding.subject, app: app)
+                    model.forgetInManifest(file: finding.subject, collection: collection, app: app)
                 }
                 .buttonStyle(.chromaSecondary)
                 .help(String(localized: "Следующая синхронизация источника запишет этот файл заново. Сама она не запустится."))
@@ -638,7 +638,9 @@ struct InspectorTabs: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Не отнесены ни к одной теме — \(report.unassigned.documentCount.plainDigits)")
                         .font(Theme.Font.control).fontWeight(.medium)
-                    Text("Документы, до своего центра которых дальше остальных. Часто именно здесь видно то, что попало в коллекцию случайно. Порог: \(String(format: "%.3f", report.unassigned.distanceThreshold)) по косинусу.")
+                    Text(report.unassigned.hasThreshold
+                        ? String(localized: "Документы, до своего центра которых дальше остальных. Часто именно здесь видно то, что попало в коллекцию случайно. Порог: \(String(format: "%.3f", report.unassigned.distanceThreshold)) по косинусу.")
+                        : String(localized: "Документы, до своего центра которых дальше остальных. Порога нет: расстояния до центров тем почти одинаковые, отделять нечего."))
                         .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(report.unassigned.examples) { example in

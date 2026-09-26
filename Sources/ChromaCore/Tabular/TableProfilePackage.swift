@@ -131,6 +131,11 @@ public enum TableProfileTransfer {
             } else {
                 var updated = profile
                 updated.name = name
+                // Идентификатор из файла бывает уже занят — свой же экспорт,
+                // переименованный здесь после выгрузки. Два профиля с одним
+                // `id` делили бы назначения файлам, и правка одного меняла бы
+                // другой. Новый профиль получает новый идентификатор.
+                if result.contains(where: { $0.id == updated.id }) { updated.id = UUID() }
                 result.append(updated)
                 added.append(name)
             }

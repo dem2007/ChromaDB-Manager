@@ -105,7 +105,10 @@ final class ConnectionViewModel: ObservableObject {
     func prepareWizard(_ app: AppEnvironment) {
         draftName = String(localized: "Локальный сервер")
         draftPath = app.settings.configuration.localDatabasePath ?? AppPaths.defaultEmbeddedDatabase.path
-        draftPort = "8000"
+        // Первый порт, не занятый другими профилями: у всех новых профилей
+        // был 8000, и два профиля на одном порту не могут работать разом.
+        let used = Set(app.settings.configuration.serverProfiles.map(\.port))
+        draftPort = String((8000...8099).first { !used.contains($0) } ?? 8000)
         draftAllowReset = false
         showServerWizard = true
     }

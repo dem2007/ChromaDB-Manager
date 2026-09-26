@@ -115,7 +115,13 @@ public enum TextDocumentLoader {
 
 /// Место фрагмента в тексте: диапазон и строка, на которой он начинается.
 public struct TextFragmentPlacement: Sendable, Equatable {
-    /// Диапазон в символах — в том виде, в каком его принимает `NSTextView`.
+    /// Диапазон в единицах UTF-16 — в том виде, в каком его принимает
+    /// `NSTextView`.
+    ///
+    /// Не в знаках Swift: «\r\n» — один знак, но две единицы, как и эмодзи
+    /// или буква с отдельным ударением. Счёт знаками сдвигал подсветку
+    /// в файле с переводами строк Windows на строку-другую назад за каждую
+    /// строку выше совпадения.
     public let characterRange: Range<Int>
     /// Номер строки с единицы — то, что показывается в поле номеров и
     /// в подписи «строка N».
@@ -140,8 +146,7 @@ public extension TextFragmentPlacement {
     /// Ищет фрагмент в тексте и считает номер строки.
     static func locate(chunk: String, in text: String) -> TextFragmentPlacement? {
         guard let match = FragmentLocator.locate(chunk: chunk, in: text) else { return nil }
-        let start = text.distance(from: text.startIndex, to: match.range.lowerBound)
-        let end = text.distance(from: text.startIndex, to: match.range.upperBound)
+        let range = NSRange(match.range, in: text)
         // Номер строки считается по исходному тексту до начала совпадения:
         // переводы строк в нормализованном виде схлопнуты, и считать по нему
         // значило бы назвать не ту строку.
@@ -150,7 +155,7 @@ public extension TextFragmentPlacement {
                 if character.isNewline { count += 1 }
             }
         return TextFragmentPlacement(
-            characterRange: start..<end, line: line, strategy: match.strategy
+            characterRange: range.location..<NSMaxRange(range), line: line, strategy: match.strategy
         )
     }
 }

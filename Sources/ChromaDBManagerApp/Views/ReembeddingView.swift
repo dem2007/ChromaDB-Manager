@@ -278,7 +278,7 @@ struct ReembeddingProgressCard: View {
                 // progress comes from the queue, the only place it lives.
                 // Отдельной вьюхой: очередь сообщает о прогрессе четыре раза
                 // в секунду, и тело экрана не должно этого оплачивать.
-                QueueProgressRow(titlePrefix: "Пересчёт коллекции")
+                QueueProgressRow(titlePrefix: QueueMirror.TitlePrefix.recompute)
                 if model.isPaused {
                     Text("Пауза — операция ждёт продолжения.").font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
                 }

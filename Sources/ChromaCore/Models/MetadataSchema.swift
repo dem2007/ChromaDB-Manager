@@ -96,15 +96,24 @@ public enum MetadataFieldType: String, Codable, CaseIterable, Identifiable, Send
         guard trimmed.count >= 8 else { return nil }
 
         if let date = iso8601.date(from: trimmed) { return date }
-
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) { return date }
-
-        let dateOnly = ISO8601DateFormatter()
-        dateOnly.formatOptions = [.withFullDate]
-        return dateOnly.date(from: trimmed)
+        if let date = fractionalISO8601.date(from: trimmed) { return date }
+        return dateOnlyISO8601.date(from: trimmed)
     }
+
+    // Один раз, а не на каждый вызов: разбор идёт по каждому значению каждого
+    // документа при выводе схемы, а форматтер создавать дорого.
+    // `ISO8601DateFormatter` потокобезопасен.
+    private static let fractionalISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let dateOnlyISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate]
+        return formatter
+    }()
 }
 
 public struct MetadataField: Identifiable, Codable, Hashable, Sendable {
@@ -225,13 +234,16 @@ public struct MetadataSchema: Codable, Hashable, Identifiable, Sendable {
         var counts: [String: Int] = [:]
 
         for document in documents {
-            for (key, value) in document.metadata ?? [:] where !isTechnicalKey(key) {
+            // Пустое значение — то же, что поля нет: ни один тип его
+            // не принимает, и «строкой» из-за него столбец становиться не должен.
+            for (key, value) in document.metadata ?? [:] where !isTechnicalKey(key) && value != .null {
                 counts[key, default: 0] += 1
                 let inferred = MetadataFieldType.inferred(from: value)
                 if let existing = types[key], existing != inferred {
-                    // Mixed types in the same column: a string is the only
-                    // description that fits every row.
-                    types[key] = .string
+                    // Целые вперемешку с дробными — дробное: оно принимает
+                    // оба. Остальные смеси описывает только строка.
+                    let numeric: Set<MetadataFieldType> = [.integer, .number]
+                    types[key] = numeric.contains(existing) && numeric.contains(inferred) ? .number : .string
                 } else {
                     types[key] = inferred
                 }
@@ -353,7 +365,7 @@ public struct MetadataSchemaValidator: Sendable {
             let key = field.trimmedKey
             guard !key.isEmpty else { continue }
 
-            guard let value = metadata[key] else {
+            guard let value = metadata[key], value != .null else {
                 if field.isRequired {
                     violations.append(SchemaViolation(
                         documentID: documentID,

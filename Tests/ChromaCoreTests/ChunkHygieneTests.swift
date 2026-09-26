@@ -100,4 +100,11 @@ final class ChunkHygieneTests: XCTestCase {
         XCTAssertEqual(merged[1].text, ")")
         XCTAssertEqual(merged[1].parentIndex, 0)
     }
+
+    /// Два бессловесных куска в начале уезжают в первого соседа со словами
+    /// в своём порядке, а не задом наперёд.
+    func testLeadingWordlessPiecesKeepTheirOrder() {
+        let merged = ChunkHygiene.merged([chunk(0, "—"), chunk(1, "***"), chunk(2, "Текст раздела.")])
+        XCTAssertEqual(merged.map(\.text), ["— *** Текст раздела."])
+    }
 }

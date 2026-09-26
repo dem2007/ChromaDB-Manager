@@ -136,7 +136,16 @@ public enum MCPFileChunks {
             collected += page
             offset += page.count
             if page.count < batch { return (collected, false) }
-            if collected.count >= maximumOrdered { return (collected, true) }
+            if collected.count >= maximumOrdered {
+                // Ровно предел — ещё не «больше предела»: файл может на нём
+                // и кончиться. Без этой проверки файл ровно в двадцать тысяч
+                // кусков объявлялся неупорядочиваемым, приходил вперемешку
+                // и получал пометку «в файле больше двадцати тысяч кусков»,
+                // которой в нём нет. Один пробный кусок отличает конец
+                // от продолжения и платится только у самой границы.
+                let probe = try await fetch(1, offset)
+                return (collected, !probe.isEmpty)
+            }
         }
     }
 

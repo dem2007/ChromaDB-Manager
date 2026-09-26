@@ -109,4 +109,28 @@ final class RobotsTxtTests: XCTestCase {
         """)
         XCTAssertTrue(rules.allows(path: "/docs"), "запрет чужому боту нас не касается")
     }
+
+    /// `"\r\n"` для Swift — один знак: файл из Windows читался одной строкой,
+    /// и не действовало ни одно правило.
+    func testWindowsLineEndingsAreLinesToo() {
+        let rules = robots("User-agent: *\r\nDisallow: /private/\r\nCrawl-delay: 2\r\n")
+        XCTAssertFalse(rules.allows(path: "/private/report"))
+        XCTAssertEqual(rules.group.crawlDelay, 2)
+    }
+
+    /// `URL.path` срезает косую черту в конце — и «/private/» не закрывал
+    /// саму папку.
+    func testTheTrailingSlashOfTheAddressCounts() {
+        let rules = robots("User-agent: *\nDisallow: /private/\nDisallow: /каталог/")
+        XCTAssertFalse(rules.allows(url: URL(string: "https://example.org/private/")!))
+        XCTAssertFalse(rules.allows(url: URL(string: "https://example.org/%D0%BA%D0%B0%D1%82%D0%B0%D0%BB%D0%BE%D0%B3/")!))
+        XCTAssertTrue(rules.allows(url: URL(string: "https://example.org/public/")!))
+    }
+
+    /// Задержка с чужого сервера не должна уметь уронить приложение.
+    func testAnAbsurdCrawlDelayIsBoundedOrDropped() {
+        XCTAssertEqual(robots("User-agent: *\nCrawl-delay: 1e20").group.crawlDelay, RobotsTxt.maximumCrawlDelay)
+        XCTAssertNil(robots("User-agent: *\nCrawl-delay: inf").group.crawlDelay)
+        XCTAssertNil(robots("User-agent: *\nCrawl-delay: -5").group.crawlDelay)
+    }
 }

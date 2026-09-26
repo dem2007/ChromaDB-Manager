@@ -124,7 +124,11 @@ public struct GitRepository: Sendable {
     /// `file_hash`/`content_hash` остаётся вторым уровнем проверки — git
     /// говорит, **что** трогали, а не **изменился ли текст**.
     public func changes(since commit: String, includeWorkingCopy: Bool) async throws -> [GitChange] {
-        var arguments = ["diff", "--name-status", "-z", "--find-renames", commit]
+        // `--relative`: источник может быть подпапкой репозитория, а
+        // `ls-files` отдаёт пути от неё. Без флага `diff` отдавал пути от
+        // корня репозитория — ни один не совпадал, и каждый изменённый
+        // файл считался нетронутым.
+        var arguments = ["diff", "--name-status", "-z", "--find-renames", "--relative", commit]
         if !includeWorkingCopy { arguments.append("HEAD") }
         let output = try await git(arguments)
         return Self.parseNameStatus(output)

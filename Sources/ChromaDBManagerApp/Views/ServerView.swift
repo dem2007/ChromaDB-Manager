@@ -75,56 +75,6 @@ struct ServerView: View {
         }
     }
 
-    // MARK: - Status
-
-    private var statusCard: some View {
-        SectionCard(
-            title: String(localized: "Состояние"),
-            subtitle: String(localized: "Процесс chroma, запущенный этим приложением.")
-        ) {
-            VStack(alignment: .leading, spacing: 6) {
-                row(String(localized: "Статус"), processManager.state.title)
-                if let pid = processManager.state.pid {
-                    row("PID", String(pid))
-                }
-                if let uptime = processManager.uptime {
-                    row("Uptime", RootView.uptimeText(uptime))
-                }
-                row(String(localized: "Адрес"), address ?? "—")
-                row(String(localized: "Папка базы"), processManager.databasePath ?? "—")
-                row(String(localized: "Режим"), settings.configuration.mode.title)
-                if let telemetry = processManager.telemetryStatus {
-                    // Shown as the server itself worded it, rather than as a
-                    // claim of ours.
-                    row(String(localized: "Телеметрия"), telemetry)
-                }
-            }
-        }
-    }
-
-    /// The address survives a stop: after a failure it is the thing the user
-    /// wants to check first.
-    private var address: String? {
-        if let endpoint = processManager.endpoint { return endpoint.baseURLString }
-        guard let launch = processManager.lastLaunch else { return nil }
-        return "http://\(launch.host):\(launch.port)"
-    }
-
-    private func row(_ title: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title)
-                .font(Theme.Font.caption)
-                .foregroundStyle(Theme.Palette.captionText)
-                .frame(width: 110, alignment: .leading)
-            Text(value)
-                .font(Theme.Font.body)
-                .textSelection(.enabled)
-                .lineLimit(2)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
-        }
-    }
-
     // MARK: - Launch options
 
     private var launchCard: some View {

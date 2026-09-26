@@ -56,9 +56,20 @@ public enum CollectionNaming {
         character.unicodeScalars.count == 1 && asciiAlphanumerics.contains(character.unicodeScalars.first!)
     }
 
+    /// Имя, которое сервер примет.
+    ///
+    /// Не-латиница сначала **транслитерируется**, а не заменяется
+    /// подчёркиванием: иначе «Договоры» и «Письма» обе становились
+    /// «collection», «Отчёты 2024» и «Планы 2024» — «2024», и режим «каждая
+    /// подпапка — своя коллекция» молча складывал разные папки в одну.
+    ///
+    /// Обрезка до 60 символов — **до** снятия краевых знаков: обрезанное
+    /// после имя могло кончиться на «_» или «-», которые сервер отвергает.
     public static func sanitize(_ raw: String) -> String {
-        var name = String(raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
+        let latin = transliterated(raw)
+        var name = String(latin.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
         while name.contains("..") { name = name.replacingOccurrences(of: "..", with: ".") }
+        name = String(name.prefix(60))
 
         while let first = name.first, !isASCIIAlphanumeric(first) { name.removeFirst() }
         while let last = name.last, !isASCIIAlphanumeric(last) { name.removeLast() }
@@ -68,7 +79,19 @@ public enum CollectionNaming {
         // A sanitised name that happens to read as an IP would be refused by
         // the server just the same.
         if looksLikeIPv4(name) { name += "_col" }
-        return String(name.prefix(60))
+        return name
+    }
+
+    /// Латиница без диакритики; знаки-модификаторы (мягкий и твёрдый знак
+    /// дают «ʹ» и «ʺ») не оставляют следа, чтобы «Письма» было «Pisma»,
+    /// а не «Pis_ma».
+    static func transliterated(_ raw: String) -> String {
+        guard raw.unicodeScalars.contains(where: { !$0.isASCII }) else { return raw }
+        let latin = raw.applyingTransform(.toLatin, reverse: false) ?? raw
+        let plain = latin.applyingTransform(.stripDiacritics, reverse: false) ?? latin
+        return String(String.UnicodeScalarView(
+            plain.unicodeScalars.filter { $0.properties.generalCategory != .modifierLetter }
+        ))
     }
 
     /// Every rule the name breaks, in the order a reader would notice them.

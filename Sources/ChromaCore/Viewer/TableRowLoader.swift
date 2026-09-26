@@ -18,7 +18,7 @@ public enum TableRowLoader {
 
     public struct Window: Sendable {
         public let sheetName: String
-        /// Первая строка листа — заголовки, если они там есть.
+        /// Строка заголовков листа, если они там есть.
         public let header: [String]?
         public let rows: [Row]
         /// Номер искомой строки, как её нумерует файл.
@@ -74,7 +74,12 @@ public enum TableRowLoader {
     }
 
     /// Окно вокруг строки. Лист выбирается по имени; без имени — первый.
-    public static func window(at url: URL, sheetName: String?, row: Int?) throws -> Window {
+    ///
+    /// - Parameter headerRow: строка заголовков, с которой этот лист
+    ///   индексировался (`SheetManifest.viewerHeaderRow`). Над таблицей бывает
+    ///   шапка отчёта — название, дата, — и заголовки тогда ниже первой
+    ///   строки. `nil` — первая непустая строка, как у автоопределения.
+    public static func window(at url: URL, sheetName: String?, row: Int?, headerRow: Int? = nil) throws -> Window {
         guard url.pathExtension.lowercased() == "xlsx" else { throw LoadError.unsupported }
         let reader = try XLSXReader(url: url)
         let sheet: SheetInfo
@@ -93,6 +98,7 @@ public enum TableRowLoader {
         // ради одной строки перебирать пятьдесят тысяч незачем.
         let upperBound = row.map { $0 + contextRows } ?? contextRows * 2
         var header: [String]?
+        var headerPassed = false
         var collected: [Row] = []
         var scanned = 0
         var width = 0
@@ -102,11 +108,25 @@ public enum TableRowLoader {
             width = max(width, sheetRow.lastColumn + 1)
             let values = sheetRow.values(width: max(width, sheetRow.lastColumn + 1)).map(\.displayText)
 
-            // Первая строка — заголовки. Это соглашение всего табличного
-            // этапа, и просмотрщик обязан его повторять, а не выдумывать своё.
-            if header == nil {
-                header = values
-                return sheetRow.number < upperBound
+            // Заголовки — та строка, с которой лист индексировался, а без
+            // неё первая непустая: просмотрщик повторяет соглашение
+            // табличного этапа, а не выдумывает своё. Строки над заголовком —
+            // шапка отчёта, записями они не были и в окно не идут.
+            if !headerPassed {
+                if let headerRow {
+                    if sheetRow.number < headerRow { return true }
+                    headerPassed = true
+                    if sheetRow.number == headerRow {
+                        header = values
+                        return sheetRow.number < upperBound
+                    }
+                    // Строки заголовков в файле не оказалось (пустая или
+                    // файл поменялся) — дальше данные, без подписей.
+                } else {
+                    headerPassed = true
+                    header = values
+                    return sheetRow.number < upperBound
+                }
             }
             if let row {
                 guard sheetRow.number >= row - contextRows else { return true }

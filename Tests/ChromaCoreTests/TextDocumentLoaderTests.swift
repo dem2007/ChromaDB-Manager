@@ -134,10 +134,20 @@ final class TextDocumentLoaderTests: XCTestCase {
         guard let placement = TextFragmentPlacement.locate(
             chunk: "Доступность рассчитывается как отношение.", in: text
         ) else { return XCTFail("не нашлось") }
-        let characters = Array(text)
-        let highlighted = String(characters[placement.characterRange])
+        let highlighted = (text as NSString).substring(with: NSRange(placement.characterRange))
         XCTAssertTrue(highlighted.hasPrefix("Доступность"), highlighted)
         XCTAssertTrue(highlighted.hasSuffix("отношение."), highlighted)
+    }
+
+    /// «\r\n» — один знак Swift, но две единицы UTF-16, а `NSTextView`
+    /// считает единицами. Диапазон в знаках уезжал на строку назад за каждую.
+    func testTheRangeIsInUTF16UnitsForWindowsLineEndings() {
+        let text = (1...30).map { "Строка \($0) 👍" }.joined(separator: "\r\n") + "\r\nНужный абзац здесь."
+        guard let placement = TextFragmentPlacement.locate(chunk: "Нужный абзац здесь.", in: text) else {
+            return XCTFail("не нашлось")
+        }
+        XCTAssertEqual((text as NSString).substring(with: NSRange(placement.characterRange)), "Нужный абзац здесь.")
+        XCTAssertEqual(placement.line, 31)
     }
 
     /// Приблизительная подсветка объясняется, точная — молчит.

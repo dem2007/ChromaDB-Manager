@@ -147,6 +147,9 @@ public struct SyncPlan {
     public let items: [SyncPlanItem]
     /// Files in the manifest that are no longer on disk, newly noticed now.
     public let newlyMissing: [PendingRemoval]
+    /// Пути, вернувшиеся на место после «Оставить в базе»: с них снимается
+    /// пометка, иначе следующее исчезновение пройдёт молча.
+    public let returnedFromOrphaned: [String]
     /// Everything awaiting a decision, including what earlier syncs found.
     public let pendingRemovals: [PendingRemoval]
     /// Массовая пропажа файлов: столько с диска разом не исчезает
@@ -169,6 +172,7 @@ public struct SyncPlan {
         sourceName: String,
         items: [SyncPlanItem],
         newlyMissing: [PendingRemoval],
+        returnedFromOrphaned: [String] = [],
         pendingRemovals: [PendingRemoval],
         massDisappearance: MassDisappearance? = nil,
         staleExtraction: [StaleExtraction] = [],
@@ -179,6 +183,7 @@ public struct SyncPlan {
         self.sourceName = sourceName
         self.items = items
         self.newlyMissing = newlyMissing
+        self.returnedFromOrphaned = returnedFromOrphaned
         self.pendingRemovals = pendingRemovals
         self.massDisappearance = massDisappearance
         self.staleExtraction = staleExtraction
@@ -1410,6 +1415,20 @@ public actor SourceSyncService {
         // «Оставить в базе» — то есть до ручной работы, которой уже не нужно.
         pending.removeAll { seenPaths.contains($0.relativePath) }
 
+        // Файл вернулся — значит он больше не «оставленный в базе».
+        //
+        // Флаг ставится, когда человек на вопрос об исчезнувшем файле выбрал
+        // «Оставить в базе», и до сих пор он не снимался **никогда**. Файл
+        // возвращался на место, проходил по быстрому пути «не изменился» —
+        // и его запись в манифесте не переписывалась, то есть флаг оставался.
+        // Исчезни он потом по-настоящему, обход пропустил бы его молча: ни
+        // в «требуют решения», ни в счёт массового исчезновения он бы не
+        // попал, а его чанки остались бы в поиске навсегда и без вопроса.
+        //
+        // План только **называет** такие пути: манифест здесь читается,
+        // а правится тем, кто план исполняет.
+        let returned = seenPaths.filter { manifest.entries[$0]?.isOrphaned == true }.sorted()
+
         // Сколько файлов манифеста не нашлось на диске — считается **до**
         // того, как из них составят список на удаление.
         let known = manifest.entries.values.filter { !$0.isOrphaned }.count
@@ -1461,6 +1480,7 @@ public actor SourceSyncService {
             sourceName: source.name,
             items: items,
             newlyMissing: newlyMissing,
+            returnedFromOrphaned: returned,
             pendingRemovals: pending,
             massDisappearance: disappearance,
             staleExtraction: staleExtraction,
@@ -1788,6 +1808,12 @@ public actor SourceSyncService {
                     restored.fileHash = ""
                     restored.size = -1
                     restored.modifiedAt = .distantPast
+                    // Прежняя версия переехавшего файла ещё лежит в прежней
+                    // коллекции: запись указывает туда, и следующий прогон
+                    // увидит переезд и уберёт её сам.
+                    if let previousCollection = entry.previousCollectionName {
+                        restored.collectionName = previousCollection
+                    }
                     manifest.record(restored)
                     report.toReindex.append(entry.relativePath)
 
@@ -1800,6 +1826,17 @@ public actor SourceSyncService {
                             for: entry.collectionName, cache: &collectionIDs, chroma: chroma
                         )
                         try await chroma.deleteDocuments(collectionID: id, ids: tail)
+                    }
+                    // Переехавший файл: прежние чанки — в прежней коллекции.
+                    if let previousCollection = entry.previousCollectionName {
+                        _ = try await deleteChunks(
+                            ofFile: entry.relativePath,
+                            sourceID: source.id,
+                            collectionName: previousCollection,
+                            knownIDs: entry.oldIDs,
+                            collectionIDs: &collectionIDs,
+                            chroma: chroma
+                        )
                     }
                     manifest.record(entry.manifestEntry())
                     report.finished.append(entry.relativePath)
@@ -1967,6 +2004,17 @@ public actor SourceSyncService {
         let writeItems = plan.writeItems.filter { !excludedPaths.contains($0.relativePath) }
         var manifest = manifests.load(sourceID: source.id)
         manifest.pendingRemovals = plan.pendingRemovals
+
+        // Вернувшийся файл перестаёт числиться «оставленным в базе».
+        //
+        // План их только назвал — снимаем пометку здесь, где манифест
+        // изменяемый, и рядом с той же причиной: это тоже правка, которую
+        // надо успеть до раннего возврата прогона «писать нечего».
+        for path in plan.returnedFromOrphaned where manifest.entries[path] != nil {
+            manifest.entries[path]?.isOrphaned = false
+            log(.info, "Источники",
+                "Файл \(path) вернулся на место — пометка «оставлен в базе» снята")
+        }
 
         // Files that moved on disk without their text changing: the manifest
         // learns the new bytes, the vectors are left alone. Applied
@@ -2380,11 +2428,18 @@ public actor SourceSyncService {
 
             // Every id this file will occupy is known before a single vector is
             // computed — they are derived from the path and the chunk index.
-            let newIDs = chunks.map { Self.documentID(relativePath: item.relativePath, chunkIndex: $0.index) }
+            let newIDs = chunks.map {
+                Self.documentID(
+                    relativePath: item.relativePath, chunkIndex: $0.index, sourceID: source.id
+                )
+            }
             let previous = manifest.entries[item.relativePath]
             let record = SyncJournalEntry(
                 relativePath: item.relativePath,
                 collectionName: collectionName,
+                previousCollectionName: previous.flatMap {
+                    $0.collectionName == collectionName ? nil : $0.collectionName
+                },
                 oldIDs: previous?.chunkIDs ?? [],
                 newIDs: newIDs,
                 contentHash: hash,
@@ -2431,7 +2486,8 @@ public actor SourceSyncService {
                     batch.append(chunk)
                     if batch.count == batchSize {
                         try await flush(
-                            batch, relativePath: item.relativePath, baseMetadata: baseMetadata,
+                            batch, relativePath: item.relativePath, sourceID: source.id,
+                            baseMetadata: baseMetadata,
                             placements: placements,
                             contextPrefixEnabled: source.chunking.contextPrefix,
                             enrichment: enrichment,
@@ -2453,7 +2509,8 @@ public actor SourceSyncService {
                 }
                 if !batch.isEmpty {
                     try await flush(
-                        batch, relativePath: item.relativePath, baseMetadata: baseMetadata,
+                        batch, relativePath: item.relativePath, sourceID: source.id,
+                        baseMetadata: baseMetadata,
                         placements: placements,
                         contextPrefixEnabled: source.chunking.contextPrefix,
                         enrichment: enrichment,
@@ -2475,6 +2532,37 @@ public actor SourceSyncService {
                     try await chroma.deleteDocuments(collectionID: collectionID, ids: tail)
                     chunksDeleted += tail.count
                 }
+                // Файл сменил коллекцию — прежние чанки снимаются из **прежней**.
+                //
+                // Хвост `oldIDs − newIDs` здесь не помогает и помочь не может:
+                // идентификатор не зависит от коллекции, поэтому у переехавшего
+                // файла новые идентификаторы те же самые, пересечение полное,
+                // хвост пуст — и снимать нечего **в новой** коллекции, тогда
+                // как лишнее осталось в старой. Манифест тут же запоминает новое
+                // имя и про старую коллекцию забывает: после этого ни один
+                // прогон о тех чанках уже не узнает, а поиск их отдаёт.
+                //
+                // Снимаем **после** успешной записи: порядок тот же, что у
+                // хвоста, — пока новая копия не легла, старую не трогаем.
+                //
+                // И ошибка здесь — такая же, как у хвоста, а не проглоченная:
+                // манифест ниже запоминает новое имя, и промолчать значило бы
+                // забыть про старую копию навсегда. Прерванный прогон доиграет
+                // уборку сам — журнал помнит прежнюю коллекцию.
+                if let previousCollection = record.previousCollectionName {
+                    let moved = try await deleteChunks(
+                        ofFile: item.relativePath,
+                        sourceID: source.id,
+                        collectionName: previousCollection,
+                        knownIDs: record.oldIDs,
+                        collectionIDs: &collectionIDs,
+                        chroma: chroma
+                    )
+                    chunksDeleted += moved
+                    log(.info, "Источники",
+                        "Файл \(item.relativePath) переехал в «\(collectionName)» — из «\(previousCollection)» удалено документов: \(moved.plainDigits)")
+                }
+
                 try journal.advance(sourceID: source.id, relativePath: item.relativePath, to: .cleaned)
 
                 if case .new = item.kind { added += 1 } else { updated += 1 }
@@ -2489,10 +2577,50 @@ public actor SourceSyncService {
             } catch let error as SyncError {
                 guard case .longerThanModelReads = error else { throw error }
                 let reason = Self.reason(for: error)
-                // Записанное этим файлом снимается: манифест о нём не
-                // узнал, и оставленные чанки стали бы сиротами, на которые
-                // никто не ссылается и которых никто не перезапишет.
-                try? await chroma.deleteDocuments(collectionID: collectionID, ids: record.newIDs)
+                // Снимается **всё** про этот файл — и записанное сейчас,
+                // и прежняя версия, — а вместе с ними запись манифеста.
+                //
+                // Прежде удалялись только `newIDs`, и это была тихая потеря.
+                // Идентификатор чанка — отпечаток файла и номер, без версии:
+                // у переиндексируемого файла новые идентификаторы **те же
+                // самые**, что у прежней версии. То есть удалялись чанки,
+                // которые лежали в базе и находились поиском, а запись
+                // манифеста при этом оставалась нетронутой — она описывала
+                // их как живые. Файл исчезал из поиска, а следующий прогон
+                // видел совпадающий хеш, считал файл неизменным и проходил
+                // мимо: вернуть его было уже нечем.
+                //
+                // Согласованность важнее сохранности половины: пусто в базе
+                // и пусто в манифесте — это состояние, которое прогон видит
+                // и о котором докладывает каждый раз, пока человек не
+                // поправит нарезку или предел модели.
+                let gone = Array(Set(record.oldIDs + record.newIDs))
+                try? await chroma.deleteDocuments(collectionID: collectionID, ids: gone)
+                // У переехавшего файла прежняя версия лежит в **прежней**
+                // коллекции: удаление выше её не касается. Не удалась уборка
+                // там — запись манифеста остаётся: она и есть единственная
+                // ссылка на те чанки, и следующий прогон попробует снова.
+                var previousCopyGone = true
+                if let previousCollection = record.previousCollectionName {
+                    do {
+                        _ = try await deleteChunks(
+                            ofFile: item.relativePath,
+                            sourceID: source.id,
+                            collectionName: previousCollection,
+                            knownIDs: record.oldIDs,
+                            collectionIDs: &collectionIDs,
+                            chroma: chroma
+                        )
+                    } catch {
+                        previousCopyGone = false
+                        log(.warning, "Источники",
+                            "Файл \(item.relativePath): прежняя версия в «\(previousCollection)» не удалена — \(error.localizedDescription)")
+                    }
+                }
+                if previousCopyGone {
+                    manifest.forget(relativePath: item.relativePath)
+                    manifests.save(manifest)
+                }
                 try? journal.finish(sourceID: source.id, relativePath: item.relativePath)
                 chunksWritten = writtenBeforeFile
                 skipped.append((item.relativePath, reason))
@@ -2710,8 +2838,8 @@ public actor SourceSyncService {
             var deleted = 0
             for variant in FilePathKey.variants(relativePath) {
                 let filter = DocumentFilter(conditions: [
-                    MetadataCondition(field: "source_id", op: .equals, value: sourceID.uuidString),
-                    MetadataCondition(field: "source_file", op: .equals, value: variant),
+                    MetadataCondition(field: "source_id", op: .equals, value: sourceID.uuidString, valueIsText: true),
+                    MetadataCondition(field: "source_file", op: .equals, value: variant, valueIsText: true),
                 ])
                 deleted = try await chroma.deleteDocuments(collectionID: id, filter: filter)
                 if deleted > 0 { break }
@@ -2798,6 +2926,9 @@ public actor SourceSyncService {
     private func flush(
         _ chunks: [TextChunk],
         relativePath: String,
+        /// Отпечаток файла считается от источника (П6.16), а он же уходит
+        /// в идентификатор каждого чанка и в ссылку на родителя.
+        sourceID: UUID,
         baseMetadata: ChromaMetadata,
         placements: [Int: ChunkPlacement],
         contextPrefixEnabled: Bool,
@@ -2868,7 +2999,11 @@ public actor SourceSyncService {
             // so the level and the link to the parent have to be queryable.
             metadata["chunk_level"] = .int(chunk.level)
             if let parentIndex = chunk.parentIndex {
-                metadata["parent_chunk_id"] = .string(Self.documentID(relativePath: relativePath, chunkIndex: parentIndex))
+                metadata["parent_chunk_id"] = .string(
+                    Self.documentID(
+                        relativePath: relativePath, chunkIndex: parentIndex, sourceID: sourceID
+                    )
+                )
             }
             // Where in the document this chunk came from. Written only
             // for chunks that were actually found back in the text: a page
@@ -2923,7 +3058,9 @@ public actor SourceSyncService {
                 metadata = validator.normalised(metadata, schema: schema)
             }
             return EmbeddedRecord(
-                id: Self.documentID(relativePath: relativePath, chunkIndex: chunk.index),
+                id: Self.documentID(
+                    relativePath: relativePath, chunkIndex: chunk.index, sourceID: sourceID
+                ),
                 document: chunk.text,
                 embedding: vector,
                 metadata: metadata
@@ -2990,7 +3127,7 @@ public actor SourceSyncService {
             // Путь для этого плох: его перепечатывают в другой форме записи,
             // теряют верхние папки, ломают кодировкой. Шестнадцать
             // шестнадцатеричных знаков так не испортишь.
-            "file_id": .string(Self.fileFingerprint(item.relativePath)),
+            "file_id": .string(Self.fileFingerprint(item.relativePath, sourceID: source.id)),
             "content_hash": .string(hash),
             "chunk_count": .int(totalChunks),
             "_cdbm_source_name": .string(source.name),
@@ -3068,14 +3205,12 @@ public actor SourceSyncService {
 
     // MARK: - Identity
 
-    /// `id = <sha256(relative_path) первые 16 hex>-<chunk_index>`, fixed by the
-    /// spec: re-indexing a file replaces its chunks instead of duplicating them.
-    ///
-    /// Хеш берётся от каноничной формы пути: sha256 считает байты, и
-    /// одно и то же имя, записанное разложенным и слитным, дало бы файлу два
-    /// разных отпечатка — то есть два набора чанков вместо замены прежних.
-    public static func documentID(relativePath: String, chunkIndex: Int) -> String {
-        "\(fileFingerprint(relativePath))-\(chunkIndex)"
+    /// `id = <отпечаток файла>-<chunk_index>`: переиндексация файла заменяет
+    /// его чанки, а не удваивает их.
+    public static func documentID(
+        relativePath: String, chunkIndex: Int, sourceID: UUID?
+    ) -> String {
+        "\(fileFingerprint(relativePath, sourceID: sourceID))-\(chunkIndex)"
     }
 
     /// Отпечаток файла — то, чем его чанки отличаются от чужих.
@@ -3083,9 +3218,44 @@ public actor SourceSyncService {
     /// Шестнадцать шестнадцатеричных знаков: их нельзя перепечатать «в другой
     /// форме», потерять верхние папки или испортить кодировкой, и потому
     /// именно он отдаётся агенту как способ спросить файл целиком.
-    public static func fileFingerprint(_ relativePath: String) -> String {
-        let digest = SHA256.hash(data: Data(FilePathKey.canonical(relativePath).utf8))
+    ///
+    /// Хеш берётся от каноничной формы пути: sha256 считает байты, и
+    /// одно и то же имя, записанное разложенным и слитным, дало бы файлу два
+    /// разных отпечатка — то есть два набора чанков вместо замены прежних.
+    ///
+    /// **И от источника (П6.16).** Путь сам по себе файл не называет: два
+    /// источника в одной коллекции — настройка поддерживаемая, и у обоих
+    /// бывает `README.md`. Пока отпечаток считался от одного пути, у таких
+    /// файлов совпадали и `file_id`, и идентификаторы чанков: запись второго
+    /// источника молча затирала чанки первого, `get_file` по отпечатку
+    /// отдавал выборку из двух файлов вперемешку, а удаление файла у одного
+    /// источника уносило содержимое другого. Удаление чанков различало
+    /// источники (`source_id` + `source_file`) с самого начала — запись
+    /// не различала, и выполнена была половина договора.
+    ///
+    /// `sourceID: nil` даёт **прежнюю** форму, знак в знак. Это не запасной
+    /// путь, а честный ответ для записей, у которых источника нет вовсе:
+    /// ручной импорт, старые коллекции, имя временного файла. Благодаря
+    /// этому смена формулы ничего не ломает задним числом.
+    public static func fileFingerprint(_ relativePath: String, sourceID: UUID?) -> String {
+        let canonical = FilePathKey.canonical(relativePath)
+        // Разделитель — перевод строки: в UUID его не бывает, значит склеить
+        // два разных «источник+путь» в одну строку нельзя.
+        let key = sourceID.map { "\($0.uuidString)\n\(canonical)" } ?? canonical
+        let digest = SHA256.hash(data: Data(key.utf8))
         return String(digest.compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
+    /// Источник записи — из её же метаданных (`source_id`).
+    ///
+    /// Одно место на всех, кто пересчитывает отпечаток уже записанного чанка:
+    /// переименование, уборка путей. Прочитай они поле по-разному — и один
+    /// и тот же чанк получил бы два отпечатка. `nil` у записей, которым
+    /// источник не проставляли: ручной импорт и старые коллекции — для них
+    /// отпечаток остаётся прежним.
+    public static func recordedSourceID(_ metadata: ChromaMetadata?) -> UUID? {
+        guard case .string(let raw)? = metadata?["source_id"] else { return nil }
+        return UUID(uuidString: raw)
     }
 
     /// SHA-256 of the extracted text.

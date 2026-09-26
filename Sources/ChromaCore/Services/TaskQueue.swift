@@ -270,7 +270,23 @@ public actor TaskQueue {
         operation: @Sendable (QueueContext) async throws -> T
     ) async throws -> T {
         let id = UUID()
-        try await acquire(id: id, ticket: ticket)
+        // Уборка охватывает и **ожидание места**, а не только работу.
+        //
+        // `acquire` первым делом зовёт `remember`: возобновляемый запрос
+        // запоминается до того, как задача дождалась очереди. А `defer`
+        // стоял после `acquire` — и задача, отменённая пока она ещё ждала,
+        // уходила с ошибкой мимо всякой уборки. Запись оставалась в
+        // `pendingByID` навсегда, каждое следующее `release` сохраняло её
+        // заново, и на следующем запуске приложение предлагало доделать
+        // работу, которую человек отменил сам. Согласиться значило
+        // повторить её — а импорт без колонки-ключа при повторе удваивает
+        // строки.
+        do {
+            try await acquire(id: id, ticket: ticket)
+        } catch {
+            release(id: id)
+            throw error
+        }
         defer { release(id: id) }
         return try await operation(QueueContext(id: id, queue: self))
     }

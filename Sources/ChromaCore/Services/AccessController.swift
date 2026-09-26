@@ -172,7 +172,46 @@ public actor AccessController {
     // MARK: - Configuration
 
     public func setClients(_ clients: [ExternalClient]) {
+        // Вёдра переживают смену настроек — и не должны переживать смену
+        // **предела**.
+        //
+        // `capacity` и `refillPerSecond` у ведра неизменяемы, а само ведро
+        // заводится один раз и живёт, пока жив контролёр. Правка предела на
+        // экране меняла только список клиентов: счёт шёл по прежним числам,
+        // а отказ цитировал новые — «разрешено 200 за раз» там, где на деле
+        // останавливали на двадцатом. Понижение предела не действовало так же.
+        //
+        // Ведро сбрасывается только у того клиента, чьи числа изменились:
+        // трогать чужие значило бы дарить им полный запас на ровном месте.
+        let previous = Dictionary(
+            self.clients.map { ($0.id, $0.permissions) }, uniquingKeysWith: { first, _ in first }
+        )
+        for client in clients {
+            guard let was = previous[client.id] else { continue }
+            let now = client.permissions
+            if was.requestsPerMinute != now.requestsPerMinute || was.burst != now.burst {
+                buckets[client.id] = nil
+            }
+            if was.writesPerMinute != now.writesPerMinute
+                || Self.writeBurst(for: client) != writeBurstOf(was, client: client) {
+                writeBuckets[client.id] = nil
+            }
+        }
+        // Клиента больше нет — и вёдра его держать незачем: иначе словарь
+        // растёт на каждый удалённый ключ до перезапуска.
+        let living = Set(clients.map(\.id))
+        buckets = buckets.filter { living.contains($0.key) }
+        writeBuckets = writeBuckets.filter { living.contains($0.key) }
+        throttled = throttled.filter { living.contains($0.key) }
+
         self.clients = clients
+    }
+
+    /// Запас записи, посчитанный по **прежним** правам того же клиента.
+    private func writeBurstOf(_ permissions: ClientPermissions, client: ExternalClient) -> Int {
+        var older = client
+        older.permissions = permissions
+        return Self.writeBurst(for: older)
     }
 
     /// Supplies the collection catalogue. The proxy needs names and vector
@@ -205,6 +244,18 @@ public actor AccessController {
     }
 
     public func snapshot(forCollectionID id: String) -> CollectionSnapshot? { byID[id] }
+
+    /// Вернуть дневной предел записи: она не состоялась.
+    ///
+    /// Предел списывается при **решении**, то есть до того, как база скажет
+    /// «нельзя». Отказавшая запись его не тратила, а держать его потраченным
+    /// значит наказывать за чужую ошибку: агент, получивший «идентификаторы
+    /// заняты — не записано ничего», повторял с новыми и упирался в «дневной
+    /// предел исчерпан», не записав ни одного документа.
+    public func refundWrite(_ documents: Int, forKey key: String?) {
+        guard documents > 0, let client = client(withKey: key) else { return }
+        written[client.id] = max(0, (written[client.id] ?? 0) - documents)
+    }
 
     public func usageToday(for clientID: UUID) -> Int {
         rolloverIfNeeded()

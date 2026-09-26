@@ -130,6 +130,16 @@ struct FilterNodeEditor: View {
                 )
                 .textFieldStyle(.roundedBorder)
 
+                // «2025» и «true» иначе уходят числом и логическим значением,
+                // а в поле могут лежать строки — тогда равенство не найдёт
+                // ничего.
+                if condition.wrappedValue.valueLooksTyped || condition.wrappedValue.valueIsText {
+                    Toggle(String(localized: "как текст"), isOn: condition.valueIsText)
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                        .help(String(localized: "Отправить значение строкой, даже если оно похоже на число или true/false."))
+                }
+
                 if let onRemove {
                     Button(role: .destructive, action: onRemove) {
                         Image(systemName: "minus.circle")

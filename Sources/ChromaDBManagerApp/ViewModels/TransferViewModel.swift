@@ -112,7 +112,7 @@ final class TransferViewModel: ObservableObject {
                     self.isRunning = false
                     self.stage = nil
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run {
                     self.statusMessage = String(localized: "Экспорт отменён — недописанный пакет удалён.")
                     self.isRunning = false
@@ -188,7 +188,15 @@ final class TransferViewModel: ObservableObject {
         let policy = conflictPolicy
         let intoNew = importsIntoNewCollection
         let name = intoNew ? CollectionNaming.sanitize(newCollectionName) : (target?.name ?? "")
-        let model = app.settings.configuration.defaultEmbeddingModel
+        // Векторы, посчитанные заново, обязаны быть той модели, к которой
+        // привязана коллекция: поиск спрашивает её же. Новая коллекция
+        // заводится с метаданными пакета — значит, и с его моделью.
+        // Модель по умолчанию — только когда привязки нет вовсе: иначе
+        // коллекция, привязанная к одной модели, наполнялась векторами
+        // другой, и поиск либо падал на размерности, либо молча врал.
+        let model = (intoNew ? manifest.model : target?.boundModel)
+            ?? manifest.model
+            ?? app.settings.configuration.defaultEmbeddingModel
 
         task = Task { [weak self] in
             guard let self else { return }
@@ -199,13 +207,19 @@ final class TransferViewModel: ObservableObject {
 
                 let collectionID: String
                 if intoNew {
+                    // «В новую» — значит в новую. С `getOrCreate` импорт молча
+                    // сливался с одноимённой коллекцией, в том числе чужой
+                    // модели и метрики.
+                    if try await client.listCollections(withCounts: false).contains(where: { $0.name == name }) {
+                        throw TransferError.collectionExists(name)
+                    }
                     let created = try await client.createCollection(
                         name: name,
                         metadata: manifest.collectionMetadata,
                         configuration: CollectionConfiguration(
                             metric: DistanceMetric(rawValue: manifest.metric ?? "cosine") ?? .cosine
                         ),
-                        getOrCreate: true
+                        getOrCreate: false
                     )
                     collectionID = created.id
                 } else {
@@ -252,7 +266,7 @@ final class TransferViewModel: ObservableObject {
                     self.isRunning = false
                     self.stage = nil
                 }
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 await MainActor.run {
                     self.statusMessage = String(localized: "Импорт прерван. Запустите ещё раз — он продолжится с места остановки.")
                     self.isRunning = false

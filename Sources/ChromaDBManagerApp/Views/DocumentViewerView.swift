@@ -148,7 +148,29 @@ struct DocumentViewerSheet: View {
             TableWindowView(window: window)
         case .externalOnly(let url):
             externalOnlyView(url)
+        case .webPage(let url):
+            webPageView(url)
         }
+    }
+
+    private func webPageView(_ url: URL) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "globe")
+                .font(.system(size: 32)).foregroundStyle(Theme.Palette.captionText)
+            Text(String(localized: "Документ — страница сайта. Панель показывает файлы, а у этого документа есть только адрес."))
+                .font(Theme.Font.body).multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 520)
+            Text(url.absoluteString)
+                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                .textSelection(.enabled)
+                .lineLimit(2).truncationMode(.middle)
+                .frame(maxWidth: 520)
+            Button(String(localized: "Открыть в браузере")) { NSWorkspace.shared.open(url) }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Файл не найден, источник не зарегистрирован или документ добавлен
@@ -208,20 +230,42 @@ private struct PDFViewer: NSViewRepresentable {
     let document: PDFDocument
     let location: PDFFragmentFinder.Location
 
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Помнит, что уже показано, — как у `TextViewer`, и по той же причине.
+    ///
+    /// Без этого каждая перерисовка SwiftUI (обновление списка моделей раз
+    /// в минуту, возврат в приложение по ⌘Tab) снова делала `go(to:)`
+    /// и уносила человека, отлиставшего на другую страницу, обратно
+    /// к подсвеченному фрагменту.
+    final class Coordinator {
+        var shownDocument: PDFDocument?
+        var shownPage: Int?
+        var shownRange: Range<Int>?
+    }
+
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
-        apply(to: view)
+        apply(to: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: PDFView, context: Context) {
-        apply(to: view)
+        apply(to: view, coordinator: context.coordinator)
     }
 
-    private func apply(to view: PDFView) {
+    private func apply(to view: PDFView, coordinator: Coordinator) {
+        guard coordinator.shownDocument !== document
+                || coordinator.shownPage != location.pageIndex
+                || coordinator.shownRange != location.characterRange
+        else { return }
+        coordinator.shownDocument = document
+        coordinator.shownPage = location.pageIndex
+        coordinator.shownRange = location.characterRange
+
         if view.document !== document { view.document = document }
         guard let page = document.page(at: location.pageIndex) else { return }
         view.go(to: page)
@@ -391,9 +435,15 @@ private final class LineNumberTextView: NSTextView {
         // Номер первой нарисованной строки считается от начала текста один
         // раз, а дальше наращивается: перебирать весь файл на каждую строку —
         // это квадрат от его длины, и на большом логе прокрутка встала бы.
+        //
+        // От **начала строки**, в которой начинается перерисовка, а не от
+        // места, где она начинается: перерисовка часто начинается посреди
+        // перенесённой строки, и её начало считалось отдельной строкой —
+        // все номера ниже съезжали на единицу.
+        let firstLine = text.lineRange(for: NSRange(location: characterRange.location, length: 0)).location
         var line = 1
         text.enumerateSubstrings(
-            in: NSRange(location: 0, length: characterRange.location),
+            in: NSRange(location: 0, length: firstLine),
             options: [.byLines, .substringNotRequired]
         ) { _, _, _, _ in line += 1 }
 
@@ -402,7 +452,7 @@ private final class LineNumberTextView: NSTextView {
             .foregroundColor: NSColor.tertiaryLabelColor,
         ]
 
-        var index = characterRange.location
+        var index = firstLine
         while index < NSMaxRange(characterRange) {
             let lineRange = text.lineRange(for: NSRange(location: index, length: 0))
             let glyphs = layoutManager.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)

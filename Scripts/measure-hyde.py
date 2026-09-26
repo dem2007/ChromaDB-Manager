@@ -19,7 +19,11 @@
 Результат замера 21 августа 2026: +0.041 на двенадцати запросах, 8.8 с
 медианы на вызов чат-модели. Подробности —.
 """
-import json, os, time, unicodedata, urllib.request, sqlite3, sys
+import json, os, time, urllib.request, sqlite3
+
+# Приведение текста — общее со стендом и остальными скриптами: своя копия
+# уже разошлась (`combining` вместо категории «Mn», без составной формы).
+from evaluation_common import LOCAL, normalised as norm
 
 SUPPORT = os.path.expanduser('~/Library/Application Support/ChromaDBManager')
 CHROMA = "http://127.0.0.1:51987"
@@ -38,10 +42,6 @@ def post(url, body, timeout=300):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
-
-def norm(t):
-    t = " ".join((t or "").split()).lower()
-    return "".join(c for c in unicodedata.normalize("NFD", t) if not unicodedata.combining(c))
 
 cid = sqlite3.connect(f"file:{os.path.join(SUPPORT,'chroma_data/chroma.sqlite3')}?mode=ro", uri=True)\
     .execute("SELECT id FROM collections WHERE name=?", (COLLECTION,)).fetchone()[0]
@@ -84,7 +84,6 @@ def rrf(*lists):
 
 sets = json.load(open(os.path.join(SUPPORT, 'query-sets.json'), encoding='utf-8'))
 queries = next(s for s in sets if s['name'] == SET_NAME)['queries']
-S = {"relevant": 2, "partial": 1, "irrelevant": 0}
 
 def first_relevant(query, hits):
     for position, (_, text) in enumerate(hits[:10], start=1):
@@ -116,7 +115,13 @@ for q in queries:
     })
     print(".", end="", flush=True)
 print()
-json.dump(rows, open("hyde-rows.json", "w"), ensure_ascii=False, indent=1)
+# Запросы и гипотезы о чужих документах — данные человека: их место
+# в docs/local/, которую git не видит, а не в текущей папке, которая при
+# запуске по инструкции — корень репозитория.
+LOCAL.mkdir(parents=True, exist_ok=True)
+with open(LOCAL / "hyde-rows.json", "w", encoding="utf-8") as out:
+    json.dump(rows, out, ensure_ascii=False, indent=1)
+print(f"построчно: {LOCAL / 'hyde-rows.json'}")
 
 def mrr(key, subset=None):
     use = [r for r in rows if subset is None or subset(r)]

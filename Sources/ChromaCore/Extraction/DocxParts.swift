@@ -46,9 +46,22 @@ public struct DocxPartsReader {
             if isHeader { headers.append(piece) } else { footers.append(piece) }
         }
 
+        // Сноски и концевые сноски — два разных счёта, и оба начинаются
+        // с единицы. Пока ссылки обоих видов искались в одной только
+        // `footnotes.xml`, концевая сноска 1 получала текст обычной сноски 1,
+        // а её собственный текст не извлекался вовсе.
         var footnotes: [String: String] = [:]
-        if !body.footnoteReferences.isEmpty, let data = try? reader.read("word/footnotes.xml") {
-            footnotes = FootnoteParser.notes(of: data).filter { body.footnoteReferences.contains($0.key) }
+        if !body.footnoteReferences.isEmpty {
+            if let data = try? reader.read("word/footnotes.xml") {
+                footnotes.merge(FootnoteParser.notes(of: data)) { first, _ in first }
+            }
+            if let data = try? reader.read("word/endnotes.xml") {
+                let endnotes = FootnoteParser.notes(of: data)
+                footnotes.merge(
+                    Dictionary(uniqueKeysWithValues: endnotes.map { (Self.endnoteKey($0.key), $0.value) })
+                ) { first, _ in first }
+            }
+            footnotes = footnotes.filter { body.footnoteReferences.contains($0.key) }
         }
 
         // Комментарии — такой же написанный человеком текст, как сноска
@@ -305,6 +318,17 @@ extension DocxPartsReader {
 // MARK: - document.xml
 
 extension DocxPartsReader {
+    /// Ключ концевой сноски — отдельно от обычных: у них свой счёт.
+    static func endnoteKey(_ id: String) -> String { "endnote:\(id)" }
+
+    /// Номер сноски, как его видит человек, и концевая ли она.
+    static func noteLabel(_ key: String) -> (number: String, isEndnote: Bool) {
+        let prefix = endnoteKey("")
+        return key.hasPrefix(prefix) ? (String(key.dropFirst(prefix.count)), true) : (key, false)
+    }
+}
+
+extension DocxPartsReader {
     /// Потоковый разбор тела документа.
     ///
     /// Собирается **весь** видимый текст в порядке файла, включая надписи:
@@ -388,8 +412,9 @@ extension DocxPartsReader {
                 return
             }
             switch element {
-            case "mc:Fallback", "w:instrText", "w:delText", "w:proofErr":
+            case _ where Self.skipped.contains(element):
                 skipDepth = 1
+                if Self.revisionRecords.contains(element) { sawRevisions = true }
             case "w:ins", "w:del":
                 sawRevisions = true
             case "w:commentRangeStart", "w:commentReference":
@@ -449,7 +474,8 @@ extension DocxPartsReader {
                     stack.mutateLast { $0.links.append(target) }
                 }
             case "w:footnoteReference", "w:endnoteReference":
-                if let id = attributes["w:id"] {
+                if let raw = attributes["w:id"] {
+                    let id = element == "w:endnoteReference" ? DocxPartsReader.endnoteKey(raw) : raw
                     footnoteReferences.insert(id)
                     stack.mutateLast { $0.footnotes.append(id) }
                 }
@@ -543,7 +569,20 @@ extension DocxPartsReader {
         }
 
         /// Элементы, чьё содержимое в документе не видно.
-        static let skipped: Set<String> = ["mc:Fallback", "w:instrText", "w:delText", "w:proofErr"]
+        static let skipped = Set(["mc:Fallback", "w:instrText", "w:delText", "w:proofErr"])
+            .union(revisionRecords)
+
+        /// Записи правок: прежнее состояние, а не нынешнее.
+        ///
+        /// `w:moveFrom` — перенесённый **отсюда** текст, и лежит он в обычных
+        /// `w:t`: без пропуска абзац, перенесённый при включённых правках,
+        /// попадал в базу дважды. `…PrChange` хранят прежние свойства и
+        /// разбираются **после** нынешних — прежний стиль «Заголовок 1»
+        /// затирал нынешний «Обычный», и абзац резал нарезку как заголовок.
+        static let revisionRecords: Set<String> = [
+            "w:moveFrom", "w:pPrChange", "w:rPrChange", "w:sectPrChange",
+            "w:tblPrChange", "w:tblPrExChange", "w:trPrChange", "w:tcPrChange", "w:numberingChange",
+        ]
     }
 }
 

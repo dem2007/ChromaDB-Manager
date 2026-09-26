@@ -40,6 +40,11 @@ struct HTTPRequestParser {
     /// proxy must not be a way to make the app run out of memory.
     static let maximumBodyBytes = 64 * 1024 * 1024
 
+    /// Есть ли в пути сегмент `.` или `..` — в любой записи.
+    static func hasDotSegment(_ target: String) -> Bool {
+        ChromaRoute.segments(of: target).contains { $0 == "." || $0 == ".." }
+    }
+
     mutating func append(_ data: Data) {
         buffer.append(data)
     }
@@ -84,6 +89,27 @@ struct HTTPRequestParser {
         guard parts[1].hasPrefix("/"), !parts[1].hasPrefix("//") else {
             throw Failure.malformed("в строке запроса должен стоять путь, а не адрес: «\(parts[1].prefix(80))»")
         }
+        // Точечные сегменты — отказ, и это третий пояс к тому же месту.
+        //
+        // Права проверяются по пути, **разобранному на сегменты**, а
+        // пересылается путь как пришёл, и собирается он как
+        // `URL(string:relativeTo:)`. Foundation при этом схлопывает `..`
+        // по RFC 3986 — проверено: `/collections/x/y/../../ДРУГАЯ`
+        // превращается в `/collections/ДРУГАЯ`. То есть разрешали один
+        // адрес, а уходил другой.
+        //
+        // Хуже всего это ложилось на неизвестные чтения: у них нет ни
+        // коллекции, ни белого списка — они проходят по правилу «новая ручка
+        // будущей ChromaDB не должна ломать никому жизнь». Ключ, которому
+        // разрешена одна коллекция, так добирался до любой.
+        //
+        // Разбирать «куда же он на самом деле денется» — гадание. Ни один
+        // путь ChromaDB точечных сегментов не содержит, поэтому честный
+        // ответ — отказ. Сравнение после раскодирования: `%2e%2e` — те же
+        // две точки.
+        guard !Self.hasDotSegment(parts[1]) else {
+            throw Failure.malformed("в пути запроса точечные сегменты: «\(parts[1].prefix(80))»")
+        }
 
         var headers: [(String, String)] = []
         for line in lines where !line.isEmpty {
@@ -103,7 +129,25 @@ struct HTTPRequestParser {
             // a permission check is not.
             throw Failure.malformed("chunked-тело не поддерживается прокси")
         }
-        let length = header("Content-Length").flatMap { Int($0) } ?? 0
+        // Длина разбирается **строго**: заголовка нет — тела нет, а заголовок
+        // есть, но не число или число отрицательное — это испорченный запрос,
+        // а не «ноль».
+        //
+        // Прежде `Int($0) ?? 0` пропускал `Content-Length: -1`: минус единица
+        // проходит и проверку на потолок, и проверку «хватает ли байтов»,
+        // а потом `bodyStart..<(bodyStart - 1)` — перевёрнутый диапазон,
+        // то есть ловушка времени выполнения. Прокси живёт в том же процессе,
+        // что и приложение, и падало всё приложение целиком — **до** всякой
+        // проверки ключа, от кого угодно, кто дотянулся до порта.
+        let length: Int
+        if let raw = header("Content-Length") {
+            guard let value = Int(raw), value >= 0 else {
+                throw Failure.malformed("заголовок Content-Length не длина: «\(raw.prefix(40))»")
+            }
+            length = value
+        } else {
+            length = 0
+        }
         guard length <= Self.maximumBodyBytes else {
             throw Failure.malformed("тело запроса больше \(Self.maximumBodyBytes.plainDigits) байт")
         }

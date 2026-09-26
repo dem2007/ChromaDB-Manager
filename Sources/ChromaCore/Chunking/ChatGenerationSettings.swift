@@ -102,6 +102,10 @@ public struct ChatGenerationSettings: Codable, Hashable, Sendable {
 
     public static let defaultSeed = 42
 
+    private enum CodingKeys: String, CodingKey {
+        case temperature, seed, maxTokens, topP, topK, minP, repeatPenalty, frequencyPenalty
+    }
+
     public init(
         temperature: Double = 0,
         seed: Int? = ChatGenerationSettings.defaultSeed,
@@ -127,13 +131,35 @@ public struct ChatGenerationSettings: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0
-        seed = try c.decodeIfPresent(Int.self, forKey: .seed) ?? ChatGenerationSettings.defaultSeed
+        // «Ключа нет» и «ключ есть, но пуст» — разные ответы. Первое —
+        // конфигурация, записанная до появления seed: ей положено умолчание.
+        // Второе — человек выключил фиксированный seed, и вернуть его молча
+        // значило бы сменить подпись нарезки и перенарезать моделью всё.
+        if c.contains(.seed) {
+            seed = try c.decodeIfPresent(Int.self, forKey: .seed)
+        } else {
+            seed = ChatGenerationSettings.defaultSeed
+        }
         maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)
         topP = try c.decodeIfPresent(Double.self, forKey: .topP)
         topK = try c.decodeIfPresent(Int.self, forKey: .topK)
         minP = try c.decodeIfPresent(Double.self, forKey: .minP)
         repeatPenalty = try c.decodeIfPresent(Double.self, forKey: .repeatPenalty)
         frequencyPenalty = try c.decodeIfPresent(Double.self, forKey: .frequencyPenalty)
+    }
+
+    /// Как синтезированное кодирование, но пустой `seed` пишется явным
+    /// `null`: без ключа он читался бы обратно как умолчание 42.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(temperature, forKey: .temperature)
+        if let seed { try c.encode(seed, forKey: .seed) } else { try c.encodeNil(forKey: .seed) }
+        try c.encodeIfPresent(maxTokens, forKey: .maxTokens)
+        try c.encodeIfPresent(topP, forKey: .topP)
+        try c.encodeIfPresent(topK, forKey: .topK)
+        try c.encodeIfPresent(minP, forKey: .minP)
+        try c.encodeIfPresent(repeatPenalty, forKey: .repeatPenalty)
+        try c.encodeIfPresent(frequencyPenalty, forKey: .frequencyPenalty)
     }
 
     /// Request fields, omitting everything left empty.

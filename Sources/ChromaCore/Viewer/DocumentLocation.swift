@@ -99,6 +99,10 @@ public enum DocumentResolution: Sendable, Equatable {
     /// Документ добавлен руками, а не из файла: показывать нечего, и это
     /// не поломка.
     case notFromFile
+    /// Документ — страница сайта. Ключ у неё хоть и лежит в `source_file`,
+    /// но файла под ним на диске нет и не было: «файл не найден, укажите
+    /// новое расположение» здесь было бы неправдой.
+    case webPage(URL)
 
     public var url: URL? {
         if case .found(let url, _, _) = self { return url }
@@ -116,6 +120,8 @@ public enum DocumentResolution: Sendable, Equatable {
             return String(localized: "Источник «\(reference.sourceName ?? "—")» больше не зарегистрирован — папку, в которой лежал файл «\(reference.savedPath)», приложение не знает. Добавьте источник заново, и просмотр заработает.")
         case .notFromFile:
             return String(localized: "Документ добавлен вручную, а не из файла — исходника у него нет.")
+        case .webPage(let url):
+            return String(localized: "Документ — страница сайта \(url.absoluteString). Панель показывает файлы; страницу откройте в браузере.")
         }
     }
 }
@@ -177,6 +183,10 @@ public enum DocumentLocator {
         guard reference.sourceID != nil || reference.relativePath != nil else {
             return .notFromFile
         }
+        if let address = string(metadata, "source_url"), let url = URL(string: address),
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            return .webPage(url)
+        }
         guard let relativePath = reference.relativePath, !relativePath.isEmpty else {
             return .sourceUnknown(reference: reference)
         }
@@ -235,7 +245,9 @@ public enum DocumentLocator {
     static func int(_ metadata: ChromaMetadata?, _ key: String) -> Int? {
         switch metadata?[key] {
         case .int(let value): return value
-        case .double(let value): return Int(value)
+        // `Int(_:)` на дробном вне диапазона Int (или NaN) роняет приложение,
+        // а значение пришло из чужих метаданных.
+        case .double(let value): return Int(exactly: value.rounded(.towardZero))
         // Число, приехавшее строкой, — обычное дело для чужой коллекции,
         // и терять из-за этого переход на страницу незачем.
         case .string(let value): return Int(value)

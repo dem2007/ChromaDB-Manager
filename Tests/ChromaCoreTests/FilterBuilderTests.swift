@@ -68,7 +68,7 @@ final class FilterTreeGoldenTests: XCTestCase {
     func testAnEmptyFilterProducesNothingAtAll() throws {
         XCTAssertTrue(DocumentFilter().isEmpty)
         XCTAssertNil(try DocumentFilter().whereClause())
-        XCTAssertNil(DocumentFilter().whereDocumentClause())
+        XCTAssertNil(try DocumentFilter().whereDocumentClause())
 
         let halfTyped = DocumentFilter(root: .group(.and, [condition("field", .equals, "")]))
         XCTAssertNil(try halfTyped.whereClause(), "недописанное условие не отправляется")
@@ -104,6 +104,46 @@ final class FilterTreeGoldenTests: XCTestCase {
         filter.rawWhereJSON = "{не json"
         XCTAssertThrowsError(try filter.whereClause())
     }
+
+    /// Сломанный `where_document` раньше молча снимался — фильтр выглядел
+    /// применённым, а список показывал всю коллекцию.
+    func testBrokenRawDocumentJSONIsRefusedToo() {
+        var filter = DocumentFilter()
+        filter.rawWhereDocumentJSON = #"{"$contains": "договор""#
+        XCTAssertThrowsError(try filter.whereDocumentClause())
+        XCTAssertNil(filter.whereDocumentJSONString())
+    }
+
+    /// Строка, похожая на число, уходит строкой, когда так сказано: поле
+    /// `year` из уровня пути хранит «2025», и число 2025 его не найдёт.
+    func testAValueMarkedAsTextStaysAString() {
+        let node = FilterNode.leaf(MetadataCondition(field: "year", op: .equals, value: "2025", valueIsText: true))
+        XCTAssertEqual(json(DocumentFilter(root: .group(.and, [node]))), #"{"year":{"$eq":"2025"}}"#)
+        let list = FilterNode.leaf(MetadataCondition(field: "id", op: .inList, value: "1, 2", valueIsText: true))
+        XCTAssertEqual(json(DocumentFilter(root: .group(.and, [list]))), #"{"id":{"$in":["1","2"]}}"#)
+        // Значение фасета помнит свой тип.
+        let facet = MetadataCondition(field: "year", equals: .string("2025"))
+        XCTAssertTrue(facet.valueIsText)
+        XCTAssertFalse(MetadataCondition(field: "n", equals: .int(5)).valueIsText)
+    }
+
+    /// «inf» и «nan» Double принимает, а JSONSerialization на них роняет
+    /// приложение исключением, которое Swift не ловит.
+    func testNonFiniteLookingTextIsAString() {
+        XCTAssertEqual(MetadataValue.inferred(from: "inf"), .string("inf"))
+        XCTAssertEqual(MetadataValue.inferred(from: "nan"), .string("nan"))
+        XCTAssertEqual(MetadataValue.inferred(from: "3e14159265358979"), .string("3e14159265358979"))
+        XCTAssertEqual(json(DocumentFilter(root: .group(.and, [condition("w", .equals, "information")]))),
+                       #"{"w":{"$eq":"information"}}"#)
+    }
+
+    /// Сохранённые до признака фильтры читаются как раньше.
+    func testOldSavedConditionsDecode() throws {
+        let data = Data(#"{"id":"8B1C3D4E-0000-0000-0000-000000000000","field":"n","op":"$eq","value":"5"}"#.utf8)
+        let condition = try JSONDecoder().decode(MetadataCondition.self, from: data)
+        XCTAssertFalse(condition.valueIsText)
+        XCTAssertEqual(condition.value, "5")
+    }
 }
 
 final class FilterTreeParsingTests: XCTestCase {
@@ -128,6 +168,26 @@ final class FilterTreeParsingTests: XCTestCase {
         XCTAssertTrue(reloaded.adoptRawWhereIntoTree())
         XCTAssertEqual(reloaded.whereJSONString(), text, "дерево → JSON → дерево должно давать тот же запрос")
         XCTAssertTrue(reloaded.rawWhereJSON.isEmpty, "после разбора сырой текст больше не нужен")
+    }
+
+    /// Числа 0 и 1 из JSON — числа, а не false/true: `NSNumber` охотно
+    /// отдаёт их как `Bool`, и `chunk_level = 0` возвращался `= false`.
+    /// Строка «2025» возвращается строкой.
+    func testNumbersAndNumericStringsSurviveTheRoundTrip() throws {
+        for text in [
+            #"{"chunk_level":{"$eq":0}}"#,
+            #"{"page_number":{"$eq":1}}"#,
+            #"{"flag":{"$eq":true}}"#,
+            #"{"r":{"$eq":1.5}}"#,
+            #"{"year":{"$eq":"2025"}}"#,
+            #"{"n":{"$in":[0,1,2]}}"#,
+            #"{"year":{"$in":["2024","2025"]}}"#,
+        ] {
+            var filter = DocumentFilter()
+            filter.rawWhereJSON = text
+            XCTAssertTrue(filter.adoptRawWhereIntoTree(), text)
+            XCTAssertEqual(filter.whereJSONString(), text)
+        }
     }
 
     /// The shorthand the server also accepts.
@@ -282,5 +342,16 @@ final class SavedFilterStoreTests: XCTestCase {
         let saved = store.save(name: "X", filter: DocumentFilter(documentContains: "x"), collectionName: "notes")
         store.remove(id: saved.id)
         XCTAssertTrue(store.filters(for: "notes").isEmpty)
+    }
+
+    /// Для «тот же ли это запрос» важны оба условия — и `where`, и текст.
+    func testTheIdentityKeySeesTheTextCondition() {
+        var plain = DocumentFilter()
+        var worded = DocumentFilter()
+        worded.textConditions = [DocumentTextCondition(op: .contains, text: "кошек")]
+        XCTAssertNotEqual(plain.identityKey, worded.identityKey)
+        XCTAssertEqual(plain.identityKey, "", "пустой фильтр — то же, что никакого")
+        plain.textConditions = [DocumentTextCondition(op: .contains, text: "кошек")]
+        XCTAssertEqual(plain.identityKey, worded.identityKey)
     }
 }

@@ -62,6 +62,15 @@ final class RerankerTests: XCTestCase {
         XCTAssertEqual(verdicts.first?.score, 1)
     }
 
+    /// Номер, не влезающий в Int, — не номер, а не ловушка, роняющая
+    /// приложение посреди поиска.
+    func testAnAbsurdIndexIsDroppedNotACrash() throws {
+        let verdicts = try Reranker.verdicts(
+            from: #"{"ranking":[{"index":1e20,"score":1},{"index":1.5,"score":1},{"index":2,"score":0.5}]}"#, count: 2
+        )
+        XCTAssertEqual(verdicts.map(\.index), [2])
+    }
+
     func testProseInsteadOfJSONIsAnError() {
         XCTAssertThrowsError(try Reranker.verdicts(from: "Первый фрагмент лучше.", count: 2))
     }

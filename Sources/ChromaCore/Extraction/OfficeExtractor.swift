@@ -175,6 +175,16 @@ public struct OfficeExtractor: DocumentTextExtractor {
     // MARK: - Свой разбор `.docx`
 
     /// Части контейнера → документ, каким его увидит нарезка.
+    /// Строка сноски в тексте документа. Концевая называется своим именем:
+    /// номера у обычных и концевых сносок свои, и «Сноска 1» дважды
+    /// назвала бы разные вещи одинаково.
+    static func noteLine(_ key: String, _ text: String) -> String {
+        let label = DocxPartsReader.noteLabel(key)
+        return label.isEndnote
+            ? String(localized: "Концевая сноска \(label.number): \(text)")
+            : String(localized: "Сноска \(label.number): \(text)")
+    }
+
     static func assemble(
         _ parts: DocxPartsReader.Document, url: URL, type: UTType, options: ExtractionOptions
     ) throws -> ExtractedDocument {
@@ -229,7 +239,7 @@ public struct OfficeExtractor: DocumentTextExtractor {
         func notes(of paragraph: DocxPartsReader.Paragraph) -> [String] {
             paragraph.footnotes.compactMap { id in
                 guard let text = parts.footnotes[id], placed.insert(id).inserted else { return nil }
-                return String(localized: "Сноска \(id): \(text)")
+                return Self.noteLine(id, text)
             }
         }
 
@@ -274,7 +284,7 @@ public struct OfficeExtractor: DocumentTextExtractor {
         for (id, text) in parts.footnotes
             .filter({ !placed.contains($0.key) })
             .sorted(by: { $0.key.localizedStandardCompare($1.key) == .orderedAscending }) {
-            add(String(localized: "Сноска \(id): \(text)"))
+            add(Self.noteLine(id, text))
         }
         // Замечание рецензента — такой же написанный человеком текст, как
         // сноска: «уточнить срок поставки» ищут теми же словами.

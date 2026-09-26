@@ -286,7 +286,23 @@ final class TopicClusteringTests: XCTestCase {
         // Все расстояния одинаковы: медианное отклонение — ноль, и объявлять
         // выбросом половину коллекции нельзя.
         let threshold = TopicClustering.outlierThreshold([0.2, 0.2, 0.2, 0.2, 0.2])
-        XCTAssertEqual(threshold, .greatestFiniteMagnitude)
+        XCTAssertEqual(threshold, UnassignedTopic.noThreshold)
+    }
+
+    /// Шум округления у одиночек — это ноль, а не разброс: порог из него
+    /// объявлял выбросами членов единственной настоящей темы.
+    func testRoundingNoiseIsNotADeviation() {
+        let threshold = TopicClustering.outlierThreshold([1.1e-16, 0, 2.2e-16, 0.02, 0.03])
+        XCTAssertEqual(threshold, UnassignedTopic.noThreshold)
+        let topic = UnassignedTopic(documentCount: 0, share: 0, distanceThreshold: threshold, examples: [])
+        XCTAssertFalse(topic.hasThreshold, "порога нет — числом в 309 знаков он не показывается")
+    }
+
+    /// Одинаковые векторы в одной теме — силуэт не «чётко отделяются».
+    func testIdenticalVectorsDoNotScoreAPerfectSilhouette() {
+        let points = VectorSet(vectors: Array(repeating: [1, 0, 0], count: 12), dimension: 3)
+        let score = KMeans.silhouette(points, assignments: Array(repeating: 0, count: 12), k: 3)
+        XCTAssertEqual(score, 0)
     }
 
     func testTheOutlierIsPastTheThresholdAndTheRestIsNot() {

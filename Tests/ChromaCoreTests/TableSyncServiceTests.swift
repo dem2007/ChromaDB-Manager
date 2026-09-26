@@ -21,19 +21,30 @@ final class TableSyncServiceTests: XCTestCase {
             upsertCalls += 1
             for record in records { documents[record.id] = record }
         }
+        /// Как у ChromaDB: `update` метаданные **сливает**, ключ убирает только
+        /// явным снятием, а записи с незнакомым идентификатором не создаёт.
+        /// Стенд, заменявший метаданные целиком и не отдававший документов,
+        /// не видел ни забытых ключей, ни пропадавших строк.
         func updateDocuments(collectionID: String, updates: [DocumentUpdate]) async throws {
             metadataUpdates += updates
             for update in updates {
                 guard let existing = documents[update.id], let metadata = update.metadata else { continue }
+                var merged = existing.metadata.merging(metadata) { _, new in new }
+                for key in update.removedMetadataKeys { merged[key] = nil }
                 documents[update.id] = EmbeddedRecord(
                     id: existing.id, document: existing.document,
-                    embedding: existing.embedding, metadata: metadata
+                    embedding: existing.embedding, metadata: merged
                 )
             }
         }
-        /// Переносом чанков при переименовании этот стенд не занимается.
-        func documents(collectionID: String, ids: [String]) async throws -> [DocumentRecord] { [] }
-        func embeddings(collectionID: String, ids: [String]) async throws -> [String: [Double]] { [:] }
+        func documents(collectionID: String, ids: [String]) async throws -> [DocumentRecord] {
+            ids.compactMap { documents[$0] }.map {
+                DocumentRecord(id: $0.id, document: $0.document, metadata: $0.metadata, embeddingDimension: $0.embedding.count)
+            }
+        }
+        func embeddings(collectionID: String, ids: [String]) async throws -> [String: [Double]] {
+            ids.reduce(into: [:]) { result, id in result[id] = documents[id]?.embedding }
+        }
 
         func deleteDocuments(collectionID: String, ids: [String]) async throws {
             deleted += ids
@@ -291,6 +302,33 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(database.metadataUpdates.count, 1)
         XCTAssertEqual(database.documents[id]?.embedding, vector, "вектор должен остаться на месте")
         XCTAssertEqual(database.documents[id]?.metadata["цена"], .int(15))
+    }
+
+    /// Лист без колонки-ключа: идентификатор строки считается от её значений,
+    /// и правка одной цены его меняет. `update` по новому идентификатору
+    /// не делал ничего, а прежний документ удалялся как заменённый — строка
+    /// пропадала из коллекции насовсем.
+    func testARepricedRowWithoutAKeyColumnMovesWithItsVector() async throws {
+        let profile = profile(keyColumn: nil)
+        let url = try workbook([("A-1", "Болт", 12)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        try await run(url, manifest: &manifest, profiles: [profile], database: database, embeddings: embeddings)
+        let oldID = try XCTUnwrap(database.documents.keys.first)
+        let vector = try XCTUnwrap(database.documents[oldID]?.embedding)
+        let before = embeddings.counter.texts
+
+        let repriced = try workbook([("A-1", "Болт", 15)])
+        let report = try await run(repriced, manifest: &manifest, profiles: [profile], database: database, embeddings: embeddings)
+
+        XCTAssertEqual(report.rowsMetadataOnly, 1)
+        XCTAssertEqual(database.documents.count, 1, "строка пропала из коллекции")
+        let moved = try XCTUnwrap(database.documents.values.first)
+        XCTAssertNotEqual(moved.id, oldID)
+        XCTAssertEqual(moved.metadata["цена"], .int(15))
+        XCTAssertEqual(moved.embedding, vector, "текст тот же — вектор переехал, а не посчитан заново")
+        XCTAssertEqual(embeddings.counter.texts, before)
     }
 
     ///, до конца конвейера: вставка строки в файл без ключевой колонки

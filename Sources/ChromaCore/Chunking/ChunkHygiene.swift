@@ -69,7 +69,9 @@ public enum ChunkHygiene {
                 continue
             }
             // Всё, что ждало впереди идущего соседа, уезжает в него.
-            for waiting in pending where group(chunks[waiting]) == key {
+            // С конца: каждый кусок приставляется **перед** текстом, и в
+            // прямом порядке два ждавших встали бы задом наперёд.
+            for waiting in pending.reversed() where group(chunks[waiting]) == key {
                 texts[position] = joined(chunks[waiting].text, texts[position])
                 dropped.insert(waiting)
             }

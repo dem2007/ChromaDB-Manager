@@ -108,10 +108,10 @@ public struct TopicClustering: Sendable {
         while sampleIDs.count < options.sampleSize {
             try Task.checkCancellation()
             let limit = min(Self.pageSize, options.sampleSize - sampleIDs.count)
-            let page = try await reader.documents(collectionID: collectionID, limit: limit, offset: offset)
+            let page = try await reader.documentIDs(collectionID: collectionID, limit: limit, offset: offset)
             guard !page.isEmpty else { break }
             offset += page.count
-            sampleIDs.append(contentsOf: page.map(\.id))
+            sampleIDs.append(contentsOf: page)
             progress?(Progress(
                 done: sampleIDs.count, total: min(total, options.sampleSize),
                 stage: String(localized: "Чтение документов")
@@ -258,13 +258,15 @@ public struct TopicClustering: Sendable {
                         summary = parsed.summary
                         named = true
                     } else {
-                        notes.append(String(localized: "Ответ модели на тему \((cluster + 1).plainDigits) не разобран — тема осталась без названия."))
+                        // Тема называется так, как её покажет отчёт, — номером
+                        // кластера она там не называется нигде.
+                        notes.append(String(localized: "Ответ модели на тему «\(title)» не разобран — тема осталась без названия."))
                         log(.warning, "Темы", "Ответ модели не разобран как название темы: «\(answer.prefix(120))»")
                     }
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    notes.append(String(localized: "Модель не назвала тему \((cluster + 1).plainDigits): \(error.localizedDescription)"))
+                    notes.append(String(localized: "Модель не назвала тему «\(title)»: \(error.localizedDescription)"))
                 }
             }
 
@@ -334,13 +336,18 @@ public struct TopicClustering: Sendable {
         return result
     }
 
+    /// Отклонение, которое уже не шум округления. Косинусное расстояние
+    /// лежит в [0, 2], так что миллионная — заведомо меньше любой разницы
+    /// по смыслу.
+    static let negligibleDeviation = 1e-6
+
     /// Порог «не отнесён ни к одной теме»: медиана расстояний плюс два
     /// медианных абсолютных отклонения.
     ///
     /// Устойчивая к выбросам мера — в том и смысл: среднее и стандартное
     /// отклонение сами сдвигаются теми документами, которые мы пытаемся найти.
     static func outlierThreshold(_ distances: [Double]) -> Double {
-        guard !distances.isEmpty else { return 1 }
+        guard !distances.isEmpty else { return UnassignedTopic.noThreshold }
         let sorted = distances.sorted()
         let median = sorted[sorted.count / 2]
         let deviations = sorted.map { abs($0 - median) }.sorted()
@@ -348,7 +355,11 @@ public struct TopicClustering: Sendable {
         // Совсем плотное разбиение даёт MAD, равный нулю: порог тогда — сама
         // медиана, и неотнесённым станет половина коллекции. Такой ответ
         // бесполезен, поэтому в этом случае не отнесённых нет вовсе.
-        guard mad > 0 else { return .greatestFiniteMagnitude }
+        //
+        // «Равный нулю» — с допуском: расстояния одиночек до своих центров
+        // выходят не нулём, а шумом округления около 1e-16, и порог из такого
+        // MAD объявлял неотнесёнными обычных членов настоящей темы.
+        guard mad > Self.negligibleDeviation else { return UnassignedTopic.noThreshold }
         return median + 2 * mad
     }
 

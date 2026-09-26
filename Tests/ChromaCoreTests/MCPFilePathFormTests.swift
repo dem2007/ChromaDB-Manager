@@ -273,7 +273,7 @@ final class MCPFileFingerprintTests: XCTestCase {
     /// Отпечаток — тот самый, что приложение пишет в метаданные при синхронизации.
     func testTheFingerprintIsTheOneSynchronisationWrites() async throws {
         let path = "Отчёты/Первый/Договор.pdf"
-        let fingerprint = SourceSyncService.fileFingerprint(path)
+        let fingerprint = SourceSyncService.fileFingerprint(path, sourceID: nil)
         let backend = Backend(path: path, fingerprint: fingerprint)
         let service = await service(backend)
 
@@ -289,7 +289,7 @@ final class MCPFileFingerprintTests: XCTestCase {
     /// обойдётся без пути вовсе.
     func testAskingByPathStillAnswersWithTheFingerprint() async throws {
         let path = "Отчёты/Первый/Договор.pdf"
-        let fingerprint = SourceSyncService.fileFingerprint(path)
+        let fingerprint = SourceSyncService.fileFingerprint(path, sourceID: nil)
         let service = await service(Backend(path: path, fingerprint: fingerprint))
 
         let result = try await call(service, ["file": .string(path)])
@@ -305,7 +305,7 @@ final class MCPFileFingerprintTests: XCTestCase {
         let result = try await call(service, ["file": .string(path)])
         XCTAssertNil(result["structuredContent"]?["fileId"])
 
-        let miss = try await call(service, ["file_id": .string(SourceSyncService.fileFingerprint(path))])
+        let miss = try await call(service, ["file_id": .string(SourceSyncService.fileFingerprint(path, sourceID: nil))])
         let text = miss["content"]?[0]?["text"]?.stringValue ?? ""
         XCTAssertTrue(text.contains("earlier builds"), "надо сказать, почему промах и что делать: \(text)")
     }
@@ -329,7 +329,7 @@ final class MCPFileFingerprintTests: XCTestCase {
     /// среди трёх десятков метаданных, и агент опять хватается за путь.
     func testSearchResultsCarryTheFingerprint() async throws {
         let path = "Отчёты/Первый/Договор.pdf"
-        let fingerprint = SourceSyncService.fileFingerprint(path)
+        let fingerprint = SourceSyncService.fileFingerprint(path, sourceID: nil)
         let service = await service(Backend(path: path, fingerprint: fingerprint))
 
         let result = try await service.call(

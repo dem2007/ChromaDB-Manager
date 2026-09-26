@@ -43,7 +43,13 @@ public struct LineFramer: Sendable {
         // `startIndex` уползал бы всё дальше от нуля.
         pending = Data(pending)
         guard pending.count <= Self.lineLimit else {
-            throw FramingError.lineTooLong(pending.count)
+            // Отказавшись от строки, её не хранят: иначе `flush` на закрытии
+            // отправляет дальше ровно то, что мы только что отвергли по
+            // длине, — и следующий кадрировщик упирается в тот же предел
+            //.
+            let length = pending.count
+            pending = Data()
+            throw FramingError.lineTooLong(length)
         }
         return messages
     }

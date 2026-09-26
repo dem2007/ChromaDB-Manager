@@ -88,6 +88,19 @@ public struct UnassignedTopic: Codable, Sendable, Hashable {
     public var sharePercent: String {
         String(format: "%.1f%%", share * 100)
     }
+
+    /// Порога нет — расстояния до центров почти одинаковые, отделять нечего.
+    ///
+    /// Хранится наибольшим конечным числом, а не бесконечностью: отчёт
+    /// сохраняется в JSON, а бесконечность JSON не записывает.
+    public static let noThreshold = Double.greatestFiniteMagnitude
+
+    /// Есть ли порог, который имеет смысл показывать. Косинусное расстояние
+    /// не больше 2 — всё выше пришло из «порога нет», в том числе в отчётах,
+    /// сохранённых до этой пометки.
+    public var hasThreshold: Bool {
+        distanceThreshold.isFinite && distanceThreshold <= 2
+    }
 }
 
 /// Отчёт о темах коллекции.
@@ -304,7 +317,11 @@ public enum TopicExport {
 
         lines.append("## Не отнесены ни к одной теме — \(report.unassigned.documentCount.plainDigits) (\(report.unassigned.sharePercent))")
         lines.append("")
-        lines.append("Документы, до своего центра которых дальше, чем \(String(format: "%.3f", report.unassigned.distanceThreshold)) по косинусу. Часто именно здесь видно то, что попало в коллекцию случайно.")
+        if report.unassigned.hasThreshold {
+            lines.append("Документы, до своего центра которых дальше, чем \(String(format: "%.3f", report.unassigned.distanceThreshold)) по косинусу. Часто именно здесь видно то, что попало в коллекцию случайно.")
+        } else {
+            lines.append("Порога нет: расстояния до центров тем почти одинаковые, отделять нечего.")
+        }
         lines.append("")
         for example in report.unassigned.examples {
             lines.append("- `\(example.id)` — \(example.excerpt)")

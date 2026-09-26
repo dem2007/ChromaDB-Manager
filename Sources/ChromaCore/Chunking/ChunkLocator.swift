@@ -61,7 +61,8 @@ public enum ChunkLocator {
         // search past a boundary it still needs. Parents are located in order;
         // each child is then searched inside its own parent's span.
         let parents = chunks.filter { $0.parentIndex == nil }
-        var result = locate(parents, in: text, from: 0, to: text.count)
+        let length = text.count
+        var result = locate(parents, in: text, from: 0, to: length)
 
         let children = Dictionary(grouping: chunks.filter { $0.parentIndex != nil }, by: { $0.parentIndex! })
         for (parentIndex, group) in children {
@@ -71,7 +72,7 @@ public enum ChunkLocator {
                 group.sorted { $0.index < $1.index },
                 in: text,
                 from: parentStart,
-                to: min(text.count, parentStart + parent.text.count)
+                to: min(length, parentStart + parent.text.count)
             )
             result.merge(located) { current, _ in current }
         }
@@ -117,18 +118,54 @@ public enum ChunkLocator {
         return urls.filter { seen.insert($0).inserted }
     }
 
+    /// Где стоит чанк, текст которого в документе дословно не встречается.
+    ///
+    /// Такие чанки делает сам конвейер: семантическая нарезка склеивает
+    /// предложения пробелом там, где в файле был перевод строки, а чанк
+    /// таблицы получает приписанную сверху строку шапки. Искать их целиком
+    /// бесполезно — и они оставались без страницы, раздела и ссылок.
+    ///
+    /// Ищется **опорная строка**, которая в файле есть дословно: у таблицы —
+    /// вторая строка, первая после приписанной шапки (иначе чанк встал бы
+    /// к началу таблицы), у остального — начало текста. Короче двенадцати
+    /// знаков опора не годится: такое совпадёт где угодно.
+    static func anchorRange(
+        of chunk: String, in text: String, range: Range<String.Index>
+    ) -> Range<String.Index>? {
+        let lines = chunk.split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let candidates = lines.count > 1 ? [lines[1], lines[0]] : Array(lines.prefix(1))
+        for line in candidates {
+            // Начало строки — до шестидесяти знаков: дальше в семантическом
+            // чанке начинается склейка, которой в файле нет.
+            let anchor = String(line.prefix(60))
+            guard anchor.count >= 12 else { continue }
+            if let found = text.range(of: anchor, range: range) { return found }
+        }
+        return nil
+    }
+
     /// Chunks in document order, each searched from just after the previous one
     /// started — never from where it ended, because chunks overlap.
     private static func locate(_ chunks: [TextChunk], in text: String, from lower: Int, to upper: Int) -> [Int: Int] {
         var result: [Int: Int] = [:]
+        guard lower < upper else { return result }
+        // Курсор — индексом строки, а не числом: `index(offsetBy:)` от начала
+        // текста на каждый чанк проходил документ заново, и файл в тысячу
+        // чанков обходился тысячей проходов. Число знаков считается по ходу,
+        // от прошлой находки.
         var cursor = lower
+        var cursorIndex = text.index(text.startIndex, offsetBy: lower)
+        let searchEnd = text.index(cursorIndex, offsetBy: upper - lower)
         for chunk in chunks {
-            guard !chunk.text.isEmpty, cursor < upper else { continue }
-            let searchStart = text.index(text.startIndex, offsetBy: cursor)
-            let searchEnd = text.index(text.startIndex, offsetBy: upper)
-            guard let found = text.range(of: chunk.text, range: searchStart..<searchEnd) else { continue }
-            let offset = cursor + text.distance(from: searchStart, to: found.lowerBound)
+            guard !chunk.text.isEmpty, cursorIndex < searchEnd else { continue }
+            guard let found = text.range(of: chunk.text, range: cursorIndex..<searchEnd)
+                    ?? anchorRange(of: chunk.text, in: text, range: cursorIndex..<searchEnd)
+            else { continue }
+            let offset = cursor + text.distance(from: cursorIndex, to: found.lowerBound)
             result[chunk.index] = offset
+            cursorIndex = text.index(after: found.lowerBound)
             cursor = offset + 1
         }
         return result

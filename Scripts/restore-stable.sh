@@ -19,23 +19,50 @@ if [ ! -d "$STABLE_ROOT" ]; then
     exit 1
 fi
 
+# Дописанная метка — та, у которой есть и архив, и отпечаток: mark-stable
+# пишет отпечаток последним. Оборванная на полпути метка без него — не
+# стабильная сборка, и выбирать её по умолчанию нельзя.
+complete() {
+    [ -f "$1/ChromaDB-Manager.app.tar.gz" ] && [ -f "$1/MANIFEST.txt" ]
+}
+
 if [ "${1:-}" = "--list" ]; then
     for dir in "$STABLE_ROOT"/*/; do
         [ -d "$dir" ] || continue
         echo "── $(basename "$dir")"
-        sed 's/^/   /' "$dir/MANIFEST.txt" 2>/dev/null | head -4
+        if complete "$dir"; then
+            head -4 "$dir/MANIFEST.txt" | sed 's/^/   /'
+        else
+            echo "   (метка не дописана — архива или отпечатка нет)"
+        fi
     done
     exit 0
 fi
 
-NAME="${1:-$(ls -1t "$STABLE_ROOT" | head -1)}"
+if [ -n "${1:-}" ]; then
+    NAME="$1"
+else
+    NAME=""
+    while IFS= read -r candidate; do
+        if complete "$STABLE_ROOT/$candidate"; then NAME="$candidate"; break; fi
+    done < <(ls -1t "$STABLE_ROOT")
+    [ -n "$NAME" ] || { echo "!! ни одной дописанной стабильной метки нет" >&2; exit 1; }
+fi
 DIR="$STABLE_ROOT/$NAME"
 ARCHIVE="$DIR/ChromaDB-Manager.app.tar.gz"
 
-[ -f "$ARCHIVE" ] || { echo "!! нет архива для метки «$NAME»" >&2; exit 1; }
+complete "$DIR" || { echo "!! метка «$NAME» не дописана — архива или отпечатка нет" >&2; exit 1; }
 
 echo "==> метка: $NAME"
-sed 's/^/    /' "$DIR/MANIFEST.txt" | head -6
+head -6 "$DIR/MANIFEST.txt" | sed 's/^/    /'
+
+# Архив проверяется **до** того, как текущая сборка отодвигается: обрезанный
+# архив иначе оставлял на месте приложения пустоту.
+EXPECTED="$(sed -n 's/^sha256 архива: //p' "$DIR/MANIFEST.txt")"
+if [ -n "$EXPECTED" ] && [ "$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)" != "$EXPECTED" ]; then
+    echo "!! архив метки «$NAME» не совпадает с отпечатком — повреждён" >&2
+    exit 1
+fi
 
 # Приложение может быть запущено: подменять бандл под работающим процессом —
 # верный способ получить наполовину старое, наполовину новое приложение.
@@ -55,7 +82,16 @@ if [ -d "$BUNDLE" ]; then
     echo "==> прежняя сборка отложена: $(basename "$ASIDE")"
 fi
 
-tar -xzf "$ARCHIVE" -C "$ROOT/dist"
+# Распаковка — сперва рядом, потом на место: сбой посреди `tar` не должен
+# оставить половину приложения там, где его будут запускать.
+STAGING="$(mktemp -d "$ROOT/dist/.restore-XXXXXX")"
+trap 'rm -rf "$STAGING"' EXIT
+if ! tar -xzf "$ARCHIVE" -C "$STAGING"; then
+    [ -n "${ASIDE:-}" ] && mv "$ASIDE" "$BUNDLE"
+    echo "!! архив не распаковался — прежняя сборка возвращена на место" >&2
+    exit 1
+fi
+mv "$STAGING/ChromaDB Manager.app" "$BUNDLE"
 echo "==> восстановлено: dist/ChromaDB Manager.app"
 echo
 echo "Открыть:      open \"$BUNDLE\""

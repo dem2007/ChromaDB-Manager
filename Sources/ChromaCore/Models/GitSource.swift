@@ -49,11 +49,33 @@ public struct GitSourceState: Codable, Hashable, Sendable {
     public var commit: String?
     public var branch: String?
     public var syncedAt: Date?
+    /// Пути, которые следующий прогон перечитывает, что бы ни сказал `git diff`.
+    ///
+    /// `git diff` от прошлого коммита не видит трёх вещей: файл, который
+    /// прошлый прогон не дописал (извлечение упало, файл сняли с прогона
+    /// руками), — коммит при этом запомнен, и файл больше не «трогали»;
+    /// неотслеживаемый файл; правку рабочей копии, откаченную обратно
+    /// к коммиту, — в базе лежит правленый текст, а git разницы не видит.
+    /// Без этого списка такие файлы числились неизменными навсегда.
+    ///
+    /// Необязательный — чтобы состояние, записанное до него, читалось.
+    public var revisit: [String]?
 
-    public init(commit: String? = nil, branch: String? = nil, syncedAt: Date? = nil) {
+    public init(
+        commit: String? = nil, branch: String? = nil, syncedAt: Date? = nil, revisit: [String]? = nil
+    ) {
         self.commit = commit
         self.branch = branch
         self.syncedAt = syncedAt
+        self.revisit = revisit
+    }
+
+    /// То же состояние, где к перечитыванию добавлены недоделанные файлы.
+    public func revisiting(_ paths: some Sequence<String>) -> GitSourceState {
+        var copy = self
+        let all = Set(revisit ?? []).union(paths)
+        copy.revisit = all.isEmpty ? nil : all.sorted()
+        return copy
     }
 }
 

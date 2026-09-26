@@ -9,6 +9,14 @@ public struct BackupRecord: Identifiable, Hashable, Sendable {
     /// it is not a restore point.
     public var isIncomplete: Bool = false
 
+    public init(url: URL, createdAt: Date, sizeBytes: Int64, sourcePath: String?, isIncomplete: Bool = false) {
+        self.url = url
+        self.createdAt = createdAt
+        self.sizeBytes = sizeBytes
+        self.sourcePath = sourcePath
+        self.isIncomplete = isIncomplete
+    }
+
     public var id: String { url.path }
     public var name: String { url.lastPathComponent }
 
@@ -131,12 +139,28 @@ public final class BackupService: @unchecked Sendable {
         let destination = directory.appendingPathComponent(name, isDirectory: true)
 
         log(.info, "Бэкап", "Копирование \(source.path) → \(destination.path)")
-        try fileManager.copyItem(at: source, to: destination)
-        // The marker goes in immediately after the copy and comes off only
-        // when the result has been checked; a crash in between leaves a backup
-        // that says so instead of one that lies.
+        // Метка ставится **до** копирования и снимается только после проверки.
+        //
+        // Прежде она ставилась строкой ниже — после `copyItem`, — и окно,
+        // которое она закрывала, начиналось там, где опасность кончалась.
+        // Копия базы на сорок гигабайт идёт минутами: выход из приложения,
+        // падение или ошибка ввода-вывода посреди копирования оставляли папку
+        // с половиной файлов и **без** метки. `list()` называл такую копию
+        // годной, а `restore()` соглашался её развернуть — то есть отодвигал
+        // живую базу и ставил на её место обрезанную.
+        //
+        // Поэтому папка заводится заранее, метка ложится в неё первой, а
+        // содержимое копируется внутрь по одному элементу: `copyItem` на
+        // готовую папку не соглашается.
         let marker = destination.appendingPathComponent(Self.incompleteMarker)
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
         fileManager.createFile(atPath: marker.path, contents: Data("copy in progress\n".utf8))
+        for entry in try fileManager.contentsOfDirectory(atPath: source.path) {
+            try fileManager.copyItem(
+                at: source.appendingPathComponent(entry),
+                to: destination.appendingPathComponent(entry)
+            )
+        }
 
         if let note {
             let metadata = "source: \(source.path)\ncreated: \(Date())\nnote: \(note)\n"
@@ -258,6 +282,30 @@ public final class BackupService: @unchecked Sendable {
             record: nil,
             exportURL: destination,
             describedAs: String(localized: "экспорт \(rows.count) документов в \(destination.lastPathComponent) (\(size))")
+        )
+    }
+
+    /// Экспорт нескольких коллекций — одним свидетельством.
+    ///
+    /// Источник с раскладкой по подпапкам или по правилу пишет в несколько
+    /// коллекций, и переизвлечение переписывает их все. Копия одной первой
+    /// оставляла остальные без бэкапа — вопреки «сначала копия, всегда».
+    public func exportCollections(
+        _ collections: [ChromaCollection],
+        from chroma: ChromaClient,
+        note: String
+    ) async throws -> BackupEvidence {
+        var evidence: [BackupEvidence] = []
+        for collection in collections {
+            evidence.append(try await exportCollection(collection, from: chroma, note: note))
+        }
+        guard evidence.count != 1 else { return evidence[0] }
+        return BackupEvidence(
+            record: nil,
+            exportURL: evidence.first?.exportURL,
+            describedAs: zip(collections, evidence)
+                .map { "«\($0.name)»: \($1.describedAs)" }
+                .joined(separator: "; ")
         )
     }
 

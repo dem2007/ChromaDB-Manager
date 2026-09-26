@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 import ChromaCore
 
 /// Decides *when* sources sync by themselves (substage 2D).
@@ -25,6 +26,15 @@ final class AutoSyncCoordinator: ObservableObject {
     /// The launch-trigger and folder-watcher runs, which have no timer to hold
     /// them. Without a handle they could not be stopped on quit.
     private var unscheduledWork: [Task<Void, Never>] = []
+    /// Источники, чей прошлый срок по расписанию пропущен (нет подключения,
+    /// уже идёт, ветка переключена). Следующая попытка — не раньше чем через
+    /// `retryDelay`: `lastRun` пишется только при настоящем запуске, и
+    /// просроченный источник иначе перепланировался через секунду — бесконечно,
+    /// по две строки журнала в секунду.
+    private var skippedSchedule: Set<UUID> = []
+    private static let retryDelay: TimeInterval = 300
+    /// Следит за правками источников: новые и изменённые режимы запуска.
+    private var sourcesWatch: AnyCancellable?
 
     // MARK: - Lifecycle
 
@@ -34,6 +44,35 @@ final class AutoSyncCoordinator: ObservableObject {
         sources.cancelAutomaticWork = { [weak self] in self?.cancelRunningWork() }
         reload()
         track(Task { await runLaunchSyncs() })
+        // `reload()` обещал «после любой правки списка», а звали его только
+        // запуск, пауза и отмена: добавленный или изменённый источник
+        // с расписанием или слежением не получал ни таймера, ни наблюдателя
+        // до перезапуска приложения, а карточка показывала режим включённым.
+        // Сравниваются только поля, от которых зависят таймеры и слежение, —
+        // отметка о последнем прогоне сюда не входит, иначе каждый прогон
+        // перестраивал бы всё заново.
+        sourcesWatch = app.settings.$configuration
+            .map { configuration in
+                configuration.dataSources.map { TriggerKey(source: $0) }
+            }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.reload() }
+            }
+    }
+
+    /// То, от чего зависят таймер и слежение источника.
+    private struct TriggerKey: Equatable {
+        let id: UUID
+        let path: String
+        let triggers: SyncTriggers
+
+        init(source: DataSource) {
+            id = source.id
+            path = source.url.path
+            triggers = source.triggers
+        }
     }
 
     /// Останавливает автоматический прогон, который сейчас идёт, — и **только
@@ -118,10 +157,15 @@ final class AutoSyncCoordinator: ObservableObject {
 
     private func scheduleNext(for source: DataSource) {
         guard let app else { return }
-        guard let fireDate = source.triggers.schedule.nextFireDate(
+        timers[source.id]?.cancel()
+        timers[source.id] = nil
+        guard var fireDate = source.triggers.schedule.nextFireDate(
             after: Date(),
             lastRun: lastRun[source.id] ?? source.lastSyncedAt
         ) else { return }
+        if skippedSchedule.contains(source.id) {
+            fireDate = max(fireDate, Date().addingTimeInterval(Self.retryDelay))
+        }
 
         nextRun[source.id] = fireDate
         let delay = max(1, fireDate.timeIntervalSinceNow)
@@ -131,16 +175,29 @@ final class AutoSyncCoordinator: ObservableObject {
             "Источник «\(source.name)»: следующая синхронизация \(fireDate.formatted(date: .abbreviated, time: .shortened)) (\(source.triggers.schedule.summary))"
         )
 
+        // Таймер только ждёт. Сам прогон — отдельной задачей: иначе
+        // перестройка таймеров (правка источника, пауза) снимала бы вместе
+        // с таймером и идущую по нему синхронизацию.
         timers[source.id] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             guard let self, let app = self.app else { return }
+            self.timers[source.id] = nil
             // The source may have been edited or removed while we were sleeping.
             guard let current = app.settings.configuration.dataSources.first(where: { $0.id == source.id }),
                   current.triggers.scheduled else { return }
-            await self.requestSync(current, reason: .schedule)
-            guard !Task.isCancelled else { return }
-            self.scheduleNext(for: current)
+            self.track(Task { [weak self] in
+                guard let self else { return }
+                let started = await self.requestSync(current, reason: .schedule)
+                if started { self.skippedSchedule.remove(source.id) } else { self.skippedSchedule.insert(source.id) }
+                guard !Task.isCancelled, let app = self.app,
+                      !app.settings.configuration.automaticSyncPaused,
+                      let latest = app.settings.configuration.dataSources.first(where: { $0.id == source.id }),
+                      latest.triggers.scheduled,
+                      self.timers[source.id] == nil
+                else { return }
+                self.scheduleNext(for: latest)
+            })
         }
     }
 
@@ -170,23 +227,26 @@ final class AutoSyncCoordinator: ObservableObject {
     /// Serialises automatic runs. A second request for a source that is already
     /// syncing is dropped with a log entry — queueing it would only mean running
     /// the same comparison twice in a row.
-    private func requestSync(_ source: DataSource, reason: SyncReason) async {
-        guard let app, let sources else { return }
+    ///
+    /// - Returns: `true`, если прогон действительно был.
+    @discardableResult
+    private func requestSync(_ source: DataSource, reason: SyncReason) async -> Bool {
+        guard let app, let sources else { return false }
         guard !app.settings.configuration.automaticSyncPaused else {
             app.log.record(.info, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) не запущена: автоматическая индексация приостановлена")
-            return
+            return false
         }
 
         // Starting the server on launch is optional, so a timer or a
         // folder watcher can now fire while nothing is connected.
         guard app.client != nil else {
             app.log.record(.info, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) не запущена: нет подключения к ChromaDB")
-            return
+            return false
         }
 
         if await app.syncService.isRunning(sourceID: source.id) {
             app.log.record(.warning, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) отброшена: для этого источника она уже идёт")
-            return
+            return false
         }
         // A source whose interrupted run could not be replayed waits for a
         // person: retrying it on a timer would just repeat the same failure and
@@ -197,7 +257,7 @@ final class AutoSyncCoordinator: ObservableObject {
                 "Источники",
                 "Автоматическая синхронизация «\(source.name)» приостановлена: \(reason). Запустите её вручную, когда причина устранена."
             )
-            return
+            return false
         }
         // ветку переключили — автоматическая переиндексация не
         // запускается. Переключить ветку это обычное рабочее действие, а
@@ -210,7 +270,7 @@ final class AutoSyncCoordinator: ObservableObject {
                 app.notify(OperationNotice(
                     kind: .sync, subject: source.name, problems: [note]
                 ))
-                return
+                return false
             }
         }
 
@@ -220,11 +280,22 @@ final class AutoSyncCoordinator: ObservableObject {
             queued.append(source.id)
             app.log.record(.info, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) поставлена в очередь")
             while isRunning || sources.isBusy {
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                // Отмена — выход, а не повод крутиться дальше: `try?` глотал
+                // её, сон бросал сразу, опрос превращался в пустой цикл,
+                // а по окончании чужого прогона отменённая заявка всё равно
+                // запускала свой — и сообщала о сбое того, что человек
+                // только что остановил.
+                do {
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                } catch {
+                    queued.removeAll { $0 == source.id }
+                    app.log.record(.info, "Источники", "Синхронизация «\(source.name)» снята с очереди: отменена")
+                    return false
+                }
                 if app.settings.configuration.automaticSyncPaused {
                     queued.removeAll { $0 == source.id }
                     app.log.record(.info, "Источники", "Синхронизация «\(source.name)» снята с очереди: индексация приостановлена")
-                    return
+                    return false
                 }
             }
             queued.removeAll { $0 == source.id }
@@ -247,6 +318,7 @@ final class AutoSyncCoordinator: ObservableObject {
                 "«\(source.name)»: файлов, требующих решения — \(summary.needsDecision.count). Автоматически из базы ничего не удалено."
             )
         }
+        return true
     }
 
     /// Toggles the global pause and rebuilds everything accordingly.

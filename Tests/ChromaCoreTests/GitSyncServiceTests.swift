@@ -194,7 +194,7 @@ final class GitSyncServiceTests: XCTestCase {
             manifest.record(ManifestEntry(
                 relativePath: item.relativePath, contentHash: item.contentHash ?? "",
                 modifiedAt: item.modifiedAt, size: item.size,
-                chunkIDs: [SourceSyncService.documentID(relativePath: item.relativePath, chunkIndex: 0)],
+                chunkIDs: [SourceSyncService.documentID(relativePath: item.relativePath, chunkIndex: 0, sourceID: nil)],
                 collectionName: "code", chunkingSignature: source.chunking.signature,
                 embeddingModel: "e5", extractionSignature: source.extractionSignature
             ))

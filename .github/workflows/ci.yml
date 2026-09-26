@@ -8,14 +8,37 @@ name: CI
 on:
   push:
     branches: [main]
+    # A prose-only push builds nothing new: the cache key below follows
+    # Package.swift and Sources/**, so the whole macOS job would run and
+    # produce a result identical to the one already cached.
+    #
+    # docs/hermes/** is deliberately NOT here: Scripts/build-app.sh copies
+    # the skill from it into the bundle, so a change there does reach the
+    # product and must be built.
+    paths-ignore:
+      - "README.md"
+      - "README.en.md"
+      - "CONTRIBUTING.md"
+      - "docs/*.md"
+      - "docs/screenshots/**"
+      - "LICENSE"
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  # A new push supersedes a run that is still going: the older result is about
-  # code nobody will look at any more.
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a pull request supersedes itself. On `main` each push is a commit
+  # someone will look for later — a release among them — and cancelling it
+  # leaves that commit marked cancelled with its build cache unsaved.
+  # Measured: a README push cancelled the release run for v0.3.6 after build,
+  # test and bundle had already passed, and it took a manual re-run of about
+  # twelve minutes to get the result back.
+  #
+  # `cancel-in-progress: false` alone is not enough: within one group a newer
+  # *pending* run still cancels an older pending one, so three quick pushes
+  # to `main` would cancel the middle one before it starts. Outside pull
+  # requests the group is therefore the commit itself.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
@@ -49,6 +72,15 @@ jobs:
       - name: Test
         run: swift test
 
+      # A string in the code that the catalogue does not know shows up in
+      # Russian for everyone reading the app in English. `--check` fails only
+      # on such new strings (not on retired ones), which is what lets it run
+      # here as a guard. The tests do not cover this: they scan
+      # `String(localized:)` literals, not SwiftUI's `Text("…")` keys.
+      # Its build lives in .build/strings, so it does not invalidate the main one.
+      - name: String catalogue is complete
+        run: python3 Scripts/build-strings.py --check
+
       # The app bundle is what people actually run, and it is assembled by a
       # script rather than by SwiftPM: Info.plist, the icon, the entitlements,
       # the string catalogues and the signature. A build that passes the tests
@@ -62,3 +94,7 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
             "dist/ChromaDB Manager.app/Contents/Info.plist"
           codesign --verify --strict "dist/ChromaDB Manager.app"
+          # Without it Shortcuts sees no intents at all. The script only warns
+          # when the step fails, so the check that it did not is here.
+          test -d "dist/ChromaDB Manager.app/Contents/Resources/Metadata.appintents" \
+            || { echo "the bundle has no App Intents metadata"; exit 1; }

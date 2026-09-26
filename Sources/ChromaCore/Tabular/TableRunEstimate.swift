@@ -130,6 +130,7 @@ extension SheetSyncPlan {
         result.unchanged = unchanged
         result.empty = empty
         result.mappingChanged = mappingChanged
+        result.headerRow = headerRow
         // Rows that vanished are **not** carried into a sample run: a decision
         // about deleting documents must not be taken on the strength of a
         // partial read of the file.

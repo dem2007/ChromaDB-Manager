@@ -140,7 +140,13 @@ public final class SiteCrawler {
     public init(
         userAgent: String,
         fetch: @escaping Fetch,
-        pause: @escaping Pause = { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        pause: @escaping Pause = { seconds in
+            // Перевод в наносекунды ловит ловушкой всё, что не влезает
+            // в UInt64: неконечное, отрицательное, огромное.
+            guard seconds.isFinite, seconds > 0 else { return }
+            let bounded = min(seconds, RobotsTxt.maximumCrawlDelay)
+            try await Task.sleep(nanoseconds: UInt64(bounded * 1_000_000_000))
+        },
         log: @escaping LogHandler = noopLogHandler
     ) {
         self.userAgent = userAgent

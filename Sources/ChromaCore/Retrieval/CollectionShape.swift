@@ -94,7 +94,8 @@ public actor CollectionShapeCache {
         if let known = pinned[collectionID] { return known }
         let filter = DocumentFilter(conditions: [
             MetadataCondition(
-                field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue
+                field: DocumentMarks.markKey, op: .equals, value: DocumentMark.pinned.rawValue,
+                valueIsText: true
             ),
         ])
         guard let found = try? await database.anyDocument(

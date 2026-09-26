@@ -35,6 +35,9 @@ public struct RobotsTxt: Sendable, Hashable {
 
     public static let missing = RobotsTxt(isMissing: true)
 
+    /// Больше суток между запросами не ждём: такой сайт просит не ходить.
+    public static let maximumCrawlDelay: TimeInterval = 86_400
+
     /// Разбирает файл для конкретного агента.
     ///
     /// Правила действуют по самой **точной** подходящей группе: если есть
@@ -50,7 +53,10 @@ public struct RobotsTxt: Sendable, Hashable {
         /// Строки `User-agent` идут подряд — и все относятся к одной группе.
         var expectingAgents = false
 
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        // Концы строк — любые: `"\r\n"` для Swift один знак, и деление по
+        // `"\n"` его не видит. Файл с IIS или из Windows читался одной
+        // строкой, все правила пропадали, и разрешено было всё.
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             // Комментарий может стоять и в конце строки.
             let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
                 .trimmingCharacters(in: .whitespaces)
@@ -77,7 +83,14 @@ public struct RobotsTxt: Sendable, Hashable {
                     // корень». Перепутать значит либо не индексировать ничего,
                     // либо индексировать всё вопреки запрету.
                     case "disallow": if !value.isEmpty { group.disallow.append(value) }
-                    default: group.crawlDelay = TimeInterval(value.replacingOccurrences(of: ",", with: "."))
+                    // Задержка приходит с чужого сервера: «1e20» и «inf»
+                    // разбираются как числа, а превратить их в наносекунды
+                    // нельзя — это ловушка, роняющая приложение целиком.
+                    // Годное значение конечно и неотрицательно, а сверху
+                    // ограничено: сутки между запросами — это уже «не ходи».
+                    default:
+                        group.crawlDelay = TimeInterval(value.replacingOccurrences(of: ",", with: "."))
+                            .flatMap { $0.isFinite && $0 >= 0 ? min($0, Self.maximumCrawlDelay) : nil }
                     }
                     groups[agent] = group
                 }
@@ -98,19 +111,32 @@ public struct RobotsTxt: Sendable, Hashable {
     /// При равной длине побеждает `Allow` — так разрешают спорные случаи
     /// и Google, и черновик стандарта: запрет по ошибке дороже разрешения.
     public func allows(path: String) -> Bool {
-        let target = path.isEmpty ? "/" : path
-        let bestDisallow = group.disallow.filter { Self.matches(pattern: $0, path: target) }
+        // Путь и правила сравниваются в одной записи — раскодированной:
+        // «/каталог/» в файле и «/%D0%BA…/» в адресе — один и тот же путь.
+        let target = Self.decoded(path.isEmpty ? "/" : path)
+        let disallow = group.disallow.map(Self.decoded)
+        let allow = group.allow.map(Self.decoded)
+        let bestDisallow = disallow.filter { Self.matches(pattern: $0, path: target) }
             .map(\.count).max()
         guard let bestDisallow else { return true }
-        let bestAllow = group.allow.filter { Self.matches(pattern: $0, path: target) }
+        let bestAllow = allow.filter { Self.matches(pattern: $0, path: target) }
             .map(\.count).max() ?? -1
         return bestAllow >= bestDisallow
     }
 
     public func allows(url: URL) -> Bool {
-        var path = url.path.isEmpty ? "/" : url.path
-        if let query = url.query, !query.isEmpty { path += "?" + query }
+        // Не `url.path`: он срезает косую черту в конце, и «Disallow:
+        // /private/» не закрывал «https://site/private/» — путь выходил
+        // «/private», короче правила.
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: true)
+        var path = components?.percentEncodedPath ?? url.path
+        if path.isEmpty { path = "/" }
+        if let query = components?.percentEncodedQuery ?? url.query, !query.isEmpty { path += "?" + query }
         return allows(path: path)
+    }
+
+    private static func decoded(_ text: String) -> String {
+        text.removingPercentEncoding ?? text
     }
 
     /// Сопоставление с учётом `*` и `$` — они встречаются в каждом втором файле.

@@ -78,7 +78,7 @@ final class FilePathRepairLiveTests: XCTestCase {
 
         let afterTyped = try await found("source_file", typed)
         XCTAssertEqual(afterTyped, 3, "после уборки файл находится по набранному пути")
-        let byFingerprint = try await found("file_id", SourceSyncService.fileFingerprint(typed))
+        let byFingerprint = try await found("file_id", SourceSyncService.fileFingerprint(typed, sourceID: nil))
         XCTAssertEqual(byFingerprint, 3, "и по отпечатку — им агент просит файл целиком")
 
         // Текст не тронут: уборка обещает не пересчитывать векторы, а для

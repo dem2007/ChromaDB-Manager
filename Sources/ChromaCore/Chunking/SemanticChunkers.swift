@@ -159,12 +159,17 @@ public struct SemanticChunker: AsyncChunking {
             let candidate = current.isEmpty ? sentence : current + " " + sentence
             // A chunk that would exceed the ceiling breaks here regardless of
             // where the meaning changes: the size limit is the hard one.
+            //
+            // Без `continue`: у предложения, начавшего новый чанк, граница
+            // смысла после него проверяется так же, как у любого другого.
+            // Раньше она пропускалась, и следующее предложение другой темы
+            // приклеивалось к нему.
             if candidate.count > maximum, !current.isEmpty {
                 result.append(TextChunk(index: result.count, text: current))
                 current = sentence
-                continue
+            } else {
+                current = candidate
             }
-            current = candidate
 
             let isBreakpoint = index < distances.count && distances[index] >= threshold && threshold > 0
             if isBreakpoint, current.count >= minimum {
@@ -180,7 +185,11 @@ public struct SemanticChunker: AsyncChunking {
         // последние в своём файле.
         let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
         if !tail.isEmpty {
-            if tail.count < minimum, let last = result.popLast() {
+            // Потолок главнее минимума, как и в цикле: хвост, с которым
+            // предыдущий чанк вылез бы за `maximum`, остаётся коротким.
+            if tail.count < minimum, let last = result.last,
+               last.text.count + tail.count + 1 <= maximum {
+                result.removeLast()
                 result.append(TextChunk(index: last.index, text: ChunkHygiene.joined(last.text, current)))
             } else {
                 result.append(TextChunk(index: result.count, text: current))

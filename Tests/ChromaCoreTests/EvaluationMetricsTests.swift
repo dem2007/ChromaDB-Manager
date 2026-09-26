@@ -259,6 +259,34 @@ final class EvaluationMetricsTests: XCTestCase {
         XCTAssertEqual(score.value ?? 0, 0.5, accuracy: 0.0001)
     }
 
+    /// Числитель полноты — разные документы из списка эталона. Совпавший
+    /// по фрагменту чанк вне списка и повтор одного идентификатора раньше
+    /// давали единицу там, где второй известный документ не нашёлся.
+    func testRecallCountsOnlyDistinctListedDocuments() {
+        var q = query("а", relevant: ["d1", "d2"])
+        q.fragments = [ExpectedFragment(fragment: "текст x", grade: .relevant)]
+        let v = UUID()
+        let score = EvaluationMetrics.recallScore(
+            results: [result(q.id, v, ["x", "d1", "d1"])], truth: truth([q]), k: 5
+        )
+        XCTAssertEqual(score.value ?? 0, 0.5, accuracy: 0.0001)
+    }
+
+    /// Порог по длине выключает текстовую стадию на длинном запросе — и тогда
+    /// поиск ищет вектором даже у варианта «только текст». Стенд обязан
+    /// дать такому запросу вектор, иначе ячейка записывается сбоем.
+    func testALongQueryNeedsAVectorWhenTheTextStageStepsAside() {
+        var profile = SearchProfile.plain(collectionName: "c", name: "текст")
+        profile.vectorSearchEnabled = false
+        profile.textSearchEnabled = true
+        profile.textSearchMaxWords = 3
+        let variant = EvaluationVariant(
+            name: "т", collectionID: "id", collectionName: "c", model: "m", nResults: 10, profile: profile
+        )
+        XCTAssertFalse(variant.needsVector(for: "МВХ"))
+        XCTAssertTrue(variant.needsVector(for: "как организуется экспертиза результатов работ"))
+    }
+
     func testRecallCountsPartialAsFound() {
         // Полный список — два: релевантный и частичный. Найден частичный.
         let q = query("а", relevant: ["a1"], partial: ["a2"])

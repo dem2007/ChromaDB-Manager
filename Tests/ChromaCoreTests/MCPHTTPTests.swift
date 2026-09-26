@@ -120,10 +120,71 @@ final class MCPHTTPTests: XCTestCase {
 
     // MARK: - Заголовки против тела
 
-    func testAMissingProtocolVersionHeaderIsAMismatch() async {
+    /// Заголовка версии нет вовсе — это старая эпоха, а не нарушение.
+    ///
+    /// Спецификация прямо велит считать такого клиента ревизией 2025-03-26,
+    /// а не отказывать ему. Отказ здесь бил по тем, кого мы сами объявили
+    /// поддерживаемыми: рукопожатие они проходили, а на первом же
+    /// `tools/list` получали 400.
+    func testAMissingProtocolVersionHeaderIsTheOldEpochAndNotARefusal() async {
+        // Тело — как у старого клиента: версии в `_meta` прежние ревизии
+        // не кладут.
+        let response = await transport().handle(
+            method: "POST",
+            headers: headers(version: nil),
+            body: body(method: "tools/list", version: nil)
+        )
+        XCTAssertNotEqual(response.status, 400)
+        XCTAssertNotEqual(errorCode(in: response), MCPHTTPTransport.headerMismatch)
+    }
+
+    /// Послабление старой эпохе — на отсутствие заголовка, а не на расхождение.
+    ///
+    /// Без версии в заголовке присланный `Mcp-Method` раньше не сверялся
+    /// вовсе: посредник видел один метод, сервер исполнял другой.
+    func testAMirroredHeaderIsCheckedEvenWithoutTheVersionHeader() async {
         let response = await transport().handle(
             method: "POST",
             headers: headers(version: nil, method: "tools/list"),
+            body: body(method: "tools/call", params: ["name": .string("search")], version: nil)
+        )
+        XCTAssertEqual(response.status, 400)
+        XCTAssertEqual(errorCode(in: response), MCPHTTPTransport.headerMismatch)
+    }
+
+    /// Тело, объявившее нынешнюю ревизию, без заголовка версии — не старый
+    /// клиент, а несоответствующий новый.
+    func testABodyDeclaringTheVersionNeedsTheHeader() async {
+        let response = await transport().handle(
+            method: "POST",
+            headers: headers(version: nil, method: "tools/list"),
+            body: body(method: "tools/list")
+        )
+        XCTAssertEqual(response.status, 400)
+        XCTAssertEqual(errorCode(in: response), MCPHTTPTransport.headerMismatch)
+    }
+
+    /// Ревизия, зеркальных заголовков не знавшая, не обязана их присылать.
+    ///
+    /// `Mcp-Method` ввела ревизия 2026-07-28. Клиент 2025-06-18 честно шлёт
+    /// свою версию — и упирался в заголовок, которого в его эпоху не было.
+    func testAnOlderRevisionIsNotAskedForTheMirrorHeaders() async {
+        for version in MCPProtocol.legacyVersions {
+            let response = await transport().handle(
+                method: "POST",
+                headers: headers(version: version, method: nil),
+                body: body(method: "tools/list", version: version)
+            )
+            XCTAssertNotEqual(response.status, 400, version)
+            XCTAssertNotEqual(errorCode(in: response), MCPHTTPTransport.headerMismatch, version)
+        }
+    }
+
+    /// А с нынешней ревизии зеркала спрашиваются по-прежнему.
+    func testTheCurrentRevisionStillMirrorsItsHeaders() async {
+        let response = await transport().handle(
+            method: "POST",
+            headers: headers(version: MCPProtocol.version, method: nil),
             body: body(method: "tools/list")
         )
         XCTAssertEqual(response.status, 400)

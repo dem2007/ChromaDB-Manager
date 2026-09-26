@@ -30,6 +30,9 @@ final class EnvironmentViewModel: ObservableObject {
     /// последнюю копию базы на пять гигабайт, и узнать об этом можно было
     /// только по исчезнувшей строке.
     @Published var pendingBackupDeletion: BackupRecord?
+    /// Копия, восстановление из которой ждёт подтверждения. Восстановление
+    /// подменяет базу целиком — одним щелчком оно больше не делается.
+    @Published var pendingRestore: BackupRecord?
     /// Whether the installed CLI has the vacuum command. Probed once.
     @Published var maintenanceAvailable = false
     @Published var lastMaintenance: MaintenanceService.Result?
@@ -195,97 +198,123 @@ final class EnvironmentViewModel: ObservableObject {
         run(app, title: String(localized: "Обновление движка")) { [weak self] in
             guard let self else { return }
 
-            // 1. Remember what the database looked like before.
-            if let client = app.client {
-                let collections = (try? await client.listCollections(withCounts: true)) ?? []
-                let snapshot = Dictionary(uniqueKeysWithValues: collections.map { ($0.name, $0.documentCount ?? 0) })
-                await MainActor.run {
-                    self.countsBefore = snapshot
-                    self.appendConsole("Зафиксировано коллекций: \(snapshot.count), документов: \(snapshot.values.reduce(0, +))")
-                }
-            }
-
-            // 2. The database must be closed before its files are copied.
-            if app.processManager.isRunning || app.connection.isConnected {
-                await MainActor.run { self.appendConsole("Останавливаем сервер перед обновлением…") }
-                await app.disconnect(reason: .serverRestart)
-            }
-
-            // 3. Backup.
-            if makeBackup, let databaseURL {
-                let inspection = await app.inspector.databaseDirectoryInfo(databaseURL)
-                if inspection.exists {
-                    await MainActor.run { self.appendConsole("Резервная копия: \(databaseURL.path)") }
-                    let record = try app.backupService.backup(
-                        databaseAt: databaseURL,
-                        note: "перед обновлением движка \(previousVersion)"
-                    )
+            // Прежние счётчики — от прошлого обновления: без сброса проверка
+            // сравнила бы новую базу со старым снимком и нашла «расхождение».
+            await MainActor.run { self.countsBefore = [:] }
+            // Через общую очередь и в одиночку, как копия и сжатие:
+            // обновление гасит сервер, и мимо очереди оно обрывало бы
+            // идущую индексацию.
+            let ticket = QueueTicket(
+                title: String(localized: "Обновление движка"),
+                priority: .interactive, group: .exclusive, connectionID: nil
+            )
+            try await app.queue.run(ticket) { @MainActor _ in
+                // 1. Remember what the database looked like before.
+                if let client = app.client {
+                    let collections = (try? await client.listCollections(withCounts: true)) ?? []
+                    let snapshot = Dictionary(uniqueKeysWithValues: collections.map { ($0.name, $0.documentCount ?? 0) })
                     await MainActor.run {
-                        self.lastBackup = record
-                        self.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
+                        self.countsBefore = snapshot
+                        self.appendConsole("Зафиксировано коллекций: \(snapshot.count), документов: \(snapshot.values.reduce(0, +))")
                     }
-                } else {
-                    await MainActor.run { self.appendConsole("Каталог базы пуст — копировать нечего.") }
                 }
-            } else if makeBackup {
-                await MainActor.run {
-                    self.appendConsole("Внешний сервер: файлы базы недоступны приложению, копия не создаётся.")
-                }
-            }
 
-            // 4. Upgrade.
-            if usesVenv {
-                try await app.installer.installIntoVenv(upgrade: true, baseInterpreter: nil) { line in
-                    Task { @MainActor in self.appendConsole(line) }
+                // 2. The database must be closed before its files are copied.
+                if app.processManager.isRunning || app.connection.isConnected {
+                    await MainActor.run { self.appendConsole("Останавливаем сервер перед обновлением…") }
+                    await app.disconnect(reason: .serverRestart)
                 }
-            } else {
-                let plan = try await app.installer.planStandaloneInstall()
-                try await app.installer.installStandalone(plan: plan) { line in
-                    Task { @MainActor in self.appendConsole(line) }
-                }
-            }
 
-            await app.refreshEnvironment(checkUpdates: true)
-            let newVersion = app.environmentStatus.installedVersion ?? "?"
-            await MainActor.run {
-                self.appendConsole(newVersion == previousVersion
-                    ? "Версия не изменилась: \(newVersion)"
-                    : "Версия обновлена: \(previousVersion) → \(newVersion)")
-            }
-
-            // 5. Verify: the database must open and hold the same documents.
-            await MainActor.run { self.appendConsole("Проверяем, что база открывается…") }
-            await app.connect()
-            guard let client = app.client else {
-                await MainActor.run {
-                    self.verificationFailed = true
-                    self.errorMessage = String(localized: "После обновления не удалось подключиться к базе.")
-                }
-                return
-            }
-            do {
-                let collections = try await client.listCollections(withCounts: true)
-                let after = Dictionary(uniqueKeysWithValues: collections.map { ($0.name, $0.documentCount ?? 0) })
-                let mismatches = self.countsBefore.filter { after[$0.key] != $0.value }
-                await MainActor.run {
-                    if self.countsBefore.isEmpty {
-                        self.appendConsole("✅ База открывается, коллекций: \(after.count)")
-                        self.infoMessage = String(localized: "Обновление завершено. Версия \(newVersion).")
-                    } else if mismatches.isEmpty {
-                        self.appendConsole("✅ Коллекции и счётчики совпадают с зафиксированными до обновления")
-                        self.infoMessage = String(localized: "Обновление завершено. Версия \(newVersion), коллекций: \(after.count).")
+                // 3. Backup.
+                if makeBackup, let databaseURL {
+                    let inspection = await app.inspector.databaseDirectoryInfo(databaseURL)
+                    if inspection.exists {
+                        await MainActor.run { self.appendConsole("Резервная копия: \(databaseURL.path)") }
+                        let record: BackupRecord
+                        do {
+                            record = try app.backupService.backup(
+                                databaseAt: databaseURL,
+                                note: "перед обновлением движка \(previousVersion)"
+                            )
+                        } catch {
+                            await app.connect()
+                            throw error
+                        }
+                        await MainActor.run {
+                            self.lastBackup = record
+                            self.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
+                        }
                     } else {
-                        self.verificationFailed = true
-                        let detail = mismatches.map { "\($0.key): было \($0.value), стало \(after[$0.key] ?? 0)" }.joined(separator: "; ")
-                        self.appendConsole("❌ Расхождение после обновления — \(detail)")
-                        self.errorMessage = String(localized: "После обновления данные не совпадают: \(detail)")
+                        await MainActor.run { self.appendConsole("Каталог базы пуст — копировать нечего.") }
+                    }
+                } else if makeBackup {
+                    await MainActor.run {
+                        self.appendConsole("Внешний сервер: файлы базы недоступны приложению, копия не создаётся.")
                     }
                 }
-            } catch {
+
+                // 4. Upgrade.
+                do {
+                    if usesVenv {
+                        try await app.installer.installIntoVenv(upgrade: true, baseInterpreter: nil) { line in
+                            Task { @MainActor in self.appendConsole(line) }
+                        }
+                    } else {
+                        let plan = try await app.installer.planStandaloneInstall()
+                        try await app.installer.installStandalone(plan: plan) { line in
+                            Task { @MainActor in self.appendConsole(line) }
+                        }
+                    }
+                } catch {
+                    // Не обновилось — база возвращается как была. Прежде
+                    // приложение оставалось отключённым до ручного запуска.
+                    await MainActor.run { self.appendConsole("Обновление не удалось — запускаем сервер прежней версии") }
+                    await app.connect()
+                    throw error
+                }
+
+                await app.refreshEnvironment(checkUpdates: true)
+                let newVersion = app.environmentStatus.installedVersion ?? "?"
                 await MainActor.run {
-                    self.verificationFailed = true
-                    self.errorMessage = app.describe(error)
-                    self.appendConsole("❌ Проверка не пройдена: \(app.describe(error))")
+                    self.appendConsole(newVersion == previousVersion
+                        ? "Версия не изменилась: \(newVersion)"
+                        : "Версия обновлена: \(previousVersion) → \(newVersion)")
+                }
+
+                // 5. Verify: the database must open and hold the same documents.
+                await MainActor.run { self.appendConsole("Проверяем, что база открывается…") }
+                await app.connect()
+                guard let client = app.client else {
+                    await MainActor.run {
+                        self.verificationFailed = true
+                        self.errorMessage = String(localized: "После обновления не удалось подключиться к базе.")
+                    }
+                    return
+                }
+                do {
+                    let collections = try await client.listCollections(withCounts: true)
+                    let after = Dictionary(uniqueKeysWithValues: collections.map { ($0.name, $0.documentCount ?? 0) })
+                    let mismatches = self.countsBefore.filter { after[$0.key] != $0.value }
+                    await MainActor.run {
+                        if self.countsBefore.isEmpty {
+                            self.appendConsole("✅ База открывается, коллекций: \(after.count)")
+                            self.infoMessage = String(localized: "Обновление завершено. Версия \(newVersion).")
+                        } else if mismatches.isEmpty {
+                            self.appendConsole("✅ Коллекции и счётчики совпадают с зафиксированными до обновления")
+                            self.infoMessage = String(localized: "Обновление завершено. Версия \(newVersion), коллекций: \(after.count).")
+                        } else {
+                            self.verificationFailed = true
+                            let detail = mismatches.map { "\($0.key): было \($0.value), стало \(after[$0.key] ?? 0)" }.joined(separator: "; ")
+                            self.appendConsole("❌ Расхождение после обновления — \(detail)")
+                            self.errorMessage = String(localized: "После обновления данные не совпадают: \(detail)")
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.verificationFailed = true
+                        self.errorMessage = app.describe(error)
+                        self.appendConsole("❌ Проверка не пройдена: \(app.describe(error))")
+                    }
                 }
             }
         }
@@ -328,19 +357,23 @@ final class EnvironmentViewModel: ObservableObject {
                 connectionID: nil
             )
             try await app.queue.run(ticket) { _ in
-                await MainActor.run { self?.appendConsole("Резервная копия перед обслуживанием…") }
-                let record = try app.backupService.backup(databaseAt: target, note: "перед обслуживанием базы")
-                await MainActor.run {
-                    self?.lastBackup = record
-                    self?.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
-                }
-
                 let collectionsBefore = await app.collectionSnapshots().count
+                // Сначала остановка, потом копия. Копия работающей базы —
+                // испорченная копия (SQLite держит файлы открытыми, прокси
+                // и MCP ещё пишут), а она здесь единственная точка возврата,
+                // если сжатие базу повредит.
                 await MainActor.run { self?.appendConsole("Останавливаем сервер…") }
                 await app.disconnect(reason: .serverRestart)
 
+                let record: BackupRecord
                 let result: MaintenanceService.Result
                 do {
+                    await MainActor.run { self?.appendConsole("Резервная копия перед обслуживанием…") }
+                    record = try app.backupService.backup(databaseAt: target, note: "перед обслуживанием базы")
+                    await MainActor.run {
+                        self?.lastBackup = record
+                        self?.appendConsole("Создана копия \(record.name) (\(record.sizeText))")
+                    }
                     result = try await app.maintenance.vacuum(databaseAt: target)
                 } catch {
                     // Сервер поднимается, чем бы сжатие ни кончилось: оставить
@@ -418,9 +451,38 @@ final class EnvironmentViewModel: ObservableObject {
         backups = app.backupService.list()
     }
 
-    func restore(_ backup: BackupRecord, app: AppEnvironment) {
+    /// Снята ли копия с этой базы. Копии всех баз лежат одним списком
+    /// и различаются только датой в имени: восстановить в локальную базу
+    /// копию базы управляемого профиля значило одним щелчком подменить
+    /// одну базу другой.
+    static func backup(_ backup: BackupRecord, belongsTo destination: URL) -> Bool {
+        guard let source = backup.sourcePath else { return true }
+        func normalised(_ url: URL) -> String { url.standardizedFileURL.resolvingSymlinksInPath().path }
+        return normalised(URL(fileURLWithPath: source)) == normalised(destination)
+    }
+
+    /// Спрашивает, точно ли восстанавливать, — и сперва проверяет, что копия
+    /// от этой базы.
+    func askToRestore(_ backup: BackupRecord, app: AppEnvironment) {
         guard let destination = backupTarget(app) else {
             errorMessage = String(localized: "Восстанавливать некуда: активен внешний сервер, его файлы приложению недоступны.")
+            return
+        }
+        guard Self.backup(backup, belongsTo: destination) else {
+            errorMessage = String(localized: "Копия \(backup.name) снята с другой базы (\(backup.sourcePath ?? "—")), а активна \(destination.path). Переключитесь на ту базу, чтобы восстановить её.")
+            return
+        }
+        pendingRestore = backup
+    }
+
+    func restore(_ backup: BackupRecord, app: AppEnvironment) {
+        pendingRestore = nil
+        guard let destination = backupTarget(app) else {
+            errorMessage = String(localized: "Восстанавливать некуда: активен внешний сервер, его файлы приложению недоступны.")
+            return
+        }
+        guard Self.backup(backup, belongsTo: destination) else {
+            errorMessage = String(localized: "Копия \(backup.name) снята с другой базы (\(backup.sourcePath ?? "—")), а активна \(destination.path). Переключитесь на ту базу, чтобы восстановить её.")
             return
         }
         run(app, title: String(localized: "Восстановление резервной копии")) { [weak self] in

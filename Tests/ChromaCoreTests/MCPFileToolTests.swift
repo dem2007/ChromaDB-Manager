@@ -170,6 +170,33 @@ final class MCPFileToolTests: XCTestCase {
         XCTAssertEqual(request?.filter?.conditions.first?.value, "папка/файл.md")
     }
 
+    /// Файл ровно в предел упорядочивания — не переполнение.
+    ///
+    /// Счёт «набрано не меньше предела» не отличал файл, который на пределе
+    /// кончился, от файла, который за ним продолжается. Первый объявлялся
+    /// неупорядочиваемым: куски приходили вперемешку, а агент читал
+    /// «в файле больше двадцати тысяч кусков» — которых в нём нет.
+    func testAFileExactlyAtTheOrderingLimitIsNotCalledOverflowed() async throws {
+        func page(_ from: Int, _ count: Int) -> [MCPDocumentPayload] {
+            (from..<(from + count)).map {
+                MCPDocumentPayload(id: "c\($0)", text: nil, metadata: [MCPFileChunks.orderKey: .int($0)])
+            }
+        }
+        let limit = MCPFileChunks.maximumOrdered
+
+        let exact = try await MCPFileChunks.collect(batch: MCPFileChunks.scanBatch) { batch, offset in
+            offset >= limit ? [] : page(offset, min(batch, limit - offset))
+        }
+        XCTAssertEqual(exact.documents.count, limit)
+        XCTAssertFalse(exact.overflowed, "файл кончился ровно на пределе — это не переполнение")
+
+        // А тот, что за предел выходит, по-прежнему о себе говорит.
+        let longer = try await MCPFileChunks.collect(batch: MCPFileChunks.scanBatch) { batch, offset in
+            page(offset, batch)
+        }
+        XCTAssertTrue(longer.overflowed)
+    }
+
     /// Смещение за концом файла — это смещение, а не пропавший файл.
     ///
     /// Раньше ответ гласил «в коллекции нет чанков с этим file_id» и советовал

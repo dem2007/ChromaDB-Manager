@@ -65,6 +65,20 @@ final class ChromaRouteTests: XCTestCase {
         XCTAssertEqual(ChromaRoute.parse(method: "POST", path: "/api/v2/reset").access, .write)
     }
 
+    func testTenantAndDatabaseAreServiceOnlyForReads() {
+        // DELETE по базе сносит все коллекции: служебным он быть не может,
+        // иначе его пропустил бы любой ключ только на чтение.
+        let dropDatabase = ChromaRoute.parse(
+            method: "DELETE", path: "/api/v2/tenants/default_tenant/databases/default_database"
+        )
+        XCTAssertFalse(dropDatabase.isKnown)
+        XCTAssertEqual(dropDatabase.access, .write)
+        let patchTenant = ChromaRoute.parse(method: "PATCH", path: "/api/v2/tenants/default_tenant")
+        XCTAssertFalse(patchTenant.isKnown)
+        XCTAssertEqual(patchTenant.access, .write)
+        XCTAssertEqual(ChromaRoute.parse(method: "HEAD", path: "/api/v2/tenants/default_tenant").access, .service)
+    }
+
     func testUnknownPathsAreWritesUnlessTheyAreGETs() {
         // Deny-by-default needs the unknown POST to look like a write.
         let post = ChromaRoute.parse(method: "POST", path: "/api/v2/something/new")
@@ -97,6 +111,75 @@ final class HTTPRequestParserTests: XCTestCase {
         let second = try XCTUnwrap(try parser.next())
         XCTAssertEqual(second.path, "/api/v2/y")
         XCTAssertNil(try parser.next())
+    }
+
+    /// Отрицательная длина — испорченный запрос, а не падение приложения.
+    ///
+    /// `Int("-1") ?? 0` давал минус единицу: она проходит и потолок тела,
+    /// и проверку «хватает ли байтов», а дальше `bodyStart..<(bodyStart - 1)`
+    /// — перевёрнутый диапазон и ловушка времени выполнения. Прокси живёт
+    /// в процессе приложения, так что падало всё приложение — **до** проверки
+    /// ключа, от любого, кто дотянулся до порта.
+    func testALengthThatIsNotALengthIsRefusedInsteadOfCrashing() {
+        for raw in ["-1", "-9223372036854775808", "абв", "12x", "", "0x10", "1 2"] {
+            var parser = HTTPRequestParser()
+            parser.append(Data("POST /api/v2/x HTTP/1.1\r\nHost: h\r\nContent-Length: \(raw)\r\n\r\n".utf8))
+            XCTAssertThrowsError(try parser.next(), "«\(raw)» принято как длина") { error in
+                guard case HTTPRequestParser.Failure.malformed = error else {
+                    return XCTFail("ожидался отказ как испорченному запросу, пришло: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Отсутствие заголовка — по-прежнему тело нулевой длины, а не отказ.
+    func testARequestWithoutContentLengthStillParses() throws {
+        var parser = HTTPRequestParser()
+        parser.append(Data("GET /api/v2/heartbeat HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+        let request = try XCTUnwrap(try parser.next())
+        XCTAssertEqual(request.path, "/api/v2/heartbeat")
+        XCTAssertEqual(request.body.count, 0)
+    }
+
+    /// Точечные сегменты в пути — отказ, а не обход белого списка.
+    ///
+    /// Права проверяются по пути, разобранному на сегменты, а пересылается
+    /// путь как пришёл и собирается через `URL(string:relativeTo:)` —
+    /// Foundation схлопывает `..` по RFC 3986. Проверено:
+    /// `/collections/x/y/../../ДРУГАЯ` становится `/collections/ДРУГАЯ`.
+    /// Разрешали один адрес, уходил другой; ключу с одной разрешённой
+    /// коллекцией так открывалась любая.
+    func testDotSegmentsInThePathAreRefused() {
+        let base = "/api/v2/tenants/t/databases/d/collections"
+        for path in [
+            "\(base)/x/y/../../другая",
+            "\(base)/x/%2e%2e/другая",
+            "\(base)/x/%2E%2E/другая",
+            "\(base)/./x",
+            "\(base)/x/..",
+            "\(base)/x/../y?limit=1",
+        ] {
+            var parser = HTTPRequestParser()
+            parser.append(Data("GET \(path) HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+            XCTAssertThrowsError(try parser.next(), "путь «\(path)» принят") { error in
+                guard case HTTPRequestParser.Failure.malformed = error else {
+                    return XCTFail("ожидался отказ, пришло: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Точка внутри имени — не точечный сегмент: имена файлов с ней обычны.
+    func testADotInsideASegmentIsNotADotSegment() throws {
+        for path in [
+            "/api/v2/tenants/t/databases/d/collections/отчёт.2026",
+            "/api/v2/heartbeat?x=..",
+            "/api/v2/tenants/t/databases/d/collections/..имя",
+        ] {
+            var parser = HTTPRequestParser()
+            parser.append(Data("GET \(path) HTTP/1.1\r\nHost: h\r\n\r\n".utf8))
+            XCTAssertEqual(try parser.next()?.path, path, "годный путь отвергнут")
+        }
     }
 
     func testARequestSplitAcrossPacketsIsAssembled() throws {

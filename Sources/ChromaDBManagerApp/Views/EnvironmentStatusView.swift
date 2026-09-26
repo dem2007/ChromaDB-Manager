@@ -545,7 +545,7 @@ struct EnvironmentStatusView: View {
                                 }
                             }
                             Spacer()
-                            Button(String(localized: "Восстановить")) { model.restore(backup, app: app) }
+                            Button(String(localized: "Восстановить")) { model.askToRestore(backup, app: app) }
                                 .buttonStyle(.chromaNormal)
                                 .disabled(model.isBusy || backup.isIncomplete)
                             // Спрашивает, а не удаляет: копия уходит навсегда,
@@ -586,6 +586,26 @@ struct EnvironmentStatusView: View {
             Button(String(localized: "Отмена"), role: .cancel) { model.pendingBackupDeletion = nil }
         } message: { backup in
             Text(String(localized: "\(backup.name) — \(backup.createdAt.formatted(date: .abbreviated, time: .shortened)), \(backup.sizeText). Копия удаляется с диска навсегда; восстановить базу из неё будет нельзя."))
+        }
+        // Отдельным видом, а не вторым модификатором рядом: два диалога
+        // на одном виде SwiftUI показывает не всегда.
+        .background {
+            Color.clear.confirmationDialog(
+                String(localized: "Восстановить базу из копии?"),
+                isPresented: Binding(
+                    get: { model.pendingRestore != nil },
+                    set: { if !$0 { model.pendingRestore = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: model.pendingRestore
+            ) { backup in
+                Button(String(localized: "Восстановить"), role: .destructive) {
+                    model.restore(backup, app: app)
+                }
+                Button(String(localized: "Отмена"), role: .cancel) { model.pendingRestore = nil }
+            } message: { backup in
+                Text(String(localized: "\(backup.name) — \(backup.createdAt.formatted(date: .abbreviated, time: .shortened)). Текущая база будет заменена содержимым копии; сама она отложится в папку копий."))
+            }
         }
     }
 
@@ -691,7 +711,9 @@ struct EnvironmentStatusView: View {
                         model.wipeAllData(app)
                     }
                         .buttonStyle(.chromaDanger)
-                    .disabled(model.wipeConfirmation != "УДАЛИТЬ" || model.isBusy)
+                    .disabled(!CollectionsViewModel.confirms(
+                        model.wipeConfirmation, word: String(localized: "УДАЛИТЬ"), russian: "УДАЛИТЬ"
+                    ) || model.isBusy)
                     Spacer()
                 }
             }

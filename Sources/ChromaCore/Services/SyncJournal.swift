@@ -20,6 +20,14 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
 
     public var relativePath: String
     public var collectionName: String
+    /// Коллекция, где файл лежал до этого прогона, — только когда она другая.
+    ///
+    /// Прежние чанки переехавшего файла лежат **там**, а не в `collectionName`,
+    /// и снять их после сбоя можно, только зная, где искать. Без этой записи
+    /// прогон, прерванный между записью в новую коллекцию и уборкой в старой,
+    /// доигрывался в манифест с новым именем — и про старые чанки не узнавал
+    /// больше никто.
+    public var previousCollectionName: String?
     /// Chunk ids the manifest remembered before this run.
     public var oldIDs: [String]
     /// Chunk ids this run is writing. Deterministic, so they are known before
@@ -51,6 +59,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
     public init(
         relativePath: String,
         collectionName: String,
+        previousCollectionName: String? = nil,
         oldIDs: [String],
         newIDs: [String],
         state: State = .started,
@@ -69,6 +78,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
     ) {
         self.relativePath = relativePath
         self.collectionName = collectionName
+        self.previousCollectionName = previousCollectionName
         self.oldIDs = oldIDs
         self.newIDs = newIDs
         self.state = state
@@ -96,6 +106,7 @@ public struct SyncJournalEntry: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         relativePath = try container.decode(String.self, forKey: .relativePath)
         collectionName = try container.decode(String.self, forKey: .collectionName)
+        previousCollectionName = try container.decodeIfPresent(String.self, forKey: .previousCollectionName)
         oldIDs = try container.decodeIfPresent([String].self, forKey: .oldIDs) ?? []
         newIDs = try container.decodeIfPresent([String].self, forKey: .newIDs) ?? []
         state = try container.decode(State.self, forKey: .state)
@@ -270,13 +281,15 @@ public final class SyncJournal {
     /// Last state per file, with finished files dropped. A truncated last line
     /// (a crash mid-write) is skipped rather than failing the whole read.
     private func foldEntries(sourceID: UUID) -> [SyncJournalEntry] {
-        guard let text = try? String(contentsOf: fileURL(for: sourceID), encoding: .utf8) else { return [] }
+        // Построчно и побайтно (`JSONLines`): оборванная дозаписью последняя
+        // строка стоит только себя, а не всего журнала.
+        let lines = JSONLines.read(at: fileURL(for: sourceID))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
 
         var latest: [String: SyncJournalEntry] = [:]
         var order: [String] = []
-        for line in text.split(separator: "\n") {
+        for line in lines {
             guard let entry = try? decoder.decode(SyncJournalEntry.self, from: Data(line.utf8)) else { continue }
             if latest[entry.relativePath] == nil { order.append(entry.relativePath) }
             latest[entry.relativePath] = entry

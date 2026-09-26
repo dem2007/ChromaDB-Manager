@@ -34,8 +34,19 @@ public struct EPUBExtractor: DocumentTextExtractor {
 
         // Before anything is read: a protected book is not a broken one, and
         // the app does not go around the protection.
-        if reader.contains("META-INF/encryption.xml") || reader.contains("META-INF/rights.xml") {
+        //
+        // `encryption.xml` сам по себе ещё не защита: книги без DRM носят его
+        // ради одного — объявить обфускацию встроенных шрифтов. Такая книга
+        // читается целиком, и уводить её в «требуют решения» как защищённую
+        // значило бы потерять её без причины.
+        if reader.contains("META-INF/rights.xml") {
             throw ExtractionError.drmProtected
+        }
+        if reader.contains("META-INF/encryption.xml") {
+            let declaration = (try? reader.read("META-INF/encryption.xml")) ?? Data()
+            if Self.declaresProtection(String(decoding: declaration, as: UTF8.self)) {
+                throw ExtractionError.drmProtected
+            }
         }
 
         let packagePath = try Self.packagePath(in: reader)
@@ -117,6 +128,28 @@ public struct EPUBExtractor: DocumentTextExtractor {
     struct SpineItem {
         var id: String
         var path: String
+    }
+
+    /// Алгоритмы, которые шифрованием текста не являются: обфускация
+    /// шрифтов по IDPF и по Adobe.
+    static let fontObfuscation: Set<String> = [
+        "http://www.idpf.org/2008/embedding",
+        "http://ns.adobe.com/pdf/enc#RC",
+    ]
+
+    /// Защищает ли `encryption.xml` что-то кроме шрифтов.
+    ///
+    /// Не названо ни одного алгоритма — считаем защитой: разобрать, что
+    /// именно закрыто, нечем, а прочитать закрытое мы всё равно не сможем.
+    static func declaresProtection(_ xml: String) -> Bool {
+        let pattern = #"Algorithm\s*=\s*["']([^"']+)["']"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return true }
+        let range = NSRange(xml.startIndex..., in: xml)
+        let algorithms = regex.matches(in: xml, range: range).compactMap { match in
+            Range(match.range(at: 1), in: xml).map { String(xml[$0]) }
+        }
+        guard !algorithms.isEmpty else { return true }
+        return algorithms.contains { !fontObfuscation.contains($0) }
     }
 
     static func packagePath(in reader: ZIPContainerReader) throws -> String {

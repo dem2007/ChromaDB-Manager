@@ -237,10 +237,15 @@ public struct TableRowDocument: Hashable, Sendable {
 public struct SheetCoverage: Sendable, Hashable {
     public var indexed: Int
     public var total: Int
+    /// Листы, пропущенные **намеренно**: пустые и скрытые. В `total`
+    /// они не входят — в них нечего было индексировать, и книга с одним
+    /// листом данных и пустым «Лист2» не неполная.
+    public var skipped: Set<String>
 
-    public init(indexed: Int, total: Int) {
+    public init(indexed: Int, total: Int, skipped: Set<String> = []) {
         self.indexed = indexed
         self.total = total
+        self.skipped = skipped
     }
 
     /// Книга в базе не целиком. Только в этом случае поля и пишутся: у книги,
@@ -456,10 +461,12 @@ public enum RowMapper {
         mapping: TableMapping,
         layout: SheetLayout,
         sourceFile: String,
+        sourceID: UUID?,
         rowKey: String?
     ) -> ChromaMetadata {
         metadataAndTruncations(
-            for: row, mapping: mapping, layout: layout, sourceFile: sourceFile, rowKey: rowKey
+            for: row, mapping: mapping, layout: layout,
+            sourceFile: sourceFile, sourceID: sourceID, rowKey: rowKey
         ).metadata
     }
 
@@ -468,6 +475,9 @@ public enum RowMapper {
         mapping: TableMapping,
         layout: SheetLayout,
         sourceFile: String,
+        /// Отпечаток строки таблицы считается от пары «источник + путь»
+        /// (П6.16) — тем же правилом, что у обычных документов.
+        sourceID: UUID?,
         rowKey: String?,
         coverage: SheetCoverage? = nil
     ) -> (metadata: ChromaMetadata, truncated: [String]) {
@@ -476,7 +486,7 @@ public enum RowMapper {
             // Тот же отпечаток файла, что и у обычных документов:
             // строка таблицы — тоже часть файла, и просить её целиком агент
             // должен тем же способом.
-            "file_id": .string(SourceSyncService.fileFingerprint(sourceFile)),
+            "file_id": .string(SourceSyncService.fileFingerprint(sourceFile, sourceID: sourceID)),
             "sheet_name": .string(mapping.sheetName),
             "row_number": .int(row.number),
             "table_mode": .string(mapping.mode.rawValue),
@@ -613,7 +623,7 @@ public enum RowMapper {
         )
         let fields = metadataAndTruncations(
             for: row, mapping: mapping, layout: layout,
-            sourceFile: sourceFile, rowKey: rowKey, coverage: coverage
+            sourceFile: sourceFile, sourceID: sourceID, rowKey: rowKey, coverage: coverage
         )
         return TableRowDocument(
             id: id,

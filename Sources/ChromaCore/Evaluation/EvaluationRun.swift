@@ -54,12 +54,18 @@ public struct EvaluationVariant: Codable, Hashable, Sendable, Identifiable {
         self.note = note
     }
 
-    /// Whether this variant needs the query as a vector at all.
+    /// Нужен ли вектор **этому запросу** — тем же правилом, что у поиска.
     ///
-    /// «Только текстовый поиск» needs none, and a run of such variants must not
-    /// call the model once — nor be charged for it in the estimate.
-    public var needsVector: Bool {
-        profile.vectorSearchEnabled || !profile.textSearchEnabled
+    /// «Только текстовый поиск» его не требует, и прогон таких вариантов
+    /// не должен звать модель ни разу — ни в деле, ни в оценке стоимости.
+    ///
+    /// Порог по длине (`textSearchMaxWords`) выключает текстовую стадию
+    /// на длинных запросах, и поиск тогда ищет вектором даже у варианта
+    /// «только текст». Спрашивая только профиль, стенд не давал такому
+    /// запросу вектора, база отвергала пустой, и ячейка записывалась
+    /// сбоем — там, где живой поиск ответил бы.
+    public func needsVector(for query: String) -> Bool {
+        profile.vectorSearchEnabled || !profile.textSearchApplies(to: query)
     }
 
     public var line: String {
@@ -297,8 +303,8 @@ public struct EvaluationCost: Hashable, Sendable {
     ) -> EvaluationCost {
         var callsPerModel: [String: Int] = [:]
         var naive = 0
-        for variant in variants where variant.needsVector {
-            naive += queries.count
+        for variant in variants {
+            naive += queries.filter { variant.needsVector(for: $0.text) }.count
         }
         // Ключ запаса — «модель плюс текст, уходящий в модель», ровно тот же,
         // что у раннера. Приставка живёт в профиле, и два варианта
@@ -313,8 +319,8 @@ public struct EvaluationCost: Hashable, Sendable {
             let text: String
         }
         var keys = Set<VectorKey>()
-        for variant in variants where variant.needsVector {
-            for query in queries {
+        for variant in variants {
+            for query in queries where variant.needsVector(for: query.text) {
                 keys.insert(VectorKey(
                     model: variant.model,
                     text: variant.profile.embeddedQuery(query.text)

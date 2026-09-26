@@ -60,7 +60,13 @@ public enum GitRenames {
                         break
                     }
                     let index = chunkIndex(of: record)
-                    let id = SourceSyncService.documentID(relativePath: rename.to, chunkIndex: index)
+                    // Источник берётся из самой записи: отпечаток считается
+                    // от пары «источник + путь» (П6.16), и переезд на новое
+                    // имя обязан остаться в пределах своего источника.
+                    let recordSource = SourceSyncService.recordedSourceID(record.metadata)
+                    let id = SourceSyncService.documentID(
+                        relativePath: rename.to, chunkIndex: index, sourceID: recordSource
+                    )
                     var metadata = record.metadata ?? [:]
                     // Метаданные, в которых записан путь, обязаны переехать
                     // вместе с чанком: иначе фильтр по `source_file` будет
@@ -69,10 +75,30 @@ public enum GitRenames {
                     if metadata["git_relative_path"] != nil {
                         metadata["git_relative_path"] = .string(rename.to)
                     }
+                    // Отпечаток файла тоже считается от пути: без пересчёта
+                    // переехавший чанк отдавал агенту отпечаток старого имени,
+                    // `get_file` по новому не находил ничего, а уборка путей
+                    // объявляла каждый переименованный файл испорченным.
+                    // Имя и расширение — тем же правилом, что при записи:
+                    // по ним ищут похожие пути и фильтруют по типу.
+                    let renamed = URL(fileURLWithPath: rename.to)
+                    if metadata["file_name"] != nil {
+                        metadata["file_name"] = .string(FileNameEncoding.repaired(renamed.lastPathComponent))
+                    }
+                    if metadata["file_ext"] != nil {
+                        metadata["file_ext"] = .string(renamed.pathExtension.lowercased())
+                    }
+                    if metadata["file_id"] != nil {
+                        metadata["file_id"] = .string(
+                            SourceSyncService.fileFingerprint(rename.to, sourceID: recordSource)
+                        )
+                    }
                     if let parent = metadata["parent_chunk_id"], case .string(let value) = parent,
                        let parentIndex = Int(value.split(separator: "-").last.map(String.init) ?? "") {
                         metadata["parent_chunk_id"] = .string(
-                            SourceSyncService.documentID(relativePath: rename.to, chunkIndex: parentIndex)
+                            SourceSyncService.documentID(
+                                relativePath: rename.to, chunkIndex: parentIndex, sourceID: recordSource
+                            )
                         )
                     }
                     moved.append(EmbeddedRecord(

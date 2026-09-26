@@ -27,18 +27,19 @@ final class FilePathFormSyncTests: XCTestCase {
     func testTheDocumentIDDoesNotDependOnTheForm() {
         let path = "Отчёты/Первый/Договор.pdf"
         XCTAssertEqual(
-            SourceSyncService.documentID(relativePath: path, chunkIndex: 3),
+            SourceSyncService.documentID(relativePath: path, chunkIndex: 3, sourceID: nil),
             SourceSyncService.documentID(
-                relativePath: path.decomposedStringWithCanonicalMapping, chunkIndex: 3
+                relativePath: path.decomposedStringWithCanonicalMapping, chunkIndex: 3,
+                sourceID: nil
             )
         )
-        let fingerprint = SourceSyncService.fileFingerprint(path)
+        let fingerprint = SourceSyncService.fileFingerprint(path, sourceID: nil)
         XCTAssertEqual(fingerprint.count, 16)
         XCTAssertTrue(
             fingerprint.allSatisfy { $0.isHexDigit && !$0.isUppercase },
             "отпечаток должен быть таким, чтобы его нельзя было перепечатать иначе: \(fingerprint)"
         )
-        XCTAssertTrue(SourceSyncService.documentID(relativePath: path, chunkIndex: 3).hasPrefix(fingerprint))
+        XCTAssertTrue(SourceSyncService.documentID(relativePath: path, chunkIndex: 3, sourceID: nil).hasPrefix(fingerprint))
     }
 
     /// Манифест прежних сборок читается в единой форме — вместе с записями

@@ -66,6 +66,11 @@ struct CollectionsView: View {
         // Просьба извне могла прийти после того, как список уже загрузился
         //: из строки меню, из «Служб», из интента.
         .onChange(of: model.pendingSelectionName) { _, _ in model.applyPendingRequest(app) }
+        .onChange(of: model.pendingSearchTab, initial: true) { _, wanted in
+            guard wanted else { return }
+            tab = .search
+            model.pendingSearchTab = false
+        }
         .onChange(of: model.pendingImportText) { _, _ in model.applyPendingRequest(app) }
         .onChange(of: model.documentIDToReveal) { _, identifier in
             // «Показать существующий» opens that row rather than leaving the
@@ -508,7 +513,7 @@ struct CollectionsView: View {
                             // показывает (K1 → A9).
                             applyFacetFilter: { field, value in
                                 model.filter = DocumentFilter(conditions: [
-                                    MetadataCondition(field: field, op: .equals, value: value.displayString)
+                                    MetadataCondition(field: field, equals: value)
                                 ])
                                 tab = .documents
                                 Task { await model.applyFilter(app) }
@@ -688,7 +693,9 @@ struct CollectionsView: View {
                     } label: {
                         Label(String(localized: "Импорт пакета .chromaexport…"), systemImage: "shippingbox.and.arrow.backward")
                     }
-                    .help(String(localized: "Что не так в коллекции и что в ней вообще есть. Ничего не меняет."))
+                    // Подсказка была от инспектора и обещала «ничего не
+                    // меняет» у действия, которое пишет в базу.
+                    .help(String(localized: "Загрузить пакет .chromaexport в новую коллекцию или в эту. Пишет в базу."))
 
                     Divider()
 
@@ -1097,7 +1104,11 @@ struct CollectionsView: View {
                 // Тоже лениво: у результата с метаданными и контекстом
                 // соседей строк не меньше, чем у документа в списке.
                 LazyVStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(model.hits.enumerated()), id: \.element.id) { index, hit in
+                // Ключ — коллекция **и** идентификатор: поиск по нескольким
+                // коллекциям нарочно держит одинаковые идентификаторы из
+                // разных коллекций отдельными результатами, а `ForEach`
+                // с повтором ключа показывал одну карточку за обе.
+                ForEach(Array(model.hits.enumerated()), id: \.element.listKey) { index, hit in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("#\(index + 1)").font(Theme.Font.caption).bold()
@@ -1164,7 +1175,8 @@ struct CollectionsView: View {
                         // результата, с которого его позвали: строки этого
                         // документа в списке слева может не быть вовсе —
                         // он с другой страницы или вовсе из другой коллекции.
-                        if marksEditorID == hit.id, marksEditorFromHit {
+                        if marksEditorID == hit.id, marksEditorFromHit,
+                           marksEditorCollection == hit.collectionName {
                             marksEditor(
                                 for: DocumentRecord(
                                     id: hit.id, document: hit.document, metadata: hit.metadata
@@ -2083,7 +2095,7 @@ struct CollectionsView: View {
             // the queue is the only place progress lives. Читает её
             // отдельная маленькая вьюха — тело этого экрана не должно
             // перестраиваться от каждого сообщения о прогрессе.
-            QueueProgressRow(titlePrefix: "Импорт в")
+            QueueProgressRow(titlePrefix: QueueMirror.TitlePrefix.import)
             if model.importSkippedInvalid > 0 {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(String(localized: "Пропущено по схеме: \(model.importSkippedInvalid) строк"))
@@ -2445,7 +2457,7 @@ struct CollectionsView: View {
 
             Text(String(localized: "Введите СБРОС для подтверждения:"))
                 .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            TextField("СБРОС", text: $model.resetConfirmationText)
+            TextField(String(localized: "СБРОС"), text: $model.resetConfirmationText)
                 .textFieldStyle(.roundedBorder)
         } actions: {
             Button(String(localized: "Отмена")) { model.showResetSheet = false }
@@ -2454,7 +2466,15 @@ struct CollectionsView: View {
                 Task { await model.resetDatabase(app) }
             }
             .buttonStyle(.chromaDanger)
-            .disabled(model.resetConfirmationText != "СБРОС")
+            .disabled(!CollectionsViewModel.confirms(
+                model.resetConfirmationText, word: String(localized: "СБРОС"), russian: "СБРОС"
+            ))
         }
     }
+}
+
+private extension RetrievalHit {
+    /// Ключ строки выдачи: одинаковый идентификатор в двух коллекциях —
+    /// два разных результата.
+    var listKey: String { "\(collectionName ?? "")\u{0}\(id)" }
 }

@@ -45,6 +45,8 @@ final class DocumentViewerViewModel: ObservableObject {
         case table(window: TableRowLoader.Window, url: URL)
         /// Формат, который внутри не показывается, — только системе.
         case externalOnly(url: URL)
+        /// Страница сайта: файла нет, есть адрес.
+        case webPage(url: URL)
     }
 
     /// Файл открытого документа, если он есть, — для «Открыть во внешнем
@@ -88,6 +90,10 @@ final class DocumentViewerViewModel: ObservableObject {
             metadata: request.metadata,
             sources: app.settings.configuration.dataSources
         )
+        if case .webPage(let url) = resolution {
+            state = .webPage(url: url)
+            return
+        }
         guard case .found(let url, let kind, let target) = resolution else {
             let reference = DocumentLocator.reference(metadata: request.metadata)
             state = .problem(
@@ -107,7 +113,7 @@ final class DocumentViewerViewModel: ObservableObject {
         case .epub:
             openEPUB(at: url, chunk: request.chunk, target: target)
         case .table:
-            openTable(at: url, target: target)
+            openTable(at: url, target: target, headerRow: tableHeaderRow(for: request.metadata, target: target, app: app))
         case .externalOnly:
             // Keynote и Pages внутри не показываются: ТЗ разрешает слайд по
             // сохранённому экспорту в PDF, а приложение его не хранит.
@@ -119,40 +125,75 @@ final class DocumentViewerViewModel: ObservableObject {
         // Крупные PDF не читаются в память целиком: `PDFDocument(url:)`
         // работает постранично, и это единственная причина открывать его
         // именно так.
-        guard let document = PDFDocument(url: url) else {
-            state = .problem(
-                String(localized: "Файл «\(url.lastPathComponent)» не открылся как PDF. Возможно, он повреждён или защищён паролем."),
-                reference: nil
-            )
-            return
-        }
         let page: Int? = if case .page(let number) = target { number } else { nil }
-        guard let location = PDFFragmentFinder.locate(
-            chunk: chunk, in: document, startingAt: page
-        ) else {
-            state = .problem(String(localized: "В документе нет ни одной страницы."), reference: nil)
-            return
+        offMain({ () -> (PDFDocument, PDFFragmentFinder.Location?)? in
+            guard let document = PDFDocument(url: url) else { return nil }
+            return (document, PDFFragmentFinder.locate(chunk: chunk, in: document, startingAt: page))
+        }) { [weak self] result in
+            guard let self else { return }
+            guard case .success(let found?) = result else {
+                self.state = .problem(
+                    String(localized: "Файл «\(url.lastPathComponent)» не открылся как PDF. Возможно, он повреждён или защищён паролем."),
+                    reference: nil
+                )
+                return
+            }
+            guard let location = found.1 else {
+                self.state = .problem(String(localized: "В документе нет ни одной страницы."), reference: nil)
+                return
+            }
+            self.state = .pdf(document: found.0, location: location, url: url)
         }
-        state = .pdf(document: document, location: location, url: url)
+    }
+
+    /// Результат разбора, перевозимый на главный поток. Документ после
+    /// разбора никто, кроме главного потока, не трогает.
+    private struct Carried<Value>: @unchecked Sendable { let value: Value }
+
+    /// Разбор файла — вне главного потока.
+    ///
+    /// Большой текстовый файл или PDF на сотни страниц разбирались прямо
+    /// на главном потоке, и интерфейс замирал на время разбора. Ответ
+    /// принимается, только если человек за это время не открыл другой
+    /// документ.
+    private func offMain<Value>(
+        _ work: @escaping @Sendable () throws -> Value,
+        then apply: @escaping @MainActor (Result<Value, Error>) -> Void
+    ) {
+        let requestID = request?.id
+        let deliver = Carried(value: apply)
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { Carried(value: try work()) }
+            }.value
+            guard let self, self.request?.id == requestID else { return }
+            deliver.value(result.map(\.value))
+        }
     }
 
     private func openPlainText(at url: URL, chunk: String) {
-        do {
+        offMain({ () -> (String, TextFragmentPlacement?) in
             let text = try TextDocumentLoader.plainText(at: url)
-            state = .plainText(
-                text: NSAttributedString(string: text, attributes: [
-                    // моноширинный шрифт и нумерация строк обязательны.
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                    .foregroundColor: NSColor.textColor,
-                ]),
-                placement: TextFragmentPlacement.locate(chunk: chunk, in: text),
-                url: url
-            )
-        } catch {
-            // Файл найден и цел — просто показать внутри не выходит.
-            // «Открыть во внешнем» при этом обязано остаться доступным,
-            // поэтому это не `.problem`, а состояние с файлом.
-            failedToShow(url: url, reason: error.localizedDescription)
+            return (text, TextFragmentPlacement.locate(chunk: chunk, in: text))
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let (text, placement)):
+                self.state = .plainText(
+                    text: NSAttributedString(string: text, attributes: [
+                        // моноширинный шрифт и нумерация строк обязательны.
+                        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                        .foregroundColor: NSColor.textColor,
+                    ]),
+                    placement: placement,
+                    url: url
+                )
+            case .failure(let error):
+                // Файл найден и цел — просто показать внутри не выходит.
+                // «Открыть во внешнем» при этом обязано остаться доступным,
+                // поэтому это не `.problem`, а состояние с файлом.
+                self.failedToShow(url: url, reason: error.localizedDescription)
+            }
         }
     }
 
@@ -190,20 +231,37 @@ final class DocumentViewerViewModel: ObservableObject {
         }
     }
 
-    private func openTable(at url: URL, target: ViewerTarget) {
+    /// Строка заголовков, с которой лист индексировался, — из манифеста
+    /// таблиц источника. Без неё просмотрщик взял бы первую непустую строку,
+    /// а у отчёта с названием над таблицей это название.
+    private func tableHeaderRow(for metadata: ChromaMetadata?, target: ViewerTarget, app: AppEnvironment) -> Int? {
+        guard case .tableRow(let sheet?, _) = target,
+              case .string(let sourceText)? = metadata?["source_id"],
+              let sourceID = UUID(uuidString: sourceText),
+              case .string(let file)? = metadata?["source_file"] else { return nil }
+        let files = app.tableManifests.load(sourceID: sourceID)
+        for variant in FilePathKey.variants(file) {
+            if let manifest = files[variant]?.sheets[sheet] { return manifest.viewerHeaderRow }
+        }
+        return nil
+    }
+
+    private func openTable(at url: URL, target: ViewerTarget, headerRow: Int?) {
         var sheet: String?
         var row: Int?
         if case .tableRow(let name, let number) = target {
             sheet = name
             row = number
         }
-        do {
-            state = .table(
-                window: try TableRowLoader.window(at: url, sheetName: sheet, row: row),
-                url: url
-            )
-        } catch {
-            failedToShow(url: url, reason: error.localizedDescription)
+        let (sheetName, rowNumber) = (sheet, row)
+        offMain({
+            try TableRowLoader.window(at: url, sheetName: sheetName, row: rowNumber, headerRow: headerRow)
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let window): self.state = .table(window: window, url: url)
+            case .failure(let error): self.failedToShow(url: url, reason: error.localizedDescription)
+            }
         }
     }
 

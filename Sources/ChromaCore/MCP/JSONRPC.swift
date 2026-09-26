@@ -73,6 +73,44 @@ public struct JSONRPCError: Codable, Hashable, Sendable, Error {
     }
 }
 
+/// Ответ на запрос — с той стороны, где его надо **узнать**, а не построить.
+///
+/// Мост считает, на сколько запросов он ещё ждёт ответа, и разбирал ответы
+/// как `JSONRPCIncoming`. У того `method` обязателен, а у ответа его нет
+/// вовсе — разбор проваливался всегда, и ожидание не закрывалось ни разу.
+/// Отсюда шли обе беды: выход ждал полные две секунды на каждом сеансе,
+/// а на закрытии приложения агент получал по второму — ошибочному — ответу
+/// на каждый уже отвеченный запрос.
+public struct JSONRPCReply: Decodable, Sendable {
+    public let id: JSONRPCID?
+    /// У ответа его нет. Запрос **от** сервера к клиенту тоже несёт `id`,
+    /// но несёт и метод — и ничьего ожидания не закрывает.
+    public let method: String?
+    /// Поле **присутствует** — не то же, что «не пусто»: `"result": null`
+    /// это законный ответ, и закрывать ожидание он обязан.
+    public let hasResult: Bool
+    public let hasError: Bool
+
+    private enum CodingKeys: String, CodingKey { case id, method, result, error }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(JSONRPCID.self, forKey: .id)
+        method = try container.decodeIfPresent(String.self, forKey: .method)
+        hasResult = container.contains(.result)
+        hasError = container.contains(.error)
+    }
+
+    /// Чьё ожидание закрывает это сообщение. `nil` — не ответ.
+    public static func answeredID(in data: Data) -> JSONRPCID? {
+        guard let reply = try? JSONDecoder().decode(JSONRPCReply.self, from: data),
+              let id = reply.id, reply.method == nil,
+              reply.hasResult || reply.hasError
+        else { return nil }
+        return id
+    }
+}
+
 /// Входящее сообщение: запрос или уведомление.
 ///
 /// Сервер по спецификации не получает ответов — клиент их не шлёт вовсе, —

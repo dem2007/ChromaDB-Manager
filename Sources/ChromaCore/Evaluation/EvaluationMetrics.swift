@@ -447,20 +447,23 @@ public enum EvaluationMetrics {
         results: [EvaluationResult], truth: [UUID: EvaluationQuery],
         grades: GradeIndex? = nil, k: Int
     ) -> MetricScore {
-        // Индекс необязателен: формулу можно посчитать и в одиночку — так её
-        // проверяют тесты. Полный расчёт передаёт общий индекс, и тогда
-        // приведение текстов не повторяется на каждой метрике.
-        let grades = grades ?? GradeIndex(results: results, truth: truth)
+        // Оценки индекса полноте не нужны: она считается по идентификаторам
+        // эталона. Параметр оставлен, чтобы все метрики звались одинаково.
         var applicable = 0
         var total = 0.0
         for result in results {
             guard let query = truth[result.queryID],
                   let known = query.knownRelevantCount, known > 0 else { continue }
             applicable += 1
-            let found = result.hits.prefix(k).filter {
-                grades.grade(query: result.queryID, variant: result.variantID, document: $0.id)?.isHit == true
-            }.count
-            total += min(1, Double(found) / Double(known))
+            // Числитель — из того же множества, что знаменатель: **разные**
+            // документы из списка эталона, оказавшиеся в первых k. Прежде
+            // считался любой результат с оценкой «попал», включая совпавший
+            // по фрагменту документ вне списка и повтор одного и того же
+            // идентификатора, — и полнота выходила единицей там, где один
+            // из известных документов так и не нашёлся.
+            let relevant = Set(query.documents.filter { $0.grade.isHit }.map(\.id))
+            let found = Set(result.hits.prefix(k).map(\.id)).intersection(relevant).count
+            total += min(1, Double(found) / Double(max(1, min(known, relevant.count))))
         }
         guard applicable > 0 else {
             return .inapplicable(String(localized: "полнота считается только по эталону из идентификаторов — список фрагментов не полон"))

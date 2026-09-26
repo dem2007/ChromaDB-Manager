@@ -167,6 +167,19 @@ public enum RoutingOutcome: Hashable {
 public struct CollectionRouter {
     public init() {}
 
+    /// Скомпилированные правила. Маршрутизатор проходит тысячи путей одного
+    /// источника с одним и тем же правилом, и компилировать его заново
+    /// на каждом — пустая работа. `NSCache` и `NSRegularExpression`
+    /// потокобезопасны.
+    private static let expressions = NSCache<NSString, NSRegularExpression>()
+
+    private static func compiled(_ pattern: String) -> NSRegularExpression? {
+        if let known = expressions.object(forKey: pattern as NSString) { return known }
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        expressions.setObject(regex, forKey: pattern as NSString)
+        return regex
+    }
+
     public func route(relativePath: String, source: DataSource) -> RoutingOutcome {
         let path = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let base = CollectionNaming.sanitize(source.collectionName)
@@ -244,7 +257,7 @@ public struct CollectionRouter {
         guard !pattern.isEmpty else {
             return .unroutable(reason: String(localized: "правило не задано"))
         }
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        guard let regex = Self.compiled(pattern) else {
             return .unroutable(reason: String(localized: "регулярное выражение не компилируется"))
         }
 

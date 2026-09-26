@@ -210,8 +210,10 @@ public struct XLSReader {
         func numeric(_ value: Double, style: Int) -> CellValue {
             if styles.dateStyles.contains(style) {
                 guard let date = XLSXReader.date(fromSerial: value, epoch: epoch, uses1904: uses1904Dates) else {
+                    // Числом, как у .xlsx и как обещает предупреждение
+                    // `phantomLeapDay`: пустая ячейка теряла значение молча.
                     phantomDays += 1
-                    return .empty
+                    return .number(value)
                 }
                 return .date(date)
             }

@@ -123,9 +123,12 @@ final class QuickSearchPanelController {
         // Панель показывается поверх чужих окон, но приложение при этом не
         // выходит на передний план целиком: человек вызвал поиск, а не
         // переключение задач.
+        //
+        // Без `NSApp.activate`: он и выводил вперёд всё приложение с главным
+        // окном, вопреки сказанному выше. Неактивирующая панель становится
+        // ключевой и принимает ввод сама, пока активным остаётся чужое окно.
         panel.center()
         panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func makePanel() -> NSPanel {

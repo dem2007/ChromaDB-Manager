@@ -1320,10 +1320,10 @@ struct SourceEditorSheet: View {
                     isOn: git.includesCommitInfo
                 )
 
-                TextField(String(localized: "Исключения масками через запятую (*.lock, vendor/*)"), text: Binding(
-                    get: { git.wrappedValue.excludedGlobs.joined(separator: ", ") },
-                    set: { git.wrappedValue.excludedGlobs = $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
-                ))
+                CommaListField(
+                    String(localized: "Исключения масками через запятую (*.lock, vendor/*)"),
+                    items: git.excludedGlobs
+                )
                 .textFieldStyle(.roundedBorder)
             }
         }
@@ -1387,10 +1387,12 @@ struct SourceEditorSheet: View {
                         Toggle(String(localized: "Использовать карту сайта (sitemap.xml)"), isOn: web.usesSitemap)
                             .font(Theme.Font.control)
 
-                        TextField(String(localized: "Другие разрешённые домены через запятую"), text: Binding(
-                            get: { web.wrappedValue.extraHosts.joined(separator: ", ") },
-                            set: { web.wrappedValue.extraHosts = $0.split(separator: ",").map { String($0) } }
-                        ))
+                        // Домены теперь и обрезаются: « b.ru» с пробелом
+                        // не совпадал ни с одним адресом.
+                        CommaListField(
+                            String(localized: "Другие разрешённые домены через запятую"),
+                            items: web.extraHosts
+                        )
                         .textFieldStyle(.roundedBorder)
                     }
 
@@ -1456,15 +1458,11 @@ struct SourceEditorSheet: View {
                     .lineLimit(2).truncationMode(.middle)
 
                 HStack(spacing: 10) {
-                    TextField(String(localized: "Расширения через запятую"), text: Binding(
-                        get: { draft.wrappedValue.fileExtensions.joined(separator: ", ") },
-                        set: { text in
-                            draft.wrappedValue.fileExtensions = text
-                                .split(separator: ",")
-                                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " .")) }
-                                .filter { !$0.isEmpty }
-                        }
-                    ))
+                    CommaListField(
+                        String(localized: "Расширения через запятую"),
+                        items: draft.fileExtensions,
+                        clean: { $0.trimmingCharacters(in: CharacterSet(charactersIn: " .")) }
+                    )
                     .textFieldStyle(.roundedBorder)
                     // Сузить список — одно движение, а собрать его обратно по
                     // памяти нельзя: пусть возврат к полному стоит одно нажатие.
@@ -2045,13 +2043,19 @@ struct SourceEditorSheet: View {
                 }
             }
         } catch {
+            guard (draft.wrappedValue.embeddingModel ?? "") == model else { return }
             limitProbeFailed = true
             chunkingNotice = String(localized: "Замер не удался: модель не ответила. Прежнее измеренное значение сохранено.")
             return
         }
-        limitProbeFailed = false
-        limitMeasured = true
-        inputLimit = outcome
+        // Пока шёл замер, модель в форме могли сменить: число прежней модели
+        // на экране новой — чужой предел и неверное предупреждение о размере
+        // чанка. Запоминается оно всё равно — за той моделью, что мерили.
+        if (draft.wrappedValue.embeddingModel ?? "") == model {
+            limitProbeFailed = false
+            limitMeasured = true
+            inputLimit = outcome
+        }
         if let measured = outcome {
             // Контекст загрузки пишется вместе с числом: без него
             // ядро сверяет `nil` с настоящим контекстом, признаёт запись
@@ -2174,15 +2178,11 @@ struct SourceEditorSheet: View {
                     .frame(width: 300)
             }
             if format == .html {
-                TextField("Теги через запятую", text: Binding(
-                    get: { draft.wrappedValue.chunking.splitTags.joined(separator: ", ") },
-                    set: { text in
-                        draft.wrappedValue.chunking.splitTags = text
-                            .split(separator: ",")
-                            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " <>/")) }
-                            .filter { !$0.isEmpty }
-                    }
-                ))
+                CommaListField(
+                    "Теги через запятую",
+                    items: draft.chunking.splitTags,
+                    clean: { $0.trimmingCharacters(in: CharacterSet(charactersIn: " <>/")) }
+                )
                 .textFieldStyle(.roundedBorder)
             }
             if format == .code {
@@ -2488,14 +2488,11 @@ struct SourceEditorSheet: View {
     private func optionalField(_ title: String, value: Binding<Double?>, placeholder: String) -> some View {
         HStack {
             Text(title).font(Theme.Font.mono).frame(width: 130, alignment: .leading)
-            TextField(placeholder, text: Binding(
-                get: { value.wrappedValue.map { String(format: "%g", $0) } ?? "" },
-                set: { text in
-                    let trimmed = text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
-                    value.wrappedValue = trimmed.isEmpty ? nil : Double(trimmed)
-                }
-            ))
-            .textFieldStyle(.roundedBorder)
+            OptionalNumberField(
+                placeholder: placeholder, value: value,
+                parse: { Double($0.replacingOccurrences(of: ",", with: ".").replacingOccurrences(of: "−", with: "-")) },
+                format: { String(format: "%g", $0) }
+            )
             .frame(width: 110)
         }
     }
@@ -2503,14 +2500,10 @@ struct SourceEditorSheet: View {
     private func optionalIntField(_ title: String, value: Binding<Int?>, placeholder: String) -> some View {
         HStack {
             Text(title).font(Theme.Font.mono).frame(width: 130, alignment: .leading)
-            TextField(placeholder, text: Binding(
-                get: { value.wrappedValue.map(String.init) ?? "" },
-                set: { text in
-                    let trimmed = text.trimmingCharacters(in: .whitespaces)
-                    value.wrappedValue = trimmed.isEmpty ? nil : Int(trimmed)
-                }
-            ))
-            .textFieldStyle(.roundedBorder)
+            OptionalNumberField(
+                placeholder: placeholder, value: value,
+                parse: { Int($0) }, format: { String($0) }
+            )
             .frame(width: 110)
         }
     }
@@ -2722,7 +2715,7 @@ private struct SyncProgressRows: View {
     let label: (QueuedTaskInfo) -> String
 
     var body: some View {
-        ForEach(queueMirror.tasks(titledWith: "Синхронизация")) { task in
+        ForEach(queueMirror.tasks(titledWith: QueueMirror.TitlePrefix.sync)) { task in
             VStack(alignment: .leading, spacing: 4) {
                 ProgressView(value: task.progress ?? 0) {
                     Text(label(task)).font(Theme.Font.caption)
@@ -2733,5 +2726,38 @@ private struct SyncProgressRows: View {
                 }
             }
         }
+    }
+}
+
+/// Поле необязательного числа, в котором можно **набрать** число.
+///
+/// Прежде текст поля каждый раз собирался из разобранного значения: «1.»
+/// разбиралось в 1 и печаталось «1» — точка съедалась, следующая цифра
+/// давала 11 вместо 1.1, а одинокий минус очищал поле. Здесь текст свой:
+/// неразобранное («1.», «-») — это ввод на полпути, и значение он не трогает;
+/// переписывается текст, только когда значение поменяли снаружи.
+private struct OptionalNumberField<Value: Equatable>: View {
+    let placeholder: String
+    @Binding var value: Value?
+    let parse: (String) -> Value?
+    let format: (Value) -> String
+    @State private var text = ""
+
+    var body: some View {
+        TextField(placeholder, text: $text)
+            .textFieldStyle(.roundedBorder)
+            .onAppear { text = value.map(format) ?? "" }
+            .onChange(of: text) { _, typed in
+                let trimmed = typed.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty {
+                    value = nil
+                } else if let parsed = parse(trimmed) {
+                    value = parsed
+                }
+            }
+            .onChange(of: value) { _, current in
+                let shown = parse(text.trimmingCharacters(in: .whitespaces))
+                if shown != current { text = current.map(format) ?? "" }
+            }
     }
 }

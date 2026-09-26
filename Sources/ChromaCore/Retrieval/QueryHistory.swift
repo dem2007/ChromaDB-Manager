@@ -56,8 +56,7 @@ public struct QueryHistoryEntry: Codable, Hashable, Sendable, Identifiable {
     /// What is identical about two runs of «the same» query: the text, the
     /// collection and the filter. Time and result count are not part of it.
     var sameQueryKey: String {
-        let filterKey = (try? filter.map { String(describing: try $0.whereClause() ?? [:]) }) ?? nil
-        return "\(collectionName)\u{0}\(text.trimmingCharacters(in: .whitespacesAndNewlines))\u{0}\(filterKey ?? "")"
+        "\(collectionName)\u{0}\(text.trimmingCharacters(in: .whitespacesAndNewlines))\u{0}\(filter?.identityKey ?? "")"
     }
 
     public var line: String {

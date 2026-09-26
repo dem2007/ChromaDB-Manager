@@ -354,6 +354,12 @@ public struct AppleScriptIWorkExporter: IWorkExporting {
         let errors = Pipe()
         process.standardOutput = output
         process.standardError = errors
+        // Вывод вычерпывается **пока** процесс работает, а не после: буфер
+        // канала — около 64 КБ, и `osascript` с заметками докладчика длиннее
+        // этого вставал в `write` навсегда. Дожидался он только срока —
+        // и заметки пропадали под видом «недоступны».
+        let collectedOutput = PipeCollector(output)
+        let collectedErrors = PipeCollector(errors)
 
         do {
             try process.run()
@@ -378,12 +384,39 @@ public struct AppleScriptIWorkExporter: IWorkExporting {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
 
-        let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let text = String(data: collectedOutput.finish(), encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
-            let message = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let message = String(data: collectedErrors.finish(), encoding: .utf8) ?? ""
             throw ExtractionError.applicationUnavailable(Self.explain(message, application: application))
         }
         return text
+    }
+
+    /// Читает канал по мере поступления, чтобы пишущий не упёрся в его буфер.
+    final class PipeCollector: @unchecked Sendable {
+        private let handle: FileHandle
+        private let lock = NSLock()
+        private var data = Data()
+
+        init(_ pipe: Pipe) {
+            handle = pipe.fileHandleForReading
+            handle.readabilityHandler = { [weak self] handle in
+                let chunk = handle.availableData
+                guard let self else { return }
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    self.lock.withLock { self.data.append(chunk) }
+                }
+            }
+        }
+
+        /// Всё прочитанное — вместе с тем, что осталось в канале.
+        func finish() -> Data {
+            handle.readabilityHandler = nil
+            let rest = handle.readDataToEndOfFile()
+            return lock.withLock { data + rest }
+        }
     }
 
     /// Turns the system's numbered refusals into something a person can act on.

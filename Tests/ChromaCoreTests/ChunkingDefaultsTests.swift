@@ -138,4 +138,27 @@ final class ChunkingDefaultsTests: XCTestCase {
         SettingsTransfer.apply(decoded, to: &here, schemas: &schemas, savedFilters: &filters, includePreferences: true)
         XCTAssertEqual(here.chunkingDefault(for: .fixed).chunkSize, 128)
     }
+
+    /// Абсолютный порог семантической нарезки — дробь, и округлённый до
+    /// целого он давал одну подпись для 0.20 и 0.40.
+    func testTheAbsoluteThresholdIsPartOfTheSignature() {
+        var low = ChunkingConfiguration()
+        low.strategy = .semantic
+        low.thresholdMode = .absolute
+        low.thresholdValue = 0.2
+        var high = low
+        high.thresholdValue = 0.4
+        XCTAssertNotEqual(low.signature, high.signature)
+    }
+
+    /// Разделители меняют и адаптивную нарезку — а умолчание подпись
+    /// не трогает, чтобы обновление не перенарезало то, где ничего не меняли.
+    func testCustomSeparatorsChangeTheSignatureAndDefaultsDoNot() {
+        var adaptive = ChunkingConfiguration()
+        adaptive.strategy = .adaptive
+        let plain = adaptive.signature
+        XCTAssertFalse(plain.contains("sep:"), plain)
+        adaptive.separators = ["\n\n", "; "]
+        XCTAssertNotEqual(adaptive.signature, plain)
+    }
 }

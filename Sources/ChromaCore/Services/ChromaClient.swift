@@ -524,7 +524,7 @@ public actor ChromaClient {
         if let ids, !ids.isEmpty { body["ids"] = ids }
         if let filter {
             if let clause = try filter.whereClause() { body["where"] = clause }
-            if let clause = filter.whereDocumentClause() { body["where_document"] = clause }
+            if let clause = try filter.whereDocumentClause() { body["where_document"] = clause }
         }
         let payload = try await retryingStaleID(collectionID) { id in
             try await request(
@@ -536,6 +536,20 @@ public actor ChromaClient {
             )
         }
         return payload.records
+    }
+
+    /// Идентификаторы страницы — `include: []`, без текстов и метаданных.
+    public func documentIDs(collectionID: String, limit: Int, offset: Int) async throws -> [String] {
+        let payload = try await retryingStaleID(collectionID) { id in
+            try await request(
+                GetResponse.self,
+                method: "POST",
+                path: "\(endpoint.collectionsPath)/\(id)/get",
+                body: ["limit": limit, "offset": offset, "include": []],
+                operation: .fetch
+            )
+        }
+        return payload.ids
     }
 
     /// Vectors for specific documents. Fetched on demand: pulling embeddings
@@ -638,7 +652,7 @@ public actor ChromaClient {
         ]
         if let filter {
             if let clause = try filter.whereClause() { body["where"] = clause }
-            if let clause = filter.whereDocumentClause() { body["where_document"] = clause }
+            if let clause = try filter.whereDocumentClause() { body["where_document"] = clause }
         }
         let payload = try await retryingStaleID(collectionID) { id in
             try await request(
@@ -789,7 +803,7 @@ public actor ChromaClient {
             throw ChromaError.invalidRequest(String(localized: "Удаление по фильтру без условий запрещено — так можно случайно стереть всю коллекцию."))
         }
         var body: [String: Any] = ["where": clause]
-        if let documentClause = filter.whereDocumentClause() { body["where_document"] = documentClause }
+        if let documentClause = try filter.whereDocumentClause() { body["where_document"] = documentClause }
 
         let data = try await retryingStaleID(collectionID) { id in
             try await requestRaw(

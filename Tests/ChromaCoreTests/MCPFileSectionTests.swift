@@ -869,17 +869,19 @@ final class MCPFileSectionTests: XCTestCase {
                 ]
             )
         }
+        // Потолок ключа ниже просьбы: тогда срабатывает и пометка об урезании
+        // «limit», которой у сплошного текста не было вовсе.
         let service = await service(Backend(
             chunks: documents, orderUnavailable: true,
             onDisk: MCPFileOnDisk(path: "/Источники/Документы/тз.docx", bytes: 1_240_238)
-        ))
+        ), maxResults: 3)
         let result = try await call(service, [
             "collection": .string("заметки"),
             "file": .string(String(repeating: "папка/", count: 60) + "тз.md"),
             "as": .string("text"),
             "heading": .string(heading),
             "offset": .int(1),
-            "limit": .int(3),
+            "limit": .int(300),
             "fields": .array([.string("heading_path")]),
         ])
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
@@ -887,9 +889,13 @@ final class MCPFileSectionTests: XCTestCase {
         guard case .array(let notes)? = result["structuredContent"]?["notes"] else {
             return XCTFail("пометок нет вовсе")
         }
-        // Семь — все, какие есть на сегодня. Меньше значит, что пометка
+        // Восемь — все, какие есть на сегодня. Меньше значит, что пометка
         // перестала срабатывать и запас проверяется не полностью.
-        XCTAssertGreaterThanOrEqual(notes.count, 7, "сработали не все пометки: \(notes.count)")
+        XCTAssertGreaterThanOrEqual(notes.count, 8, "сработали не все пометки: \(notes.count)")
+        XCTAssertTrue(
+            notes.contains { $0.stringValue?.contains("ceiling") == true },
+            "пометка об урезании «limit» до сплошного текста не доехала"
+        )
         XCTAssertLessThanOrEqual(
             text.count + mirror, MCPOutputLimits.defaultResponseCharacters,
             "запас под пометки устарел: текст \(text.count), зеркало \(mirror), пометок \(notes.count)"
@@ -1000,6 +1006,33 @@ final class MCPFileSectionTests: XCTestCase {
         let text = result["content"]?[0]?["text"]?.stringValue ?? ""
         XCTAssertTrue(text.contains("no documents of the file"), text)
         XCTAssertTrue(text.contains("source_file"), "сказано, откуда брать путь: \(text)")
+    }
+
+    /// Огромная глубина карты не роняет приложение.
+    ///
+    /// Глубина складывается с глубиной раздела, и `Int.max` вместе
+    /// с «heading» переполнял сложение — а переполнение в Swift это
+    /// не ошибка, а смерть процесса: вместе с приложением уходят все
+    /// мосты, прокси и окно. Ключа на чтение для этого достаточно.
+    func testAnEnormousOutlineDepthDoesNotKillTheApplication() async throws {
+        let documents = [
+            chunk(0, heading: "Требования"),
+            chunk(1, heading: "Требования > Функциональные"),
+        ]
+        let service = await service(Backend(chunks: documents))
+        for depth in [Int.max, Int.max - 1, 1_000_000_000] {
+            let result = try await call(service, [
+                "collection": .string("заметки"),
+                "file": .string("папка/тз.md"),
+                "outline": .bool(true),
+                "outline_depth": .int(depth),
+                "heading": .string("Требования"),
+            ])
+            guard case .array(let sections)? = result["structuredContent"]?["sections"] else {
+                return XCTFail("карты нет при глубине \(depth)")
+            }
+            XCTAssertFalse(sections.isEmpty, "глубина \(depth)")
+        }
     }
 
     /// Карте текст не нужен: она строится по заголовкам и номерам, а тянуть

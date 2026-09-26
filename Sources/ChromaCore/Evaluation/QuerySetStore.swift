@@ -91,11 +91,9 @@ public final class QuerySetStore {
     }
 
     static func sameQuery(_ left: EvaluationQuery, _ right: EvaluationQuery) -> Bool {
-        let leftFilter = (try? left.filter.map { String(describing: try $0.whereClause() ?? [:]) }) ?? nil
-        let rightFilter = (try? right.filter.map { String(describing: try $0.whereClause() ?? [:]) }) ?? nil
-        return left.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        left.text.trimmingCharacters(in: .whitespacesAndNewlines)
             == right.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            && leftFilter == rightFilter
+            && (left.filter?.identityKey ?? "") == (right.filter?.identityKey ?? "")
     }
 
     /// The set every history entry marked «в набор» goes into by default.

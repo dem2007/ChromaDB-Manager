@@ -219,7 +219,7 @@ final class ReembeddingViewModel: ObservableObject {
                     app.notify(result.notice)
                 }
                 await collectionsModel.refresh(app)
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 // Сообщение называет то, что произошло с клоном, а не то, что
                 // задумывалось: удаление могло и не пройти.
                 let cleanup = await app.reembeddingService.lastCloneCleanup

@@ -219,7 +219,15 @@ final class MetadataValueTests: XCTestCase {
 final class CollectionNamingTests: XCTestCase {
     /// The server enforces ASCII only — verified against chroma 1.4.4.
     func testSanitizesFolderNames() {
-        XCTAssertEqual(CollectionNaming.sanitize("Мои заметки 2024"), "2024")
+        XCTAssertEqual(CollectionNaming.sanitize("Мои заметки 2024"), "Moi_zametki_2024")
+        // Разные кириллические папки — разные коллекции.
+        XCTAssertEqual(CollectionNaming.sanitize("Договоры"), "Dogovory")
+        XCTAssertEqual(CollectionNaming.sanitize("Письма"), "Pisma")
+        XCTAssertNotEqual(CollectionNaming.sanitize("Отчёты 2024"), CollectionNaming.sanitize("Планы 2024"))
+        // Обрезка до 60 не оставляет разделитель в конце.
+        let long = CollectionNaming.sanitize(String(repeating: "a", count: 59) + "_bge-m3")
+        XCTAssertTrue(CollectionNaming.isValid(long), long)
+        XCTAssertLessThanOrEqual(long.count, 60)
         XCTAssertEqual(CollectionNaming.sanitize("docs"), "docs")
         XCTAssertEqual(CollectionNaming.sanitize("my docs!"), "my_docs")
         XCTAssertTrue(CollectionNaming.isValid(CollectionNaming.sanitize("a")))
@@ -237,15 +245,15 @@ final class CollectionNamingTests: XCTestCase {
 
 final class SourceIdentityTests: XCTestCase {
     func testDocumentIDIsStableAndUnique() {
-        let first = SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 0)
-        XCTAssertEqual(first, SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 0))
-        XCTAssertNotEqual(first, SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 1))
-        XCTAssertNotEqual(first, SourceSyncService.documentID(relativePath: "notes/b.md", chunkIndex: 0))
+        let first = SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 0, sourceID: nil)
+        XCTAssertEqual(first, SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 0, sourceID: nil))
+        XCTAssertNotEqual(first, SourceSyncService.documentID(relativePath: "notes/a.md", chunkIndex: 1, sourceID: nil))
+        XCTAssertNotEqual(first, SourceSyncService.documentID(relativePath: "notes/b.md", chunkIndex: 0, sourceID: nil))
     }
 
     func testDocumentIDFollowsTheFixedScheme() {
         // <first 16 hex of sha256(relative_path)>-<chunk_index>
-        let id = SourceSyncService.documentID(relativePath: "a.md", chunkIndex: 7)
+        let id = SourceSyncService.documentID(relativePath: "a.md", chunkIndex: 7, sourceID: nil)
         let parts = id.split(separator: "-")
         XCTAssertEqual(parts.count, 2)
         XCTAssertEqual(parts[0].count, 16)

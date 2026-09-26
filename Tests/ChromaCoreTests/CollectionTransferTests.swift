@@ -523,6 +523,34 @@ final class CollectionTransferTests: XCTestCase {
         XCTAssertNil(store.load(checksum: manifest.dataSHA256), "законченный импорт снимает отметку")
     }
 
+    /// Коллекция с тем же именем, но другая — заведённая заново или на другом
+    /// сервере — не продолжает чужой импорт с середины: первые строки иначе
+    /// не записались бы вовсе, а отчёт сказал бы «готово».
+    func testACheckpointIsNotReusedForAnotherCollectionWithTheSameName() async throws {
+        let source = Source()
+        source.documents = documents(20)
+        let exported = try await exportPackage(source)
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+        let store = ImportCheckpointStore(directory: box.appendingPathComponent("checkpoints-other"))
+
+        let first = Destination()
+        first.failsAfterUpserts = 2
+        await XCTAssertThrowsErrorAsync(
+            try await CollectionImporter(destination: first, checkpoints: store).import(
+                package: exported.url, manifest: manifest, into: "старая", collectionName: "цель",
+                options: .init(batchSize: 5)
+            )
+        )
+
+        let recreated = Destination()
+        let report = try await CollectionImporter(destination: recreated, checkpoints: store).import(
+            package: exported.url, manifest: manifest, into: "новая", collectionName: "цель",
+            options: .init(batchSize: 5)
+        )
+        XCTAssertEqual(report.written, 20, "импорт в новую коллекцию начат с середины")
+        XCTAssertEqual(recreated.stored.count, 20)
+    }
+
     /// Пакет без векторов: модель обязательна, и она действительно вызывается.
     func testAPackageWithoutVectorsNeedsAModelAndUsesIt() async throws {
         let source = Source()

@@ -66,12 +66,63 @@ public struct MetadataCondition: Identifiable, Hashable, Codable, Sendable {
     public var field: String
     public var op: FilterOperator
     public var value: String
+    /// Значение уходит строкой, как бы оно ни выглядело.
+    ///
+    /// Без этого «2025» всегда уходило числом: тип угадывался по тексту,
+    /// и равенство по полю, где лежат строки (`file_id`, уровень пути
+    /// `year`, значение фасета), не находило ничего. Приложение ставит
+    /// признак само там, где тип известен; в конструкторе его включает
+    /// человек.
+    public var valueIsText: Bool
 
-    public init(id: UUID = UUID(), field: String = "", op: FilterOperator = .equals, value: String = "") {
+    public init(
+        id: UUID = UUID(),
+        field: String = "",
+        op: FilterOperator = .equals,
+        value: String = "",
+        valueIsText: Bool = false
+    ) {
         self.id = id
         self.field = field
         self.op = op
         self.value = value
+        self.valueIsText = valueIsText
+    }
+
+    /// Условие на точное значение метаданных — с его настоящим типом.
+    public init(field: String, equals value: MetadataValue) {
+        if case .string = value {
+            self.init(field: field, op: .equals, value: value.displayString, valueIsText: true)
+        } else {
+            self.init(field: field, op: .equals, value: value.displayString)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, field, op, value, valueIsText
+    }
+
+    // Сохранённые до признака фильтры его не знают — для них тип угадывается,
+    // как и раньше.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        field = try container.decode(String.self, forKey: .field)
+        op = try container.decode(FilterOperator.self, forKey: .op)
+        value = try container.decode(String.self, forKey: .value)
+        valueIsText = try container.decodeIfPresent(Bool.self, forKey: .valueIsText) ?? false
+    }
+
+    /// Значение, которое уйдёт на сервер, — одно, без списка.
+    public func typedValue(_ text: String) -> MetadataValue {
+        valueIsText ? .string(text.trimmingCharacters(in: .whitespaces)) : MetadataValue.inferred(from: text)
+    }
+
+    /// Похоже ли значение на что-то кроме строки — тогда у конструктора
+    /// есть смысл спросить, строка ли это.
+    public var valueLooksTyped: Bool {
+        let parts = op.wantsList ? DocumentFilter.listItems(value) : [value]
+        return parts.contains { !MetadataValue.inferred(from: $0).isString }
     }
 
     public var isComplete: Bool {
@@ -88,13 +139,13 @@ public struct MetadataCondition: Identifiable, Hashable, Codable, Sendable {
             guard !parts.isEmpty else {
                 return String(localized: "«\(field)»: список пуст.")
             }
-            let kinds = Set(parts.map { MetadataValue.inferred(from: $0).kindName })
+            let kinds = Set(parts.map { typedValue($0).kindName })
             if kinds.count > 1 {
                 return String(localized: "«\(field)»: в списке значения разных типов (\(kinds.sorted().joined(separator: ", "))) — сервер такой запрос отклоняет.")
             }
             return nil
         }
-        if op.needsNumber, !MetadataValue.inferred(from: value).isNumber {
+        if op.needsNumber, !typedValue(value).isNumber {
             return String(localized: "«\(field)»: сравнение \(op.title) работает только с числами. Строки и даты сравнивать нельзя — для них подходят = и ≠.")
         }
         return nil
@@ -207,30 +258,62 @@ public struct FilterNode: Identifiable, Hashable, Codable, Sendable {
         if let expression = value as? [String: Any] {
             guard expression.count == 1,
                   let (rawOperator, rawValue) = expression.first,
-                  let op = FilterOperator(rawValue: rawOperator),
-                  let text = describe(rawValue, asList: op.wantsList) else { return nil }
-            return .leaf(MetadataCondition(field: key, op: op, value: text))
+                  let op = FilterOperator(rawValue: rawOperator) else { return nil }
+            return leaf(field: key, op: op, rawValue: rawValue)
         }
 
         // {"field": value} — the shorthand for $eq, accepted by the server.
-        guard let text = describe(value, asList: false) else { return nil }
-        return .leaf(MetadataCondition(field: key, op: .equals, value: text))
+        return leaf(field: key, op: .equals, rawValue: value)
     }
 
-    private static func describe(_ value: Any, asList: Bool) -> String? {
-        if asList {
-            guard let array = value as? [Any] else { return nil }
-            let items = array.compactMap { describe($0, asList: false) }
+    /// Условие из значения JSON — так, чтобы при сборке обратно ушло то же.
+    ///
+    /// Строка, похожая на число, помечается строкой; а если строки в списке
+    /// перемешаны с числами, одним признаком этого не выразить — такое
+    /// остаётся в JSON.
+    private static func leaf(field: String, op: FilterOperator, rawValue: Any) -> FilterNode? {
+        let values: [MetadataValue]
+        if op.wantsList {
+            guard let array = rawValue as? [Any] else { return nil }
+            let items = array.compactMap(scalar)
             guard items.count == array.count else { return nil }
-            return items.joined(separator: ", ")
+            values = items
+        } else {
+            guard let item = scalar(rawValue) else { return nil }
+            values = [item]
         }
-        switch value {
-        case let text as String: return text
-        case let flag as Bool: return flag ? "true" : "false"
-        case let number as Int: return String(number)
-        case let number as Double: return String(number)
-        case let number as NSNumber: return number.stringValue
-        default: return nil
+        let texts = values.map(\.displayString)
+        let stringsLookTyped = values.contains {
+            if case .string(let text) = $0 { return !MetadataValue.inferred(from: text).isString }
+            return false
+        }
+        let hasNonStrings = values.contains { !$0.isString }
+        if stringsLookTyped && hasNonStrings { return nil }
+        // Запятая внутри значения списка разрезала бы его на два.
+        if op.wantsList, texts.contains(where: { $0.contains(",") }) { return nil }
+        return .leaf(MetadataCondition(
+            field: field,
+            op: op,
+            value: texts.joined(separator: ", "),
+            valueIsText: stringsLookTyped
+        ))
+    }
+
+    /// Одно значение JSON.
+    ///
+    /// Числа из `JSONSerialization` приходят `NSNumber`, а `NSNumber` 0 и 1
+    /// охотно отдаются как `Bool` — поэтому тип спрашивается у самого числа,
+    /// иначе `chunk_level = 0` возвращался из JSON условием `= false`.
+    private static func scalar(_ value: Any) -> MetadataValue? {
+        if let text = value as? String { return .string(text) }
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() { return .bool(number.boolValue) }
+        switch String(cString: number.objCType) {
+        case "f", "d":
+            let double = number.doubleValue
+            return double.isFinite ? .double(double) : nil
+        default:
+            return .int(number.intValue)
         }
     }
 }
@@ -354,13 +437,52 @@ public struct DocumentFilter: Hashable, Codable, Sendable {
         return root.clause()
     }
 
-    public func whereDocumentClause() -> [String: Any]? {
+    /// Чем фильтр отличается от другого — для «тот же ли это запрос».
+    ///
+    /// Оба условия, `where` **и** `where_document`: одни и те же слова
+    /// с другим текстовым условием — другой запрос, а история и набор
+    /// запросов сливали их в один. И JSON с упорядоченными ключами, а не
+    /// `String(describing:)` словаря: порядок ключей в описании словаря
+    /// не обещан, и равные фильтры могли дать разные строки.
+    public var identityKey: String {
+        func text(_ clause: [String: Any]?) -> String {
+            guard let clause else { return "" }
+            guard JSONSerialization.isValidJSONObject(clause),
+                  let data = try? JSONSerialization.data(withJSONObject: clause, options: [.sortedKeys])
+            else { return String(describing: clause) }
+            return String(decoding: data, as: UTF8.self)
+        }
+        // Испорченный сырой `where` — тоже различие: сравнивается его текст.
+        // Не через `try?`: он склеил бы «условия нет» с «условие не разобралось».
+        let metadata: String
+        do {
+            metadata = text(try whereClause())
+        } catch {
+            metadata = "invalid:" + rawWhereJSON
+        }
+        let document: String
+        do {
+            document = text(try whereDocumentClause())
+        } catch {
+            document = "invalid:" + rawWhereDocumentJSON
+        }
+        // Пустой фильтр — то же, что никакого.
+        return metadata.isEmpty && document.isEmpty ? "" : metadata + "\u{0}" + document
+    }
+
+    /// `where_document`, или `nil`, когда по тексту не отбирается ничего.
+    ///
+    /// Бросает на испорченном JSON — как и `whereClause()`. Молча вернуть
+    /// `nil` значило снять условие: фильтр выглядел применённым, а список
+    /// показывал всю коллекцию.
+    public func whereDocumentClause() throws -> [String: Any]? {
         let raw = rawWhereDocumentJSON.trimmingCharacters(in: .whitespaces)
         if !raw.isEmpty {
             guard let data = raw.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  !object.isEmpty else { return nil }
-            return object
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw FilterError.invalidRawJSON(String(raw.prefix(120)))
+            }
+            return object.isEmpty ? nil : object
         }
 
         let parts = textConditions
@@ -443,13 +565,14 @@ public struct DocumentFilter: Hashable, Codable, Sendable {
 
     /// Values keep their type: "5" filters as a number, "true" as a boolean —
     /// ChromaDB compares typed metadata, so a quoted 5 would match nothing.
+    /// Unless the condition says the value is text (`valueIsText`).
     static func encode(_ condition: MetadataCondition) -> Any {
         if condition.op.wantsList {
             return listItems(condition.value)
-                .map { MetadataValue.inferred(from: $0) }
+                .map { condition.typedValue($0) }
                 .map(unwrap)
         }
-        return unwrap(MetadataValue.inferred(from: condition.value))
+        return unwrap(condition.typedValue(condition.value))
     }
 
     private static func unwrap(_ value: MetadataValue) -> Any {
@@ -470,7 +593,7 @@ public struct DocumentFilter: Hashable, Codable, Sendable {
     }
 
     public func whereDocumentJSONString() -> String? {
-        guard let clause = whereDocumentClause(),
+        guard let clause = ((try? whereDocumentClause()) ?? nil),
               let data = try? JSONSerialization.data(withJSONObject: clause, options: [.sortedKeys]) else { return nil }
         return String(data: data, encoding: .utf8)
     }

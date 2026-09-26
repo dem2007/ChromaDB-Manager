@@ -70,7 +70,21 @@ struct ChromaDBManagerApp: App {
 /// Keeps the app a regular windowed app when launched from the command line
 /// (`swift run`), and makes sure a server we started is not left behind.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    weak var environment: AppEnvironment?
+    /// Запустить приложение заново, когда этот процесс выйдет.
+    ///
+    /// Статическое, а не через `NSApp.delegate`: при `NSApplicationDelegateAdaptor`
+    /// делегат приложения — обёртка SwiftUI, и приведение к этому классу
+    /// ненадёжно. Снимается, если выход отменили.
+    @MainActor static var relaunchOnExit = false
+
+    /// Окружение приложения — общее, а не проведённое сюда из `.onAppear`.
+    ///
+    /// Пока ссылку ставил вид, всё, что AppKit приносит до первого окна,
+    /// терялось: папка, брошенная на значок незапущенного приложения,
+    /// приходит в `application(_:open:)` раньше любого `.onAppear`, и
+    /// `guard let environment` её выбрасывал. Так же — текст из «Служб»,
+    /// которые запускают приложение.
+    @MainActor var environment: AppEnvironment? { AppEnvironment.shared }
     var quickSearch: QuickSearchViewModel?
     /// Как открыть окно просмотра исходника. Ставится сценой: у делегата
     /// нет доступа к `openWindow`, а угадывать окно по заголовку — способ
@@ -278,7 +292,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .warning
         alert.addButton(withTitle: String(localized: "Прервать и выйти"))
         alert.addButton(withTitle: String(localized: "Не выходить"))
-        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            // Выход отменили — и перезапуск вместе с ним: иначе приложение
+            // перезапустилось бы, когда человек выйдет когда-нибудь потом.
+            Self.relaunchOnExit = false
+            return .terminateCancel
+        }
 
         environment.cancelLongOperations()
         Task { @MainActor in
@@ -296,6 +315,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Servers this app started must not outlive it.
         ManagedProcessRegistry.shared.terminateAll()
+        if Self.relaunchOnExit { Self.scheduleRelaunch() }
+    }
+
+    /// Новый экземпляр — **после** выхода этого, а не до.
+    ///
+    /// Прежде новая копия запускалась первой, а выход, о котором спрашивают
+    /// при идущей индексации, человек мог отменить: оставались две копии
+    /// с одними настройками, прокси и сервером. Здесь выход уже решён,
+    /// а запуск ждёт, пока этот процесс действительно завершится: иначе
+    /// `open` просто вернул бы на передний план нас же. Путь передаётся
+    /// аргументом, а не вставляется в строку команды.
+    static func scheduleRelaunch() {
+        let waiter = Process()
+        waiter.executableURL = URL(fileURLWithPath: "/bin/sh")
+        waiter.arguments = [
+            "-c",
+            "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$0\"",
+            Bundle.main.bundlePath,
+        ]
+        try? waiter.run()
     }
 }
 

@@ -405,11 +405,15 @@ public enum TableProfileMatcher {
     /// Если имя с номером тоже занято — номер растёт, пока не найдётся
     /// свободное: в шапке бывает и «Стоимость», и «Стоимость (2)» сразу.
     public static func uniqued(_ titles: [String]) -> [String] {
+        // Одинаковость — в той же форме, в какой колонку потом ищут
+        // (`SheetLayout.normalised`: без регистра и лишних пробелов). Иначе
+        // «Цена» и «ЦЕНА» считались разными, оставались без номера, а при
+        // чтении обе находились по одному ключу — и вторая читалась из первой.
         var seen: Set<String> = []
         return titles.map { title in
-            guard !seen.insert(title).inserted else { return title }
+            guard !seen.insert(SheetLayout.normalised(title)).inserted else { return title }
             var number = 2
-            while !seen.insert("\(title) (\(number))").inserted { number += 1 }
+            while !seen.insert(SheetLayout.normalised("\(title) (\(number))")).inserted { number += 1 }
             return "\(title) (\(number))"
         }
     }

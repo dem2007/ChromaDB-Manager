@@ -57,6 +57,24 @@ public final class WebSyncService {
         pages.save(records, sourceID: sourceID)
     }
 
+    /// Записи без ETag и даты изменения у страниц, которые в базу не легли.
+    ///
+    /// По сохранённому ETag следующий запрос получает 304, и страница
+    /// считается неизменной — то есть так и не записанной никогда.
+    public static func forgettingValidators(
+        of unfinished: Set<String>, in records: [String: WebPageRecord]
+    ) -> [String: WebPageRecord] {
+        guard !unfinished.isEmpty else { return records }
+        let failedURLs = Set(records.compactMap { key, record in unfinished.contains(key) ? record.url : nil })
+        return records.mapValues { record in
+            guard failedURLs.contains(record.url) else { return record }
+            var cleared = record
+            cleared.etag = nil
+            cleared.lastModified = nil
+            return cleared
+        }
+    }
+
     public func forget(sourceID: UUID) { pages.remove(sourceID: sourceID) }
 
     public enum WebSyncError: LocalizedError {
@@ -118,9 +136,17 @@ public final class WebSyncService {
                 if var record = previous {
                     record.fetchedAt = Date()
                     record.status = 304
-                    records[key] = record
+                    // У ответа 304 нет тела, а значит, нет и канонического
+                    // адреса: `key(of:)` отдаёт адрес запроса. Страница же
+                    // лежит в базе под тем ключом, который назвала в прошлый
+                    // раз, — и без него живая неизменная страница каждый
+                    // прогон попадала в «требуют решения» как пропавшая.
+                    let stored = Self.storedKey(of: record) ?? key
+                    visitedKeys.insert(stored)
+                    records[stored] = record
+                    if stored != key { records[key] = record }
                     items.append(Self.item(
-                        key: key, page: page, record: record, kind: .unchanged,
+                        key: stored, page: page, record: record, kind: .unchanged,
                         collectionName: source.collectionName, cache: nil, textLength: nil
                     ))
                 }
@@ -195,9 +221,13 @@ public final class WebSyncService {
         // Страницы, которые обход не смог взять, — это не пропавшие страницы,
         // а известные беды с точной причиной.
         for problem in summary.problems {
-            guard !visitedKeys.contains(SiteCrawler.normalise(URL(string: problem.url) ?? start)) else { continue }
+            let fetched = SiteCrawler.normalise(URL(string: problem.url) ?? start)
+            // Под тем ключом, под которым страница уже лежит в базе: иначе
+            // разовая ошибка сервера ставила бы её в очередь на удаление.
+            let stored = known[fetched].flatMap(Self.storedKey(of:)) ?? fetched
+            guard !visitedKeys.contains(fetched), !visitedKeys.contains(stored) else { continue }
             items.append(SyncPlanItem(
-                relativePath: problem.url,
+                relativePath: stored,
                 url: URL(string: problem.url) ?? start,
                 kind: .skipped(reason: problem.reason, remedy: .retry),
                 collectionName: source.collectionName,
@@ -237,6 +267,15 @@ public final class WebSyncService {
     ///
     /// Канонический, если страница его объявила: одна и та же статья по трём
     /// адресам иначе станет тремя документами.
+    /// Ключ страницы по её прошлой записи — тем же правилом, что `key(of:)`:
+    /// канонический адрес, если страница его называла.
+    static func storedKey(of record: WebPageRecord) -> String? {
+        if let canonical = record.canonicalURL, let url = URL(string: canonical), url.host != nil {
+            return SiteCrawler.normalise(url)
+        }
+        return URL(string: record.url).map(SiteCrawler.normalise)
+    }
+
     static func key(of page: CrawledPage) -> String {
         if let canonical = page.page?.canonicalURL,
            let url = URL(string: canonical), url.host != nil {
@@ -294,7 +333,12 @@ public final class WebSyncService {
 
     /// Кладёт тело страницы в файл — экстракторам этапа 4 нужен файл, а не байты.
     static func write(page: CrawledPage, to directory: URL) throws -> URL {
-        let name = SourceSyncService.documentID(relativePath: key(of: page), chunkIndex: 0)
+        // Имя **файла на диске**, а не идентификатор чанка: нужна короткая
+        // строка, которую нельзя испортить кодировкой. Источник сюда не
+        // входит нарочно — файл временный, живёт до конца разбора страницы.
+        let name = SourceSyncService.documentID(
+            relativePath: key(of: page), chunkIndex: 0, sourceID: nil
+        )
         let file = directory.appendingPathComponent("\(name).\(Self.extension(for: page.resource))")
         try page.resource.data.write(to: file, options: .atomic)
         return file

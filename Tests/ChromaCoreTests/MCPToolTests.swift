@@ -216,6 +216,39 @@ final class MCPToolTests: XCTestCase {
         }
     }
 
+    /// Разогнавшийся ключ не теряет инструментов записи.
+    ///
+    /// Список спрашивался через `decideTool`: тот тратит токен частоты и на
+    /// исчерпанном ведре отвечает отказом без клиента. Агент, сделавший
+    /// подряд свои десять вызовов, получал список без `add_documents`
+    /// и `delete_documents` — и держал его весь сеанс, потому что сервер
+    /// объявляет «listChanged: false». Права ключа от частоты не зависят.
+    func testAThrottledKeyIsStillOfferedItsWriteTools() async throws {
+        let service = await service(clients: [writer()])
+        // Опустошаем ведро: у ключа записи всплеск шестьдесят.
+        for _ in 0..<70 {
+            _ = await service.call(
+                name: "list_collections", arguments: .object([:]), key: key
+            )
+        }
+        let listed = await service.list(key: key)
+        guard case .array(let tools)? = listed["tools"] else { return XCTFail("нет списка") }
+        let names = tools.compactMap { $0["name"]?.stringValue }
+        XCTAssertTrue(names.contains("add_documents"), "запись пропала у разогнавшегося ключа: \(names)")
+        XCTAssertTrue(names.contains("delete_documents"), names.joined(separator: ", "))
+    }
+
+    /// Сам список частоты не тратит: он не вызов инструмента.
+    func testAskingForTheListDoesNotSpendARateToken() async throws {
+        let service = await service(clients: [client()])
+        for _ in 0..<50 { _ = await service.list(key: key) }
+        let result = await service.call(
+            name: "list_collections", arguments: .object([:]), key: key
+        )
+        let text = (try? result.get())?["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertFalse(text.contains("Too many requests"), text)
+    }
+
     /// Список сокращается под права ключа — спецификация это прямо разрешает,
     /// а инструмент, который заведомо ответит отказом, только тратит вызов.
     func testAReadOnlyKeyIsNotOfferedWriteTools() async {
@@ -1411,7 +1444,113 @@ final class MCPToolTests: XCTestCase {
         XCTAssertNil(backend.received.delete)
     }
 
+    /// Отрезанные по потолку идентификаторы отражаются в `hasMore`.
+    ///
+    /// Лишние отрезаются при разборе, и текст об этом говорит пометкой —
+    /// а зеркало утверждало «hasMore: false». Клиент, читающий структуру,
+    /// уходил с половиной выборки, считая её целой.
+    func testDroppedIdentifiersAreVisibleInTheStructuredAnswer() async throws {
+        let service = await service(clients: [client(maxResults: 10)])
+        let result = try await call(
+            service, "get_documents",
+            .object([
+                "collection": .string("заметки"),
+                "ids": .array((0..<25).map { .string("id-\($0)") }),
+            ]),
+            key: key
+        ).get()
+        XCTAssertEqual(
+            result["structuredContent"]?["hasMore"], .bool(true),
+            "структура уверяет, что это вся выборка"
+        )
+        let text = result["content"]?[0]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains("ceiling") || text.contains("25"), text)
+    }
+
+    /// Несостоявшаяся запись не тратит дневной предел.
+    ///
+    /// Предел списывается при решении, до обращения к базе. База отвечает
+    /// «идентификаторы заняты — не записано ничего», агент повторяет
+    /// с новыми и получает «дневной предел исчерпан», не записав ни одного
+    /// документа.
+    func testAFailedWriteGivesTheDailyQuotaBack() async throws {
+        struct FailingBackend: MCPToolBackend {
+            func collections(allowed: [String]) async throws -> [MCPCollectionSummary] {
+                [MCPCollectionSummary(name: "заметки", documentCount: 0, model: "e5", metric: "cosine", dimension: 8)]
+            }
+            func describe(collection: String) async throws -> MCPCollectionDescription {
+                MCPCollectionDescription(
+                    summary: try await collections(allowed: [])[0],
+                    fields: [], hasSchema: false, allowsExtraFields: true
+                )
+            }
+            func search(_ request: MCPSearchRequest) async throws -> MCPSearchAnswer {
+                MCPSearchAnswer(documents: [], metric: "cosine", model: "e5")
+            }
+            func documents(_ request: MCPDocumentsRequest) async throws -> MCPDocumentsAnswer {
+                MCPDocumentsAnswer(documents: [], hasMore: false)
+            }
+            func add(_ request: MCPAddRequest) async throws -> MCPAddAnswer {
+                throw MCPToolFailure("Identifiers are already taken. Nothing was written.")
+            }
+            func delete(_ request: MCPDeleteRequest) async throws -> MCPDeleteAnswer {
+                MCPDeleteAnswer(deleted: [], missing: [], keptInTrash: false)
+            }
+        }
+
+        let access = AccessController()
+        let client = writer(maxPerDay: 10)
+        await access.setClients([client])
+        let service = MCPToolService(backend: FailingBackend(), access: access)
+
+        _ = try await service.call(
+            name: "add_documents",
+            arguments: .object([
+                "collection": .string("заметки"),
+                "documents": .array((0..<6).map { .object(["text": .string("документ \($0)")]) }),
+            ]),
+            key: key
+        ).get()
+
+        let spent = await access.usageToday(for: client.id)
+        XCTAssertEqual(spent, 0, "предел списан за запись, которой не было")
+    }
+
     // MARK: - Журнал доступа
+
+    /// Объём запроса в журнале — настоящий, а не обрезанный.
+    ///
+    /// Текст параметров пишется в журнал до двадцати тысяч знаков, и объём
+    /// считался по нему же: запись мегабайтного документа показывала
+    /// двадцать килобайт — то есть столбец врал ровно там, где он и нужен.
+    func testTheAuditSizeIsTheRealRequestAndNotTheTruncatedCopy() async throws {
+        let recorded = Recorder()
+        let access = AccessController()
+        await access.setClients([writer()])
+        let service = MCPToolService(
+            backend: Backend(), access: access, audit: { recorded.append($0) }
+        )
+        let long = String(repeating: "договор аренды. ", count: 8_000)
+        _ = try await service.call(
+            name: "add_documents",
+            arguments: .object([
+                "collection": .string("заметки"),
+                "documents": .array([.object(["text": .string(long)])]),
+            ]),
+            key: key
+        ).get()
+
+        let entry = try XCTUnwrap(recorded.entries.first)
+        XCTAssertGreaterThan(
+            entry.requestBytes, MCPToolService.auditParameterLimit,
+            "объём посчитан по обрезанной копии"
+        )
+        XCTAssertLessThanOrEqual(
+            entry.parameters?.count ?? 0,
+            MCPToolService.auditParameterLimit + 64,
+            "сам текст параметров обрезаться обязан"
+        )
+    }
 
     func testEveryToolCallReachesTheAuditLog() async throws {
         let recorded = Recorder()

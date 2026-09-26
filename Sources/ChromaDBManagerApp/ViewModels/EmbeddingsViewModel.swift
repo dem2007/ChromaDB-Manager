@@ -458,7 +458,7 @@ final class EmbeddingsViewModel: ObservableObject {
                     kind: .benchmark, subject: model,
                     duration: result.batches.reduce(result.firstCallSeconds) { $0 + $1.seconds }
                 ))
-            } catch is CancellationError {
+            } catch let error where AppEnvironment.isCancellation(error) {
                 app.log.record(.info, "Бенчмарк", "Измерение скорости модели «\(model)» отменено — результат не сохранён")
             } catch {
                 self.errorMessage = app.describe(error)

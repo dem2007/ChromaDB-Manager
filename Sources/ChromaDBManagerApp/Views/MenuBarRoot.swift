@@ -46,7 +46,6 @@ struct MenuBarSupport: ViewModifier {
 
     func body(content: Content) -> some View {
         content.onAppear {
-            delegate.environment = app
             delegate.quickSearch = quickSearch
             delegate.openViewer = { openWindow(id: ChromaDBManagerApp.viewerWindowID) }
             delegate.openMain = { openWindow(id: ChromaDBManagerApp.mainWindowID) }

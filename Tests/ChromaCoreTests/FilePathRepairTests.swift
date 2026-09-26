@@ -32,7 +32,7 @@ final class FilePathRepairTests: XCTestCase {
         let path = "docs/readme.md"
         XCTAssertFalse(FilePathRepair.needsRepair([
             "source_file": .string(path),
-            "file_id": .string(SourceSyncService.fileFingerprint(path)),
+            "file_id": .string(SourceSyncService.fileFingerprint(path, sourceID: nil)),
         ]))
     }
 
@@ -52,7 +52,7 @@ final class FilePathRepairTests: XCTestCase {
         XCTAssertEqual(updates.count, 1)
         XCTAssertEqual(
             updates[0].metadata?["file_id"],
-            .string(SourceSyncService.fileFingerprint("Отчёты/Договор.pdf"))
+            .string(SourceSyncService.fileFingerprint("Отчёты/Договор.pdf", sourceID: nil))
         )
     }
 
@@ -81,7 +81,7 @@ final class FilePathRepairTests: XCTestCase {
         )
         XCTAssertEqual(
             fields?["file_id"],
-            .string(SourceSyncService.fileFingerprint("Отчёты/Первый/Договор.pdf"))
+            .string(SourceSyncService.fileFingerprint("Отчёты/Первый/Договор.pdf", sourceID: nil))
         )
         XCTAssertTrue(updates[0].removedMetadataKeys.isEmpty, "уборка ничего не удаляет — только переписывает")
     }
@@ -89,7 +89,7 @@ final class FilePathRepairTests: XCTestCase {
     /// Здоровые чанки в список обновлений не попадают.
     func testOnlyTheChunksThatNeedItAreUpdated() {
         let path = "docs/readme.md"
-        let healthy = record("1", path: path, fileID: SourceSyncService.fileFingerprint(path))
+        let healthy = record("1", path: path, fileID: SourceSyncService.fileFingerprint(path, sourceID: nil))
         let broken = record("2", path: "Отчёты/Договор.pdf".decomposedStringWithCanonicalMapping)
         let updates = FilePathRepair.updates(for: [healthy, broken])
         XCTAssertEqual(updates.map(\.id), ["2"])

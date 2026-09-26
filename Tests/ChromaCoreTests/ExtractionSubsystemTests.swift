@@ -169,6 +169,33 @@ final class ExtractorRegistryTests: XCTestCase {
     }
 
     /// Rich text is markup; reading it as plain text would index the markup.
+    /// Русский текст в cp1251 чётной длины UTF-16 без метки принимал за
+    /// иероглифы — и файл не находился ни по одному своему слову.
+    func testWindows1251TextIsNotReadAsUTF16() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cp1251-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try XCTUnwrap("Привет".data(using: .windowsCP1251)).write(to: url)
+        XCTAssertEqual(PlainTextExtractor.read(at: url), "Привет")
+    }
+
+    /// Срок ограничивает **ожидание**: работа, не слышащая отмены, не держит
+    /// вызывающего дольше срока.
+    func testTheDeadlineDoesNotWaitForStuckWork() async {
+        let started = Date()
+        do {
+            _ = try await Deadline.race(seconds: 0.2, timeoutError: { ExtractionError.timedOut(seconds: 0.2) }) {
+                // Работа, которая отмену не слышит: так ведёт себя синхронный
+                // системный вызов.
+                Thread.sleep(forTimeInterval: 3)
+                return 1
+            }
+            XCTFail("срок не сработал")
+        } catch {
+            XCTAssertEqual(error as? ExtractionError, .timedOut(seconds: 0.2))
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "ожидание дождалось застрявшей работы")
+    }
+
     func testRichTextIsNotClaimedByThePlainTextExtractor() {
         XCTAssertFalse(PlainTextExtractor().canHandle(.rtf))
         XCTAssertTrue(PlainTextExtractor().canHandle(.plainText))

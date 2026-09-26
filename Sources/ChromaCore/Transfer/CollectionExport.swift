@@ -87,6 +87,8 @@ public enum TransferError: LocalizedError, Equatable {
     case dimensionMismatch(expected: Int, got: Int)
     case notEnoughSpace(needed: Int64, free: Int64)
     case noEmbeddingsAndNoModel
+    /// «В новую коллекцию», а коллекция с таким именем уже есть.
+    case collectionExists(String)
 
     public var errorDescription: String? {
         switch self {
@@ -106,6 +108,8 @@ public enum TransferError: LocalizedError, Equatable {
             return String(localized: "Нужно примерно \(need), свободно \(have). Экспорт не начат — упасть на середине хуже, чем не начаться.")
         case .noEmbeddingsAndNoModel:
             return String(localized: "В пакете нет векторов, а модель для их расчёта не выбрана.")
+        case .collectionExists(let name):
+            return String(localized: "Коллекция «\(name)» уже есть. Импорт в новую коллекцию в неё не пишет: выберите другое имя или выберите «\(name)» как существующую — так же продолжается прерванный импорт.")
         }
     }
 }

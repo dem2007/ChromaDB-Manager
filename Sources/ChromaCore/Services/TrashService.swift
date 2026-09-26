@@ -309,13 +309,16 @@ public final class TrashService: ObservableObject {
     }
 
     private static func load(from url: URL) -> [TrashEntry] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         // A truncated last line is normal after a crash and must not cost the
         // whole file (same reasoning as `AuditLog.load`).
-        return text
-            .split(separator: "\n")
+        //
+        // Правило было объявлено здесь и раньше, но не выполнялось до конца:
+        // файл сперва раскодировался целиком, и обрыв **внутри** знака делал
+        // негодным весь. Для корзины это стоило дороже всего: следующая
+        // перезапись затирала записи, которых разбор не прочитал.
+        return JSONLines.read(at: url)
             .compactMap { try? decoder.decode(TrashEntry.self, from: Data($0.utf8)) }
             .sorted { $0.deletedAt > $1.deletedAt }
     }

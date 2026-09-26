@@ -132,8 +132,13 @@ public struct CollectionFacetBuilder: Sendable {
         var examined = 0
         var offset = 0
 
-        let fields = Self.standardFields + extraFields.filter { !Self.standardFields.contains($0) }
-        let dates = Self.dateFields + extraFields.filter { Self.dateFields.contains($0) }
+        // Каждое поле — ровно в одном списке и один раз. Поле-дата из схемы
+        // прежде попадало и в обычные поля, и ещё раз в даты: документ
+        // считался трижды, «нет значения» уходило в минус, а три фасета
+        // с одним id путали ForEach.
+        var seen = Set(Self.standardFields + Self.dateFields)
+        let fields = Self.standardFields + extraFields.filter { seen.insert($0).inserted }
+        let dates = Self.dateFields
 
         while examined < sampleSize {
             try Task.checkCancellation()

@@ -50,6 +50,44 @@ final class MCPTransportTests: XCTestCase {
         }())
     }
 
+    /// Ответ узнаётся как ответ, а запрос — нет.
+    ///
+    /// Мост считал ожидающие запросы и разбирал ответы как `JSONRPCIncoming`,
+    /// у которого `method` обязателен. Разбор проваливался на **каждом**
+    /// ответе, ожидание не закрывалось ни разу — и на закрытии приложения
+    /// агент получал по второму, ошибочному, ответу на каждый уже отвеченный
+    /// запрос.
+    func testAReplyIsRecognisedAndARequestIsNot() throws {
+        func id(_ text: String) -> JSONRPCID? {
+            JSONRPCReply.answeredID(in: Data(text.utf8))
+        }
+        XCTAssertEqual(id(#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#), .int(7))
+        XCTAssertEqual(id(#"{"jsonrpc":"2.0","id":"a","error":{"code":-1,"message":"нет"}}"#), .string("a"))
+        // Пустой результат — тоже результат.
+        XCTAssertEqual(id(#"{"jsonrpc":"2.0","id":1,"result":null}"#), .int(1))
+        // Запрос от приложения к клиенту несёт id, но ничьего ожидания
+        // не закрывает.
+        XCTAssertNil(id(#"{"jsonrpc":"2.0","id":2,"method":"sampling/createMessage"}"#))
+        // Уведомление — тем более.
+        XCTAssertNil(id(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#))
+        XCTAssertNil(id("не json"))
+    }
+
+    /// Отвергнутая по длине строка не остаётся в кадрировщике.
+    ///
+    /// Иначе `flush` на закрытии отправляет дальше ровно то, что мы только
+    /// что отвергли: мост отвечал агенту «сообщение превышает допустимую
+    /// длину» и следом слал приложению те же шестнадцать мегабайт, а его
+    /// кадрировщик упирался в тот же предел и ронял связь.
+    func testARefusedLineIsNotKeptForTheNextFlush() throws {
+        var framer = LineFramer()
+        let chunk = Data(repeating: UInt8(ascii: "x"), count: 1024 * 1024)
+        XCTAssertThrowsError(try {
+            for _ in 0...17 { _ = try framer.consume(chunk) }
+        }())
+        XCTAssertNil(framer.flush(), "обрывок остался и уехал бы дальше")
+    }
+
     func testEncodedMessageNeverContainsARawNewline() throws {
         // Требование спецификации «в сообщении нет переводов строк»
         // выполняется само: JSONEncoder экранирует их внутри строк.

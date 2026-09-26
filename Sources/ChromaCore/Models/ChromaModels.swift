@@ -59,12 +59,20 @@ public enum MetadataValue: Codable, Hashable, Sendable {
         }
     }
 
+    public var isString: Bool {
+        if case .string = self { return true }
+        return false
+    }
+
     /// Parses free-form user input into the most specific scalar type.
     public static func inferred(from text: String) -> MetadataValue {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return .string("") }
         if let value = Int(trimmed) { return .int(value) }
-        if let value = Double(trimmed) { return .double(value) }
+        // «inf», «nan» и «1e999» Double тоже примет, но JSONSerialization на
+        // нечисловом значении бросает исключение Objective-C, которое Swift
+        // не ловит, — такое остаётся строкой.
+        if let value = Double(trimmed), value.isFinite { return .double(value) }
         if trimmed == "true" || trimmed == "false" { return .bool(trimmed == "true") }
         return .string(trimmed)
     }

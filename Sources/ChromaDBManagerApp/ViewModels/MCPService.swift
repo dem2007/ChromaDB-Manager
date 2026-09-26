@@ -374,11 +374,17 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     ///
     /// Имя, а не идентификатор: UUID коллекции агенту негде взять, и знать его
     /// он не должен.
+    ///
+    /// Список — без счётчиков, а число документов спрашивается у одной
+    /// найденной: каждый вызов инструмента иначе делал по запросу `count`
+    /// на каждую коллекцию базы.
     private func collection(named name: String) async throws -> ChromaCollection {
-        let all = try await client().listCollections(withCounts: true)
-        guard let found = all.first(where: { $0.name == name }) else {
+        let client = try await client()
+        let all = try await client.listCollections(withCounts: false)
+        guard var found = all.first(where: { $0.name == name }) else {
             throw BackendError.noCollection(name)
         }
+        found.documentCount = try? await client.count(collectionID: found.id)
         return found
     }
 
@@ -578,7 +584,7 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                         text: query,
                         collectionID: target.collectionID,
                         collectionName: target.collectionName,
-                        nResults: request.nResults,
+                        nResults: target.results(forRequested: request.nResults),
                         filter: request.filter,
                         metric: target.metric
                     ),

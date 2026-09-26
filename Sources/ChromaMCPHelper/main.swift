@@ -48,26 +48,43 @@ let queue = DispatchQueue(label: "chromadb.mcp.helper")
 /// о причине.
 final class PendingReplies: @unchecked Sendable {
     private let lock = NSCondition()
-    private var count = 0
     /// Чьи запросы ещё ждут ответа. Раньше считались только штуки —
     /// этого хватало, чтобы не выйти раньше времени, но не хватало, чтобы
     /// ответить за приложение, когда связь с ним оборвалась посреди вызова.
+    ///
+    /// Отдельного счётчика нет: он расходился со списком. Ответ на запрос,
+    /// за который мы уже ответили сами, уменьшал счёт **чужого** ожидания,
+    /// и выход переставал ждать ответа, который ещё в пути.
     private var awaiting: [JSONRPCID] = []
 
-    func sent(_ id: JSONRPCID?) {
+    func sent(_ id: JSONRPCID) {
         lock.lock()
-        count += 1
-        if let id { awaiting.append(id) }
+        awaiting.append(id)
         lock.unlock()
     }
 
-    /// Ответ узнаётся по наличию `id`: уведомления ответа не требуют.
+    /// Ответ узнаётся по `id` **и** по отсутствию метода.
+    ///
+    /// Разбирать ответ как `JSONRPCIncoming` нельзя: у того `method`
+    /// обязателен, а у ответа его нет вовсе — разбор проваливался всегда,
+    /// и ни один идентификатор не снимался с ожидания. Отсюда шли обе беды:
+    /// выход всегда ждал полные две секунды, а на закрытии приложения агент
+    /// получал по второму — ошибочному — ответу на каждый уже отвеченный
+    /// запрос.
     func received(_ data: Data) {
-        guard let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: data),
-              let id = incoming.id else { return }
+        guard let id = JSONRPCReply.answeredID(in: data) else { return }
+        answered(id)
+    }
+
+    /// Ожидание этого запроса закрыто — ответило приложение или мы за него.
+    ///
+    /// Без этого отказ «приложение не запущено» отвечал агенту, а запрос
+    /// оставался в списке ждущих: следующий обрыв связи отвечал на него
+    /// **второй раз**, и выход ждал две секунды ответа, которого не будет
+    ///.
+    func answered(_ id: JSONRPCID) {
         lock.lock()
-        if count > 0 { count -= 1 }
-        awaiting.removeAll { $0 == id }
+        if let index = awaiting.firstIndex(of: id) { awaiting.remove(at: index) }
         lock.broadcast()
         lock.unlock()
     }
@@ -78,7 +95,6 @@ final class PendingReplies: @unchecked Sendable {
         defer { lock.unlock() }
         let taken = awaiting
         awaiting.removeAll()
-        count = 0
         lock.broadcast()
         return taken
     }
@@ -88,7 +104,7 @@ final class PendingReplies: @unchecked Sendable {
     func waitForQuiet(upTo seconds: TimeInterval) {
         let deadline = Date().addingTimeInterval(seconds)
         lock.lock()
-        while count > 0, Date() < deadline {
+        while !awaiting.isEmpty, Date() < deadline {
             lock.wait(until: deadline)
         }
         lock.unlock()
@@ -202,6 +218,17 @@ func refuse(_ incoming: JSONRPCIncoming?) {
     }
     guard let id = incoming.id else { return }
     output.write(.failure(id: id, error))
+    pending.answered(id)
+}
+
+/// Передаёт сообщение агента приложению — или отвечает за него отказом.
+///
+/// Разбираем ровно настолько, чтобы знать идентификатор: он нужен, если
+/// ответить придётся нам самим. Содержимое — дело приложения.
+func forward(_ message: Data) {
+    let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
+    if let id = incoming?.id { pending.sent(id) }
+    if !link.send(message) { refuse(incoming) }
 }
 
 // Чтение стандартного ввода блокирующим циклом.
@@ -228,19 +255,13 @@ while true {
         break
     }
 
-    for message in messages {
-        // Разбираем ровно настолько, чтобы знать идентификатор: он нужен,
-        // если ответить придётся нам самим. Содержимое — дело приложения.
-        let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
-        if incoming?.id != nil { pending.sent(incoming?.id) }
-        if !link.send(message) { refuse(incoming) }
-    }
+    for message in messages { forward(message) }
 }
 
-if let tail = framer.flush() {
-    let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: tail)
-    if !link.send(tail) { refuse(incoming) }
-}
+// Хвост без перевода строки идёт тем же путём, что и сообщения из цикла:
+// без учёта хвоста процесс выходил сразу и терял ответ на него — тот самый
+// случай, ради которого ожидание и заводилось.
+if let tail = framer.flush() { forward(tail) }
 
 // Конец ввода — сигнал завершения, но не повод проглотить ответ, который
 // уже в пути. Две секунды: столько идёт разговор через сокет с приложением,

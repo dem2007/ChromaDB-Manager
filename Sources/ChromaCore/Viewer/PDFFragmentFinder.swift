@@ -11,7 +11,7 @@ public enum PDFFragmentFinder {
     public struct Location: Sendable {
         /// Индекс страницы с нуля — как их нумерует PDFKit.
         public let pageIndex: Int
-        /// Диапазон символов на этой странице, или `nil` — открыть без
+        /// Диапазон на этой странице в единицах UTF-16, или `nil` — открыть без
         /// подсветки (четвёртый исход H1.2).
         public let characterRange: Range<Int>?
         public let strategy: FragmentLocator.Strategy?
@@ -68,11 +68,13 @@ public enum PDFFragmentFinder {
         for index in searchOrder(hint: hinted, pageCount: document.pageCount) {
             guard let text = document.page(at: index)?.string, !text.isEmpty else { continue }
             guard let match = FragmentLocator.locate(chunk: chunk, in: text) else { continue }
-            let range = text.distance(from: text.startIndex, to: match.range.lowerBound)
-                ..< text.distance(from: text.startIndex, to: match.range.upperBound)
+            // Единицы UTF-16, а не знаки Swift: `PDFPage.selection(for:)`
+            // считает ими, и знак из нескольких единиц перед совпадением
+            // сдвигал выделение.
+            let range = NSRange(match.range, in: text)
             return Location(
                 pageIndex: index,
-                characterRange: range,
+                characterRange: range.location..<NSMaxRange(range),
                 strategy: match.strategy,
                 pageDiffersFromMetadata: hinted != nil && hinted != index
             )

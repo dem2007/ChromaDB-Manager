@@ -6,6 +6,20 @@ import XCTest
 final class ChatGenerationRequestTests: XCTestCase {
     /// The rule of A1.4, applied to generation: a field nobody filled in must
     /// be absent from the body, not sent as our guess at the server's default.
+    /// Выключенный seed переживает сохранение: без ключа он читался бы
+    /// обратно как 42, подпись нарезки менялась, и всё перенарезалось моделью.
+    func testAClearedSeedSurvivesARoundTrip() throws {
+        var settings = ChatGenerationSettings()
+        settings.seed = nil
+        let decoded = try JSONDecoder().decode(
+            ChatGenerationSettings.self, from: JSONEncoder().encode(settings)
+        )
+        XCTAssertNil(decoded.seed)
+        // А конфигурация, записанная до seed, по-прежнему получает умолчание.
+        let legacy = try JSONDecoder().decode(ChatGenerationSettings.self, from: Data(#"{"temperature":0}"#.utf8))
+        XCTAssertEqual(legacy.seed, ChatGenerationSettings.defaultSeed)
+    }
+
     func testEmptyExtendedFieldsAreAbsentFromTheRequest() {
         let fields = ChatGenerationSettings().requestFields()
         for key in ["top_p", "top_k", "min_p", "repeat_penalty", "frequency_penalty", "max_tokens"] {

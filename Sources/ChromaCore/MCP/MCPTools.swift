@@ -500,6 +500,15 @@ public extension MCPToolBackend {
 
 /// Реестр инструментов этапа 7.
 public enum MCPToolCatalogue {
+    /// Предел глубины карты — и в схеме, и при разборе.
+    ///
+    /// Глубже некуда: у самого вложенного заголовка живого ТЗ пять уровней,
+    /// и сотня — с запасом на любой мыслимый документ. Число нужно не ради
+    /// обозримости (её держит умолчание), а ради того, чтобы сложение
+    /// с глубиной раздела не переполнилось: `Int.max` вместе с «heading»
+    /// роняет приложение целиком.
+    public static let outlineMaximumDepth = 100
+
     public static let listCollections = MCPToolDefinition(
         name: "list_collections",
         title: "List collections",
@@ -895,6 +904,7 @@ public enum MCPToolCatalogue {
                 "outline_depth": .object([
                     "type": .string("integer"),
                     "minimum": .int(1),
+                    "maximum": .int(outlineMaximumDepth),
                     "description": .string("""
                     How deep the outline goes. Default 1 — the top level only, \
                     which is what a map is for: a specification of a thousand \
@@ -1252,6 +1262,10 @@ public struct MCPToolService: Sendable {
     ) {
         guard let audit else { return }
         var text = arguments?.jsonString ?? ""
+        // Объём запроса считается **до** обрезки: иначе столбец «Объём»
+        // показывает двадцать килобайт на запись мегабайтного документа —
+        // то есть врёт ровно там, где этот столбец и нужен.
+        let requestBytes = text.utf8.count
         if text.count > Self.auditParameterLimit {
             text = String(text.prefix(Self.auditParameterLimit))
                 + "… [parameters truncated in the log]"
@@ -1263,7 +1277,7 @@ public struct MCPToolService: Sendable {
             operation: tool.name,
             access: tool.permission == .read ? .read : .write,
             collection: collection,
-            requestBytes: text.utf8.count,
+            requestBytes: requestBytes,
             responseStatus: nil,
             responseBytes: responseBytes,
             durationSeconds: Date().timeIntervalSince(started),
@@ -1282,10 +1296,14 @@ public struct MCPToolService: Sendable {
     /// человек прочитает из первого же вызова — она сформулирована для чтения.
     public func list(key: String?) async -> JSONValue {
         let readOnly = isReadOnlyServer()
-        let decision = await access.decideTool(
-            key: key, permission: .read, collection: nil, isReadOnlyServer: readOnly
-        )
-        let tools = decision.client.map {
+        // Список спрашивается **не** через `decideTool`: тот тратит токен
+        // частоты и на исчерпанном ведре отвечает отказом без клиента.
+        // Разогнавшийся агент получал тогда список без инструментов записи —
+        // и держал его весь сеанс, потому что сервер объявляет
+        // «listChanged: false». Права ключа от частоты вызовов не зависят
+        //.
+        let client = await access.activeClient(withKey: key)
+        let tools = client.map {
             MCPToolCatalogue.available(for: $0.permissions, readOnlyServer: readOnly)
         } ?? MCPToolCatalogue.all.filter { $0.permission == .read }
 
@@ -1476,7 +1494,21 @@ public struct MCPToolService: Sendable {
                 guard let writing else {
                     return refused(.invalidParams("No documents passed: the «documents» parameter is required."))
                 }
-                return answered(try await add(writing).result)
+                do {
+                    return answered(try await add(writing).result)
+                } catch {
+                    // Запись не состоялась — дневной предел ей не причитается
+                    //. Списан он был при решении, до обращения к базе.
+                    //
+                    // Возвращается только **незаписанное**: большая запись идёт
+                    // частями, и часть, успевшая лечь до сбоя, в базе есть.
+                    // Вернуть за неё предел значило бы дать ключу писать сверх
+                    // дневной нормы повторами одной и той же большой записи.
+                    var written = 0
+                    if case ChromaError.partialWrite(let failure) = error { written = failure.written }
+                    await access.refundWrite(writing.payload.documentCount - written, forKey: key)
+                    throw error
+                }
             case MCPToolCatalogue.deleteDocuments.name:
                 switch Self.deleteRequest(collection ?? "", arguments) {
                 case .failure(let error): return refused(error)
@@ -1666,6 +1698,13 @@ public struct MCPToolService: Sendable {
         let request: MCPDocumentsRequest
         let limitNote: String?
         let fields: [String]?
+        /// Идентификаторы, не поместившиеся в потолок ключа.
+        ///
+        /// Они отрезаются при разборе, и об этом говорит пометка — а вот
+        /// `hasMore` в структуре оставался ложью: текст обещал продолжение,
+        /// зеркало говорило «всё». Клиент, читающий структуру, уходил
+        /// с половиной выборки, считая её целой.
+        var droppedIdentifiers = 0
     }
 
     /// Разобранный «собери по теме».
@@ -2032,7 +2071,8 @@ public struct MCPToolService: Sendable {
                     offset: ids.isEmpty ? offset : 0
                 ),
                 limitNote: note,
-                fields: fields
+                fields: fields,
+                droppedIdentifiers: max(0, ids.count - limits.ceiling)
             ))
         }
     }
@@ -2188,7 +2228,11 @@ public struct MCPToolService: Sendable {
         let depth: Int
         switch integer(arguments, "outline_depth") {
         case .failure(let error): return .failure(error)
-        case .success(let value): depth = max(1, value ?? 1)
+        // Предел сверху — не придирчивость, а защита от падения: глубина
+        // складывается с глубиной раздела, и `Int.max` вместе с «heading»
+        // роняет **всё приложение** переполнением — мосты, прокси и окно
+        // заодно. Ключа на чтение для этого достаточно.
+        case .success(let value): depth = min(max(1, value ?? 1), MCPToolCatalogue.outlineMaximumDepth)
         }
         return .success(ParsedFile(
             path: path ?? "",
@@ -2234,14 +2278,14 @@ public struct MCPToolService: Sendable {
     /// Условие «этот и только этот файл».
     static func fileFilter(_ path: String) -> DocumentFilter {
         var filter = DocumentFilter()
-        filter.conditions = [MetadataCondition(field: "source_file", op: .equals, value: path)]
+        filter.conditions = [MetadataCondition(field: "source_file", op: .equals, value: path, valueIsText: true)]
         return filter
     }
 
     /// То же, но по отпечатку файла.
     static func fingerprintFilter(_ fingerprint: String) -> DocumentFilter {
         var filter = DocumentFilter()
-        filter.conditions = [MetadataCondition(field: "file_id", op: .equals, value: fingerprint)]
+        filter.conditions = [MetadataCondition(field: "file_id", op: .equals, value: fingerprint, valueIsText: true)]
         return filter
     }
 
@@ -2477,7 +2521,10 @@ public struct MCPToolService: Sendable {
         var structured: [String: JSONValue] = [
             "collection": .string(parsed.request.collection),
             "documents": .array(rendered.documents),
-            "hasMore": .bool(answer.hasMore || rendered.isTruncated),
+            // Отрезанные по потолку идентификаторы — тоже «есть ещё»:
+            // текст об этом говорит пометкой, и зеркало не вправе
+            // утверждать обратное.
+            "hasMore": .bool(answer.hasMore || rendered.isTruncated || parsed.droppedIdentifiers > 0),
         ]
 
         var notes = rendered.notes
@@ -2640,17 +2687,30 @@ public struct MCPToolService: Sendable {
         let samples = shown.flatMap { file in
             MCPFileChunks.ordered(file.samples).prefix(parsed.perFile)
         }
+
+        // Заголовок и пометки уезжают вместе с образцами и платят из того же
+        // бюджета. У этой ветки оплаты не было вовсе: перечень
+        // вычитался, а заголовок, пометки и их зеркало держались на плоском
+        // запасе обвязки — и на длинных образцах ответ выходил за потолок
+        // ключа молча. Считается до рендера: после — уже не бюджет,
+        // а отчёт о перерасходе.
+        let hasMore = parsed.offset + shown.count < files.count
+        let continueNote = hasMore
+            ? "Files \((parsed.offset + 1).plainDigits) to \((parsed.offset + shown.count).plainDigits) of \(files.count.plainDigits) are shown — continue with offset \((parsed.offset + shown.count).plainDigits)."
+            : nil
+        let header = "«\(parsed.contains)»: \(EnglishCount.grouped(answer.documents.count, "match", "matches")) in \(EnglishCount.grouped(files.count, "file", "files")), \(shown.count.plainDigits) shown"
+        let overhead = MCPDocumentRendering.overhead(
+            header: header, notes: notes + (continueNote.map { [$0] } ?? [])
+        )
+
         let rendered = MCPDocumentRendering.render(
             samples, limits: limits, fields: parsed.fields,
             budget: max(1, limits.responseCharacters - listingSize),
+            reserve: overhead,
             vocabulary: .mentionSamples
         )
         notes += rendered.notes
-
-        let hasMore = parsed.offset + shown.count < files.count
-        if hasMore {
-            notes.append("Files \((parsed.offset + 1).plainDigits) to \((parsed.offset + shown.count).plainDigits) of \(files.count.plainDigits) are shown — continue with offset \((parsed.offset + shown.count).plainDigits).")
-        }
+        if let continueNote { notes.append(continueNote) }
 
         // Ровно те зеркала, что уже оплачены выше: собирать их второй раз
         // значило бы разойтись с бюджетом при первой же правке.
@@ -2658,7 +2718,6 @@ public struct MCPToolService: Sendable {
         structured["documents"] = .array(rendered.documents)
         structured["hasMore"] = .bool(hasMore)
 
-        let header = "«\(parsed.contains)»: \(EnglishCount.grouped(answer.documents.count, "match", "matches")) in \(EnglishCount.grouped(files.count, "file", "files")), \(shown.count.plainDigits) shown"
         return answered([header] + listing + [""] + rendered.lines)
     }
 
@@ -3885,9 +3944,17 @@ public struct MCPToolService: Sendable {
         // Сделанное называется вслух ровно так же, как несделанное: страница
         // на пять кусков вместо пятнадцати выглядит как упёршаяся в бюджет,
         // и без этой строки агент решил бы, что дальше читать нечем.
-        if parsed.askedLimit != nil, cursor - from >= chunkCap, hasMore {
+        // «Сколько просили» — это просьба агента, а не то, что от неё
+        // осталось после потолка ключа. При потолке 10 и просьбе 200 ответ
+        // уверял, будто агент просил десять, и звал просить больше — то
+        // есть звал в тупик, потому что больше ключу не дадут.
+        if parsed.askedLimit == chunkCap, cursor - from >= chunkCap, hasMore {
             notes.append("The page stopped at the \(chunkCap.plainDigits) chunks you asked for, not at the answer budget — ask for more with «limit» to fill the answer.")
         }
+        // Урезанную потолком просьбу называет та же пометка, что и в двух
+        // других ветках чтения: без неё агент не знает, что его «limit»
+        // не сработал, — а это первое, что он должен узнать.
+        if let limitNote = parsed.limitNote { notes.append(limitNote) }
         // Совет читать файл на диске — только пока листать ещё есть что:
         // тому, кто дочитал до конца, он предлагает переделать сделанное.
         if hasMore, let onDisk {
@@ -4315,7 +4382,7 @@ public struct MCPToolService: Sendable {
 
         for variant in FilePathKey.variants(name) {
             var filter = DocumentFilter()
-            filter.conditions = [MetadataCondition(field: "file_name", op: .equals, value: variant)]
+            filter.conditions = [MetadataCondition(field: "file_name", op: .equals, value: variant, valueIsText: true)]
             let request = MCPDocumentsRequest(
                 collection: collection, ids: [], filter: filter,
                 limit: Self.similarFilesScan, offset: 0

@@ -17,32 +17,18 @@
 Разделитель — «|», а не двоеточие: имена профилей его и содержат («Опыт:
 опорный»), и первый же довод развалился бы на пять частей вместо четырёх.
 
-Разметка берётся из текущего набора запросов, как и в `score-evaluation.py`:
-эталон живёт в наборе и работает для всех прогонов сразу.
+Эталон и оценка — те же, что у `score-evaluation.py` и у экрана
+(`evaluation_common.py`): ячейки, где поиск упал, в счёт не идут.
 """
 
 # Аннотации не вычисляются: на системном python 3.9 «str | None» иначе падает.
 from __future__ import annotations
 
-import json
 import re
 import sys
-import unicodedata
 from pathlib import Path
 
-SUPPORT = Path.home() / "Library/Application Support/ChromaDBManager"
-RUNS = SUPPORT / "evaluation-runs"
-SETS = SUPPORT / "query-sets.json"
-STRENGTH = {"relevant": 2, "partial": 1, "irrelevant": 0}
-
-
-def normalised(text: str) -> str:
-    """То же приведение, что у эталона в приложении (`QuerySet.normalised`)."""
-    collapsed = " ".join((text or "").split()).lower()
-    return "".join(
-        c for c in unicodedata.normalize("NFD", collapsed)
-        if unicodedata.category(c) != "Mn"
-    )
+from evaluation_common import RUNS, ground_truth, grader, has_relevant, load, succeeded
 
 
 def words(text: str) -> list:
@@ -80,17 +66,6 @@ RULES = [
 ]
 
 
-def query_set(run: dict) -> dict:
-    if not SETS.exists():
-        return {"queries": []}
-    data = json.loads(SETS.read_text(encoding="utf-8"))
-    sets = data if isinstance(data, list) else data.get("sets", [])
-    for candidate in sets:
-        if candidate.get("id") == run.get("querySetID"):
-            return candidate
-    return {"queries": []}
-
-
 def find_run(prefix: str) -> Path:
     for path in sorted(RUNS.glob("*.json")):
         if path.stem.lower().startswith(prefix.lower()):
@@ -108,8 +83,8 @@ def reciprocal_ranks(spec: str) -> dict:
     if len(parts) != 4:
         raise SystemExit(f"довод «{spec}»: нужно «прогон|вариант_с_текстом|вариант_без|коллекция»")
     prefix, on_name, off_name, collection = parts
-    run = json.loads(find_run(prefix).read_text(encoding="utf-8"))
-    truth = {q["id"]: q for q in query_set(run).get("queries", [])}
+    run = load(find_run(prefix))
+    truth = ground_truth(run)
 
     ids = {}
     for variant in run.get("variants", []):
@@ -124,29 +99,20 @@ def reciprocal_ranks(spec: str) -> dict:
         if side not in ids:
             raise SystemExit(f"в прогоне {prefix} нет варианта «{name}» на коллекции {collection}")
 
-    def grade(query: dict, hit: dict) -> str | None:
-        document = normalised(hit.get("text") or "")
-        best = None
-        for fragment in query.get("fragments", []):
-            value = fragment.get("grade")
-            if not fragment.get("fragment") or value not in STRENGTH:
-                continue
-            if normalised(fragment["fragment"]) in document:
-                if best is None or STRENGTH[value] > STRENGTH[best]:
-                    best = value
-        return best
-
     out: dict = {}
     for result in run.get("results", []):
         side = "on" if result["variantID"] == ids["on"] else (
             "off" if result["variantID"] == ids["off"] else None)
-        if side is None:
+        if side is None or not succeeded(result):
             continue
         query = truth.get(result["queryID"])
-        if query is None or not any(f.get("grade") != "irrelevant" for f in query.get("fragments", [])):
+        # Только запросы с «релевантным» в эталоне: ранг здесь — первого
+        # «релевантного», и запрос с одними «частично» набрать не может ничего.
+        if not has_relevant(query):
             continue
-        rank = next((h["position"] for h in result["hits"] if grade(query, h) == "relevant"), None)
-        out.setdefault(result["queryID"], {"текст": query["text"]})[side] = 1 / rank if rank else 0.0
+        grade = grader(query)
+        rank = next((h["position"] for h in result["hits"] if grade(h) == "relevant"), None)
+        out.setdefault(result["queryID"], {"текст": query.get("text", "")})[side] = 1 / rank if rank else 0.0
     return {k: v for k, v in out.items() if "on" in v and "off" in v}
 
 
@@ -154,37 +120,39 @@ def main() -> None:
     specs = sys.argv[1:]
     if not specs:
         raise SystemExit(__doc__)
-    # Ключ — прогон **и** коллекция: один прогон часто несёт варианты обеих
-    # коллекций, и ключа по одному идентификатору не хватало — второй довод
-    # молча затирал первый, а таблица выглядела правдоподобно.
-    columns = {}
+    # Столбец — это довод целиком, а подпись у него — номер. Ключ из прогона
+    # и обрезанного имени коллекции затирал второй довод первым, стоило им
+    # отличаться только вариантами или хвостом имени, — и таблица выглядела
+    # правдоподобно. Повтор одного и того же довода — тот же столбец.
+    columns: dict = {}
     for spec in specs:
-        parts = spec.split("|")
-        label = f"{parts[0]} · {parts[-1][:18]}" if len(parts) == 4 else parts[0]
-        columns[label] = reciprocal_ranks
-    for name, rows in columns.items():
-        print(f"{name}: запросов {len(rows)}")
+        if spec not in columns:
+            columns[spec] = reciprocal_ranks(spec)
+    labels = {spec: f"#{number}" for number, spec in enumerate(columns, start=1)}
+    for spec, rows in columns.items():
+        print(f"{labels[spec]}: {spec} — запросов {len(rows)}")
     print()
+    if not any(columns.values()):
+        raise SystemExit("ни в одном доводе нет запроса с «релевантным» в эталоне — считать нечего")
 
     width = max(len(name) for name, _ in RULES) + 2
-    header = "".join(f"{name[-13:]:>15}" for name in columns)
+    header = "".join(f"{labels[spec]:>10}" for spec in columns)
     print(f"{'правило':<{width}}{header}{'всего':>10}")
     for name, rule in RULES:
         cells, pooled = [], []
         for rows in columns.values():
             values = [(v["on"] if rule(v["текст"]) else v["off"]) for v in rows.values()]
-            cells.append(sum(values) / len(values) if values else 0.0)
+            cells.append(f"{sum(values) / len(values):>10.3f}" if values else f"{'—':>10}")
             pooled += values
-        line = "".join(f"{value:>15.3f}" for value in cells)
-        print(f"{name:<{width}}{line}{sum(pooled) / len(pooled):>10.3f}")
+        print(f"{name:<{width}}{''.join(cells)}{sum(pooled) / len(pooled):>10.3f}")
 
     print("\nЗапросы, где текстовая стадия что-то решает:")
-    for name, rows in columns.items():
+    for spec, rows in columns.items():
         for row in rows.values():
             if abs(row["on"] - row["off"]) < 1e-9:
                 continue
             better = "текст" if row["on"] > row["off"] else "вектор"
-            print(f"   [{name}] {better:<7} {row['текст'][:60]}"
+            print(f"   [{labels[spec]}] {better:<7} {row['текст'][:60]}"
                   f"  · {word_count(row['текст'])} слов · с текстом {row['on']:.2f} / без {row['off']:.2f}")
 
 

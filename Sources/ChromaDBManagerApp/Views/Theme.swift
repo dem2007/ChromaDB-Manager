@@ -272,10 +272,13 @@ struct WindowScrollerStyle: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
         let coordinator = context.coordinator
+        // Координатор — слабо: замыкание держит центр уведомлений, и сильная
+        // ссылка не давала координатору умереть, а его `deinit` — снять
+        // наблюдателя. Каждое новое главное окно добавляло ещё одного.
         coordinator.token = NotificationCenter.default.addObserver(
             forName: NSWindow.didUpdateNotification, object: nil, queue: .main
-        ) { _ in
-            guard Date().timeIntervalSince(coordinator.lastRun) > 0.5 else { return }
+        ) { [weak coordinator] _ in
+            guard let coordinator, Date().timeIntervalSince(coordinator.lastRun) > 0.5 else { return }
             coordinator.lastRun = Date()
             Self.applyToAllWindows()
         }
@@ -284,6 +287,11 @@ struct WindowScrollerStyle: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        if let token = coordinator.token { NotificationCenter.default.removeObserver(token) }
+        coordinator.token = nil
+    }
 
     static func applyToAllWindows() {
         for window in NSApplication.shared.windows {

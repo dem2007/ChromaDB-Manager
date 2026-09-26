@@ -101,13 +101,23 @@ public struct ChromaRoute: Equatable {
         "count": .read,
     ]
 
-    public static func parse(method: String, path: String) -> ChromaRoute {
-        let method = method.uppercased()
+    /// Сегменты пути — так, как их видит проверка прав: без строки запроса,
+    /// раскодированные.
+    ///
+    /// Одно место на проверку прав и на отказ точечным сегментам в прокси:
+    /// разойдись они в том, что считать сегментом, и отказ пропустил бы
+    /// именно то, что проверка прав поняла иначе.
+    public static func segments(of path: String) -> [String] {
         // The query string carries no routing information (`?read_level=…`).
         let withoutQuery = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
-        var segments = withoutQuery
+        return withoutQuery
             .split(separator: "/")
             .map { $0.removingPercentEncoding ?? String($0) }
+    }
+
+    public static func parse(method: String, path: String) -> ChromaRoute {
+        let method = method.uppercased()
+        var segments = Self.segments(of: path)
 
         guard segments.count >= 2, segments[0] == "api", segments[1] == "v2" else {
             return unknown(method: method)
@@ -137,7 +147,12 @@ public struct ChromaRoute: Equatable {
         // /api/v2/tenants/{tenant}[/databases/{database}[/collections[/…]]]
         guard segments.count >= 2 else { return unknown(method: method) }
         let tenant = segments[1]
+        // Служебными чтениями эти адреса бывают только на GET/HEAD: DELETE
+        // по базе сносит её вместе со всеми коллекциями, PATCH по тенанту
+        // меняет его, а служебный доступ пропускается любым включённым ключом.
+        let isRead = method == "GET" || method == "HEAD"
         guard segments.count >= 3 else {
+            guard isRead else { return unknown(method: method, tenant: tenant) }
             return ChromaRoute(operation: "get_tenant", access: .service, tenant: tenant)
         }
         guard segments[2] == "databases", segments.count >= 4 else {
@@ -145,6 +160,7 @@ public struct ChromaRoute: Equatable {
         }
         let database = segments[3]
         guard segments.count >= 5 else {
+            guard isRead else { return unknown(method: method, tenant: tenant, database: database) }
             return ChromaRoute(operation: "get_database", access: .service, tenant: tenant, database: database)
         }
         guard segments[4] == "collections" else {

@@ -227,3 +227,65 @@ final class ServerRecordRetentionTests: XCTestCase {
         XCTAssertNil(verdict.reason)
     }
 }
+
+/// Перенятый сервер останавливается по-настоящему (разбор 24.09).
+///
+/// У сервера, поднятого прошлой сессией, объекта `Process` нет — только pid.
+/// `stop()` уходил в ветку `guard let process`, забывал запись и объявлял
+/// `.stopped`, **не послав сигнала**. Сервер продолжал работать никем не
+/// учтённым: снимок базы копировал файлы SQLite из-под живого сервера,
+/// а следующее подключение поднимало второй `chroma run` на той же папке.
+final class AdoptedServerStopTests: XCTestCase {
+    /// Живой процесс, который правда слушает порт: тождество проверяется
+    /// и по исполняемому файлу, и по времени старта, и по порту, — подделать
+    /// это записью нельзя, нужен настоящий.
+    private func listener(port: Int) -> Process? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", "-m", "http.server", "\(port)", "--bind", "127.0.0.1"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        return process
+    }
+
+    func testStoppingAnAdoptedServerActuallyKillsIt() async throws {
+        let port = Int.random(in: 49_200...49_900)
+        guard let helper = listener(port: port) else {
+            throw XCTSkip("python3 не запустился — останавливать нечего")
+        }
+        defer { if helper.isRunning { kill(helper.processIdentifier, SIGKILL) } }
+        let pid = helper.processIdentifier
+
+        // Ждём, пока процесс займёт порт: до этого тождество не подтвердится.
+        var identity: ProcessIdentity?
+        for _ in 0..<40 {
+            identity = ProcessInspector.identity(of: pid)
+            if identity?.listeningPorts.contains(port) == true { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard let identity, identity.listeningPorts.contains(port) else {
+            throw XCTSkip("процесс не занял порт \(port) — проверять нечего")
+        }
+
+        let record = RunningServerRecord(
+            pid: pid, port: port, host: "127.0.0.1",
+            path: NSTemporaryDirectory(), label: "перенятый",
+            startedAt: identity.startedAt, executablePath: identity.executablePath
+        )
+        let manager = await ChromaProcessManager(log: { _, _, _ in })
+        let endpoint = await manager.adoptOrphan(record)
+        try XCTUnwrap(endpoint, "процесс не перенят — дальше проверять нечего")
+
+        await manager.stop()
+
+        // Сигнал дошёл: процесса не стало.
+        var alive = true
+        for _ in 0..<40 {
+            alive = ProcessInspector.isAlive(pid)
+            if !alive { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTAssertFalse(alive, "перенятый сервер остался работать после stop()")
+    }
+}

@@ -290,7 +290,17 @@ struct ConnectionView: View {
 
     private func profileRow(_ profile: ServerProfile) -> some View {
         let isSelected = settings.configuration.selectedProfileID == profile.id
-        let isThisRunning = processManager.isRunning && processManager.endpoint?.port == profile.port
+        // Порт — не имя: у новых профилей он по умолчанию один и тот же,
+        // и «запущен» загоралось у всех профилей с тем же портом. Там, где
+        // у профиля есть своя база, сверяется и она.
+        let isThisRunning = processManager.isRunning
+            && processManager.endpoint?.port == profile.port
+            && (profile.databasePath.map { path in
+                processManager.databasePath.map {
+                    URL(fileURLWithPath: $0).standardizedFileURL.path
+                        == URL(fileURLWithPath: path).standardizedFileURL.path
+                } ?? false
+            } ?? true)
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack {

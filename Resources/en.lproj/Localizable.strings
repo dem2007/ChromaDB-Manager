@@ -158,6 +158,7 @@
 "Импорт CSV или JSON…" = "Import CSV or JSON…";
 "Экспорт коллекции…" = "Export collection…";
 "Импорт пакета .chromaexport…" = "Import a .chromaexport package…";
+"Загрузить пакет .chromaexport в новую коллекцию или в эту. Пишет в базу." = "Load a .chromaexport package into a new collection or into this one. Writes to the database.";
 "Удалить коллекцию…" = "Delete collection…";
 "Пересчёт векторов, импорт, удаление коллекции" = "Recompute vectors, import, delete the collection";
 "Служебные поля" = "Technical fields";
@@ -354,6 +355,8 @@
 "Пароль" = "Password";
 "Показать в Finder" = "Show in Finder";
 "Открыть во внешнем" = "Open externally";
+"Документ — страница сайта. Панель показывает файлы, а у этого документа есть только адрес." = "The document is a web page. The panel shows files, and this document only has an address.";
+"Открыть в браузере" = "Open in browser";
 "При индексации фрагмент был здесь: %@." = "At indexing time the fragment was here: %@.";
 "Показать внутри приложения не вышло." = "Showing it inside the app did not work.";
 
@@ -444,6 +447,7 @@
 "Сжать базу" = "Compact the database";
 "Не будет удалено ни при каких условиях:" = "Never deleted under any circumstances:";
 "введите УДАЛИТЬ" = "type DELETE";
+"УДАЛИТЬ" = "DELETE";
 "Удалить все данные" = "Delete all data";
 "Вывод команд" = "Command output";
 "Очистить" = "Clear";
@@ -541,6 +545,8 @@
 "Условие" = "Condition";
 "Группа" = "Group";
 "значения через запятую" = "values, comma separated";
+"как текст" = "as text";
+"Отправить значение строкой, даже если оно похоже на число или true/false." = "Send the value as a string, even if it looks like a number or true/false.";
 "подстрока" = "substring";
 
 /* ── Журналы ── */
@@ -1533,6 +1539,7 @@
 "Документы группируются по близости векторов, каждая группа получает название от чат-модели." = "Documents are grouped by the closeness of their vectors, and each group gets a name from the chat model.";
 "Прогонов ещё не было: нажмите «Найти темы», и приложение прочитает векторы выборки." = "No runs yet: press “Find topics” and the app will read the sample’s vectors.";
 "Документы, до своего центра которых дальше остальных. Часто именно здесь видно то, что попало в коллекцию случайно. Порог: %@ по косинусу." = "The documents furthest from their own centre. This is often where things that ended up in the collection by accident become visible. Threshold: %@ by cosine.";
+"Документы, до своего центра которых дальше остальных. Порога нет: расстояния до центров тем почти одинаковые, отделять нечего." = "The documents furthest from their own centre. There is no threshold: the distances to the topic centres are almost the same, so there is nothing to separate.";
 "Таких документов нет: выборка разошлась по темам целиком." = "There are none: the whole sample fell into topics.";
 "Из %lld коллекций ни одна не подходит под «%@»." = "None of the %lld collections matches “%@”.";
 "Модель и метрику коллекции менять потом нельзя — только пересоздавать её." = "A collection’s model and metric cannot be changed later — only the collection can be recreated.";
@@ -2068,7 +2075,7 @@
 "документов %@" = "%@ documents";
 "Оценка по выборке: %@ документов из %@" = "Estimated over a sample: %@ documents of %@";
 "По всей коллекции: документов %@" = "Over the whole collection: %@ documents";
-"Модель не назвала тему %@: %@" = "The model did not name topic %@: %@";
+"Модель не назвала тему «%@»: %@" = "The model did not name the topic “%@”: %@";
 "Документов в коллекции %@ — темы выделять не из чего." = "The collection holds %@ documents — there is nothing to draw topics from.";
 "Тем: %@ по выборке из %@ документов (в коллекции %@)" = "Topics: %@ over a sample of %@ documents (%@ in the collection)";
 "Тем: %@ по всей коллекции — документов %@" = "Topics: %@ over the whole collection — %@ documents";
@@ -2121,7 +2128,7 @@
 "Таблицы" = "Tables";
 
 /* ── MCP, аудит, сортировка ── */
-"Ответ модели на тему %@ не разобран — тема осталась без названия." = "The model’s answer for topic %@ could not be parsed — the topic stayed unnamed.";
+"Ответ модели на тему «%@» не разобран — тема осталась без названия." = "The model’s answer for the topic “%@” could not be parsed — the topic stayed unnamed.";
 "Темы отделяются заметно — обычное дело для текстовой коллекции." = "The topics separate noticeably — an ordinary thing for a text collection.";
 "Оценка отменена: сделано %lld из %lld. Полученные оценки сохранены." = "The evaluation was cancelled: %lld of %lld done. The scores produced are saved.";
 "%@ не ответил вовремя — документ мог остаться открытым в программе" = "%@ did not answer in time — the document may still be open in the program";
@@ -2129,6 +2136,7 @@
 "архив в распакованном виде больше предела (%@ при пределе %@)" = "the archive unpacked is over the limit (%@ against a limit of %@)";
 "Переиндексировать эти файлы: синхронизация допишет недостающее." = "Re-index these files: a sync will add what is missing.";
 "файлы: %@ и ещё %@" = "files: %@ and %@ more";
+"%@ и ещё %@" = "%@ and %@ more";
 "файлы: %@" = "files: %@";
 "id: %@" = "id: %@";
 "нет чанков: %@ из %@" = "chunks missing: %@ of %@";
@@ -2296,7 +2304,7 @@
 "Скалярное произведение (ip)" = "Inner product (ip)";
 "Подходит почти всем эмбеддинг-моделям: они нормированы под неё. Значение от 0 до 2, рядом показывается схожесть в процентах." = "Suits almost every embedding model: they are normalised for it. The value runs from 0 to 2, with similarity shown as a percentage next to it.";
 "Евклидово расстояние. Не ограничено сверху и зависит от масштаба векторов — в процентах его показать нельзя." = "Euclidean distance. It has no upper bound and depends on the scale of the vectors — it cannot be shown as a percentage.";
-"Скалярное произведение. Может быть отрицательным; чем больше, тем ближе." = "Inner product. It can be negative; the larger it is, the closer.";
+"Скалярное произведение. База показывает расстояние 1 − произведение: оно может быть отрицательным, и чем оно меньше, тем ближе." = "Inner product. The database shows the distance as 1 − product: it can be negative, and the smaller it is, the closer.";
 "%lld%% · d=%@" = "%lld%% · d=%@";
 "евклидово %@" = "euclidean %@";
 "произведение %@" = "product %@";
@@ -2940,6 +2948,7 @@
 "Файл не найден: %@. При индексации он лежал по пути «%@» в источнике «%@». Укажите новое расположение источника на экране «Эмбеддинги»." = "File not found: %@. At indexing time it lay at “%@” in the source “%@”. Set the source’s new location on the “Embeddings” screen.";
 "Источник «%@» больше не зарегистрирован — папку, в которой лежал файл «%@», приложение не знает. Добавьте источник заново, и просмотр заработает." = "The source “%@” is no longer registered — the app does not know the folder the file “%@” lay in. Add the source again and viewing will work.";
 "Документ добавлен вручную, а не из файла — исходника у него нет." = "The document was added by hand rather than from a file — it has no original.";
+"Документ — страница сайта %@. Панель показывает файлы; страницу откройте в браузере." = "The document is the web page %@. The panel shows files; open the page in a browser.";
 "глава %lld из %lld, %@" = "chapter %lld of %lld, %@";
 "Файл не открылся как EPUB — возможно, он повреждён." = "The file did not open as an EPUB — it may be damaged.";
 "Главы, из которой взят фрагмент, в книге больше нет." = "The chapter the fragment came from is no longer in the book.";
@@ -3334,6 +3343,7 @@
 "Колонтитул: %@" = "Header: %@";
 "Нижний колонтитул: %@" = "Footer: %@";
 "Сноска %@: %@" = "Footnote %@: %@";
+"Концевая сноска %@: %@" = "Endnote %@: %@";
 "пропущено скрытых абзацев: %@ — Word их не показывает и не печатает" = "hidden paragraphs skipped: %@ — Word neither shows nor prints them";
 "формат %@ не контейнер: правки, комментарии и сноски в нём не проверялись" = "the %@ format is not a container: revisions, comments and footnotes in it were not checked";
 
@@ -3664,3 +3674,12 @@
 "Положить скилл из папки" = "Install a skill from a folder";
 "Первая кнопка ставит английский скилл приложения — на этом языке отвечает и сам сервер. Русский вариант лежит рядом, Contents/Resources/Skills/chromadb-manager/SKILL.ru.md. Вторая берёт любой скилл из его папки и кладёт её агенту целиком, вместе с references и scripts: имя берётся из шапки SKILL.md, служебное (.git, .DS_Store) не едет. Прежние файлы агента сохраняются снимком." = "The first button installs the application's English skill — the language the server itself answers in. The Russian variant sits beside it, Contents/Resources/Skills/chromadb-manager/SKILL.ru.md. The second takes any skill from its own folder and puts that folder to the agent whole, references and scripts included: the name comes from the SKILL.md header, and repository plumbing (.git, .DS_Store) stays behind. The agent's previous files are kept as a snapshot.";
 "Имя скилла «%@» в шапке SKILL.md — это путь, а не имя: положить такую папку значит записать мимо папки скиллов. Исправьте строку name в шапке." = "The skill name «%@» in the SKILL.md header is a path, not a name: installing that folder would write outside the skills folder. Fix the name line in the header.";
+"Модель не назвала тему %@: %@" = "The model did not name topic %@: %@";
+"Ответ модели на тему %@ не разобран — тема осталась без названия." = "The model’s answer for topic %@ could not be parsed — the topic stayed unnamed.";
+"Скалярное произведение. Может быть отрицательным; чем больше, тем ближе." = "Inner product. It can be negative; the larger it is, the closer.";
+"Коллекция «%@» уже есть. Импорт в новую коллекцию в неё не пишет: выберите другое имя или выберите «%@» как существующую — так же продолжается прерванный импорт." = "The collection «%@» already exists. An import into a new collection does not write into it: choose another name, or choose «%@» as an existing collection — that is also how an interrupted import continues.";
+"Прокси не поднялся после перезапуска сервера: %@" = "The proxy did not come back after the server restart: %@";
+"Копия %@ снята с другой базы (%@), а активна %@. Переключитесь на ту базу, чтобы восстановить её." = "The backup %@ was taken from another database (%@), while %@ is active. Switch to that database to restore it.";
+"Отчёт на экране — про другую коллекцию. Прогоните инспектор заново." = "The report on screen is about another collection. Run the inspector again.";
+"Восстановить базу из копии?" = "Restore the database from the backup?";
+"%@ — %@. Текущая база будет заменена содержимым копии; сама она отложится в папку копий." = "%@ — %@. The current database will be replaced with the backup's contents; it will itself be set aside in the backups folder.";

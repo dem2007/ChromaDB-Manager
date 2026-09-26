@@ -404,6 +404,25 @@ public struct AdaptiveChunker: Chunking {
     /// модель может отказаться считать. Если склейка не помещается,
     /// короткий кусок остаётся как есть: нижняя граница — пожелание, верхняя —
     /// запрет.
+    /// Хвост без начала, повторяющего конец предыдущего куска.
+    ///
+    /// Перекрытие ищется как самое длинное совпадение конца `previous` с
+    /// началом `tail`. Короче шестнадцати знаков совпадение не считается
+    /// перекрытием: такое бывает и само — одинаковая пунктуация, общее
+    /// короткое слово, — и отрезать его значило бы потерять текст.
+    static func withoutOverlap(_ tail: String, after previous: String) -> String {
+        let left = Array(previous)
+        let right = Array(tail)
+        let longest = min(left.count, right.count)
+        let shortest = 16
+        guard longest >= shortest else { return tail }
+        for length in stride(from: longest, through: shortest, by: -1)
+        where left[(left.count - length)...].elementsEqual(right[..<length]) {
+            return String(right[length...])
+        }
+        return tail
+    }
+
     static func honouringMinimum(
         _ blocks: [[String]], minimum: Int, maximum: Int
     ) -> [String] {
@@ -414,9 +433,15 @@ public struct AdaptiveChunker: Chunking {
             var pieces = block
             while pieces.count > 1, let tail = pieces.last, tail.count < minimum {
                 let previous = pieces[pieces.count - 2]
-                guard previous.count + tail.count + 1 <= maximum else { break }
+                // Хвост начинается с перекрытия — с конца того самого куска,
+                // к которому он приклеивается. Без этого склейка повторяла
+                // перекрытие дважды подряд: текст чанка переставал совпадать
+                // с файлом, вектор смещался к повтору, а `ChunkLocator` не
+                // находил чанк и не давал ему ни страницы, ни раздела.
+                let rest = withoutOverlap(tail, after: previous)
+                guard previous.count + rest.count + 1 <= maximum else { break }
                 pieces.removeLast()
-                pieces[pieces.count - 1] = ChunkHygiene.joined(previous, tail)
+                pieces[pieces.count - 1] = ChunkHygiene.joined(previous, rest)
             }
             return pieces
         }

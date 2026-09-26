@@ -164,6 +164,28 @@ final class CollectionInspectorTests: XCTestCase {
         XCTAssertTrue(gap.detail?.contains("2") ?? false, gap.detail ?? "")
     }
 
+    /// Чужая нумерация: отрицательный номер ронял диапазон, сквозной счётчик
+    /// заставлял перебирать миллиард номеров.
+    func testForeignChunkNumberingIsLeftAlone() async throws {
+        let reader = Reader()
+        reader.records = [
+            record("n", metadata: ["source_file": .string("минус.md"), "chunk_index": .int(-1), "source_id": .string(sourceID)]),
+            record("g1", metadata: ["source_file": .string("счётчик.md"), "chunk_index": .int(1_000_000_000), "source_id": .string(sourceID)]),
+            record("g2", metadata: ["source_file": .string("счётчик.md"), "chunk_index": .int(1_000_000_001), "source_id": .string(sourceID)]),
+        ]
+        let report = try await inspect(reader)
+        XCTAssertTrue(report.findings(in: .chunkGaps).isEmpty)
+    }
+
+    /// Пробелы — это пусто, а не «без слов».
+    func testWhitespaceOnlyIsEmptyNotWordless() async throws {
+        let reader = Reader()
+        reader.records = [record("пробелы", text: "   \n\t  ", metadata: ["source_id": .string(sourceID)])]
+        let report = try await inspect(reader)
+        XCTAssertEqual(report.findings(in: .emptyDocuments).flatMap(\.documentIDs), ["пробелы"])
+        XCTAssertTrue(report.findings(in: .wordlessChunks).isEmpty)
+    }
+
     func testMissingCollectionBindingIsReported() async throws {
         let reader = Reader()
         reader.records = [record("a")]

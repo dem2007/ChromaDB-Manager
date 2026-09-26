@@ -105,17 +105,15 @@ struct OverviewView: View {
         }
     }
 
-    /// Перезапуск: новый процесс запускается и только потом этот выходит.
+    /// Перезапуск: этот процесс выходит, новый запускается после него.
     ///
-    /// Порядок важен: выйти первым — значит оставить человека без окна, если
-    /// запуск не удался.
+    /// Не наоборот: выход при идущей индексации спрашивают и его можно
+    /// отменить, а запущенную заранее вторую копию отменить уже нельзя — две
+    /// копии делили бы настройки, сервер и прокси. Запуск назначается
+    /// в `applicationWillTerminate`, когда выход уже состоялся.
     private func restart() {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
-            guard error == nil else { return }
-            DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
-        }
+        AppDelegate.relaunchOnExit = true
+        NSApplication.shared.terminate(nil)
     }
 
     // MARK: - Плашки

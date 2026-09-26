@@ -22,6 +22,16 @@ final class AdaptiveMinimumTests: XCTestCase {
 
     /// Заголовок — это блок целиком короче минимума, и он открывает то, что
     /// за ним. Значит вперёд.
+    /// Хвост длинного абзаца начинается с перекрытия — с конца куска,
+    /// к которому он приклеивается. Склейка не должна повторять его дважды.
+    func testGluingATailBackDoesNotRepeatTheOverlap() {
+        let previous = "Первая часть абзаца. Здесь идёт перекрытие из трёх слов."
+        let tail = "Здесь идёт перекрытие из трёх слов. Короткий хвост."
+        let merged = AdaptiveChunker.honouringMinimum([[previous, tail]], minimum: 100, maximum: 1000)
+        XCTAssertEqual(merged, ["Первая часть абзаца. Здесь идёт перекрытие из трёх слов. Короткий хвост."])
+        XCTAssertEqual(merged[0].components(separatedBy: "перекрытие").count - 1, 1, merged[0])
+    }
+
     func testAWholeShortBlockGoesForward() {
         let merged = AdaptiveChunker.honouringMinimum(
             [["== Боевой бык =="], ["В корриде участвуют быки особой породы."]],

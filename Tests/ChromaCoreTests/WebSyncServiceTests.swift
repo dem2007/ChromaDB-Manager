@@ -111,7 +111,7 @@ final class WebSyncServiceTests: XCTestCase {
         )
         defer { preparation.discardCache() }
 
-        let id = SourceSyncService.documentID(relativePath: "https://example.org/note", chunkIndex: 0)
+        let id = SourceSyncService.documentID(relativePath: "https://example.org/note", chunkIndex: 0, sourceID: nil)
         XCTAssertTrue(id.hasSuffix("-0"))
         XCTAssertEqual(id.count, 18)
     }

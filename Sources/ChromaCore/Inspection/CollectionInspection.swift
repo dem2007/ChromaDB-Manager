@@ -142,8 +142,11 @@ public struct InspectionFinding: Codable, Sendable, Hashable, Identifiable {
     /// Документы входят в опознание: у дублей находка называется началом
     /// повторившегося текста, и два разных повтора могут начинаться одинаково
     ///. Списку в интерфейсе нужен ключ, который их различает.
+    ///
+    /// Подробность — тоже: у одного документа бывает несколько нарушений
+    /// схемы, и без неё они получали один ключ на всех.
     public var id: String {
-        "\(category.rawValue)|\(subject)|\(documentIDs.joined(separator: ","))"
+        "\(category.rawValue)|\(subject)|\(documentIDs.joined(separator: ","))" + (detail.map { "|\($0)" } ?? "")
     }
     public let category: InspectionCategory
     /// Идентификаторы документов, которых находка касается.

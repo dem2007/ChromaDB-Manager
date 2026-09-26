@@ -64,14 +64,16 @@ enum MCPConnectionTester {
             ))
             return MCPConnectionCheck(steps: steps)
         }
+        let reader = LineReader(handle: output.fileHandleForReading)
+        let diagnostics = LineReader(handle: errors.fileHandleForReading)
         defer {
+            reader.stop()
+            diagnostics.stop()
             if process.isRunning {
                 try? input.fileHandleForWriting.close()
                 process.terminate()
             }
         }
-
-        let reader = LineReader(handle: output.fileHandleForReading)
 
         func ask(_ id: Int, _ method: String, _ params: [String: JSONValue]) async -> JSONValue? {
             var body = params
@@ -105,9 +107,11 @@ enum MCPConnectionTester {
                     : String(localized: "Сервер ответил, но инструментов не объявил — этого быть не должно, сообщите о дефекте.")
             ))
         } else {
-            let stderr = String(
-                data: errors.fileHandleForReading.availableData, encoding: .utf8
-            )?.trimmingCharacters(in: .whitespacesAndNewlines)
+            // То, что мост успел написать в stderr, — без ожидания: чтение
+            // `availableData` здесь блокировалось, пока живой мост молчал,
+            // то есть навсегда.
+            let stderr: String? = diagnostics.collectedText()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             steps.append(.init(
                 title: String(localized: "Связь с приложением"),
                 outcome: .failed,
@@ -182,28 +186,47 @@ enum MCPConnectionTester {
 /// Отдельным типом, потому что `readLine` у `FileHandle` нет, а блокирующее
 /// чтение без предела превратило бы кнопку проверки в зависание — то самое,
 /// от чего она должна избавить.
+///
+/// Данные собирает `readabilityHandler`, а ожидание только смотрит в буфер.
+/// Прежде каждый шаг ждал `availableData`, а оно блокирует до первых байтов
+/// или конца потока: молчащий мост держал проверку сколько угодно, и
+/// пятнадцатисекундный предел не наступал никогда.
 private final class LineReader: @unchecked Sendable {
     private let handle: FileHandle
+    private let lock = NSLock()
     private var buffer = Data()
 
     init(handle: FileHandle) {
         self.handle = handle
+        handle.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let self else { return }
+            self.lock.withLock { self.buffer.append(chunk) }
+        }
+    }
+
+    func stop() {
+        handle.readabilityHandler = nil
     }
 
     func next(timeout: TimeInterval) async -> JSONValue? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let line = takeLine() {
+            if let line = lock.withLock({ takeLine() }) {
                 return try? JSONDecoder().decode(JSONValue.self, from: line)
             }
-            let chunk = await read()
-            if chunk.isEmpty {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-            } else {
-                buffer.append(chunk)
-            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return nil
+    }
+
+    /// Всё, что пришло и не разобрано строками, — текстом.
+    func collectedText() -> String {
+        lock.withLock { String(decoding: buffer, as: UTF8.self) }
     }
 
     private func takeLine() -> Data? {
@@ -211,13 +234,5 @@ private final class LineReader: @unchecked Sendable {
         let line = buffer[buffer.startIndex..<index]
         buffer.removeSubrange(buffer.startIndex...index)
         return line.isEmpty ? takeLine() : Data(line)
-    }
-
-    private func read() async -> Data {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [handle] in
-                continuation.resume(returning: handle.availableData)
-            }
-        }
     }
 }

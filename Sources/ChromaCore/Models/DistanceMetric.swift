@@ -34,7 +34,7 @@ public enum DistanceMetric: String, Codable, CaseIterable, Identifiable, Sendabl
         case .l2:
             return String(localized: "Евклидово расстояние. Не ограничено сверху и зависит от масштаба векторов — в процентах его показать нельзя.")
         case .ip:
-            return String(localized: "Скалярное произведение. Может быть отрицательным; чем больше, тем ближе.")
+            return String(localized: "Скалярное произведение. База показывает расстояние 1 − произведение: оно может быть отрицательным, и чем оно меньше, тем ближе.")
         }
     }
 

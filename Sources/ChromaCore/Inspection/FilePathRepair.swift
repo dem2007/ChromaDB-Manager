@@ -22,7 +22,10 @@ public enum FilePathRepair {
         guard let path = filePath(metadata) else { return false }
         if Array(path.utf8) != Array(FilePathKey.canonical(path).utf8) { return true }
         guard case .string(let fingerprint)? = metadata?["file_id"], !fingerprint.isEmpty else { return true }
-        return fingerprint != SourceSyncService.fileFingerprint(path)
+        // Отпечаток считается от пары «источник + путь» (П6.16). Источник
+        // берётся из самой записи: у чанка, которому его не проставляли,
+        // остаётся прежняя форма — и такая запись уборки не требует.
+        return fingerprint != SourceSyncService.fileFingerprint(path, sourceID: SourceSyncService.recordedSourceID(metadata))
     }
 
     /// Что переписать у этих записей. Записи, которым уборка не нужна,
@@ -34,7 +37,9 @@ public enum FilePathRepair {
             let canonical = FilePathKey.canonical(path)
             var fields: ChromaMetadata = [
                 "source_file": .string(canonical),
-                "file_id": .string(SourceSyncService.fileFingerprint(canonical)),
+                "file_id": .string(
+                    SourceSyncService.fileFingerprint(canonical, sourceID: SourceSyncService.recordedSourceID(record.metadata))
+                ),
             ]
             // Имя файла приводится к той же форме — по нему приложение ищет
             // похожие пути, когда агент промахнулся мимо папок.

@@ -132,4 +132,22 @@ final class TableProfileTransferTests: XCTestCase {
         XCTAssertEqual(twice.replaced.sorted(), ["Прайс", "Смета"])
         XCTAssertEqual(twice.profiles.map(\.id), once.profiles.map(\.id))
     }
+
+    /// Свой же экспорт, переименованный здесь после выгрузки: идентификатор
+    /// из файла уже занят, и новый профиль обязан получить свой.
+    func testAnImportedProfileNeverSharesAnIdentifier() {
+        var mine = profile("Смета, новое имя", columns: ["A"])
+        var exported = mine
+        exported.name = "Смета"
+        mine.id = exported.id
+        let merged = TableProfileTransfer.merge([exported], into: [mine])
+        XCTAssertEqual(merged.profiles.count, 2)
+        XCTAssertEqual(Set(merged.profiles.map(\.id)).count, 2, "два профиля с одним id")
+    }
+
+    /// «Цена» и «ЦЕНА» — одна колонка для чтения, и разводиться номером
+    /// они обязаны по тому же правилу.
+    func testHeaderTitlesDifferingOnlyByCaseAreNumbered() {
+        XCTAssertEqual(TableProfileMatcher.uniqued(["Цена", "ЦЕНА", "цена "]), ["Цена", "ЦЕНА (2)", "цена  (3)"])
+    }
 }

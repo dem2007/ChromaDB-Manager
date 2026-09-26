@@ -12,8 +12,18 @@ public protocol InspectionReader: Sendable {
     /// Именно эти документы, а не страница подряд. Нужен там, где текст
     /// требуется у горстки записей из десятков тысяч.
     func documents(collectionID: String, ids: [String]) async throws -> [DocumentRecord]
+    /// Только идентификаторы страницы — без текстов и метаданных. Выборке
+    /// тем больше ничего и не нужно, а тексты десяти тысяч документов — это
+    /// мегабайты по сети ради того, чтобы их выбросить.
+    func documentIDs(collectionID: String, limit: Int, offset: Int) async throws -> [String]
     func embeddings(collectionID: String, ids: [String]) async throws -> [String: [Double]]
     func query(collectionID: String, embedding: [Double], nResults: Int) async throws -> [QueryHit]
+}
+
+public extension InspectionReader {
+    func documentIDs(collectionID: String, limit: Int, offset: Int) async throws -> [String] {
+        try await documents(collectionID: collectionID, limit: limit, offset: offset).map(\.id)
+    }
 }
 
 extension ChromaClient: InspectionReader {
@@ -38,6 +48,11 @@ public struct CollectionInspector: Sendable {
     /// Сколько документов брать на проверку размерности: она «средняя» по цене,
     /// и вытягивать ради неё векторы всей коллекции незачем.
     static let dimensionProbe = 20
+    /// На сколько номеров наибольший `chunk_index` может обогнать число
+    /// кусков файла, чтобы нумерацию ещё считать своей — «с нуля подряд».
+    static let chunkGapLimit = 10_000
+    /// Сколько пропущенных номеров называть в находке.
+    static let chunkGapsShown = 20
 
     private let reader: any InspectionReader
     private let validator = MetadataSchemaValidator()
@@ -150,17 +165,21 @@ public struct CollectionInspector: Sendable {
                 //: такой чанк не молчит в выдаче, а лезет в неё
                 // по любому запросу. Показывать сам текст здесь можно и нужно
                 // — он в один-два знака и объясняет находку целиком.
-                if !text.isEmpty, !ChunkHygiene.carriesMeaning(text) {
+                //
+                // Одни пробелы и переводы строк — это пустой документ, а не
+                // бессловесный: показывать «текст: «»» в находке бессмысленно.
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty, !ChunkHygiene.carriesMeaning(text) {
                     findings.append(InspectionFinding(
                         category: .wordlessChunks, documentIDs: [record.id],
                         subject: record.id,
-                        detail: String(localized: "текст: «\(text.trimmingCharacters(in: .whitespacesAndNewlines))»")
+                        detail: String(localized: "текст: «\(trimmed)»")
                     ))
-                } else if text.trimmingCharacters(in: .whitespacesAndNewlines).count < options.minimumTextLength {
+                } else if trimmed.count < options.minimumTextLength {
                     findings.append(InspectionFinding(
                         category: .emptyDocuments, documentIDs: [record.id],
                         subject: record.id,
-                        detail: String(localized: "знаков: \(text.count.plainDigits)")
+                        detail: String(localized: "знаков: \(trimmed.count.plainDigits)")
                     ))
                 }
 
@@ -274,14 +293,25 @@ public struct CollectionInspector: Sendable {
         }
 
         // Разрывы в нумерации: след прерванной синхронизации.
+        //
+        // `chunk_index` мог записать чужой инструмент, и нумерация у него
+        // бывает не «с нуля подряд»: отрицательные номера роняли диапазон
+        // `0...maximum`, а сквозной счётчик на миллиард заставлял перебирать
+        // и перечислять миллиард номеров. Такая нумерация — не наша, разрывов
+        // в ней не ищем.
         for (file, indexes) in chunkIndexes.sorted(by: { $0.key < $1.key }) {
-            guard let maximum = indexes.max() else { continue }
-            let missing = (0...maximum).filter { !indexes.contains($0) }
+            let known = indexes.filter { $0 >= 0 }
+            guard let maximum = known.max(), maximum < known.count + Self.chunkGapLimit else { continue }
+            let missing = (0...maximum).filter { !known.contains($0) }
             guard !missing.isEmpty else { continue }
+            let shown = missing.prefix(Self.chunkGapsShown).map(\.description).joined(separator: ", ")
+            let list = missing.count > Self.chunkGapsShown
+                ? String(localized: "\(shown) и ещё \((missing.count - Self.chunkGapsShown).plainDigits)")
+                : shown
             findings.append(InspectionFinding(
                 category: .chunkGaps, documentIDs: [],
                 subject: file,
-                detail: String(localized: "нет чанков: \(missing.map(\.description).joined(separator: ", ")) из \((maximum + 1).plainDigits)")
+                detail: String(localized: "нет чанков: \(list) из \((maximum + 1).plainDigits)")
             ))
         }
 
@@ -379,6 +409,7 @@ public struct CollectionInspector: Sendable {
         var skipped = 0
         var done = 0
 
+        let limit = Self.nearDuplicateLimit(options.nearDuplicateDistance, metric: context.collection.space)
         var index = 0
         while index < ids.count {
             try Task.checkCancellation()
@@ -393,7 +424,7 @@ public struct CollectionInspector: Sendable {
                     collectionID: collectionID, embedding: vector, nResults: options.neighbours
                 )
                 for hit in hits {
-                    guard hit.id != id, let distance = hit.distance, distance <= options.nearDuplicateDistance else { continue }
+                    guard hit.id != id, let distance = hit.distance, distance <= limit else { continue }
                     let key = Self.pairKey(id, hit.id)
                     guard seenPairs.insert(key).inserted else { continue }
                     guard !context.acknowledgedPairs.contains(key) else {
@@ -414,6 +445,18 @@ public struct CollectionInspector: Sendable {
         }
         progress?(done, ids.count, String(localized: "Поиск похожих документов"))
         return (findings, skipped)
+    }
+
+    /// Порог задан косинусным расстоянием; база отвечает расстоянием своей
+    /// метрики.
+    ///
+    /// `ip` у ChromaDB — это 1 − скалярное произведение, на нормированных
+    /// векторах то же самое, что косинусное. `l2` — **квадрат** евклидова
+    /// расстояния, а у единичных векторов он ровно вдвое больше косинусного:
+    /// сравнивать его с косинусным порогом значило находить вдвое меньше
+    /// похожих, чем обещано.
+    static func nearDuplicateLimit(_ cosine: Double, metric: DistanceMetric?) -> Double {
+        metric == .l2 ? cosine * 2 : cosine
     }
 
     // MARK: - Мелочи

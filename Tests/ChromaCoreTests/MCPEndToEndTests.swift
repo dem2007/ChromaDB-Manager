@@ -41,6 +41,49 @@ final class MCPEndToEndTests: XCTestCase {
 
     // MARK: - Сокет
 
+    /// Обработчик, назначенный с опозданием, всё равно узнаёт о закрытии.
+    ///
+    /// `connect` отдаёт уже запущенный канал, и связь успевает оборваться
+    /// до того, как мост назначит обработчики. Раньше такое закрытие некому
+    /// было доложить, и мост держал мёртвый канал навсегда: переподключение
+    /// заводится только на `channel == nil`.
+    func testALateCloseHandlerStillLearnsTheChannelIsGone() throws {
+        let path = try makeSocketPath()
+        let listener = try startServer(at: path)
+        defer { listener.stop() }
+        let channel = try MCPConnector.connect(path: path, queue: .global())
+
+        let closed = expectation(description: "канал закрылся")
+        channel.onClose = { _ in closed.fulfill() }
+        channel.close()
+        wait(for: [closed], timeout: 5)
+
+        let late = UncheckedBox<Bool>(false)
+        channel.onClose = { _ in late.value = true }
+        XCTAssertTrue(late.value, "опоздавший обработчик о закрытии не узнал")
+    }
+
+    /// Закрывшийся канал отпускает обработчики.
+    ///
+    /// Замыкания захватывают канал сильно, канал держит замыкания — и каждое
+    /// закрытое соединение оставалось в памяти до конца работы приложения
+    /// вместе с отменённым соединением и его буфером.
+    func testAClosedChannelReleasesItsHandlers() throws {
+        let path = try makeSocketPath()
+        let listener = try startServer(at: path)
+        defer { listener.stop() }
+        let channel = try MCPConnector.connect(path: path, queue: .global())
+
+        let closed = expectation(description: "канал закрылся")
+        channel.onMessage = { _ in }
+        channel.onClose = { _ in closed.fulfill() }
+        channel.close()
+        wait(for: [closed], timeout: 5)
+
+        XCTAssertNil(channel.onMessage, "канал держит обработчик сообщений")
+        XCTAssertNil(channel.onClose, "канал держит обработчик закрытия")
+    }
+
     func testRequestTravelsOverTheSocketAndTheAnswerComesBack() throws {
         let path = try makeSocketPath()
         let listener = try startServer(at: path)

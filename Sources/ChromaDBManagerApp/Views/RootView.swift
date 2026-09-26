@@ -207,10 +207,11 @@ struct RootView: View {
     @StateObject private var collectionsModel = CollectionsViewModel()
     @StateObject private var evaluationModel = EvaluationViewModel()
     @StateObject private var trashModel = TrashViewModel()
-    @StateObject private var embeddingsModel = EmbeddingsViewModel()
-    @StateObject private var sourcesModel = SourcesViewModel()
-    @StateObject private var autoSync = AutoSyncCoordinator()
-    @StateObject private var reembedding = ReembeddingViewModel()
+    // Не `@StateObject`: эти живут дольше окна (см. `AppEnvironment.sourcesModel`).
+    @ObservedObject private var embeddingsModel = AppEnvironment.shared.embeddingsModel
+    @ObservedObject private var sourcesModel = AppEnvironment.shared.sourcesModel
+    @ObservedObject private var autoSync = AppEnvironment.shared.autoSync
+    @ObservedObject private var reembedding = AppEnvironment.shared.reembedding
     /// Что бросили на окно и о чём ещё не спросили.
     @State private var droppedItems: DroppedItems?
 
@@ -321,6 +322,10 @@ struct RootView: View {
                     registerSources: { urls in
                         droppedItems = nil
                         selection = .sources
+                        // И первая вкладка раздела: брошенное подхватывает
+                        // список источников, и с «Диагностики» или «Стенда»
+                        // его не было на экране — не открывалось ничего.
+                        tabs[.sources] = 0
                         sourcesModel.pendingDrop = urls
                     },
                     addDocuments: { urls, collectionName in
@@ -389,6 +394,7 @@ struct RootView: View {
             selection = .collections
             collectionsModel.pendingSelectionName = collection
             collectionsModel.queryText = text
+            collectionsModel.pendingSearchTab = true
         case .sources:
             selection = .sources
         case .dropped(let urls):
@@ -416,6 +422,15 @@ struct RootView: View {
     /// Startup does not touch the network: versions are only checked when the
     /// user asks — or when they turned the option on themselves.
     private func startUp() async {
+        // Главное окно открывается заново при каждом возврате из строки меню,
+        // и `.task` запускается вместе с ним. Второй запуск подключался
+        // поверх живого подключения — останавливал сервер под идущей
+        // синхронизацией — и повторял синхронизации «при запуске».
+        guard !app.didStartUp else {
+            await environmentModel.refresh(app)
+            return
+        }
+        app.didStartUp = true
         settings.saveNow()
         app.refreshOrphans()
         await environmentModel.refresh(app)

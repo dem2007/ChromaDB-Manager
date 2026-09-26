@@ -92,7 +92,7 @@ public actor EvaluationRunner {
                 var embeddingSeconds: TimeInterval?
                 var reused = false
 
-                if variant.needsVector {
+                if variant.needsVector(for: query.text) {
                     // Приставка входит в ключ, а не только в вызов:
                     // иначе вариант «с приставкой» достал бы из запаса вектор,
                     // посчитанный без неё, и сравнивал бы приставку саму с собой.

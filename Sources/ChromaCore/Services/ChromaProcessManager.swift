@@ -302,6 +302,11 @@ public final class ChromaProcessManager: ObservableObject {
     public var onUnexpectedExit: ((ServerFailure?, Int32) -> Void)?
 
     private var process: Process?
+    /// Сервер, поднятый **не нами** и перенятый при запуске.
+    ///
+    /// Объекта `Process` у него нет — есть только pid. Без этой записи
+    /// `stop()` не мог его остановить и молча объявлял остановленным.
+    private var adopted: RunningServerRecord?
     private let log: LogHandler
     private let locator: ToolLocator
     public let serverLog: ServerLogStore
@@ -363,6 +368,44 @@ public final class ChromaProcessManager: ObservableObject {
         }
         try? RunningServerStore.save(kept)
         return orphans
+    }
+
+    /// Остановить сервер, который мы переняли: сигнал по pid, а не по объекту.
+    ///
+    /// Тождество проверяется тем же `ServerIdentity`, что и у сироты: pid
+    /// переиспользуется системой, и слать сигнал, не убедившись, — значит
+    /// однажды убить чужую программу. Запись забывается только когда процесса
+    /// и правда не стало: сервер, проигнорировавший сигнал, не должен
+    /// стать невидимым.
+    private func stopAdopted(_ record: RunningServerRecord, graceful: Bool) async {
+        let verdict = ServerIdentity.verify(record)
+        guard verdict.isConfirmed else {
+            if let reason = verdict.reason {
+                log(.warning, "Сервер", "PID \(record.pid.plainDigits) не остановлен: \(reason)")
+            }
+            if verdict.allowsForgetting { RunningServerStore.forget(pid: record.pid) }
+            return
+        }
+        log(.info, "Сервер", "Остановка перенятого сервера (PID \(record.pid.plainDigits))…")
+        if graceful {
+            kill(record.pid, SIGTERM)
+            for _ in 0..<20 {
+                if !ProcessInspector.isAlive(record.pid) { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        if ProcessInspector.isAlive(record.pid) {
+            log(.warning, "Сервер", "Перенятый сервер не завершился по SIGTERM — отправляем SIGKILL")
+            kill(record.pid, SIGKILL)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        ManagedProcessRegistry.shared.unregister(record.pid)
+        if ProcessInspector.isAlive(record.pid) {
+            log(.warning, "Сервер", "PID \(record.pid.plainDigits) всё ещё жив — запись сохранена")
+        } else {
+            RunningServerStore.forget(pid: record.pid)
+            log(.success, "Сервер", "Перенятый сервер остановлен")
+        }
     }
 
     /// Verified again immediately before the signal, not just when the list was
@@ -428,13 +471,14 @@ public final class ChromaProcessManager: ObservableObject {
             return nil
         }
         state = .running(pid: record.pid, since: record.startedAt)
+        adopted = record
         databasePath = record.path
-        let adopted = ChromaEndpoint(host: record.host, port: record.port)
-        endpoint = adopted
+        let reached = ChromaEndpoint(host: record.host, port: record.port)
+        endpoint = reached
         orphans.removeAll { $0.pid == record.pid }
         ManagedProcessRegistry.shared.register(record.pid)
-        log(.info, "Сервер", "Подключаемся к уже запущенному процессу PID \(record.pid.plainDigits) на \(adopted.baseURLString)")
-        return adopted
+        log(.info, "Сервер", "Подключаемся к уже запущенному процессу PID \(record.pid.plainDigits) на \(reached.baseURLString)")
+        return reached
     }
 
     // MARK: - Start / stop
@@ -521,7 +565,16 @@ public final class ChromaProcessManager: ObservableObject {
                 guard let self else { return }
                 pipe.fileHandleForReading.readabilityHandler = nil
                 ManagedProcessRegistry.shared.unregister(finished.processIdentifier)
-                try? RunningServerStore.clear()
+                // Забывается **свой** pid, а не весь список.
+                //
+                // `clear()` стирал файл целиком — вместе с записями о сиротах
+                // прошлых сессий и о тех, чья судьба ещё не выяснена
+                // (`.unverified`). Человек мог завести и остановить свой
+                // сервер, а из списка пропадал чужой, который так и держит
+                // свой порт и папку базы: на следующем запуске его уже никто
+                // не найдёт и не предложит остановить. `stop()` и `upsert`
+                // трогают только свой pid — этот обработчик выбивался.
+                RunningServerStore.forget(pid: finished.processIdentifier)
                 self.process = nil
                 self.stopUptimeTimer()
                 self.serverLog.endRun(note: "процесс завершился, код \(status)")
@@ -582,7 +635,20 @@ public final class ChromaProcessManager: ObservableObject {
                     host: configuration.host,
                     path: configuration.databasePath.path,
                     label: configuration.label,
-                    startedAt: Date(),
+                    // Время старта спрашивается **у ядра**, а не берётся здесь.
+                    //
+                    // Эта строка выполняется после цикла готовности, а он ждёт
+                    // ответа на `/healthcheck` до сорока пяти секунд: первый
+                    // запуск после обновления движка, большая база, медленный
+                    // диск. Записанное тут `Date()` расходилось с настоящим
+                    // временем старта на все эти секунды, а `ServerIdentity`
+                    // считает расхождение больше десяти признаком того, что
+                    // pid переиспользован. После падения приложения свой же
+                    // живой сервер объявлялся чужим, запись выбрасывалась —
+                    // и остановить или перенять его было уже нечем, а
+                    // следующий запуск поднимал второй на той же папке.
+                    startedAt: ProcessInspector.identity(of: process.processIdentifier)?.startedAt
+                        ?? Date(),
                     executablePath: cli
                 ))
                 log(.success, "Сервер", "ChromaDB отвечает на \(endpoint.baseURLString)")
@@ -633,10 +699,23 @@ public final class ChromaProcessManager: ObservableObject {
     /// SIGTERM first (ChromaDB flushes and closes SQLite cleanly), SIGKILL last.
     public func stop(graceful: Bool = true) async {
         guard let process, process.isRunning else {
-            // Only our own record goes: other sessions' orphans stay on file.
-            if let pid = state.pid { RunningServerStore.forget(pid: pid) }
+            // Перенятый сервер останавливается **по-настоящему**.
+            //
+            // Объекта `Process` у него нет — есть pid, — и прежде эта ветка
+            // просто забывала запись и объявляла `.stopped`. Сервер при этом
+            // продолжал работать, уже никем не учтённый: снимок базы
+            // копировал файлы SQLite из-под живого сервера, а следующее
+            // подключение поднимало **второй** `chroma run` на той же папке.
+            if let record = adopted {
+                await stopAdopted(record, graceful: graceful)
+            } else if let pid = state.pid {
+                // Only our own record goes: other sessions' orphans stay on file.
+                RunningServerStore.forget(pid: pid)
+            }
+            adopted = nil
             state = .stopped
             self.process = nil
+            endpoint = nil
             stopUptimeTimer()
             return
         }
@@ -660,6 +739,7 @@ public final class ChromaProcessManager: ObservableObject {
 
         ManagedProcessRegistry.shared.unregister(process.processIdentifier)
         RunningServerStore.forget(pid: process.processIdentifier)
+        adopted = nil
         self.process = nil
         endpoint = nil
         state = .stopped

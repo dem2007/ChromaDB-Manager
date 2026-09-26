@@ -106,13 +106,25 @@ public struct ImportCheckpoint: Codable, Sendable, Hashable {
     public var packagePath: String
     public var dataSHA256: String
     public var collectionName: String
+    /// Коллекция, в которую шла запись, — по идентификатору, а не по имени.
+    ///
+    /// Имя повторяется: половину заполненную коллекцию удалили и завели
+    /// заново под тем же именем, или переключились на другой сервер.
+    /// Совпадение по имени продолжало такой импорт с середины, и первые
+    /// тысячи документов не записывались вовсе — при отчёте «готово».
+    /// Необязательный — чтобы точка, записанная до него, читалась.
+    public var collectionID: String?
     public var processedLines: Int
     public var updatedAt: Date
 
-    public init(packagePath: String, dataSHA256: String, collectionName: String, processedLines: Int, updatedAt: Date = Date()) {
+    public init(
+        packagePath: String, dataSHA256: String, collectionName: String, collectionID: String? = nil,
+        processedLines: Int, updatedAt: Date = Date()
+    ) {
         self.packagePath = packagePath
         self.dataSHA256 = dataSHA256
         self.collectionName = collectionName
+        self.collectionID = collectionID
         self.processedLines = processedLines
         self.updatedAt = updatedAt
     }
@@ -275,6 +287,9 @@ public struct CollectionImporter: Sendable {
         manifest: CollectionExportManifest, target: ChromaCollection?
     ) throws -> [String] {
         guard let target else { return [] }
+        // Пакет без векторов пересчитывается моделью самой коллекции: его
+        // размерность и модель ни с чем не смешиваются, сверять их незачем.
+        guard manifest.includesEmbeddings else { return [] }
         if let expected = target.effectiveDimension, let got = manifest.dimension, expected != got {
             throw TransferError.dimensionMismatch(expected: expected, got: got)
         }
@@ -304,9 +319,13 @@ public struct CollectionImporter: Sendable {
 
         var report = ImportReport()
         var startLine = 0
-        if options.resumesFromCheckpoint,
+        // Без контрольной суммы пакет не опознать: у всех таких пакетов
+        // точка легла бы в один и тот же файл.
+        let usesCheckpoint = !manifest.dataSHA256.isEmpty
+        if options.resumesFromCheckpoint, usesCheckpoint,
            let checkpoint = checkpoints.load(checksum: manifest.dataSHA256),
-           checkpoint.collectionName == collectionName {
+           checkpoint.collectionName == collectionName,
+           checkpoint.collectionID == collectionID {
             startLine = checkpoint.processedLines
             log(.info, "Перенос", "Импорт продолжается со строки \(startLine.plainDigits): прошлый запуск остановился на ней")
         }
@@ -332,10 +351,13 @@ public struct CollectionImporter: Sendable {
             // конфликт: следующий заход начинал уже после них.
             let reached = consumed > 0 ? batch[consumed - 1].line : batch[0].line - 1
             batch.removeAll(keepingCapacity: true)
-            checkpoints.save(ImportCheckpoint(
-                packagePath: package.path, dataSHA256: manifest.dataSHA256,
-                collectionName: collectionName, processedLines: reached
-            ))
+            if usesCheckpoint {
+                checkpoints.save(ImportCheckpoint(
+                    packagePath: package.path, dataSHA256: manifest.dataSHA256,
+                    collectionName: collectionName, collectionID: collectionID,
+                    processedLines: reached
+                ))
+            }
             progress?(Progress(processed: reached, total: manifest.documentCount))
         }
 
