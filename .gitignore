@@ -41,3 +41,6 @@ Resources/AppIcon.iconset/
 # `git archive` публикации (Scripts/publish.sh собирает снимок из HEAD),
 # ни в бандл (Scripts/build-app.sh берёт из docs/ только два файла скилла).
 docs/local/
+
+# Регрессии на живых документах: ссылка на docs/local/regressions, только на этой машине.
+Tests/*/LocalRegressions

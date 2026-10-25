@@ -31,6 +31,18 @@ The project has no external dependencies: SwiftUI, AppKit and Foundation only.
 - Errors go through `LocalizedError` with text that can be shown to a user, without
   "Error Domain=…".
 
+## Examples in tests and comments
+
+- Tests and comments use only invented data of the same shape: amounts such as
+  "12 345 678,00", "Server Type 1", "the town of Ensk". Never a line from a real
+  document, a file name, a contract number, bank details or your own search queries.
+- When a bug shows up on a real document, describe the case in words ("an amount
+  with digit groups lost its comma") and carry its shape into the test, not its text.
+- Keep a regression on a real document to yourself: `*.swift` files in
+  `Tests/ChromaCoreTests/LocalRegressions/` are built and run with the other tests
+  but are covered by `.gitignore`. It is convenient to make that folder a link to a
+  directory outside the repository.
+
 ## Commits and pull requests
 
 - Small commits with a meaningful title in the imperative:

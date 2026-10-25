@@ -1245,8 +1245,8 @@ public actor RetrievalPipeline {
         let pattern = profile.textSearchUsesRegex ? TextRelevance.regexPattern(of: terms) : ""
         let usesRegex = !pattern.isEmpty
         // `$contains` у ChromaDB различает регистр, а ранжирование здесь — нет.
-        // Без вариантов написания стадия честно спрашивала «astra» у текста со
-        // словом «Astra» и не находила ничего. Выражению это не нужно:
+        // Без вариантов написания стадия честно спрашивала «nova» у текста со
+        // словом «Nova» и не находила ничего. Выражению это не нужно:
         // регистр ему снимает `(?i)`.
         let variants = usesRegex ? [] : TextRelevance.caseVariants(of: terms)
         var textFilter = filter ?? DocumentFilter()
