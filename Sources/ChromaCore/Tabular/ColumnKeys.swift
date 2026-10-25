@@ -80,7 +80,14 @@ public enum ColumnKeyNormaliser {
     /// in many query languages.
     public static func normalise(_ title: String, fallback: String = "column") -> String {
         var result = ""
-        for character in title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) {
+        // Знаки, которые и есть смысл подписи, — словами: «№»
+        // выбрасывался вместе с прочей пунктуацией, ключом колонки «№»
+        // становилась её буква, и в метаданных 122 листов из 150 стояло
+        // «b: 3» вместо «номер: 3».
+        let spelled = title
+            .replacingOccurrences(of: "№", with: " номер ")
+            .replacingOccurrences(of: "%", with: " процент ")
+        for character in spelled.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) {
             if character.isLetter || character.isNumber {
                 result.append(character)
             } else if character == "_" {
@@ -110,7 +117,17 @@ public enum ColumnKeyNormaliser {
         var used: Set<String> = []
         var collisions: [ColumnKeyCollision] = []
 
-        for (index, title) in titles.enumerated() {
+        // Подписи, где слово стоит буквами, получают ключ первыми, а те, где
+        // оно выведено из знака («№» → «номер»), — следом. Иначе
+        // «№» в первой колонке занимал ключ «номер» у настоящей колонки
+        // «Номер» правее, и её сохранённые фильтры молча начинали искать
+        // по номерам строк.
+        let spelled = { (title: String) in title.contains("№") || title.contains("%") }
+        let order = titles.indices.sorted { left, right in
+            (spelled(titles[left]) ? 1 : 0, left) < (spelled(titles[right]) ? 1 : 0, right)
+        }
+        for index in order {
+            let title = titles[index]
             let wanted = normalise(title, fallback: XLSXReader.columnName(index).lowercased())
             var key = wanted
             var reason: ColumnKeyCollision.Reason?

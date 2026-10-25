@@ -151,6 +151,30 @@ final class ContextEnricherTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Раздел 2"))
     }
 
+    /// Модель видит документ — его начало и оглавление, — а фрагмент стоит
+    /// в запросе последним: общая часть у всех кусков файла одна.
+    func testThePromptCarriesTheDocumentBeforeTheFragment() {
+        let document = ExtractedDocument(
+            plainText: "Техническое задание на оказание услуг облачной платформы.\n\n1 Общие положения\nТекст.",
+            structure: [
+                DocumentNode(level: 1, title: "1 Общие положения", start: 58),
+                DocumentNode(level: 2, title: "1.1 Предмет закупки", start: 60),
+                DocumentNode(level: 3, title: "1.1.1 Глубоко", start: 62),
+                DocumentNode(level: 1, title: "2 Требования", start: 64),
+            ],
+            containerFormat: "docx", extractorID: "test", extractorVersion: 1
+        )
+        let context = ContextEnricher.documentContext(of: document)
+        XCTAssertTrue(context?.contains("Техническое задание на оказание услуг") == true, context ?? "")
+        XCTAssertTrue(context?.contains("1.1 Предмет закупки") == true, context ?? "")
+        XCTAssertFalse(context?.contains("1.1.1 Глубоко") == true, "третий уровень оглавлению не нужен")
+        let prompt = ContextEnricher.prompt(
+            documentTitle: "ТЗ", headingPath: "1 Общие положения", text: "фрагмент", documentContext: context
+        )
+        XCTAssertTrue(prompt.hasSuffix("фрагмент"), prompt)
+        XCTAssertLessThan(prompt.range(of: "Оглавление документа")!.lowerBound, prompt.range(of: "Раздел:")!.lowerBound)
+    }
+
     // MARK: - Оценка стоимости
 
     func testTheEstimateCountsOneCallPerChunk() {

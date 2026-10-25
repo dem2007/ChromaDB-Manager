@@ -57,6 +57,9 @@ public struct TimeoutSettings: Codable, Hashable, Sendable {
 
     public static let allowedRange: ClosedRange<TimeInterval> = 1...3600
 
+    /// Нижняя граница срока для создания и удаления коллекций.
+    public static let managementFloor: TimeInterval = 300
+
     public init(
         liveness: TimeInterval = 3,
         metadata: TimeInterval = 15,
@@ -78,7 +81,13 @@ public struct TimeoutSettings: Codable, Hashable, Sendable {
     public subscript(operation: ChromaOperation) -> TimeInterval {
         switch operation {
         case .liveness: return clamped(liveness)
-        case .metadata, .management: return clamped(metadata)
+        case .metadata: return clamped(metadata)
+        // Создать или удалить коллекцию — не «прочитать список»:
+        // удаление коллекции на 187 тысяч векторов идёт на сервере 22 с,
+        // а срок был тот же, что у списка, — 15 с. Запрос обрывался,
+        // сервер бросал удаление, и коллекция оставалась на месте.
+        // Не меньше пяти минут и не меньше срока записи.
+        case .management: return clamped(max(write, Self.managementFloor))
         case .fetch: return clamped(fetch)
         case .query: return clamped(query)
         case .write: return clamped(write)

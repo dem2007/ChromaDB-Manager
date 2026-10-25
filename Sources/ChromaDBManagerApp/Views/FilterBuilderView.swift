@@ -23,10 +23,11 @@ struct FilterNodeEditor: View {
         }
     }
 
+    @ViewBuilder
     private var groupBody: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Picker("", selection: Binding(
+        let controls = VStack(alignment: .leading) {
+            HStack {
+                Picker(String(localized: "Логика"), selection: Binding(
                     get: { node.logic ?? .and },
                     set: { node.logic = $0 }
                 )) {
@@ -35,7 +36,7 @@ struct FilterNodeEditor: View {
                     }
                 }
                 .labelsHidden()
-                .frame(width: 190)
+                .fixedSize()
 
                 Button {
                     node.children.append(.leaf(MetadataCondition()))
@@ -58,10 +59,7 @@ struct FilterNodeEditor: View {
                 Spacer()
 
                 if let onRemove {
-                    Button(role: .destructive, action: onRemove) {
-                        Image(systemName: "minus.circle")
-                    }
-                    .buttonStyle(.borderless)
+                    removeButton(onRemove)
                 }
             }
 
@@ -74,13 +72,27 @@ struct FilterNodeEditor: View {
                 )
             }
         }
-        .padding(depth == 0 ? 0 : 8)
-        .background(
-            depth == 0
-                ? Color.clear
-                : Color(nsColor: .textBackgroundColor).opacity(0.6)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        // Вложенная группа — с отступом и чертой слева: видно, какие
+        // условия связаны её логикой. `GroupBox` внутри формы рамки не
+        // рисует.
+        if depth == 0 {
+            controls
+        } else {
+            HStack(alignment: .top) {
+                Divider()
+                controls
+            }
+            .padding(.leading)
+        }
+    }
+
+    private func removeButton(_ action: @escaping () -> Void) -> some View {
+        Button(role: .destructive, action: action) {
+            Label(String(localized: "Убрать"), systemImage: "minus.circle")
+                .labelStyle(.iconOnly)
+        }
+        .buttonStyle(.borderless)
+        .help(String(localized: "Убрать"))
     }
 
     @ViewBuilder
@@ -89,45 +101,45 @@ struct FilterNodeEditor: View {
             get: { node.condition ?? MetadataCondition() },
             set: { node.condition = $0 }
         )
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
-                if knownFields.isEmpty {
-                    TextField(String(localized: "поле"), text: condition.field)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 150)
-                } else {
+        VStack(alignment: .leading) {
+            HStack {
+                // Поля в строке условия — с рамкой: без неё подсказки «поле»
+                // и «значение» читаются как подписи.
+                TextField(String(localized: "Поле"), text: condition.field, prompt: Text("поле"))
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                if !knownFields.isEmpty {
                     // The known keys as a menu, with a free-text field kept for
                     // everything the current page did not happen to show.
-                    HStack(spacing: 2) {
-                        TextField(String(localized: "поле"), text: condition.field)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 122)
-                        Menu {
-                            ForEach(knownFields, id: \.self) { key in
-                                Button(key) { condition.wrappedValue.field = key }
-                            }
-                        } label: {
-                            Image(systemName: "list.bullet")
+                    Menu {
+                        ForEach(knownFields, id: \.self) { key in
+                            Button(key) { condition.wrappedValue.field = key }
                         }
-                        .menuStyle(.borderlessButton)
-                        .frame(width: 24)
+                    } label: {
+                        Label(String(localized: "Известные поля"), systemImage: "list.bullet")
+                            .labelStyle(.iconOnly)
                     }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help(String(localized: "Известные поля"))
                 }
 
-                Picker("", selection: condition.op) {
+                Picker(String(localized: "Оператор"), selection: condition.op) {
                     ForEach(FilterOperator.allCases) { op in
                         Text(op.title).tag(op)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 120)
+                .fixedSize()
 
                 TextField(
-                    condition.wrappedValue.op.wantsList
+                    String(localized: "Значение"),
+                    text: condition.value,
+                    prompt: Text(condition.wrappedValue.op.wantsList
                         ? String(localized: "значения через запятую")
-                        : String(localized: "значение"),
-                    text: condition.value
+                        : String(localized: "значение"))
                 )
+                .labelsHidden()
                 .textFieldStyle(.roundedBorder)
 
                 // «2025» и «true» иначе уходят числом и логическим значением,
@@ -141,17 +153,12 @@ struct FilterNodeEditor: View {
                 }
 
                 if let onRemove {
-                    Button(role: .destructive, action: onRemove) {
-                        Image(systemName: "minus.circle")
-                    }
-                    .buttonStyle(.borderless)
+                    removeButton(onRemove)
                 }
             }
             // Said here, next to the field, and before the request is sent.
             if let problem = condition.wrappedValue.problem {
-                Text(problem)
-                    .font(Theme.Font.micro).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                Notice(.warning, problem)
             }
         }
     }
@@ -165,18 +172,17 @@ struct DocumentTextConditionsEditor: View {
     @Binding var logic: FilterLogic
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text(String(localized: "Текст документа")).font(Theme.Font.caption).bold()
+        VStack(alignment: .leading) {
+            HStack {
                 if conditions.count > 1 {
-                    Picker("", selection: $logic) {
+                    Picker(String(localized: "Логика"), selection: $logic) {
                         ForEach(FilterLogic.allCases) { item in
                             Text(item.shortTitle).tag(item)
                         }
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .frame(width: 110)
+                    .fixedSize()
                 }
                 Button {
                     conditions.append(DocumentTextCondition())
@@ -188,30 +194,33 @@ struct DocumentTextConditionsEditor: View {
             }
 
             ForEach($conditions) { $condition in
-                HStack(spacing: 8) {
-                    Picker("", selection: $condition.op) {
+                HStack {
+                    Picker(String(localized: "Оператор"), selection: $condition.op) {
                         ForEach(DocumentTextOperator.allCases) { op in
                             Text(op.title).tag(op)
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 130)
+                    .fixedSize()
 
-                    TextField(String(localized: "подстрока"), text: $condition.text)
+                    TextField(String(localized: "Подстрока"), text: $condition.text, prompt: Text("подстрока"))
+                        .labelsHidden()
                         .textFieldStyle(.roundedBorder)
 
                     Button(role: .destructive) {
                         conditions.removeAll { $0.id == condition.id }
                     } label: {
-                        Image(systemName: "minus.circle")
+                        Label(String(localized: "Убрать"), systemImage: "minus.circle")
+                            .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless)
+                    .help(String(localized: "Убрать"))
                 }
             }
 
             if !conditions.isEmpty {
                 Text(String(localized: "Поиск по подстроке различает регистр: «Груша» и «груша» — разные условия."))
-                    .font(Theme.Font.micro).foregroundStyle(.secondary)
+                    .foregroundStyle(.secondary)
             }
         }
     }

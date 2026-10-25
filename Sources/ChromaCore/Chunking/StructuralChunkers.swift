@@ -115,7 +115,14 @@ public struct DocumentBasedChunker: Chunking {
                 continue
             }
             if !insideFence, let headingLevel = Self.headingLevel(of: stripped), headingLevel <= level {
-                if !current.isEmpty {
+                // Раздел из одного заголовка — «# Глава 2» и сразу «## 2.1» —
+                // не кусок, а начало следующего: так же, как у разделов
+                // по оглавлению (`DocumentStructureSections`).
+                let hasBody = current.contains { line in
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    return !trimmed.isEmpty && Self.headingLevel(of: trimmed) == nil
+                }
+                if hasBody {
                     sections.append(current.joined(separator: "\n"))
                     current = []
                 }
@@ -162,7 +169,10 @@ public struct DocumentBasedChunker: Chunking {
             let isClosing = token.hasPrefix("</")
 
             if isClosing {
-                depth = max(0, depth - 1)
+                // Закрывающий без открывающего — лишний тег, а не конец
+                // блока: иначе прошлый блок выдавался второй раз.
+                guard depth > 0 else { return }
+                depth -= 1
                 if depth == 0 {
                     let end = match.range.location + match.range.length
                     sections.append(nsText.substring(with: NSRange(location: blockStart, length: end - blockStart)))
@@ -175,6 +185,9 @@ public struct DocumentBasedChunker: Chunking {
                         sections.append(nsText.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
                     }
                     blockStart = match.range.location
+                    // Текст до блока уже выдан: незакрытый последний блок
+                    // иначе приходил хвостом вместе с ним ещё раз.
+                    cursor = match.range.location
                 }
                 depth += 1
             }
@@ -304,6 +317,8 @@ public struct HierarchicalChunker: Chunking {
     /// split — but only within its own boundaries, never across a heading.
     /// Sections shorter than the limit are *not* glued together: merging two
     /// chapters into one parent would undo the point of using the structure.
+    /// The one exception is a section that is nothing but its heading — it
+    /// opens the next one (`DocumentStructureSections.joiningBareHeadings`).
     private func structuralParents(of text: String, size: Int) -> [TextChunk]? {
         let sections = DocumentStructureSections.sections(
             in: text,
@@ -345,11 +360,69 @@ public struct AdaptiveChunker: Chunking {
     }
 
     public func chunks(from text: String) -> [TextChunk] {
-        Self.honouringMinimum(
-            blocks(from: text),
+        let sources = sourceBlocks(of: text)
+        return Self.honouringMinimum(
+            sources.map(pieces(of:)),
             minimum: configuration.minSizeInCharacters,
-            maximum: max(configuration.minSizeInCharacters + 1, configuration.maxSizeInCharacters)
+            maximum: max(configuration.minSizeInCharacters + 1, configuration.maxSizeInCharacters),
+            sources: sources
         ).enumerated().map { TextChunk(index: $0.offset, text: $0.element) }
+    }
+
+    /// Блоки текста — подряд идущие абзацы, набранные до своего размера.
+    ///
+    /// **Что было**. Блоком был каждый абзац, и резался он отдельно:
+    /// соседние абзацы склеивались, только если абзац короче минимума. Размер
+    /// по плотности текста так ни на что и не влиял — кусок был абзацем.
+    /// Замер на корпусе при настройках по умолчанию: медиана куска 584 знака
+    /// при целевых 1792, у 72 % кусков меньше половины цели.
+    ///
+    /// **Как теперь.** Абзацы набираются подряд, пока набранное укладывается
+    /// в размер, посчитанный по плотности **набранного** текста: плотный текст
+    /// (таблица, перечень цифр) получает куски поменьше, разреженная проза —
+    /// побольше. Блок — вырезка из текста от начала первого абзаца до конца
+    /// последнего: пустые строки между абзацами остаются как были.
+    func sourceBlocks(of text: String) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var paragraphs: [Range<String.Index>] = []
+        var start = trimmed.startIndex
+        while start < trimmed.endIndex,
+              let gap = trimmed.range(of: "\n\n", range: start..<trimmed.endIndex) {
+            if !trimmed[start..<gap.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                paragraphs.append(start..<gap.lowerBound)
+            }
+            start = gap.upperBound
+        }
+        if start < trimmed.endIndex, !trimmed[start...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            paragraphs.append(start..<trimmed.endIndex)
+        }
+        guard !paragraphs.isEmpty else { return [trimmed] }
+
+        var blocks: [String] = []
+        var current = paragraphs[0]
+        for paragraph in paragraphs.dropFirst() {
+            let candidate = String(trimmed[current.lowerBound..<paragraph.upperBound])
+            if candidate.count <= targetSize(for: candidate) {
+                current = current.lowerBound..<paragraph.upperBound
+            } else {
+                blocks.append(String(trimmed[current]))
+                current = paragraph
+            }
+        }
+        blocks.append(String(trimmed[current]))
+        return blocks.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    /// Куски одного блока — своим размером по его плотности.
+    func pieces(of block: String) -> [String] {
+        let size = targetSize(for: block)
+        return RecursiveChunker(
+            size: size,
+            overlap: configuration.overlapInCharacters(percent: configuration.overlapPercent, of: size),
+            separators: configuration.separators
+        ).chunks(from: block).map(\.text)
     }
 
     /// Куски по блокам — до того, как сработала нижняя граница.
@@ -360,21 +433,9 @@ public struct AdaptiveChunker: Chunking {
     /// тридцати двух знаков (`converted`), и ноль в форме означал бы
     /// не «правило выключено», а «правило с полом в 32».
     func blocks(from text: String) -> [[String]] {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-
         // Blocks are sized independently, so a folder mixing tables and prose
         // does not have to compromise on one size for the whole file.
-        let blocks = trimmed.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-
-        return (blocks.isEmpty ? [trimmed] : blocks).map { block in
-            let size = targetSize(for: block)
-            return RecursiveChunker(
-                size: size,
-                overlap: configuration.overlapInCharacters(percent: configuration.overlapPercent, of: size),
-                separators: configuration.separators
-            ).chunks(from: block).map(\.text)
-        }
+        sourceBlocks(of: text).map(pieces(of:))
     }
 
     /// Соблюдает нижнюю границу размера — ту самую, что записана у стратегии
@@ -423,13 +484,28 @@ public struct AdaptiveChunker: Chunking {
         return tail
     }
 
+    /// Хвост, приклеенный к соседу по блоку, — тем, что стояло между ними
+    /// в блоке. Склейка пробелом сливала строки таблицы в одну:
+    /// «…год | 12 345 678 | | Подсистема резервирования |».
+    static func rejoined(_ previous: String, _ rest: String, in source: String?) -> String {
+        if let source, let found = source.range(of: previous) {
+            let after = source[found.upperBound...]
+            if let next = after.range(of: rest) {
+                let gap = after[..<next.lowerBound]
+                if gap.allSatisfy({ $0.isWhitespace || $0.isNewline }) { return previous + gap + rest }
+            }
+        }
+        return ChunkHygiene.joined(previous, rest)
+    }
+
     static func honouringMinimum(
-        _ blocks: [[String]], minimum: Int, maximum: Int
+        _ blocks: [[String]], minimum: Int, maximum: Int, sources: [String]? = nil
     ) -> [String] {
         guard minimum > 0 else { return blocks.flatMap { $0 } }
 
         // Хвост блока — назад, к соседу по своему блоку.
-        var tightened: [[String]] = blocks.map { block in
+        var tightened: [[String]] = blocks.enumerated().map { position, block in
+            let source = sources.flatMap { position < $0.count ? $0[position] : nil }
             var pieces = block
             while pieces.count > 1, let tail = pieces.last, tail.count < minimum {
                 let previous = pieces[pieces.count - 2]
@@ -441,7 +517,7 @@ public struct AdaptiveChunker: Chunking {
                 let rest = withoutOverlap(tail, after: previous)
                 guard previous.count + rest.count + 1 <= maximum else { break }
                 pieces.removeLast()
-                pieces[pieces.count - 1] = ChunkHygiene.joined(previous, rest)
+                pieces[pieces.count - 1] = rejoined(previous, rest, in: source)
             }
             return pieces
         }
@@ -477,8 +553,19 @@ public struct AdaptiveChunker: Chunking {
         return tightened.flatMap { $0 }
     }
 
-    /// Density in 0…1, then the size moves from base towards min (dense) or max
-    /// (sparse), scaled by `sensitivity`.
+    /// Размер куска для текста такой плотности — **около базового**.
+    ///
+    /// Базовый размер — то, что человек задал в настройке: «512» должно
+    /// давать куски около 512, «2048» — около 2048. Плотность сдвигает размер
+    /// не дальше чем на половину чувствительности в долях базы: при 0,5 —
+    /// на ±25 %, при 1 — на ±50 %; плотный текст (цифры, знаки, таблица) —
+    /// вниз, разреженная проза — вверх. Минимум и максимум остаются рамкой.
+    ///
+    /// Раньше размер тянулся от базы до самого минимума или максимума: при
+    /// базе 512 и максимуме 3072 разреженная проза получала куски по 1150
+    /// токенов — вдвое больше заданного. Пока каждый абзац резался отдельно,
+    /// этого не было видно; с набором абзацев до размера (`sourceBlocks`)
+    /// это стало бы размером кусков.
     func targetSize(for text: String) -> Int {
         let base = configuration.baseSizeInCharacters
         let minimum = min(configuration.minSizeInCharacters, base)
@@ -486,17 +573,14 @@ public struct AdaptiveChunker: Chunking {
         let sensitivity = max(0, min(configuration.sensitivity, 1))
         guard sensitivity > 0 else { return base }
 
-        let density = Self.density(of: text)
-        let size: Double
-        if density >= 0.5 {
-            let factor = (density - 0.5) * 2 * sensitivity
-            size = Double(base) - Double(base - minimum) * factor
-        } else {
-            let factor = (0.5 - density) * 2 * sensitivity
-            size = Double(base) + Double(maximum - base) * factor
-        }
-        return max(32, Int(size.rounded()))
+        // −1 — самый плотный текст, +1 — самый разреженный.
+        let shift = (0.5 - Self.density(of: text)) * 2
+        let size = Double(base) * (1 + shift * sensitivity * Self.maximumShift)
+        return max(32, min(maximum, max(minimum, Int(size.rounded()))))
     }
+
+    /// Насколько размер может отойти от базового при чувствительности 1.
+    static let maximumShift = 0.5
 
     /// 0 = airy prose, 1 = dense reference material.
     static func density(of text: String) -> Double {

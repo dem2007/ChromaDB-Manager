@@ -153,6 +153,20 @@ public actor AccessController {
         perMinute: AccessController.globalRequestsPerMinute, burst: AccessController.globalBurst
     )
 
+    /// Запросы без действующего ключа — свой счётчик на всех.
+    ///
+    /// До ключа частота не проверялась вовсе: перебор случайных ключей
+    /// с прокси, открытого в сеть, стоил каждым запросом записи в журнал
+    /// аудита и уведомления на экране, без всякого предела. Счётчик отдельный
+    /// от общего: перебор не должен выедать запас настоящих клиентов.
+    static let anonymousRequestsPerMinute = 60
+    static let anonymousBurst = 20
+    private var anonymousBucket = TokenBucket(
+        perMinute: AccessController.anonymousRequestsPerMinute, burst: AccessController.anonymousBurst
+    )
+    /// Окно, в котором отказы перебору уже сообщены: дальше — молча, счётом.
+    private var anonymousWindow: (start: Date, suppressed: Int)?
+
     /// Запас всплеска на запись — половина общего.
     ///
     /// Считается здесь, а не на месте, по той же причине: это число называется
@@ -162,12 +176,28 @@ public actor AccessController {
     }
     private var usageDay: Date = Calendar.current.startOfDay(for: Date())
     private var catalogLoader: (@Sendable () async -> [CollectionSnapshot])?
+    /// Тенант и база, которые приложение показывает наружу.
+    ///
+    /// Каталог коллекций — только этой базы, а коллекции ищутся в нём по
+    /// имени. Без сверки адреса запрос в **другую** базу с тем же именем
+    /// коллекции проходил проверку по здешней коллекции и уходил туда,
+    /// куда ключу дороги нет. Умолчание — то же, что у `ChromaEndpoint`.
+    private var scope = (tenant: ChromaEndpoint.defaultTenant, database: ChromaEndpoint.defaultDatabase)
     /// References already confirmed absent, with an expiry. Without this a
     /// client asking for a collection that does not exist would make the proxy
     /// re-read the whole catalogue on every request.
     private var confirmedMissing: [String: Date] = [:]
+    /// Коллекции, запись в которые снаружи сейчас закрыта: их пересчитывают
+    /// на другую модель. Документ, записанный в середине прогона, получил бы
+    /// вектор старой модели, и коллекция навсегда смешала бы две.
+    private var frozen: Set<String> = []
 
     public init() {}
+
+    /// Закрывает запись снаружи — прокси и MCP — в эти коллекции.
+    public func freezeWrites(to names: [String]) { frozen.formUnion(names) }
+
+    public func thawWrites(to names: [String]) { frozen.subtract(names) }
 
     // MARK: - Configuration
 
@@ -220,6 +250,11 @@ public actor AccessController {
         catalogLoader = loader
     }
 
+    /// Тенант и база подключения — ставит тот, кто запускает прокси.
+    public func setScope(tenant: String, database: String) {
+        scope = (tenant, database)
+    }
+
     public func setCatalog(_ snapshots: [CollectionSnapshot]) {
         byID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.id, $0) })
         byName = Dictionary(snapshots.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
@@ -255,6 +290,18 @@ public actor AccessController {
     public func refundWrite(_ documents: Int, forKey key: String?) {
         guard documents > 0, let client = client(withKey: key) else { return }
         written[client.id] = max(0, (written[client.id] ?? 0) - documents)
+    }
+
+    /// Ключи, у которых сейчас идёт тяжёлый вызов (обход всей коллекции).
+    private var heavyCalls: Set<UUID> = []
+
+    /// Начать тяжёлый вызов — если у этого ключа другой не идёт.
+    public func beginHeavyCall(for clientID: UUID) -> Bool {
+        heavyCalls.insert(clientID).inserted
+    }
+
+    public func endHeavyCall(for clientID: UUID) {
+        heavyCalls.remove(clientID)
     }
 
     public func usageToday(for clientID: UUID) -> Int {
@@ -305,6 +352,7 @@ public actor AccessController {
         rolloverIfNeeded()
 
         guard let key, !key.isEmpty else {
+            if let refusal = throttleAnonymous() { return refusal }
             return .reject(
                 status: 401,
                 message: String(localized: "Ключ доступа не передан. Ожидается заголовок X-Chroma-Token или Authorization: Bearer."),
@@ -315,6 +363,7 @@ public actor AccessController {
         // `!$0.isRevoked` is not belt-and-braces: a revoked client has an empty
         // hash, and an empty hash must never be matched by anything.
         guard let client = clients.first(where: { !$0.isRevoked && $0.keyHash == hash }) else {
+            if let refusal = throttleAnonymous() { return refusal }
             return .reject(status: 401, message: String(localized: "Ключ доступа не зарегистрирован."), clientName: nil)
         }
         guard client.isEnabled else {
@@ -324,6 +373,17 @@ public actor AccessController {
         // Rate first, before anything expensive: a runaway loop should cost the
         // proxy one dictionary lookup, not a catalogue refresh.
         if let refusal = consumeRate(for: client, route: route) { return refusal }
+
+        // Чужой тенант или чужая база — как несуществующие: каталог и права
+        // знают только базу приложения.
+        if let tenant = route.tenant, tenant != scope.tenant
+            || (route.database.map { $0 != scope.database } ?? false) {
+            return .reject(
+                status: 404,
+                message: String(localized: "Через прокси доступна только база «\(scope.database)» тенанта «\(scope.tenant)»."),
+                clientName: client.name
+            )
+        }
 
         // Heartbeat, version, identity: no collection is involved, and the
         // client cannot even be created without them.
@@ -392,13 +452,28 @@ public actor AccessController {
 
         // An endpoint we do not recognise: reads pass (a new read-only endpoint
         // in a future ChromaDB should not break anyone), writes do not.
-        guard route.isKnown else {
-            return route.access.changesData
-                ? .reject(
+        //
+        // Но не любые чтения. Неизвестное чтение **внутри коллекции** проходит
+        // ту же проверку коллекции, что и известное, — ниже: иначе им читалась
+        // коллекция, закрытая ключу. А неизвестное чтение уровня тенанта или
+        // базы (`collections_count`, список баз) отвечает про все коллекции
+        // сразу, и решить, что из ответа ключу можно, прокси не в силах.
+        if !route.isKnown {
+            if route.access.changesData {
+                return .reject(
                     status: 403,
                     message: String(localized: "Неизвестная операция записи отклонена: прокси не может проверить её права."),
                     clientName: client.name)
-                : .allow(clientID: client.id, clientName: client.name, filter: .none)
+            }
+            if route.collectionReference == nil {
+                guard route.tenant == nil else {
+                    return .reject(
+                        status: 403,
+                        message: String(localized: "Неизвестное чтение уровня базы отклонено: ответ касается всех коллекций, а ключу открыты не все."),
+                        clientName: client.name)
+                }
+                return .allow(clientID: client.id, clientName: client.name, filter: .none)
+            }
         }
 
         guard let reference = route.collectionReference else {
@@ -421,6 +496,25 @@ public actor AccessController {
             )
         }
 
+        // Пересчёт на другую модель: запись сейчас смешала бы модели.
+        if route.access.changesData, frozen.contains(collection.name) {
+            return .reject(
+                status: 409,
+                message: String(localized: "Коллекция «\(collection.name)» сейчас пересчитывается на другую модель — запись в неё откроется, когда пересчёт закончится."),
+                clientName: client.name
+            )
+        }
+
+        // Тело записи, которое не разбирается, — отказ, а не пропуск: иначе
+        // по нему не проверялись бы ни размер документа, ни суточная норма.
+        if route.access.changesData, Self.payloadOperations.contains(route.operation),
+           WritePayload.parse(body) == nil {
+            return .reject(
+                status: 400,
+                message: String(localized: "Тело запроса записи не разобрано как JSON-объект — прокси не может проверить его лимиты."),
+                clientName: client.name
+            )
+        }
         if route.access.changesData, let payload = WritePayload.parse(body) {
             if let problem = checkLimits(payload, client: client) {
                 return .reject(status: 429, message: problem, clientName: client.name)
@@ -518,6 +612,9 @@ public actor AccessController {
             guard client.permissions.allows(collection: collection) else {
                 return .reject("Collection not found: \(collection)", clientName: client.name)
             }
+            if permission != .read, frozen.contains(collection) {
+                return .reject("The collection «\(collection)» is being re-embedded with another model right now — writing to it reopens when that finishes.", clientName: client.name)
+            }
         }
 
         // Лимиты объёма — после прав и после whitelist: сообщать «суточная
@@ -536,6 +633,32 @@ public actor AccessController {
         }
 
         return .allow(client)
+    }
+
+    /// Отказ запросу без действующего ключа, когда их слишком много.
+    /// Открыто для конечной точки MCP: ключ там проверяется до решения.
+    public func throttleAnonymous() -> AccessDecision? {
+        let taken = anonymousBucket.take()
+        guard !taken.allowed else { return nil }
+        return .reject(
+            status: 429,
+            message: String(localized: "Слишком много запросов без действующего ключа: всем им вместе разрешено \(Self.anonymousBurst.plainDigits) за раз и \(Self.anonymousRequestsPerMinute.plainDigits) в минуту."),
+            clientName: nil,
+            retryAfterSeconds: taken.retryAfterSeconds
+        )
+    }
+
+    /// Сообщать ли об отказе перебору: первый в минуте — да, с числом
+    /// молча отклонённых за прошлое окно; остальные — нет, только счёт.
+    /// `nil` — молчать.
+    public func reportAnonymousRefusal(now: Date = Date()) -> Int? {
+        if let window = anonymousWindow, now.timeIntervalSince(window.start) < 60 {
+            anonymousWindow?.suppressed += 1
+            return nil
+        }
+        let suppressed = anonymousWindow?.suppressed ?? 0
+        anonymousWindow = (now, 0)
+        return suppressed
     }
 
     private func consumeRate(for client: ExternalClient, route: ChromaRoute) -> AccessDecision? {
@@ -584,6 +707,9 @@ public actor AccessController {
         }
         return nil
     }
+
+    /// Операции, тело которых — всегда объект с документами или условием.
+    static let payloadOperations: Set<String> = ["add", "upsert", "update", "delete"]
 
     /// The name a creation request carries — the only place it appears, since
     /// the path has no collection segment yet.

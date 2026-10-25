@@ -48,6 +48,18 @@ public struct ChatJSONSchema: Hashable, @unchecked Sendable {
         ]
     )
 
+    /// Что просит LLM-нарезка с пронумерованными предложениями:
+    /// номера предложений, с которых начинаются фрагменты.
+    public static let boundaries = ChatJSONSchema(
+        name: "boundaries",
+        schema: [
+            "type": "object",
+            "properties": ["starts": ["type": "array", "items": ["type": "integer"]]],
+            "required": ["starts"],
+            "additionalProperties": false,
+        ]
+    )
+
     /// What LLM-based chunking asks for: a list of fragments, nothing else.
     public static let chunks = ChatJSONSchema(
         name: "chunks",

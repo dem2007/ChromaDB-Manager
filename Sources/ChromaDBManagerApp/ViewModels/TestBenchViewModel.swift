@@ -251,7 +251,7 @@ final class TestBenchViewModel: ObservableObject {
         let parents = previewChunks.filter { $0.level > 0 }.count
         var text = "чанков: \(previewChunks.count) · символов в среднем \(average) (от \(sizes.min() ?? 0) до \(sizes.max() ?? 0))"
         if parents > 0 { text += " · родительских \(parents), дочерних \(previewChunks.count - parents)" }
-        if let duration = previewDuration { text += " · чанкинг занял \(String(format: "%.2f", duration)) с" }
+        if let duration = previewDuration { text += " · чанкинг занял \((duration).decimal(2)) с" }
         return text
     }
 

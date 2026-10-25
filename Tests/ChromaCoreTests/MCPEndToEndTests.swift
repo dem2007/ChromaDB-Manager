@@ -106,6 +106,7 @@ final class MCPEndToEndTests: XCTestCase {
             "method": .string(MCPProtocol.discoverMethod),
             "params": .object(["_meta": .object([
                 MCPProtocol.metaProtocolVersion: .string(MCPProtocol.version),
+                MCPProtocol.metaClientCapabilities: .object([:]),
             ])]),
         ])))
 
@@ -182,7 +183,7 @@ final class MCPEndToEndTests: XCTestCase {
         process.standardError = errors
         try process.run()
 
-        let line = #"{"jsonrpc":"2.0","id":"probe","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"# + "\n"
+        let line = #"{"jsonrpc":"2.0","id":"probe","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"# + "\n"
         input.fileHandleForWriting.write(Data(line.utf8))
 
         let answered = expectation(description: "ответ на стандартном выводе")

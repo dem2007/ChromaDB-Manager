@@ -32,13 +32,45 @@ final class TrashViewModel: ObservableObject {
 
     // MARK: - Restore
 
+    /// Ждут ли выбранные записи подтверждения восстановления.
+    @Published var confirmingRestore = false
+
+    /// Восстановить выбранное — сразу или после вопроса.
+    ///
+    /// Двойной щелчок и Return спрашивают всегда: раньше они восстанавливали
+    /// без вопроса, и случайный щелчок по строке удалённой коллекции
+    /// создавал её заново с одной записью. Кнопка и меню спрашивают, когда
+    /// восстанавливается **часть** удалённой целиком коллекции.
+    func requestRestore(_ ids: Set<UUID>, app: AppEnvironment, alwaysAsk: Bool) {
+        guard !ids.isEmpty, !isRestoring else { return }
+        selectedIDs = ids
+        if alwaysAsk || restoreWarning(app) != nil {
+            confirmingRestore = true
+        } else {
+            Task { await restoreSelected(app) }
+        }
+    }
+
+    /// «Это 1 из 51 863 записей удалённой коллекции «X»…» — когда выбрана
+    /// не вся удалённая коллекция.
+    func restoreWarning(_ app: AppEnvironment) -> String? {
+        let chosen = app.trash.entries(withIDs: selectedIDs).filter { $0.reason == .collection }
+        let parts = Dictionary(grouping: chosen, by: \.collectionName).compactMap { name, picked -> String? in
+            let whole = app.trash.entries.filter { $0.reason == .collection && $0.collectionName == name }.count
+            guard picked.count < whole else { return nil }
+            return String(localized: "\(picked.count.plainDigits) из \(whole.plainDigits) записей удалённой коллекции «\(name)»")
+        }
+        guard !parts.isEmpty else { return nil }
+        return String(localized: "Выбрано \(parts.sorted().joined(separator: "; ")). Если коллекции уже нет, она будет создана заново только с выбранным. Чтобы вернуть коллекцию целиком, выберите её в фильтре «Коллекция» и восстановите всё.")
+    }
+
     func restoreSelected(_ app: AppEnvironment) async {
-        await restore(app.trash.entries(withIDs: selectedIDs), app: app)
+        await restore(await app.trash.fullEntries(withIDs: selectedIDs), app: app)
         selectedIDs.removeAll()
     }
 
     func restoreAll(_ app: AppEnvironment) async {
-        await restore(entries(app), app: app)
+        await restore(await app.trash.fullEntries(withIDs: Set(entries(app).map(\.id))), app: app)
         selectedIDs.removeAll()
     }
 
@@ -94,6 +126,8 @@ final class TrashViewModel: ObservableObject {
         if skipped > 0 {
             app.log.record(.warning, "Корзина", "Пропущено при восстановлении (нет текста или вектора): \(skipped.plainDigits)")
         }
+        // Восстановление читало полные записи с векторами.
+        MemoryRelief.soon()
         statusMessage = restoredCount > 0
             ? String(localized: "Восстановлено документов: \(restoredCount.plainDigits).")
             : nil

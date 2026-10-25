@@ -71,6 +71,19 @@ def names(run: dict) -> dict:
             collection = variant.get("profile", {}).get("collectionName", "")
             name = f"{name} · {collection}" if collection else name
         result[variant["id"]] = name
+    # Тот же профиль на той же коллекции дважды — коллекция их не различает.
+    # Остаётся номер по порядку: «A · docs (2)». Без него две строки сводки
+    # снова звались одинаково.
+    counts = {}
+    for variant in run.get("variants", []):
+        counts[result[variant["id"]]] = counts.get(result[variant["id"]], 0) + 1
+    order = {}
+    for variant in run.get("variants", []):
+        name = result[variant["id"]]
+        if counts[name] > 1:
+            order[name] = order.get(name, 0) + 1
+            if order[name] > 1:
+                result[variant["id"]] = f"{name} ({order[name]})"
     return result
 
 

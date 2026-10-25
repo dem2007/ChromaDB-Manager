@@ -96,3 +96,149 @@ final class PathLevelEditorTests: XCTestCase {
         XCTAssertEqual(model.draft?.pathLevels.count, PathLevel.maximumLevels)
     }
 }
+
+/// Разделители нарезки и поле редактора.
+@MainActor
+final class SeparatorFieldTests: XCTestCase {
+    /// Разделители по умолчанию переживают поле без потерь: прежде «. »
+    /// становилось «.», а « » пропадал.
+    func testTheDefaultsSurviveTheField() {
+        let defaults = ChunkingConfiguration.defaultSeparators
+        let text = SourcesViewModel.formatSeparators(defaults)
+        XCTAssertEqual(SourcesViewModel.parseSeparators(text, fallback: []), defaults)
+    }
+
+    /// Пробел по краю разделителя виден: такой разделитель — в кавычках.
+    func testASpacedSeparatorIsShownInQuotes() {
+        XCTAssertEqual(SourcesViewModel.formatSeparators(ChunkingConfiguration.defaultSeparators),
+                       #"\n\n | \n | ". " | " ""#)
+    }
+
+    /// Строку, перепечатанную так, как она выглядит, разбор понимает так же.
+    func testWhatIsSeenIsWhatIsSaved() {
+        XCTAssertEqual(SourcesViewModel.parseSeparators(#"\n\n | \n | ". " | " ""#, fallback: []),
+                       ChunkingConfiguration.defaultSeparators)
+    }
+
+    func testTypedSeparatorsAreSplitOnTheBar() {
+        XCTAssertEqual(SourcesViewModel.parseSeparators("a | b|c |d", fallback: []), ["a", "b", "c", "d"])
+        XCTAssertEqual(SourcesViewModel.parseSeparators(#"\n\n | ; "#, fallback: []), ["\n\n", ";"],
+                       "пробел без кавычек — от набора")
+        XCTAssertEqual(SourcesViewModel.parseSeparators(#"\n\n | "; ""#, fallback: []), ["\n\n", "; "])
+        XCTAssertEqual(SourcesViewModel.parseSeparators("  ", fallback: ["x"]), ["x"], "одни пробелы — поле пусто")
+        XCTAssertEqual(SourcesViewModel.parseSeparators("", fallback: ["x"]), ["x"])
+    }
+}
+
+/// Другой подключённый диск — вопрос, отключённый — нет.
+@MainActor
+final class VolumeMismatchPromptTests: XCTestCase {
+    private let old = SourceVolume(uuid: "A", name: "Backup", mountPoint: "/Volumes/Backup")
+    private let new = SourceVolume(uuid: "B", name: "Backup", mountPoint: "/Volumes/Backup")
+
+    private func source(_ name: String, volume: SourceVolume?) -> DataSource {
+        var source = DataSource(name: name, path: "/Volumes/Backup/\(name)", collectionName: name)
+        source.volume = volume
+        return source
+    }
+
+    func testOnlyAnotherMountedDiskIsAsked() {
+        let docs = source("Документы", volume: old)
+        let prompt = SourcesViewModel.VolumeMismatchPrompt(
+            SyncError.volumeChanged(expected: "Backup", found: "Backup"), source: docs, volumeAt: { _ in self.new }
+        )
+        XCTAssertEqual(prompt?.found, new)
+        XCTAssertNil(SourcesViewModel.VolumeMismatchPrompt(
+            SyncError.volumeChanged(expected: "Backup", found: nil), source: docs, volumeAt: { _ in nil }
+        ), "отключённый диск принимать нечего")
+        XCTAssertNil(SourcesViewModel.VolumeMismatchPrompt(SyncError.noExtensions, source: docs, volumeAt: { _ in self.new }))
+    }
+
+    /// Два диска с одним именем — вопрос так и говорит, а не «Backup вместо
+    /// Backup»; источники на том же диске названы числом.
+    func testTheQuestionReadsWhenNamesCoincide() throws {
+        let docs = source("Документы", volume: old)
+        let photos = source("Фото", volume: old)
+        let prompt = try XCTUnwrap(SourcesViewModel.VolumeMismatchPrompt(
+            SyncError.volumeChanged(expected: "Backup", found: "Backup"), source: docs,
+            among: [docs, photos], volumeAt: { _ in self.new }
+        ))
+        XCTAssertTrue(prompt.message.contains("другой диск с тем же именем"), prompt.message)
+        XCTAssertEqual(prompt.alsoMoving, 1)
+    }
+}
+
+/// Что делать с прогоном, упёршимся в диск.
+@MainActor
+final class VolumeQuestionTests: XCTestCase {
+    private let old = SourceVolume(uuid: "A", name: "Backup")
+    private let new = SourceVolume(uuid: "B", name: "Backup")
+    private let other = SourceVolume(uuid: "C", name: "Archive")
+    private let failure = SyncError.volumeChanged(expected: "Backup", found: "Backup")
+
+    private func source(_ name: String, volume: SourceVolume?) -> DataSource {
+        var source = DataSource(name: name, path: "/Volumes/Backup/\(name)", collectionName: name)
+        source.volume = volume
+        return source
+    }
+
+    private func question(
+        _ snapshot: DataSource, settings: [DataSource], shown: SourcesViewModel.VolumeMismatchPrompt? = nil,
+        at volume: SourceVolume?
+    ) -> SourcesViewModel.VolumeQuestion {
+        SourcesViewModel.volumeQuestion(failure, source: snapshot, sources: settings, shown: shown, volumeAt: { _ in volume })
+    }
+
+    func testAnotherMountedDiskIsAsked() {
+        let docs = source("Документы", volume: old)
+        guard case .ask(let prompt) = question(docs, settings: [docs], at: new) else { return XCTFail("вопрос не задан") }
+        XCTAssertEqual(prompt.found, new)
+    }
+
+    /// Прогон начался до ответа и упёрся в прежний диск из своей копии —
+    /// в настройках диск уже принят, и спрашивать второй раз не о чем.
+    func testARunThatStartedBeforeTheAnswerIsNotAskedAgain() {
+        let snapshot = source("Документы", volume: old)
+        var settled = snapshot
+        settled.volume = new
+        XCTAssertEqual(question(snapshot, settings: [settled], at: new), .alreadySettled)
+    }
+
+    /// Показанный вопрос не подменяется: тот же диск — его ответ примет и
+    /// этот источник, другой — строкой ошибки.
+    func testTheShownQuestionIsNotReplaced() throws {
+        let docs = source("Документы", volume: old)
+        let photos = source("Фото", volume: old)
+        guard case .ask(let shown) = question(docs, settings: [docs, photos], at: new) else { return XCTFail() }
+        XCTAssertEqual(question(photos, settings: [docs, photos], shown: shown, at: new), .covered)
+        let archive = source("Архив", volume: other)
+        XCTAssertEqual(question(archive, settings: [docs, photos, archive], shown: shown, at: new), .asError)
+    }
+
+    func testOtherErrorsAreNotAboutTheDisk() {
+        let docs = source("Документы", volume: old)
+        XCTAssertEqual(SourcesViewModel.volumeQuestion(
+            SyncError.noExtensions, source: docs, sources: [docs], shown: nil, volumeAt: { _ in self.new }
+        ), .notAboutDisk)
+        XCTAssertEqual(SourcesViewModel.volumeQuestion(
+            SyncError.volumeChanged(expected: "Backup", found: nil), source: docs, sources: [docs], shown: nil,
+            volumeAt: { _ in nil }
+        ), .notAboutDisk, "отключённый диск принимать нечего")
+    }
+}
+
+/// Разделители: одно правило пробела на оба направления.
+@MainActor
+final class SeparatorEdgeTests: XCTestCase {
+    func testAnyKindOfSpaceAtTheEdgeIsQuoted() {
+        let separators = [".\u{00A0}", "\u{202F}", "\t"]
+        let text = SourcesViewModel.formatSeparators(separators)
+        XCTAssertEqual(SourcesViewModel.parseSeparators(text, fallback: []), separators, text)
+    }
+
+    func testASeparatorInQuotesKeepsItsQuotes() {
+        let separators = [#""x""#, #"""#, #""abc"#]
+        let text = SourcesViewModel.formatSeparators(separators)
+        XCTAssertEqual(SourcesViewModel.parseSeparators(text, fallback: []), separators, text)
+    }
+}

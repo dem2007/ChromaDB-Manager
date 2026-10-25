@@ -13,10 +13,12 @@ struct QuickSearchView: View {
     /// Открыть исходник результата. Снаружи, потому что из строки меню это
     /// отдельное окно, а из панели — она же.
     let openDocument: () -> Void
+    /// Плавающая панель — во всю свою высоту; окно значка — по содержимому.
+    var fillsHeight = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("", selection: Binding(
+        VStack(alignment: .leading) {
+            Picker(String(localized: "Коллекция"), selection: Binding(
                 get: { settings.configuration.menuBar.quickSearchCollection ?? "" },
                 set: { search.choose($0.isEmpty ? nil : $0, app: app) }
             )) {
@@ -25,34 +27,34 @@ struct QuickSearchView: View {
                     Text(collection.name).tag(collection.name)
                 }
             }
-            .labelsHidden().controlSize(.small)
+            .labelsHidden()
+            .controlSize(.small)
 
-            HStack(spacing: 6) {
-                TextField("Что искать", text: $search.text)
+            HStack {
+                TextField(String(localized: "Что искать"), text: $search.text, prompt: Text("Что искать"))
+                    .labelsHidden()
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { Task { await search.search(app) } }
                 if search.isSearching { ProgressView().controlSize(.small) }
             }
 
             if let problem = search.problem {
-                Text(problem).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Notice(.info, problem)
+                    .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if search.hits.isEmpty {
-                // Место под результаты занято сразу: у всплывающего окна
-                // строки меню высота фиксированная, и без распорки список
-                // прыгал бы снизу вверх при каждом поиске.
-                Spacer(minLength: 0)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(search.hits) { hit in
-                            resultRow(hit)
-                        }
-                    }
+            if !search.hits.isEmpty {
+                List(search.hits) { hit in
+                    resultRow(hit)
                 }
-                .frame(maxHeight: .infinity)
+                .listStyle(.plain)
+                .resultsHeight(fillsHeight: fillsHeight)
+            } else if fillsHeight {
+                // Место под результаты в панели занято сразу: высота у неё
+                // постоянная, и без распорки список прыгал бы снизу вверх при
+                // каждом поиске.
+                Spacer(minLength: 0)
             }
         }
         .task { await search.reloadCollections(app) }
@@ -70,13 +72,17 @@ struct QuickSearchView: View {
             )
             openDocument()
         } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(hit.document ?? "")
-                    .font(Theme.Font.caption).lineLimit(2)
+            VStack(alignment: .leading) {
+                // Начало, а не весь документ: две строки из сотен
+                // тысяч знаков раскладывались целиком.
+                Text(DisplayText.preview(hit.document, limit: 400).text)
+                    .font(.callout)
+                    .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
                 if let name = DocumentLocator.reference(metadata: hit.metadata).fileName {
-                    Text(name).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                    Text(name)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
             }
@@ -137,14 +143,11 @@ final class QuickSearchPanelController {
             self?.openDocument()
         })
         .chromaEnvironment(app)
-        .padding(14)
-        // Высота задана сразу: панель по клавише открывается ради
-        // результатов, и показывать их в щели высотой в две строки
-        // бессмысленно.
-        .frame(width: 460, height: 420, alignment: .top)
+        .padding()
+        .frame(width: QuickSearchPanelSize.size.width, height: QuickSearchPanelSize.size.height, alignment: .top)
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 420),
+            contentRect: NSRect(origin: .zero, size: QuickSearchPanelSize.size),
             styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered, defer: false
         )

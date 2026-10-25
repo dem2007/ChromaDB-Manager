@@ -69,6 +69,13 @@ public struct SyncPlanItem: Identifiable, Hashable {
     /// временный файл с телом ответа, и рассказывать про него как про файл
     /// пользователя нельзя: имя и время у него наши, а не страницы.
     public let isRemote: Bool
+    /// Хеш байтов файла, если план его уже посчитал.
+    ///
+    /// План хеширует файл, у которого сдвинулись размер или время, — чтобы
+    /// отличить пересохранение от правки. Прогон записи считал тот же хеш
+    /// заново: каждый изменившийся файл читался с диска целиком два раза,
+    /// и на сетевой папке это минуты.
+    public let fileHash: String?
 
     public init(
         relativePath: String,
@@ -81,7 +88,8 @@ public struct SyncPlanItem: Identifiable, Hashable {
         textLength: Int? = nil,
         routeMetadata: ChromaMetadata = [:],
         refresh: ManifestRefresh? = nil,
-        isRemote: Bool = false
+        isRemote: Bool = false,
+        fileHash: String? = nil
     ) {
         self.relativePath = relativePath
         self.url = url
@@ -94,6 +102,7 @@ public struct SyncPlanItem: Identifiable, Hashable {
         self.routeMetadata = routeMetadata
         self.refresh = refresh
         self.isRemote = isRemote
+        self.fileHash = fileHash
     }
 
     /// Тот же элемент с другим видом работы.
@@ -109,7 +118,8 @@ public struct SyncPlanItem: Identifiable, Hashable {
             relativePath: relativePath, url: url, kind: kind,
             collectionName: collectionName, size: size, modifiedAt: modifiedAt,
             contentHash: contentHash, textLength: textLength,
-            routeMetadata: routeMetadata, refresh: refresh, isRemote: isRemote
+            routeMetadata: routeMetadata, refresh: refresh, isRemote: isRemote,
+            fileHash: fileHash
         )
     }
 }
@@ -144,12 +154,16 @@ public struct MassDisappearance: Sendable, Hashable {
 public struct SyncPlan {
     public let sourceID: UUID
     public let sourceName: String
-    public let items: [SyncPlanItem]
+    public internal(set) var items: [SyncPlanItem]
     /// Files in the manifest that are no longer on disk, newly noticed now.
     public let newlyMissing: [PendingRemoval]
     /// Пути, вернувшиеся на место после «Оставить в базе»: с них снимается
     /// пометка, иначе следующее исчезновение пройдёт молча.
     public let returnedFromOrphaned: [String]
+    /// Пути, которые лежат на диске, но в источник больше не входят:
+    /// исключены, больше предела, не подходят под правило. Строки таблиц
+    /// с таких путей уходят в «требуют решения», как у исчезнувших.
+    public let outOfScope: Set<String>
     /// Everything awaiting a decision, including what earlier syncs found.
     public let pendingRemovals: [PendingRemoval]
     /// Массовая пропажа файлов: столько с диска разом не исчезает
@@ -159,13 +173,15 @@ public struct SyncPlan {
     /// Files whose text came from an older version of the extractor that reads
     /// them today. Deliberately **not** part of `items`: forbids queueing
     /// them, and anything inside `items` is work this run intends to do.
-    public let staleExtraction: [StaleExtraction]
+    public internal(set) var staleExtraction: [StaleExtraction]
     /// Rows a table source would send to the model. Counted during the
     /// plan, because the price of a sheet cannot be guessed from its file size.
     public let tableRowsToEmbed: Int
     /// Уровни вложенности глубже названных. Как и устаревший
     /// экстрактор — сообщаются, но работы не создают: имя уровню даёт человек.
     public let newFolderLevels: [NewFolderLevel]
+    /// Файлы папки, не взятые по расширению.
+    public internal(set) var ignored = IgnoredFiles()
 
     public init(
         sourceID: UUID,
@@ -173,6 +189,7 @@ public struct SyncPlan {
         items: [SyncPlanItem],
         newlyMissing: [PendingRemoval],
         returnedFromOrphaned: [String] = [],
+        outOfScope: Set<String> = [],
         pendingRemovals: [PendingRemoval],
         massDisappearance: MassDisappearance? = nil,
         staleExtraction: [StaleExtraction] = [],
@@ -184,6 +201,7 @@ public struct SyncPlan {
         self.items = items
         self.newlyMissing = newlyMissing
         self.returnedFromOrphaned = returnedFromOrphaned
+        self.outOfScope = outOfScope
         self.pendingRemovals = pendingRemovals
         self.massDisappearance = massDisappearance
         self.staleExtraction = staleExtraction
@@ -358,6 +376,10 @@ public struct SyncProgress {
     public var totalFiles: Int
     public var chunksWritten: Int
     public var currentFile: String?
+    /// Коллекции прогона заведены: они уже есть на сервере, и списки
+    /// коллекций в приложении — экран, выбор доступа клиента — должны
+    /// узнать о них сейчас, а не в конце прогона на несколько часов.
+    public var collectionsReady = false
 
     public init(stage: String, processedFiles: Int = 0, totalFiles: Int = 0, chunksWritten: Int = 0, currentFile: String? = nil) {
         self.stage = stage
@@ -419,6 +441,10 @@ public struct SyncSummary {
     public var tableRowsNeedingDecision: Int = 0
     /// Уровни вложенности глубже названных.
     public var newFolderLevels: [NewFolderLevel] = []
+    /// Файлы папки, не взятые по расширению. Не проблема прогона —
+    /// так задан источник, — поэтому в «пропущено» не считаются и значок
+    /// предупреждения не зажигают; но названы.
+    public var ignored = IgnoredFiles()
 
     public var wroteNothing: Bool { added == 0 && updated == 0 }
 
@@ -455,9 +481,31 @@ public struct SyncSummary {
         return String(localized: "восстановлено после незавершённого прогона: доиграно \(recoveredFiles), переиндексировано \(reindexedAfterFailure)")
     }
 
+    /// Пропущенные, собранные по причине: самые частые — первыми,
+    /// при равенстве — в порядке прогона. Сотня листов «листу подходит
+    /// несколько профилей» — одна строка со счётчиком, а не сто строк,
+    /// из которых в окно влезали десять одинаковых.
+    public var skippedByReason: [(reason: String, files: [String])] {
+        var order: [String] = []
+        var files: [String: [String]] = [:]
+        for item in skipped {
+            if files[item.reason] == nil { order.append(item.reason) }
+            files[item.reason, default: []].append(item.file)
+        }
+        return order.enumerated()
+            .sorted { lhs, rhs in
+                let left = files[lhs.element]?.count ?? 0, right = files[rhs.element]?.count ?? 0
+                return left != right ? left > right : lhs.offset < rhs.offset
+            }
+            .map { ($0.element, files[$0.element] ?? []) }
+    }
+
     public var line: String {
         let base = String(localized: "добавлено \(added), обновлено \(updated), без изменений \(unchanged); чанков записано \(chunksWritten), удалено \(chunksDeleted)")
-        return [base, recoveryLine, heterogeneityLine, staleExtractionLine, newFolderLevelsLine]
+        // Пропущенные — в самой строке: раньше о них говорил только
+        // жёлтый значок рядом, и число приходилось искать в окне итога.
+        let skippedLine = skipped.isEmpty ? nil : String(localized: "пропущено файлов \(skipped.count.plainDigits)")
+        return [base, skippedLine, recoveryLine, heterogeneityLine, staleExtractionLine, newFolderLevelsLine, ignored.line]
             .compactMap { $0 }.joined(separator: "; ")
     }
 }
@@ -537,7 +585,7 @@ public enum SyncError: LocalizedError {
     public var recoverySuggestion: String? {
         switch self {
         case .volumeChanged:
-            return String(localized: "Подключите тот же диск (или сетевую шару) и запустите синхронизацию заново. Если папка действительно переехала, укажите новый путь в настройках источника — том запомнится заново.")
+            return String(localized: "Подключите тот же диск (или сетевую шару) и запустите синхронизацию заново. Если папка действительно переехала, укажите новый путь в настройках источника — том запомнится заново. Если диск заменили другим с теми же файлами, запустите синхронизацию вручную — приложение спросит, принять ли новый диск.")
         case .massDisappearance:
             return String(localized: "Проверьте, что диск с папкой подключён и это тот самый диск. Если файлы удалены намеренно, запустите синхронизацию ещё раз и подтвердите массовое исчезновение — только тогда они попадут в «требуют решения».")
         case .longerThanModelReads:
@@ -868,8 +916,17 @@ public actor SourceSyncService {
     /// while being read are the same thing to the person looking at the screen.
     static func plannedProblems(of plan: SyncPlan) -> [FileProblem] {
         plan.items.compactMap { item in
-            guard case .skipped(let reason, let remedy) = item.kind else { return nil }
-            return FileProblem(relativePath: item.relativePath, reason: reason, remedy: remedy)
+            switch item.kind {
+            case .skipped(let reason, let remedy):
+                return FileProblem(relativePath: item.relativePath, reason: reason, remedy: remedy)
+            case .unroutable(let reason):
+                // Файл, которому правило не нашло коллекцию, — тоже не в базе
+                //. Раньше он был только в итоге прогона и пропадал
+                // из виду, как только итог закрывали.
+                return FileProblem(relativePath: item.relativePath, reason: reason, remedy: .fixRule)
+            default:
+                return nil
+            }
         }
     }
 
@@ -932,21 +989,25 @@ public actor SourceSyncService {
         // Переносится **всё**, кроме того, что этот вызов меняет намеренно.
         // Раньше поля перечислялись выборочно, и каждое новое поле плана
         // молча терялось при переизвлечении: так исчезала пометка о новом
-        // уровне вложенности — уровень в папке оставался, а строка с карточки
-        // пропадала.
-        return SyncPlan(
-            sourceID: plan.sourceID, sourceName: plan.sourceName, items: items,
-            newlyMissing: plan.newlyMissing, pendingRemovals: plan.pendingRemovals,
-            massDisappearance: plan.massDisappearance,
-            // The list is kept as it was: a run that re-extracts part of it
-            // should still report what is left.
-            staleExtraction: plan.staleExtraction.filter { !paths.contains($0.relativePath) },
-            tableRowsToEmbed: plan.tableRowsToEmbed,
-            newFolderLevels: plan.newFolderLevels
-        )
+        // уровне вложенности, а потом — список файлов, вернувшихся
+        // после «Оставить в базе». Теперь план копируется целиком, и
+        // перечислять нечего.
+        var forced = plan
+        forced.items = items
+        // The list is kept as it was: a run that re-extracts part of it
+        // should still report what is left.
+        forced.staleExtraction = plan.staleExtraction.filter { !paths.contains($0.relativePath) }
+        return forced
     }
 
     public func isRunning(sourceID: UUID) -> Bool { running.contains(sourceID) }
+
+    /// Занимает источник для операции, которая правит его манифест.
+    /// Снимает занятость вызывающий — `defer { running.remove(source.id) }`.
+    private func claim(_ source: DataSource) throws {
+        guard !running.contains(source.id) else { throw SyncError.alreadyRunning(source.name) }
+        running.insert(source.id)
+    }
 
     public func manifest(for sourceID: UUID) -> SourceManifest { manifests.load(sourceID: sourceID) }
 
@@ -1066,6 +1127,11 @@ public actor SourceSyncService {
     // MARK: - Scanning
 
     public func scanFiles(source: DataSource) throws -> [URL] {
+        try scanFolder(source: source).files
+    }
+
+    /// Файлы источника и то, что обход отбросил по расширению.
+    public func scanFolder(source: DataSource) throws -> (files: [URL], ignored: IgnoredFiles) {
         let root = source.url
         // Том проверяется **до** обхода папки: пустая папка на чужом
         // диске неотличима от папки, из которой всё удалили, — а стоит эта
@@ -1086,6 +1152,17 @@ public actor SourceSyncService {
         guard !wanted.isEmpty else { throw SyncError.noExtensions }
 
         var files: [URL] = []
+        var ignored = IgnoredFiles()
+        /// Файл человека не того расширения — сосчитать. Папка, ссылка,
+        /// служебный файл Office — не файл источника, о них не говорится.
+        func consider(_ url: URL) {
+            let fileExtension = url.pathExtension.lowercased()
+            if wanted.contains(fileExtension) {
+                if Self.isIndexableEntry(url) { files.append(url) }
+            } else if Self.isIndexableEntry(url) {
+                ignored.byExtension[fileExtension, default: 0] += 1
+            }
+        }
         if source.recursive {
             // Читаемость корня проверяется **до** обхода.
             //
@@ -1105,26 +1182,23 @@ public actor SourceSyncService {
                     "Источник «\(source.name)»: папку \(root.path) не удалось прочитать — \(error.localizedDescription)")
                 throw SyncError.folderUnreadable(root.path, error.localizedDescription)
             }
+            // Ссылка спрашивается у каждого файла — и у не взятых, которые
+            // теперь считаются: оба ключа берутся за один обход.
             guard let enumerator = fileManager.enumerator(
                 at: root,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
-            ) else { return [] }
-            for case let url as URL in enumerator {
-                guard wanted.contains(url.pathExtension.lowercased()) else { continue }
-                if Self.isIndexableEntry(url) { files.append(url) }
-            }
+            ) else { return ([], ignored) }
+            for case let url as URL in enumerator { consider(url) }
         } else {
             let contents = try fileManager.contentsOfDirectory(
                 at: root,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
-            files = contents.filter {
-                wanted.contains($0.pathExtension.lowercased()) && Self.isIndexableEntry($0)
-            }
+            contents.forEach(consider)
         }
-        return files.sorted { $0.path < $1.path }
+        return (files.sorted { $0.path < $1.path }, ignored)
     }
 
     /// Уровни вложенности папки источника — тем же обходом и теми же
@@ -1134,6 +1208,25 @@ public actor SourceSyncService {
     /// и прогон, работающий по другому, рано или поздно разойдутся в том,
     /// сколько в папке уровней, — и правым в этом споре будет прогон, а
     /// объясняться придётся человеку.
+    /// Уровни папки и сколько в ней файлов каждого расширения — одним
+    /// обходом, для редактора источника. Расширения считаются все,
+    /// и выбранные, и нет: по ним человек и решает, что выбрать.
+    public func folderOverview(source: DataSource) throws -> (levels: FolderLevels, extensionCounts: [String: Int]) {
+        var probe = source
+        // Ничего не выбрано — уровни пусты, но счёт расширений нужен тем более.
+        if probe.fileExtensions.allSatisfy({ $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")).isEmpty }) {
+            probe.fileExtensions = ["\u{1}"]
+        }
+        let scan = try scanFolder(source: probe)
+        var counts = scan.ignored.byExtension
+        for file in scan.files { counts[file.pathExtension.lowercased(), default: 0] += 1 }
+        let excluded = Set(source.excludedPaths)
+        let paths = scan.files
+            .map { Self.relative($0, to: source.url) }
+            .filter { !excluded.contains($0) }
+        return (FolderLevels.of(paths: paths), counts)
+    }
+
     public func folderLevels(source: DataSource) throws -> FolderLevels {
         let files = try scanFiles(source: source)
         let excluded = Set(source.excludedPaths)
@@ -1159,7 +1252,7 @@ public actor SourceSyncService {
             throw SyncError.ruleInvalid(problem)
         }
 
-        let files = try scanFiles(source: source)
+        let (files, ignored) = try scanFolder(source: source)
         let manifest = manifests.load(sourceID: source.id)
         let signature = source.chunking.signature
         let extractionSignature = source.extractionSignature
@@ -1169,8 +1262,16 @@ public actor SourceSyncService {
         var items: [SyncPlanItem] = []
         var staleExtraction: [StaleExtraction] = []
         var seenPaths: Set<String> = []
+        // На диске, но вне источника: исключены, больше предела, не подходят
+        // ни под одно правило. Для манифеста они как исчезнувшие — их чанки
+        // уходят в «требуют решения», — но в счёт массовой пропажи не идут:
+        // та защищает от отключённого диска, а эти файлы на месте.
+        var outOfScope: Set<String> = []
         let tableFiles = tableManifests.load(sourceID: source.id)
-        let currentProfilesSignature = TableSyncService.profilesSignature(tableProfiles(of: source))
+        let currentProfilesSignature = TableSyncService.profilesSignature(
+            tableProfiles(of: source), unmatchedSheetsAsText: source.unmatchedSheetsAsText
+        )
+        let currentMetadataSignature = source.metadataSignature
         var tableRowsToEmbed = 0
 
         let excluded = Set(source.excludedPaths)
@@ -1188,7 +1289,10 @@ public actor SourceSyncService {
             // Not added to `seenPaths`: from the source's point of view the file
             // is no longer there, so an entry left in the manifest becomes
             // «требует решения» rather than being quietly forgotten.
-            if excluded.contains(relativePath) { continue }
+            if excluded.contains(relativePath) {
+                outOfScope.insert(relativePath)
+                continue
+            }
             seenPaths.insert(relativePath)
 
             // Снимка нет — файл исчез между обходом папки и замером. Прежние
@@ -1228,6 +1332,11 @@ public actor SourceSyncService {
             }
 
             guard size <= source.maxFileSizeBytes else {
+                // Проиндексированный раньше файл, переросший предел (или
+                // предел снизили), — вне источника. Оставь его в `seenPaths`,
+                // и его прежние чанки жили бы в поиске без единого вопроса.
+                seenPaths.remove(relativePath)
+                outOfScope.insert(relativePath)
                 items.append(SyncPlanItem(
                     relativePath: relativePath, url: file,
                     kind: .skipped(
@@ -1244,6 +1353,9 @@ public actor SourceSyncService {
 
             let outcome = router.route(relativePath: relativePath, source: source)
             guard let route = outcome.route else {
+                // Так же — файл, который правило больше никуда не ведёт.
+                seenPaths.remove(relativePath)
+                outOfScope.insert(relativePath)
                 let reason: String
                 if case .unroutable(let value) = outcome { reason = value } else { reason = "" }
                 items.append(SyncPlanItem(
@@ -1260,18 +1372,30 @@ public actor SourceSyncService {
             //.
             if TabularFormat.of(file) != nil {
                 let known = tableFiles[relativePath]
+                // Коллекция назначения — тоже часть «не изменился»: без неё
+                // таблица, которую правило или новое имя коллекции увели
+                // в другую, оставалась строками в прежней.
                 let untouched = known.map {
                     abs($0.modifiedAt.timeIntervalSince(modified)) < 1
                         && $0.size == size
                         && $0.profilesSignature == currentProfilesSignature
+                        && $0.metadataSignature == currentMetadataSignature
+                        && $0.collectionName == route.collectionName
                 } ?? false
                 let kind: SyncItemKind
                 if known == nil {
                     kind = .new
                 } else if untouched {
                     kind = .unchanged
+                } else if known?.collectionName != route.collectionName {
+                    kind = .changed(reason: String(localized: "сменилась коллекция назначения"))
                 } else if known?.profilesSignature != currentProfilesSignature {
                     kind = .changed(reason: String(localized: "изменился профиль сопоставления"))
+                } else if known?.metadataSignature != currentMetadataSignature {
+                    // Поля файла стоят в каждой строке книги, а
+                    // обновление полей ходит только по документам: книга
+                    // перечитывается, и меняются метаданные, а не векторы.
+                    kind = .changed(reason: String(localized: "изменились поля из пути или свои поля источника"))
                 } else {
                     kind = .changed(reason: String(localized: "файл изменился"))
                 }
@@ -1391,7 +1515,7 @@ public actor SourceSyncService {
                     relativePath: relativePath, url: file, kind: kind,
                     collectionName: route.collectionName, size: size, modifiedAt: modified,
                     contentHash: hash, textLength: text.count, routeMetadata: route.extraMetadata,
-                    refresh: refresh
+                    refresh: refresh, fileHash: fileHash
                 ))
             } catch {
                 // Never a silent drop: every file the run cannot read says why,
@@ -1432,7 +1556,9 @@ public actor SourceSyncService {
         // Сколько файлов манифеста не нашлось на диске — считается **до**
         // того, как из них составят список на удаление.
         let known = manifest.entries.values.filter { !$0.isOrphaned }.count
-        let vanished = manifest.entries.filter { !seenPaths.contains($0.key) && !$0.value.isOrphaned }.count
+        let vanished = manifest.entries.filter {
+            !seenPaths.contains($0.key) && !outOfScope.contains($0.key) && !$0.value.isOrphaned
+        }.count
         let disappearance = Self.massDisappearance(missing: vanished, known: known)
 
         // Массовая пропажа — и список не пополняется вовсе. Это и есть
@@ -1475,18 +1601,24 @@ public actor SourceSyncService {
                 "Источник «\(source.name)»: появился уровень вложенности \(deepest.number) (\(deepest.folderCount) папок) — поле для него не задано, названия папок в базу не попадают.")
         }
 
-        return SyncPlan(
+        if let line = ignored.line {
+            log(.info, "Источники", "Источник «\(source.name)»: \(line)")
+        }
+        var plan = SyncPlan(
             sourceID: source.id,
             sourceName: source.name,
             items: items,
             newlyMissing: newlyMissing,
             returnedFromOrphaned: returned,
+            outOfScope: outOfScope,
             pendingRemovals: pending,
             massDisappearance: disappearance,
             staleExtraction: staleExtraction,
             tableRowsToEmbed: tableRowsToEmbed,
             newFolderLevels: newLevels
         )
+        plan.ignored = ignored
+        return plan
     }
 
     // MARK: - Schema hookup
@@ -1866,6 +1998,45 @@ public actor SourceSyncService {
         return report
     }
 
+    /// Таблицы, которых в плане нет или которые вне источника, — исчезли
+    /// с диска, исключены, переросли предел, не подходят под правило.
+    ///
+    /// Файловый манифест таблиц не знает, что они пропали: план сверяет
+    /// с диском только записи текстовых файлов. Строки удалённой книги
+    /// оставались в поиске без единого вопроса. Теперь они уходят в тот же
+    /// список «требуют решения», что и строки, исчезнувшие из файла, —
+    /// удаляет их по-прежнему только человек.
+    ///
+    /// Размер и время файла сбрасываются: вернётся файл — план его прочтёт,
+    /// и пометка о пропавших строках снимется сама, как у вернувшихся строк.
+    static func markVanishedTables(
+        present: Set<String>, store: TableManifestStore, sourceID: UUID, log: LogHandler
+    ) {
+        var files = store.load(sourceID: sourceID)
+        var changed = false
+        for (path, file) in files where !present.contains(path) {
+            var updated = file
+            for (sheetName, sheet) in file.sheets {
+                let rows = sheet.rows.values.filter { !$0.isOrphaned }
+                guard !rows.isEmpty else { continue }
+                updated.pendingRemovals[sheetName] = SheetRowRemoval(
+                    rows: rows.sorted { $0.rowNumber < $1.rowNumber },
+                    noticedAt: file.pendingRemovals[sheetName]?.noticedAt ?? Date()
+                )
+            }
+            updated.size = -1
+            updated.modifiedAt = .distantPast
+            guard updated != file else { continue }
+            if file.size != -1 {
+                log(.warning, "Таблицы",
+                    "Файл \(path) исчез с диска или вышел из источника — его строки (\(updated.pendingRemovals.values.reduce(0) { $0 + $1.rows.count }.plainDigits)) ждут решения, из базы не удалены")
+            }
+            files[path] = updated
+            changed = true
+        }
+        if changed { store.save(files, sourceID: sourceID) }
+    }
+
     /// Resolves a collection name once per sync, not once per file.
     private func collectionID(
         for name: String,
@@ -2034,6 +2205,9 @@ public actor SourceSyncService {
 
         // Save at once: what disappeared from disk must survive a cancelled run.
         manifests.save(manifest)
+        Self.markVanishedTables(
+            present: Set(plan.items.map(\.relativePath)).subtracting(plan.outOfScope), store: tableManifests, sourceID: source.id, log: log
+        )
 
         // Schema hookup, before anything is written.
         var attentionNote: [String: String] = [:]
@@ -2070,7 +2244,8 @@ public actor SourceSyncService {
                 recoveredFiles: recovery.finished.count,
                 reindexedAfterFailure: recovery.toReindex.count,
                 staleExtraction: plan.staleExtraction,
-                newFolderLevels: plan.newFolderLevels
+                newFolderLevels: plan.newFolderLevels,
+                ignored: plan.ignored
             )
             // The skipped files belong in this line too. Without them a run that
             // read nothing because every file was refused looked identical to a
@@ -2125,6 +2300,11 @@ public actor SourceSyncService {
             if try await isHeterogeneous(collection, chunking: source.chunking, chroma: chroma) {
                 heterogeneous.append(name)
             }
+        }
+        if !plan.targetCollections.isEmpty {
+            var ready = SyncProgress(stage: String(localized: "Коллекции готовы"))
+            ready.collectionsReady = true
+            progress(ready)
         }
 
         // One pipeline for every strategy, including the ones that call a model
@@ -2231,9 +2411,37 @@ public actor SourceSyncService {
                         log(.warning, "Таблицы", "Файл \(item.relativePath): \(warning)")
                     }
 
+                    let tableBatches = WrittenCounter()
                     var fileManifest = tableFiles[item.relativePath]
                         ?? TableFileManifest(relativePath: item.relativePath, collectionName: collectionName)
-                    let report = try await tables.sync(
+                    // Таблица сменила коллекцию — переезжает, как текстовый
+                    // файл: пишется в новую целиком, прежние строки снимаются
+                    // из прежней после записи. Манифест строк начинается
+                    // заново: иначе неизменившиеся строки сочлись бы уже
+                    // записанными — в коллекции, где их нет.
+                    var movedFrom: (collection: String, ids: [String])?
+                    if fileManifest.collectionName != collectionName {
+                        // Исчезнувшие строки ждут решения человека — в прежней
+                        // коллекции. Переезд унёс бы их без вопроса, поэтому
+                        // сначала решение, потом переезд.
+                        let waiting = fileManifest.pendingRemovals.values.reduce(0) { $0 + $1.rows.count }
+                        guard waiting == 0 else {
+                            let reason = String(localized: "таблица переехала в «\(collectionName)», а в «\(fileManifest.collectionName)» у неё строк ждут решения: \(waiting.plainDigits) — решите их, и следующий прогон перенесёт файл")
+                            skipped.append((item.relativePath, reason))
+                            runProblems.append(FileProblem(relativePath: item.relativePath, reason: reason, remedy: .retry))
+                            continue
+                        }
+                        // Строки, оставленные в базе по решению человека, —
+                        // его решение, и переезд их не трогает.
+                        let ids = fileManifest.sheets.values.flatMap { sheet in
+                            sheet.rows.values.filter { !$0.isOrphaned }.map(\.documentID)
+                        }
+                        movedFrom = (fileManifest.collectionName, ids)
+                        fileManifest = TableFileManifest(relativePath: item.relativePath, collectionName: collectionName)
+                    }
+                    let report: TableSyncReport
+                    do {
+                    report = try await tables.sync(
                         sheets: read.sheets,
                         manifest: &fileManifest,
                         context: TableSyncService.Context(
@@ -2256,15 +2464,68 @@ public actor SourceSyncService {
                             // invent one.
                             chunker: { text in
                                 try await pipeline.chunks(from: text, fileExtension: "md")
-                            }
+                            },
+                            chunkLimit: { [chunking = pipeline.configuration] chunk in chunking.characterLimit(of: chunk) },
+                            // Ход — по партиям, а не по файлу целиком.
+                            onBatchWritten: { [progress, writtenBefore = chunksWritten, fileIndex = index,
+                                               fileCount = writeItems.count, path = item.relativePath] count in
+                                let total = tableBatches.add(count)
+                                progress(SyncProgress(
+                                    stage: String(localized: "Запись таблицы"),
+                                    processedFiles: fileIndex, totalFiles: fileCount,
+                                    chunksWritten: writtenBefore + total, currentFile: path
+                                ))
+                            },
+                            unmatchedSheetsAsText: source.unmatchedSheetsAsText,
+                            documentMetadata: Self.tableDocumentMetadata(for: item, source: source, embeddingModel: embeddingModel),
+                            metadataSignature: source.metadataSignature
                         ),
                         chroma: chroma,
                         embeddings: embeddings
                     )
-                    fileManifest.modifiedAt = item.modifiedAt
-                    fileManifest.size = item.size
+                    } catch {
+                        // Листы, записанные до сбоя, — в базе, и манифест должен
+                        // это помнить: иначе следующий прогон пересчитал бы их
+                        // строки заново. Размер и время файла прежние — он
+                        // перечитается и допишет оставшееся. Переезд в другую
+                        // коллекцию — исключение: прежние строки ещё в старой,
+                        // и манифест, глядящий в новую, их бы потерял.
+                        if movedFrom == nil {
+                            tableFiles[item.relativePath] = fileManifest
+                            tableManifests.save(tableFiles, sourceID: source.id)
+                        }
+                        throw error
+                    }
+                    // После выборки файл записан не весь: размер и
+                    // время остаются прежними, и полный прогон его откроет.
+                    // Записанные выборкой строки манифест помнит — второй раз
+                    // их не посчитают.
+                    if tableRowLimit == nil {
+                        fileManifest.modifiedAt = item.modifiedAt
+                        fileManifest.size = item.size
+                    }
                     tableFiles[item.relativePath] = fileManifest
                     tableManifests.save(tableFiles, sourceID: source.id)
+
+                    if let movedFrom, !movedFrom.ids.isEmpty {
+                        do {
+                            let oldID = try await chroma.resolveID(of: movedFrom.collection)
+                            try await chroma.deleteDocuments(collectionID: oldID, ids: movedFrom.ids)
+                            chunksDeleted += movedFrom.ids.count
+                            log(.info, "Таблицы",
+                                "Файл \(item.relativePath) переехал в «\(collectionName)» — из «\(movedFrom.collection)» удалено строк: \(movedFrom.ids.count.plainDigits)")
+                        } catch ChromaError.collectionNotFound {
+                            // Прежней коллекции нет — убирать нечего.
+                        } catch {
+                            // Манифест уже смотрит в новую коллекцию, и молча
+                            // забыть прежние строки нельзя: они продолжают
+                            // находиться поиском.
+                            let reason = String(localized: "таблица переехала в «\(collectionName)», но строки в «\(movedFrom.collection)» удалить не удалось (\(error.localizedDescription)) — удалите их там по полю source_file")
+                            runProblems.append(FileProblem(relativePath: item.relativePath, reason: reason, remedy: .retry))
+                            tableWarnings.append("\(item.relativePath): \(reason)")
+                            log(.error, "Таблицы", "Файл \(item.relativePath): \(reason)")
+                        }
+                    }
 
                     chunksWritten += report.rowsWritten
                     if report.rowsAdded > 0 || report.rowsReembedded > 0 || report.rowsMetadataOnly > 0 {
@@ -2296,7 +2557,7 @@ public actor SourceSyncService {
                         runProblems.append(FileProblem(
                             relativePath: "\(item.relativePath) → \(problem.sheetName)",
                             reason: problem.reason,
-                            remedy: .retry
+                            remedy: problem.remedy ?? .chooseProfile
                         ))
                     }
                     log(.info, "Таблицы", "Файл \(item.relativePath): \(report.line)")
@@ -2352,16 +2613,21 @@ public actor SourceSyncService {
             let chunkingStarted = Date()
             // Подмена стратегии учитывается на месте: иначе о ней узнают
             // только раскрыв чанк в списке документов.
-            if let swap = Self.substitution(for: source.chunking, document: extracted) {
-                substituted.append((item.relativePath, swap.note))
-            }
-            var chunks = try await Self.plannedChunks(
+            //
+            // Решение о подмене берётся у самой нарезки, а не считается рядом
+            // ещё раз: у Document-based это поиск разделов по всему тексту,
+            // и считался он дважды на файл — для пометки и внутри нарезки.
+            let planned = try await Self.plannedChunksAndSubstitution(
                 of: extracted,
                 fileExtension: item.url.pathExtension,
                 pipeline: pipeline,
                 ocrPipeline: ocrPipeline,
                 configuration: source.chunking
             )
+            if let swap = planned.substitution {
+                substituted.append((item.relativePath, swap.note))
+            }
+            var chunks = planned.chunks
             // Подмена, случившаяся **во время** нарезки, а не при планировании:
             // чат-модель ответила не по формату, и границы определил Recursive.
             // Об этом говорил только журнал, то есть практически никто.
@@ -2447,7 +2713,7 @@ public actor SourceSyncService {
                 // run finished after a crash records what this one would have
                 //: otherwise a recovered file would look «extracted by
                 // an unknown version» forever.
-                fileHash: Self.fileHash(of: item.url) ?? "",
+                fileHash: item.fileHash ?? Self.fileHash(of: item.url) ?? "",
                 extractorID: extracted.extractorID,
                 extractorVersion: extracted.extractorVersion,
                 extractionSignature: source.extractionSignature,
@@ -2480,6 +2746,8 @@ public actor SourceSyncService {
                 let schema = schemas[collectionName]
                 // Where each chunk landed in the document, found once per file.
                 let placements = ChunkLocator.placements(of: chunks, in: extracted)
+                // Документ для обогащения — один на файл.
+                let documentContext = enrichment == nil ? nil : ContextEnricher.documentContext(of: extracted)
 
                 var batch: [TextChunk] = []
                 for chunk in chunks {
@@ -2490,7 +2758,7 @@ public actor SourceSyncService {
                             baseMetadata: baseMetadata,
                             placements: placements,
                             contextPrefixEnabled: source.chunking.contextPrefix,
-                            enrichment: enrichment,
+                            enrichment: enrichment, documentContext: documentContext,
                             schema: schema, collectionID: collectionID, model: embeddingModel,
                             dimension: dimension, chroma: chroma, embeddings: embeddings,
                             binding: binding
@@ -2513,7 +2781,7 @@ public actor SourceSyncService {
                         baseMetadata: baseMetadata,
                         placements: placements,
                         contextPrefixEnabled: source.chunking.contextPrefix,
-                        enrichment: enrichment,
+                        enrichment: enrichment, documentContext: documentContext,
                         schema: schema, collectionID: collectionID, model: embeddingModel,
                         dimension: dimension, chroma: chroma, embeddings: embeddings,
                         binding: binding
@@ -2595,7 +2863,17 @@ public actor SourceSyncService {
                 // и о котором докладывает каждый раз, пока человек не
                 // поправит нарезку или предел модели.
                 let gone = Array(Set(record.oldIDs + record.newIDs))
-                try? await chroma.deleteDocuments(collectionID: collectionID, ids: gone)
+                // Не удалось снять — запись манифеста остаётся, как и для
+                // прежней коллекции ниже: забыть файл, чьи чанки ещё в поиске,
+                // значит оставить их там без единой ссылки.
+                var cleanedHere = true
+                do {
+                    try await chroma.deleteDocuments(collectionID: collectionID, ids: gone)
+                } catch {
+                    cleanedHere = false
+                    log(.warning, "Источники",
+                        "Файл \(item.relativePath): чанки в «\(collectionName)» не сняты — \(error.localizedDescription)")
+                }
                 // У переехавшего файла прежняя версия лежит в **прежней**
                 // коллекции: удаление выше её не касается. Не удалась уборка
                 // там — запись манифеста остаётся: она и есть единственная
@@ -2617,8 +2895,17 @@ public actor SourceSyncService {
                             "Файл \(item.relativePath): прежняя версия в «\(previousCollection)» не удалена — \(error.localizedDescription)")
                     }
                 }
-                if previousCopyGone {
+                if previousCopyGone && cleanedHere {
                     manifest.forget(relativePath: item.relativePath)
+                    manifests.save(manifest)
+                } else if !cleanedHere, var entry = manifest.entries[item.relativePath],
+                          entry.collectionName == collectionName {
+                    // Записанное сейчас тоже лежит в базе: запись должна
+                    // ссылаться и на него, иначе следующая удачная запись
+                    // снимет только прежние чанки.
+                    let known = Set(entry.chunkIDs)
+                    entry.chunkIDs += record.newIDs.filter { !known.contains($0) }
+                    manifest.entries[item.relativePath] = entry
                     manifests.save(manifest)
                 }
                 try? journal.finish(sourceID: source.id, relativePath: item.relativePath)
@@ -2659,7 +2946,8 @@ public actor SourceSyncService {
             tableWarnings: tableWarnings,
             tableRowsNeedingDecision: tableManifests.pendingRemovals(sourceID: source.id)
                 .reduce(0) { $0 + $1.rows.count },
-            newFolderLevels: plan.newFolderLevels
+            newFolderLevels: plan.newFolderLevels,
+            ignored: plan.ignored
         )
         log(.success, "Источники", "Источник «\(source.name)» → \(plan.targetCollections.joined(separator: ", ")): \(summary.line), за \(String(format: "%.1f", summary.duration)) с")
         for item in skipped {
@@ -2705,6 +2993,13 @@ public actor SourceSyncService {
         source: DataSource,
         chroma: (any SyncDatabase)?
     ) async throws -> Int {
+        guard decision != .postpone else { return 0 }
+        // Тот же замок, что у прогона. Идущая синхронизация держит свою копию
+        // манифеста и сохраняет её после каждого файла: решение, записанное
+        // в обход, она затёрла бы — пункт вернулся бы в «требуют решения»,
+        // а после «Удалить» запись о файле пережила бы его чанки.
+        try claim(source)
+        defer { running.remove(source.id) }
         var manifest = manifests.load(sourceID: source.id)
         switch decision {
         case .postpone:
@@ -2754,6 +3049,9 @@ public actor SourceSyncService {
         chroma: (any SyncDatabase)?
     ) async throws -> Int {
         guard decision != .postpone else { return 0 }
+        // Тот же замок, что у прогона: см. `resolve(removal:)`.
+        try claim(source)
+        defer { running.remove(source.id) }
         var files = tableManifests.load(sourceID: source.id)
         guard var file = files[rowRemoval.relativePath] else { return 0 }
 
@@ -2789,7 +3087,13 @@ public actor SourceSyncService {
             // По явным id, никогда по условию на `row_number`: фильтр забрал бы
             // всё, что случайно делит с ними номер.
             let ids = TableSyncPlanner.removalIDs(for: rowRemoval.rows)
-            try await chroma.deleteDocuments(collectionID: collectionID, ids: ids)
+            // Удалена мимо приложения, а id ещё в памяти, — удалять нечего.
+            var gone = false
+            do {
+                try await chroma.deleteDocuments(collectionID: collectionID, ids: ids)
+            } catch ChromaError.collectionNotFound {
+                gone = true
+            }
             if var sheet = file.sheets[rowRemoval.sheetName] {
                 for record in rowRemoval.rows { sheet.rows[record.identity] = nil }
                 file.sheets[rowRemoval.sheetName] = sheet
@@ -2797,9 +3101,10 @@ public actor SourceSyncService {
             file.pendingRemovals[rowRemoval.sheetName] = nil
             files[rowRemoval.relativePath] = file
             tableManifests.save(files, sourceID: source.id)
+            let removed = gone ? 0 : ids.count
             log(.warning, "Таблицы",
-                "Лист «\(rowRemoval.sheetName)» файла \(rowRemoval.relativePath): строк исчезло из файла — из базы удалено документов: \(ids.count.plainDigits)")
-            return ids.count
+                "Лист «\(rowRemoval.sheetName)» файла \(rowRemoval.relativePath): строк исчезло из файла — из базы удалено документов: \(removed.plainDigits)")
+            return removed
         }
     }
 
@@ -2822,8 +3127,16 @@ public actor SourceSyncService {
         if let cached = collectionIDs[collectionName] {
             id = cached
         } else {
-            guard let resolved = try? await chroma.resolveID(of: collectionName) else {
-                // The collection is gone: nothing to delete, and that is not an error.
+            // The collection is gone: nothing to delete, and that is not an error.
+            //
+            // Только «коллекции нет» — а не любая ошибка. Сбой связи, принятый
+            // за отсутствие коллекции, возвращал ноль как удачу: вызывающий
+            // забывал файл в манифесте, а его чанки оставались в поиске без
+            // единой ссылки на них.
+            let resolved: String
+            do {
+                resolved = try await chroma.resolveID(of: collectionName)
+            } catch ChromaError.collectionNotFound {
                 return 0
             }
             collectionIDs[collectionName] = resolved
@@ -2845,11 +3158,21 @@ public actor SourceSyncService {
                 if deleted > 0 { break }
             }
             return deleted
+        } catch ChromaError.collectionNotFound {
+            // Коллекцию удалили мимо приложения, а её id ещё был в памяти:
+            // поиск по имени выше ответил из кэша. Клиент, не найдя её и под
+            // именем, говорит «коллекции нет» уже здесь — и это тот же ответ
+            // «удалять нечего», а не сбой.
+            return 0
         } catch {
             // Older or stricter servers might refuse the filter; the ids we
             // remembered still let us clean up.
             guard !knownIDs.isEmpty else { throw error }
-            try await chroma.deleteDocuments(collectionID: id, ids: knownIDs)
+            do {
+                try await chroma.deleteDocuments(collectionID: id, ids: knownIDs)
+            } catch ChromaError.collectionNotFound {
+                return 0
+            }
             return knownIDs.count
         }
     }
@@ -2933,6 +3256,7 @@ public actor SourceSyncService {
         placements: [Int: ChunkPlacement],
         contextPrefixEnabled: Bool,
         enrichment: ContextEnricher?,
+        documentContext: String? = nil,
         schema: MetadataSchema?,
         collectionID: String,
         model: String,
@@ -2965,7 +3289,8 @@ public actor SourceSyncService {
         if let enrichment {
             texts = try await enrichment.enriched(
                 chunks: chunks, texts: texts, documentTitle: title,
-                headingPaths: placements.compactMapValues(\.headingPath)
+                headingPaths: placements.compactMapValues(\.headingPath),
+                documentContext: documentContext
             )
         }
         // Модель читает не всё, что ей дают, и молчит об этом.
@@ -3037,6 +3362,9 @@ public actor SourceSyncService {
             }
             if let note = chunk.note {
                 metadata["_cdbm_chunk_note"] = .string(note)
+            }
+            if chunk.repeatedHeaderLength > 0 {
+                metadata[TableChunkHeaders.lengthKey] = .int(chunk.repeatedHeaderLength)
             }
             // Язык и ключевые слова — средствами системы. Считаются
             // по тексту чанка, а не документа: в многоязычном файле фильтр
@@ -3147,7 +3475,7 @@ public actor SourceSyncService {
         // из I1.2.
         if !item.isRemote {
             metadata["file_ext"] = .string(item.url.pathExtension.lowercased())
-            metadata["file_mtime"] = .string(ISO8601DateFormatter().string(from: item.modifiedAt))
+            metadata["file_mtime"] = .string(Self.mtimeFormatter.string(from: item.modifiedAt))
             metadata["file_size"] = .int(Int(item.size))
             // Имя, а не путь: испорченную кодировку из чужого архива чиним
             // здесь, а `source_file` оставляем как на диске.
@@ -3202,6 +3530,36 @@ public actor SourceSyncService {
         }
         return metadata
     }
+
+    /// Поля файла для листов и строк книги — те же, что у документа
+    /// (`metadata(for:…)`), кроме тех, что меняются с каждым сохранением.
+    ///
+    /// Без них лист книги не попадал под фильтр по уровням пути («ведомство»,
+    /// «год», «тип документа») и своим полям источника, а в выдаче у него не
+    /// было имени файла: на «Базе 2» — 519 кусков из 4 466. Время изменения и
+    /// размер не пишутся: они входят в хеш метаданных каждой строки, и каждое
+    /// сохранение книги переписывало бы метаданные всех её строк, хотя ни
+    /// одна не менялась.
+    static func tableDocumentMetadata(for item: SyncPlanItem, source: DataSource, embeddingModel: String) -> ChromaMetadata {
+        var metadata: ChromaMetadata = [
+            "file_id": .string(fileFingerprint(item.relativePath, sourceID: source.id)),
+            "_cdbm_source_name": .string(source.name),
+            "_cdbm_model": .string(embeddingModel),
+        ]
+        if !item.isRemote {
+            metadata["file_ext"] = .string(item.url.pathExtension.lowercased())
+            metadata["file_name"] = .string(FileNameEncoding.repaired(item.url.lastPathComponent))
+        }
+        for (key, value) in item.routeMetadata { metadata[key] = value }
+        for (key, value) in source.customMetadata where !key.isEmpty {
+            metadata[key] = .inferred(from: value)
+        }
+        return metadata
+    }
+
+    /// Один на службу: форматтер дорог в создании, а пишется он на каждый
+    /// файл прогона. `ISO8601DateFormatter` потокобезопасен.
+    private static let mtimeFormatter = ISO8601DateFormatter()
 
     // MARK: - Identity
 
@@ -3381,12 +3739,26 @@ public actor SourceSyncService {
         ocrPipeline: ChunkingPipeline,
         configuration: ChunkingConfiguration
     ) async throws -> [TextChunk] {
+        try await plannedChunksAndSubstitution(
+            of: document, fileExtension: fileExtension, pipeline: pipeline,
+            ocrPipeline: ocrPipeline, configuration: configuration
+        ).chunks
+    }
+
+    /// То же — и подмена стратегии, по которой резали: решение одно на оба.
+    public static func plannedChunksAndSubstitution(
+        of document: ExtractedDocument,
+        fileExtension: String?,
+        pipeline: ChunkingPipeline,
+        ocrPipeline: ChunkingPipeline,
+        configuration: ChunkingConfiguration
+    ) async throws -> (chunks: [TextChunk], substitution: ChunkingSubstitution?) {
         let substitution = substitution(for: configuration, document: document)
 
-        if case .slides = substitution, let slides = slideChunks(of: document) { return slides }
+        if case .slides = substitution, let slides = slideChunks(of: document) { return (slides, substitution) }
 
         let structural = substitution.map { if case .noStructure = $0 { true } else { false } } ?? false
-        return try await (structural ? ocrPipeline : pipeline).chunks(
+        let chunks = try await (structural ? ocrPipeline : pipeline).chunks(
             from: document.plainText,
             fileExtension: fileExtension,
             structure: document.structure
@@ -3396,6 +3768,7 @@ public actor SourceSyncService {
             marked.note = substitution.note
             return marked
         }
+        return (chunks, substitution)
     }
 
     /// One slide, one chunk — `nil` for anything that is not a presentation.
@@ -3516,13 +3889,31 @@ public actor SourceSyncService {
     /// другие байты, и путь, попавший в базу в таком виде, не находился ни
     /// фильтром человека, ни `get_file` агента. Форма выбирается здесь, в
     /// одном месте, — дальше по коду путь идёт уже слитным.
+    ///
+    /// Корень сравнивается по компонентам, без учёта регистра и формы записи
+    /// букв. Обход папки отдаёт пути так, как они записаны на диске, — не
+    /// так, как записан корень источника: корень «~/Docs» у папки «~/docs»
+    /// давал несовпадение префикса, и путь падал до одного имени файла.
+    /// `a/README.md` и `b/README.md` получали тогда один путь, одни
+    /// идентификаторы чанков, и второй затирал первый. По той же причине
+    /// префикс строкой ловил соседнюю папку: корень «/x/doc» — и файл
+    /// «/x/docs/a.md» становился «s/a.md».
     public static func relative(_ url: URL, to root: URL) -> String {
-        let rootPath = root.standardizedFileURL.path
-        let filePath = url.standardizedFileURL.path
-        guard filePath.hasPrefix(rootPath) else { return FilePathKey.canonical(url.lastPathComponent) }
-        return FilePathKey.canonical(
-            String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        )
+        let file = url.standardizedFileURL.pathComponents
+        for base in [root.standardizedFileURL, root.resolvingSymlinksInPath()] {
+            let prefix = base.pathComponents
+            guard file.count > prefix.count,
+                  zip(prefix, file).allSatisfy({ Self.sameComponent($0, $1) }) else { continue }
+            return FilePathKey.canonical(file.dropFirst(prefix.count).joined(separator: "/"))
+        }
+        // Файл вне корня — так бывает только у путей, пришедших не из обхода
+        // источника.
+        return FilePathKey.canonical(url.lastPathComponent)
+    }
+
+    private static func sameComponent(_ a: String, _ b: String) -> Bool {
+        a.precomposedStringWithCanonicalMapping
+            .caseInsensitiveCompare(b.precomposedStringWithCanonicalMapping) == .orderedSame
     }
 }
 
@@ -3547,9 +3938,26 @@ extension SourceSyncService {
             sourceID: source.id, relativePath: relativePath,
             collectionID: "", collectionName: collectionName,
             embeddingModel: "", dimension: 0, profiles: tableProfiles(of: source),
-            assignedProfileID: source.tableProfileAssignments[relativePath]
+            assignedProfileID: source.tableProfileAssignments[relativePath],
+            unmatchedSheetsAsText: source.unmatchedSheetsAsText
         )
         let planned = await tables.plan(sheets: read.sheets, manifest: manifest, context: context)
         return planned.plans.reduce(0) { $0 + $1.plan.embeddings }
+    }
+}
+
+/// Счёт записанного табличным файлом, по партиям. Класс, а не
+/// переменная: обработчик партии зовётся изнутри записи таблицы, и копия
+/// числа в нём не накапливалась бы.
+final class WrittenCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var total = 0
+
+    /// Прибавить партию и вернуть итог по файлу.
+    func add(_ count: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        total += count
+        return total
     }
 }

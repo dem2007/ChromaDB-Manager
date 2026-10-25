@@ -12,13 +12,12 @@ import Foundation
 /// Поэтому показывается **окрестность совпадения с запросом**, а не начало:
 /// именно ради неё карточку и читают — «отвечает ли этот кусок на вопрос».
 public enum EvaluationPreview {
-    /// Сколько знаков помещается в карточку.
+    /// Сколько знаков помещается в карточку: пять строк колонки.
     ///
-    /// Столько же, сколько уходит в эталон при отметке
-    /// (`QuerySetStore.fragmentLength`), — но это совпадение, а не связь:
-    /// фрагмент эталона по-прежнему берётся с начала куска, чтобы пережить
-    /// перенарезку, а окно показа ходит по тексту за совпадением.
-    public static let limit = 120
+    /// Не связано с длиной фрагмента эталона (`QuerySetStore.fragmentLength`):
+    /// фрагмент берётся с начала куска, чтобы пережить перенарезку, а окно
+    /// показа ходит по тексту за совпадением.
+    public static let limit = 240
 
     /// Слова запроса длиной хотя бы столько попадают в поиск совпадения.
     ///
@@ -34,7 +33,12 @@ public enum EvaluationPreview {
 
     /// Кусок текста вокруг совпадения с запросом — с многоточиями там, где
     /// текст обрезан.
-    public static func snippet(of text: String, matching query: String, limit: Int = limit) -> String {
+    ///
+    /// - Parameter rarity: насколько редко слова запроса встречаются в
+    /// выдаче прогона. Без неё все слова весят одинаково.
+    public static func snippet(
+        of text: String, matching query: String, limit: Int = limit, rarity: Rarity? = nil
+    ) -> String {
         let collapsed = text
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .joined(separator: " ")
@@ -42,18 +46,23 @@ public enum EvaluationPreview {
 
         let characters = Array(collapsed)
         let stems = self.stems(of: query)
+        let weights = rarity?.weights(of: stems) ?? Array(repeating: 1, count: stems.count)
         let matches = self.matches(in: characters, stems: stems)
         // Ни одно слово запроса не встретилось — показывается начало, как и
         // раньше: выдумывать место, которого нет, хуже, чем показать первое.
-        guard let best = bestWindow(matches: matches, stems: stems.count, limit: limit) else {
+        guard let best = bestWindow(matches: matches, weights: weights, limit: limit) else {
             return String(characters.prefix(limit)) + "…"
         }
 
-        var start = max(0, best - limit / 4)
+        // Перед совпадением — немного текста, но не больше восьмой части
+        // окна: ответ обычно стоит за словами вопроса («класса не ниже КС3»),
+        // и с прежней четвертью он уходил за край.
+        let lead = min(limit / 8, max(0, (limit - best.span) / 2))
+        var start = max(0, best.start - lead)
         // Окно начинается со слова целиком: обрывок вроде «нзирование» читается
         // как опечатка.
         if start > 0 {
-            while start < best, !characters[start - 1].isWhitespace { start += 1 }
+            while start < best.start, !characters[start - 1].isWhitespace { start += 1 }
         }
         var end = min(characters.count, start + limit)
         if end < characters.count {
@@ -72,18 +81,20 @@ public enum EvaluationPreview {
     static func stems(of query: String) -> [String] {
         var result: [String] = []
         for word in query.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            let folded = String(word).lowercased().folding(options: .diacriticInsensitive, locale: nil)
-            guard folded.count >= shortestWord else { continue }
-            let stem = String(folded.prefix(stemLength))
+            let stem = String(folded(word).prefix(stemLength))
+            guard stem.count >= shortestWord else { continue }
             if !result.contains(stem) { result.append(stem) }
         }
         return result
     }
 
-    /// Где в тексте встретились слова запроса: начало слова и какие из них.
-    private static func matches(in characters: [Character], stems: [String]) -> [(start: Int, stems: Set<Int>)] {
-        guard !stems.isEmpty else { return [] }
-        var result: [(start: Int, stems: Set<Int>)] = []
+    private static func folded<S: StringProtocol>(_ word: S) -> String {
+        String(word).lowercased().folding(options: .diacriticInsensitive, locale: nil)
+    }
+
+    /// Слова текста: где начинается и кончается каждое.
+    private static func words(in characters: [Character]) -> [Range<Int>] {
+        var result: [Range<Int>] = []
         var index = 0
         while index < characters.count {
             guard characters[index].isLetter || characters[index].isNumber else {
@@ -94,42 +105,117 @@ public enum EvaluationPreview {
             while index < characters.count, characters[index].isLetter || characters[index].isNumber {
                 index += 1
             }
-            let word = String(characters[start..<index]).lowercased()
-                .folding(options: .diacriticInsensitive, locale: nil)
-            var matched: Set<Int> = []
-            for (number, stem) in stems.enumerated() where word.hasPrefix(stem) { matched.insert(number) }
-            if !matched.isEmpty { result.append((start: start, stems: matched)) }
+            result.append(start..<index)
         }
         return result
     }
 
-    /// Начало окна: там, где в `limit` знаков попадает больше всего **разных**
-    /// слов запроса.
+    /// Где в тексте встретились слова запроса: место слова и какие из них.
+    private static func matches(in characters: [Character], stems: [String]) -> [(word: Range<Int>, stems: Set<Int>)] {
+        guard !stems.isEmpty else { return [] }
+        var result: [(word: Range<Int>, stems: Set<Int>)] = []
+        for word in words(in: characters) {
+            let text = folded(String(characters[word]))
+            var matched: Set<Int> = []
+            for (number, stem) in stems.enumerated() where text.hasPrefix(stem) { matched.insert(number) }
+            if !matched.isEmpty { result.append((word: word, stems: matched)) }
+        }
+        return result
+    }
+
+    /// Окно: там, где в `limit` знаков набирается больше всего веса
+    /// **разных** слов запроса.
     ///
     /// Разных, а не всех подряд: кусок, где двадцать раз повторяется одно и то
     /// же слово, отвечает на запрос хуже, чем кусок, где рядом стоят три
-    /// разных. При равенстве берётся то, что раньше, — читать документ
-    /// привычно сверху.
+    /// разных. Вес слова — его редкость в выдаче: «государственных
+    /// информационных систем» есть почти в каждом куске прогона по ведомству, и
+    /// окно, собравшее эти три слова, обходило то, где стоят «комплексное
+    /// тестирование» и «дней».
+    ///
+    /// При равном весе — окно, где слова стоят теснее, а из равно тесных —
+    /// то, что раньше: читать документ привычно сверху.
+    ///
+    /// - Returns: начало первого слова окна и длина от него до конца
+    ///   последнего слова, добавившего новое.
     private static func bestWindow(
-        matches: [(start: Int, stems: Set<Int>)], stems: Int, limit: Int
-    ) -> Int? {
+        matches: [(word: Range<Int>, stems: Set<Int>)], weights: [Double], limit: Int
+    ) -> (start: Int, span: Int)? {
         guard !matches.isEmpty else { return nil }
-        var best = matches[0].start
-        var bestCount = 0
+        var best: (start: Int, span: Int, score: Double)?
         for (index, match) in matches.enumerated() {
             var covered = match.stems
+            var span = match.word.count
             var ahead = index + 1
-            while ahead < matches.count, matches[ahead].start < match.start + limit {
-                covered.formUnion(matches[ahead].stems)
+            while ahead < matches.count, matches[ahead].word.lowerBound < match.word.lowerBound + limit {
+                if !matches[ahead].stems.isSubset(of: covered) {
+                    covered.formUnion(matches[ahead].stems)
+                    span = matches[ahead].word.upperBound - match.word.lowerBound
+                }
                 ahead += 1
             }
-            if covered.count > bestCount {
-                bestCount = covered.count
-                best = match.start
-                if bestCount == stems { break }
+            let score = covered.reduce(0) { $0 + weights[$1] }
+            if let current = best {
+                let tie = abs(score - current.score) < 1e-9
+                guard score > current.score && !tie || tie && span < current.span else { continue }
+            }
+            best = (match.word.lowerBound, span, score)
+        }
+        return best.map { ($0.start, $0.span) }
+    }
+}
+
+public extension EvaluationPreview {
+    /// Насколько редко каждое слово встречается в выдаче прогона.
+    ///
+    /// Считается по всем результатам прогона, всех запросов и вариантов, а не
+    /// по выдаче одного запроса: выдача отобрана под этот вопрос, и слова
+    /// вопроса в ней часты по построению. «Коэффициент» в выдаче запроса о
+    /// доступности стоял в 57 кусках из 70 и весил меньше, чем «должен»;
+    /// по всему прогону — в 110 из 1 476.
+    struct Rarity: Sendable {
+        /// В скольких текстах встретилось слово, начинающееся с основы.
+        let frequency: [String: Int]
+        let count: Int
+
+        /// Считаются только основы слов из `queries`: окно ищется по ним и
+        /// ни по чему больше. Все начала всех слов прогона — это словарь в
+        /// сотню тысяч строк на всё время, пока прогон открыт (ревью
+        ///…). Основа не из `queries` весит как не встреченная.
+        public init(texts: some Sequence<String>, queries: some Sequence<String>) {
+            let stems = Set(queries.flatMap { EvaluationPreview.stems(of: $0) }.map { Substring($0) })
+            var frequency: [String: Int] = [:]
+            var count = 0
+            for text in Set(texts) where !text.isEmpty {
+                count += 1
+                guard !stems.isEmpty else { continue }
+                var present: Set<Substring> = []
+                let folded = EvaluationPreview.folded(text)
+                for word in folded.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
+                    // Основа бывает длиной от четырёх до шести букв.
+                    for length in EvaluationPreview.shortestWord...EvaluationPreview.stemLength where word.count >= length {
+                        let prefix = word.prefix(length)
+                        if stems.contains(prefix) { present.insert(prefix) }
+                    }
+                }
+                for stem in present { frequency[String(stem), default: 0] += 1 }
+            }
+            self.frequency = frequency
+            self.count = count
+        }
+
+        /// Все тексты прогона — по основам его запросов.
+        public init(run: EvaluationRun) {
+            self.init(texts: run.results.lazy.flatMap(\.hits).compactMap(\.text), queries: run.queries.map(\.text))
+        }
+
+        /// Вес слова: обратная частота, как в BM25. Слово, которого в выдаче
+        /// нет вовсе, весит больше всех, но и окна оно не притянет.
+        func weights(of stems: [String]) -> [Double] {
+            stems.map { stem in
+                log((Double(count) + 1) / (Double(frequency[stem] ?? 0) + 0.5))
             }
         }
-        return best
     }
 }
 
@@ -202,11 +288,11 @@ public extension EvaluationPreview {
     /// Считается по требованию — на ту строку, которую сейчас показывают
     ///: весь прогон разом стоил 513 мс при открытии, а на экране
     /// живёт три десятка строк из пятисот.
-    static func card(for hit: EvaluationHit, query: String) -> Card {
+    static func card(for hit: EvaluationHit, query: String, rarity: Rarity? = nil) -> Card {
         let text = hit.text ?? ""
         return Card(
             shape: shape(text: hit.text, metadata: hit.metadata),
-            snippet: text.isEmpty ? hit.id : snippet(of: text, matching: query)
+            snippet: text.isEmpty ? hit.id : snippet(of: text, matching: query, rarity: rarity)
         )
     }
 }

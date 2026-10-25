@@ -229,15 +229,15 @@ EOF
 | `word` | `.docx`, `.doc`, `.odt`, `.rtf`, `.pages` |
 | `excel` | `.xlsx`, `.xls`, `.xlsm`, `.ods`, `.numbers`, `.csv`, `.tsv` |
 | `pdf` | `.pdf` |
-| `presentation` | `.key` |
+| `presentation` | `.key`, `.pptx` |
 | `text` | `.txt`, `.md`, `.markdown` |
 | `web` | `.html`, `.htm` |
 | `book` | `.epub` |
 | `code` | `.swift`, `.py`, `.js`, `.ts`, `.sh`, `.sql` |
 | `data` | `.json`, `.xml`, `.yaml`, `.yml` |
 
-Список — то, что сборка **умеет читать**: `presentation` означает только
-`.key`, потому что `.pptx`, `.ppt` и `.odp` эта сборка не извлекает.
+Список — то, что сборка **умеет читать**: `presentation` означает `.pptx`
+и `.key`, потому что `.ppt` и `.odp` эта сборка не извлекает.
 
 Принимается и само расширение: `"docx"`. Несколько значений складываются по
 «или», с `filter` — по «и».

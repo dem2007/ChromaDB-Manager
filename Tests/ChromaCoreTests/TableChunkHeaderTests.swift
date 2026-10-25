@@ -59,6 +59,22 @@ final class TableChunkHeaderTests: XCTestCase {
         }
     }
 
+    /// дописанная шапка измерена — ровно её знаки и перевод строки,
+    /// и мера переживает перенумерацию кусков в конвейере.
+    func testTheAddedHeaderIsMeasured() async throws {
+        let table = "Вступление.\n\n" + TableText.render(
+            [["Артикул", "Цена"]] + (1...200).map { ["АРТ-\(1000 + $0)", "\($0 * 100)"] }
+        )
+        let pieces = try await chunks(of: table)
+        let measured = pieces.filter { $0.repeatedHeaderLength > 0 }
+        XCTAssertFalse(measured.isEmpty, "\(pieces.count) кусков")
+        for piece in measured {
+            let prefix = String(piece.text.prefix(piece.repeatedHeaderLength))
+            XCTAssertTrue(prefix.hasPrefix("| Артикул | Цена |") && prefix.hasSuffix("\n"), prefix)
+        }
+        XCTAssertEqual(pieces.first?.repeatedHeaderLength, 0, "первому куску дописывать нечего")
+    }
+
     /// На куске стоит пометка: человек должен знать, откуда в тексте строка,
     /// которой в этом месте файла нет.
     func testTheRepeatIsExplained() {
@@ -91,8 +107,31 @@ extension TableChunkHeaderTests {
         | Москва | 12 |
         """
         let headers = TableChunkHeaders.headers(in: text)
-        XCTAssertEqual(headers["| АРТ-1 | 100 |"], "| Артикул | Цена |\n| --- | --- |")
-        XCTAssertEqual(headers["| Москва | 12 |"], "| Склад | Остаток |\n| --- | --- |")
+        XCTAssertEqual(headers["| АРТ-1 | 100 |"], ["| Артикул | Цена |\n| --- | --- |"])
+        XCTAssertEqual(headers["| Москва | 12 |"], ["| Склад | Остаток |\n| --- | --- |"])
         XCTAssertNil(headers["| Склад | Остаток |"], "это шапка второй таблицы, а не строка первой")
+    }
+
+    /// Строка, которая есть в обеих таблицах, шапку не решает: решают её
+    /// соседи по куску.
+    func testARowSharedByTwoTablesTakesTheHeaderItsNeighboursConfirm() {
+        let text = """
+        | Артикул | Цена |
+        | --- | --- |
+        | Итого | 100 |
+
+        | Склад | Остаток |
+        | --- | --- |
+        | Москва | 12 |
+        | Итого | 100 |
+        """
+        let chunks = [
+            TextChunk(index: 0, text: "| Артикул | Цена |\n| --- | --- |\n| Итого | 100 |\n\n| Склад | Остаток |\n| --- | --- |"),
+            TextChunk(index: 1, text: "| Москва | 12 |\n| Итого | 100 |"),
+            TextChunk(index: 2, text: "| Итого | 100 |\n| Москва | 12 |"),
+        ]
+        let result = TableChunkHeaders.applied(to: chunks, in: text)
+        XCTAssertTrue(result[1].text.hasPrefix("| Склад | Остаток |"), result[1].text)
+        XCTAssertTrue(result[2].text.hasPrefix("| Склад | Остаток |"), "первая строка — общая, решает вторая")
     }
 }

@@ -29,12 +29,53 @@ public enum TableText {
 
     /// Труба внутри ячейки закрыла бы колонку раньше времени, перевод строки —
     /// строку. И то и другое экранируется, а не выбрасывается: значение чужое.
+    ///
+    /// Обратная черта удваивается, только когда её иначе прочли бы как
+    /// экранирование (`cells(of:)`): перед `\`, `|` и в конце значения.
+    /// Путь `C:\Users` остаётся как есть.
     public static func escape(_ value: String) -> String {
-        value
+        var doubled = ""
+        let characters = Array(value)
+        for (index, character) in characters.enumerated() {
+            doubled.append(character)
+            guard character == "\\" else { continue }
+            let next = index + 1 < characters.count ? characters[index + 1] : nil
+            if next == nil || next == "\\" || next == "|" { doubled.append("\\") }
+        }
+        return doubled
             .replacingOccurrences(of: "|", with: "\\|")
             .replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\t", with: " ")
+    }
+
+    /// Ячейки строки `| раз | два |` — обратно в значения.
+    /// Экранированная труба `\|` остаётся в значении трубой, удвоенная
+    /// обратная черта `\\` — одной (`escape`).
+    public static func cells(of line: String) -> [String] {
+        var body = line.trimmingCharacters(in: .whitespaces)
+        guard body.hasPrefix("|"), body.hasSuffix("|"), body.count >= 2 else { return [body] }
+        body = String(body.dropFirst().dropLast())
+        var result: [String] = []
+        var current = ""
+        var escaped = false
+        for character in body {
+            if escaped {
+                if character != "|", character != "\\" { current.append("\\") }
+                current.append(character)
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "|" {
+                result.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        if escaped { current.append("\\") }
+        result.append(current.trimmingCharacters(in: .whitespaces))
+        return result
     }
 
     /// Готовая таблица: первая строка — заголовки, под ней разделитель.
@@ -60,6 +101,42 @@ public enum TableText {
     }
 
     // MARK: - Узнавание
+
+    /// Ряд нумерации колонок: «1 | 2 | 3 | …», «А | 1 | 1а | 2 | …».
+    ///
+    /// Его ставят под шапкой формы, чтобы ссылаться на графы («графа 5»).
+    /// Данных в нём нет: в документе это лишняя строка в каждом куске таблицы,
+    /// а в книге Excel — запись «Наименование: 2 / Роль: 3» со значениями
+    /// 1…102. Узнаётся по виду: хотя бы три заполненные ячейки, каждая —
+    /// номер графы (число до трёх цифр, с буквой или без, или одна заглавная
+    /// буква), числа начинаются с единицы или двойки и растут — на единицу,
+    /// изредка через одну. Повтор числа — только графа с буквой («1», «1а»):
+    /// строка количеств «1 | 1 | 2 | 3» нумерацией не считается.
+    public static func isColumnNumbering(_ cells: [String]) -> Bool {
+        let filled = cells.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard filled.count >= 3 else { return false }
+        var numbers: [(value: Int, lettered: Bool)] = []
+        for cell in filled {
+            if cell.count == 1, let letter = cell.first, letter.isUppercase, letter.isLetter { continue }
+            let digits = cell.prefix { $0.isNumber }
+            let rest = cell.dropFirst(digits.count)
+            guard !digits.isEmpty, digits.count <= 3, rest.count <= 1, rest.allSatisfy(\.isLetter),
+                  let number = Int(digits) else { return false }
+            numbers.append((number, !rest.isEmpty))
+        }
+        guard numbers.count >= 3, let first = numbers.first, first.value <= 2 else { return false }
+        var unit = 0
+        for (left, right) in zip(numbers, numbers.dropFirst()) {
+            switch right.value - left.value {
+            case 1: unit += 1
+            case 2: continue
+            case 0 where right.lettered: continue
+            default: return false
+            }
+        }
+        // Шаг через одну — пропущенная графа, а не правило.
+        return unit * 2 >= numbers.count - 1
+    }
 
     /// Строка таблицы — по обрамляющим трубам.
     public static func isRow(_ line: String) -> Bool {

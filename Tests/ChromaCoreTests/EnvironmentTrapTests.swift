@@ -224,3 +224,195 @@ final class EnvironmentTrapTests: XCTestCase {
         XCTAssertFalse(SourceSyncService.needsDownloadFromCloud(file))
     }
 }
+
+/// Редактор источника и отметки прогона.
+final class RunStampTests: XCTestCase {
+    private let diskA = SourceVolume(uuid: "A", name: "Backup", mountPoint: "/Volumes/Backup", isRemovable: true)
+
+    private func source(path: String, volume: SourceVolume? = nil, synced: Date? = nil) -> DataSource {
+        var source = DataSource(name: "Документы", path: path, collectionName: "docs")
+        source.volume = volume
+        source.lastSyncedAt = synced
+        return source
+    }
+
+    /// Прогон, закончившийся, пока редактор был открыт, оставляет свои
+    /// отметки: черновик их не знает.
+    func testARunFinishedDuringEditingKeepsItsStamps() {
+        let synced = Date(timeIntervalSince1970: 1_000)
+        let current = source(path: "/Volumes/Backup/Документы", volume: diskA, synced: synced)
+        var draft = source(path: "/Volumes/Backup/Документы")
+        draft.takeRunStamps(from: current)
+        XCTAssertEqual(draft.lastSyncedAt, synced)
+        XCTAssertEqual(draft.volume, diskA)
+    }
+
+    /// Тот же путь, записанный иначе, — та же папка.
+    func testTheSameFolderSpelledDifferentlyKeepsTheVolume() {
+        let current = source(path: "/Volumes/Backup/Документы", volume: diskA)
+        var draft = source(path: "/Volumes/Backup/Документы/")
+        draft.takeRunStamps(from: current)
+        XCTAssertEqual(draft.volume, diskA)
+    }
+
+    /// Папка переехала — прежний том не переносится: иначе сверка томов
+    /// не пустила бы сканирование по новому пути никогда, а совет у ошибки
+    /// обещает, что том запомнится заново.
+    func testAMovedFolderForgetsTheOldVolume() {
+        let synced = Date(timeIntervalSince1970: 1_000)
+        let current = source(path: "/Volumes/Backup/Документы", volume: diskA, synced: synced)
+        var draft = source(path: "/Users/USER/Документы", volume: diskA)
+        draft.takeRunStamps(from: current)
+        XCTAssertNil(draft.volume)
+        XCTAssertEqual(draft.lastSyncedAt, synced, "дата прошлого прогона — история, она остаётся")
+        if case .changed = SourceVolume.check(path: NSTemporaryDirectory(), expected: diskA) {} else {
+            XCTFail("прежний том у нового пути и правда не пускает сканирование")
+        }
+        if case .ready = SourceVolume.check(path: NSTemporaryDirectory(), expected: draft.volume) {} else {
+            XCTFail("без запомненного тома новый путь сканируется")
+        }
+    }
+}
+
+/// Сохранение редактора — поверх того, что сейчас в настройках.
+final class EditorMergeTests: XCTestCase {
+    private func source() -> DataSource {
+        DataSource(name: "Документы", path: "/Volumes/Backup/Документы", collectionName: "docs")
+    }
+
+    /// Поменянное в окне записывается, записанное другими за это время —
+    /// остаётся: и отметки прогона, и правки из окна «Настройки».
+    func testOnlyWhatWasEditedIsWritten() {
+        let base = source()
+        var edited = base
+        edited.name = "Документы отдела"
+        var current = base
+        current.lastSyncedAt = Date(timeIntervalSince1970: 1_234.5)
+        current.ocrEnabled = true
+        current.excludedPaths = ["черновик.docx"]
+
+        let saved = DataSource.savingEdits(edited, madeOn: base, onto: current)
+        XCTAssertEqual(saved.name, "Документы отдела", "правка окна")
+        XCTAssertTrue(saved.ocrEnabled, "записанное другими остаётся")
+        XCTAssertEqual(saved.excludedPaths, ["черновик.docx"])
+        XCTAssertEqual(saved.lastSyncedAt, current.lastSyncedAt, "дата прогона — с долями секунды")
+    }
+
+    /// То же поле поменяли и в окне, и снаружи — побеждает окно: это то, что
+    /// человек нажал «Сохранить».
+    func testTheWindowWinsOnTheSameField() {
+        let base = source()
+        var edited = base
+        edited.pathLevels = [PathLevel(key: "OGV")]
+        var current = base
+        current.pathLevels = [PathLevel(key: "GIS")]
+        XCTAssertEqual(DataSource.savingEdits(edited, madeOn: base, onto: current).pathLevels.map(\.key), ["OGV"])
+    }
+
+    /// Поле, очищенное в окне, очищается и в настройках.
+    func testAFieldClearedInTheWindowIsCleared() {
+        var base = source()
+        base.embeddingModel = "bge-m3"
+        var edited = base
+        edited.embeddingModel = nil
+        XCTAssertNil(DataSource.savingEdits(edited, madeOn: base, onto: base).embeddingModel)
+    }
+
+    /// Ничего не поменяли — сохраняется ровно то, что в настройках.
+    func testAnUntouchedDraftChangesNothing() {
+        let base = source()
+        var current = base
+        current.tableProfileAssignments = ["смета.xlsx": UUID()]
+        XCTAssertEqual(DataSource.savingEdits(base, madeOn: base, onto: current), current)
+    }
+
+    /// Папку перенесли в окне — том забывается и здесь.
+    func testMovingTheFolderStillForgetsTheVolume() {
+        var base = source()
+        base.volume = SourceVolume(uuid: "A", name: "Backup")
+        var edited = base
+        edited.path = "/Users/USER/Документы"
+        XCTAssertNil(DataSource.savingEdits(edited, madeOn: base, onto: base).volume)
+    }
+}
+
+/// Склейка правки редактора не теряет вложенных настроек: разбор
+/// источника терпимый, и поле, не пережившее круг «закодировать —
+/// склеить — раскодировать», молча стало бы умолчанием.
+final class EditorMergeRoundTripTests: XCTestCase {
+    private func richSource() -> DataSource {
+        var source = DataSource(
+            name: "Сметы", path: "/Volumes/Backup/Сметы", fileExtensions: ["xlsx", "md"], recursive: false,
+            mapping: .folderToCollection, collectionName: "smety",
+            pathLevels: [PathLevel(key: "OGV"), PathLevel(), PathLevel(key: "YEAR", type: .integer, fallbackValue: "0")]
+        )
+        source.embeddingModel = "bge-m3"
+        source.customMetadata = ["отдел": "закупки"]
+        source.chunking.strategy = .adaptive
+        source.chunking.chunkSize = 777
+        source.chunking.overlapPercent = 12.5
+        source.chunking.sensitivity = 0.3
+        source.ocrEnabled = true
+        source.ocrLanguages = ["ru-RU", "en-US"]
+        source.excludedPaths = ["черновик.xlsx"]
+        source.volume = SourceVolume(uuid: "A", name: "Backup", mountPoint: "/Volumes/Backup", isRemovable: true)
+        source.lastSyncedAt = Date(timeIntervalSinceReferenceDate: 812_345_678.123_456)
+        let mapping = TableMapping(sheetName: "Лист1", mode: .dataTable, headerRow: 2, columns: ["Позиция", "Цена"],
+                                   roles: [:], keyColumn: "Позиция", textTemplate: "{Позиция}: {Цена}", titles: ["Цена": "Цена, ₽"])
+        let profile = TableProfile(name: "Смета", sheets: .named(["Лист1"]), mapping: mapping)
+        source.tableProfiles = [profile]
+        source.tableProfileAssignments = ["смета.xlsx": profile.id]
+        source.unmatchedSheetsAsText = false
+        source.triggers.debounceSeconds = 9
+        source.git = GitSourceSettings(indexesWorkingCopy: false, includesCommitInfo: true, excludedGlobs: ["*.lock"])
+        return source
+    }
+
+    func testAnUntouchedRichSourceComesBackUnchanged() {
+        let source = richSource()
+        XCTAssertEqual(DataSource.savingEdits(source, madeOn: source, onto: source), source)
+    }
+
+    func testEditingOneFieldKeepsEveryNestedSetting() {
+        let base = richSource()
+        var edited = base
+        edited.name = "Сметы отдела"
+        var expected = base
+        expected.name = edited.name
+        XCTAssertEqual(DataSource.savingEdits(edited, madeOn: base, onto: base), expected)
+    }
+
+    func testAWebSourceComesBackUnchanged() {
+        var web = DataSource(name: "Сайт", path: "https://example.com/docs", collectionName: "site")
+        web.web = WebSourceSettings()
+        web.web?.delaySeconds = 2.5
+        XCTAssertEqual(DataSource.savingEdits(web, madeOn: web, onto: web), web)
+    }
+}
+
+/// Новый диск принимают вместе источники с тем же прежним диском.
+final class SourcesMovingTests: XCTestCase {
+    private let old = SourceVolume(uuid: "A", name: "Backup")
+    private let new = SourceVolume(uuid: "B", name: "Backup")
+    private let other = SourceVolume(uuid: "C", name: "Archive")
+
+    private func source(_ path: String, remembered: SourceVolume?) -> DataSource {
+        var source = DataSource(name: path, path: path, collectionName: "c")
+        source.volume = remembered
+        return source
+    }
+
+    func testOnlySourcesWithTheSameOldAndNewDiskMove() {
+        let first = source("/Volumes/Backup/a", remembered: old)
+        let second = source("/Volumes/Backup/b", remembered: old)
+        let elsewhere = source("/Volumes/Archive/c", remembered: other)
+        let unplugged = source("/Volumes/Old/d", remembered: old)
+        let volumes = ["/Volumes/Backup/a": new, "/Volumes/Backup/b": new, "/Volumes/Archive/c": new]
+        let moving = SourceVolume.sourcesMoving(
+            from: old, to: new, among: [first, second, elsewhere, unplugged],
+            volumeAt: { volumes[$0.path] }
+        )
+        XCTAssertEqual(Set(moving), [first.id, second.id],
+                       "другой прежний диск и источник, чей путь сейчас не на новом диске, не трогаются")
+    }
+}

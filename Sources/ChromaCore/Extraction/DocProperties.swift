@@ -48,6 +48,26 @@ extension DocPartsReader {
         var isRowEnd = false
         /// Уровень структуры, заданный прямо в абзаце.
         var outline: Int?
+        /// Экземпляр списка, заданный прямо в абзаце (`sprmPIlfo`), с 1;
+        /// 0 — абзац из списка выведен, даже если его стиль нумерован.
+        var listInstance: Int?
+        /// Уровень в списке (`sprmPIlvl`), с 0.
+        var listLevel: Int?
+        /// Ячейки строки — только у знака конца строки: там Word хранит
+        /// описание всей строки таблицы.
+        var rowCells: [TableCellDefinition]?
+    }
+
+    /// Ячейка строки таблицы: где стоит и объединена ли.
+    ///
+    /// Границы — в двадцатых долях пункта, от края страницы. Сетки колонок,
+    /// как у `.docx`, в двоичном формате нет: у каждой строки свои границы,
+    /// и общая сетка таблицы собирается из них потом.
+    struct TableCellDefinition: Equatable {
+        var left: Int
+        var right: Int
+        /// Продолжение объединения вниз: значения своего нет.
+        var continuesAbove = false
     }
 
     /// Коды свойств, которые разбираются. Имена — как в MS-DOC.
@@ -61,6 +81,14 @@ extension DocPartsReader {
         case paragraphRowEnd = 0x2417
         case paragraphOutline = 0x2640
         case paragraphStyle = 0x4600
+        /// Уровень в списке (`sprmPIlvl`).
+        case paragraphListLevel = 0x260A
+        /// Экземпляр списка (`sprmPIlfo`).
+        case paragraphListInstance = 0x460B
+        /// Описание строки таблицы (`sprmTDefTable`).
+        case tableDefinition = 0xD608
+        /// Правка объединения вниз одной ячейки (`sprmTVertMerge`).
+        case tableVerticalMerge = 0xD62B
     }
 
     // MARK: - Страницы свойств
@@ -162,6 +190,20 @@ extension DocPartsReader {
                     case .paragraphOutline:
                         let level = Int(CFBContainerReader.byte(value, 0))
                         run.outline = level <= 8 ? level : nil
+                    case .paragraphListInstance:
+                        run.listInstance = Self.listInstance(value)
+                    case .paragraphListLevel:
+                        let level = Int(CFBContainerReader.byte(value, 0))
+                        run.listLevel = level <= 8 ? level : nil
+                    case .tableDefinition:
+                        run.rowCells = Self.tableCells(value)
+                    case .tableVerticalMerge:
+                        // cb, номер ячейки, признак — по байту.
+                        guard value.count >= 3, var cells = run.rowCells else { break }
+                        let index = Int(CFBContainerReader.byte(value, 1))
+                        let flag = CFBContainerReader.byte(value, 2)
+                        if index < cells.count { cells[index].continuesAbove = flag == 1 }
+                        run.rowCells = cells
                     default: break
                     }
                 }
@@ -169,6 +211,41 @@ extension DocPartsReader {
             }
         }
         return result.sorted { $0.start < $1.start }
+    }
+
+    /// Номер экземпляра списка из `sprmPIlfo`: со знаком, и всё, что не
+    /// номер экземпляра (0 и особое 0xF801 — «без нумерации»), — 0.
+    static func listInstance(_ value: Data) -> Int {
+        let raw = Int(Int16(bitPattern: CFBContainerReader.u16(value, 0)))
+        return (1...0x07FE).contains(raw) ? raw : 0
+    }
+
+    /// Ячейки из `sprmTDefTable`: число ячеек, их границы и по двадцать
+    /// байт описания на ячейку (MS-DOC, TDefTableOperand и TC80).
+    ///
+    /// Из описания берётся одно — признак объединения вниз (биты 5–6
+    /// первого слова): 1 — продолжение, 3 — начало. Описаний может быть
+    /// меньше, чем ячеек: у недостающих объединения нет.
+    static func tableCells(_ value: Data) -> [TableCellDefinition]? {
+        // Первые два байта — длина операнда, их уже учёл обход.
+        guard value.count >= 3 else { return nil }
+        let count = Int(CFBContainerReader.byte(value, 2))
+        let edges = 3
+        guard count > 0, edges + (count + 1) * 2 <= value.count else { return nil }
+        var result: [TableCellDefinition] = []
+        for index in 0..<count {
+            let left = Int(Int16(bitPattern: CFBContainerReader.u16(value, edges + index * 2)))
+            let right = Int(Int16(bitPattern: CFBContainerReader.u16(value, edges + (index + 1) * 2)))
+            result.append(TableCellDefinition(left: left, right: max(left, right)))
+        }
+        let descriptions = edges + (count + 1) * 2
+        for index in 0..<count {
+            let offset = descriptions + index * 20
+            guard offset + 2 <= value.count else { break }
+            let flags = CFBContainerReader.u16(value, offset)
+            result[index].continuesAbove = (flags >> 5) & 0x3 == 1
+        }
+        return result
     }
 
     // MARK: - Обход набора свойств

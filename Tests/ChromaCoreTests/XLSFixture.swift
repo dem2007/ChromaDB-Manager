@@ -1,4 +1,5 @@
 import Foundation
+@testable import ChromaCore
 
 /// Сборщик старых книг Excel (BIFF8) для проверок.
 ///
@@ -28,6 +29,11 @@ struct XLSFixture {
         var name: String
         var isHidden = false
         var rows: [[Cell]]
+        /// Объединения, как в Excel: «A2:A1000».
+        var merges: [String] = []
+        /// Диаграмма на листе — свой подпоток BOF…EOF перед объединениями,
+        /// как его пишет Excel.
+        var embeddedChart = false
     }
 
     var sheets: [Sheet]
@@ -79,6 +85,19 @@ struct XLSFixture {
                 for (columnNumber, cell) in row.enumerated() {
                     body.append(self.cell(cell, row: rowNumber, column: columnNumber, shared: index))
                 }
+            }
+            if sheet.embeddedChart {
+                body.append(record(0x0809, u16(0x0600) + u16(0x0020) + Data(count: 12)))
+                body.append(record(0x000A, Data()))
+            }
+            let ranges = sheet.merges.compactMap(XLSXReader.MergedRange.init(reference:))
+            if !ranges.isEmpty {
+                var payload = u16(UInt16(ranges.count))
+                for range in ranges {
+                    payload.append(u16(UInt16(range.firstRow - 1)) + u16(UInt16(range.lastRow - 1)))
+                    payload.append(u16(UInt16(range.firstColumn)) + u16(UInt16(range.lastColumn)))
+                }
+                body.append(record(0x00E5, payload))
             }
             body.append(record(0x000A, Data()))
         }

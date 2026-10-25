@@ -25,11 +25,6 @@ final class EnvironmentViewModel: ObservableObject {
     @Published var backups: [BackupRecord] = []
     /// Копия, о которой спрошено «точно удалить».
     ///
-    /// Удаление копии необратимо и стоит ровно один щелчок по значку корзины,
-    /// стоящему в ряду с «Восстановить». Промах по соседней кнопке уносил
-    /// последнюю копию базы на пять гигабайт, и узнать об этом можно было
-    /// только по исчезнувшей строке.
-    @Published var pendingBackupDeletion: BackupRecord?
     /// Копия, восстановление из которой ждёт подтверждения. Восстановление
     /// подменяет базу целиком — одним щелчком оно больше не делается.
     @Published var pendingRestore: BackupRecord?
@@ -544,13 +539,10 @@ final class EnvironmentViewModel: ObservableObject {
         }
     }
 
-    /// Спрашивает, точно ли удалять копию. Сама не удаляет ничего.
-    func askToDelete(_ backup: BackupRecord) {
-        pendingBackupDeletion = backup
-    }
-
+    /// Удаляет копию. Подтверждение — у экрана: диалог держит
+    /// выбранные копии сам, `presenting:`, и закрытие диалога их не обнуляет
+    /// раньше, чем сработает кнопка.
     func delete(_ backup: BackupRecord, app: AppEnvironment) {
-        pendingBackupDeletion = nil
         do {
             try app.backupService.delete(backup)
             // Не молча: строка исчезла бы и без сообщения, а «что именно

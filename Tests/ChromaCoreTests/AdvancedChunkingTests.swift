@@ -485,13 +485,43 @@ final class LLMChunkingTests: XCTestCase {
         XCTAssertNil(LLMChunker.parse("[1, 2, 3]"), "числа — не фрагменты текста")
     }
 
+    /// Модель называет номера предложений, куски вырезаются из исходника
+    ///.
     func testUsesTheModelsBoundaries() async throws {
-        let chat = ScriptedChat(answers: ["[\"часть про кошек\", \"часть про счета\"]"])
+        let chat = ScriptedChat(answers: [#"{"starts": [2]}"#])
         let chunks = try await LLMChunker(configuration: configuration, chat: chat)
             .chunks(from: "Кошка спит. Счёт оплачен.")
 
-        XCTAssertEqual(chunks.map(\.text), ["часть про кошек", "часть про счета"])
+        XCTAssertEqual(chunks.map(\.text), ["Кошка спит.", "Счёт оплачен."])
         XCTAssertTrue(chunks.allSatisfy { $0.note == nil })
+    }
+
+    /// Шаблон со старой подстановкой `{{TEXT}}`: фрагменты текстом. Те,
+    /// что стоят в исходнике, режут его; пересказ — ответ не по формату.
+    func testFragmentsAsTextMustBeFoundInTheSource() async throws {
+        var legacy = configuration
+        legacy.promptTemplate = "Раздели текст на фрагменты, ответь JSON-массивом строк.\n{{TEXT}}"
+        legacy.onMalformedOutput = .retryThenFail
+        let verbatim = ScriptedChat(answers: [#"["Кошка спит.", "Счёт  оплачен."]"#])
+        let chunks = try await LLMChunker(configuration: legacy, chat: verbatim)
+            .chunks(from: "Кошка спит.\nСчёт оплачен.")
+        XCTAssertEqual(chunks.map(\.text), ["Кошка спит.", "Счёт оплачен."])
+
+        let retold = ScriptedChat(answers: [#"["часть про кошек", "часть про счета"]"#])
+        do {
+            _ = try await LLMChunker(configuration: legacy, chat: retold).chunks(from: "Кошка спит.\nСчёт оплачен.")
+            XCTFail("пересказ в базу не идёт")
+        } catch let error as LLMChunkingError {
+            guard case .malformedOutput = error else { return XCTFail("ожидалась malformedOutput: \(error)") }
+        }
+    }
+
+    func testBoundaryNumbersAreParsedAndCleaned() {
+        XCTAssertEqual(LLMChunker.parseStarts(#"{"starts": [5, 2, 2, 1, 99]}"#, unitCount: 6), [2, 5])
+        XCTAssertEqual(LLMChunker.parseStarts("Ответ: [3]", unitCount: 4), [3])
+        XCTAssertEqual(LLMChunker.parseStarts(#"{"starts": []}"#, unitCount: 4), [])
+        XCTAssertNil(LLMChunker.parseStarts(#"["текст"]"#, unitCount: 4))
+        XCTAssertNil(LLMChunker.parseStarts("не понял", unitCount: 4))
     }
 
     func testRetriesThenFallsBackToRecursiveWithAMark() async throws {
@@ -583,7 +613,7 @@ final class LLMChunkingTests: XCTestCase {
         let chat = ScriptedChat(answers: ["ерунда"])
 
         do {
-            _ = try await LLMChunker(configuration: strict, chat: chat).chunks(from: "Текст.")
+            _ = try await LLMChunker(configuration: strict, chat: chat).chunks(from: "Первое предложение. Второе предложение.")
             XCTFail("политика «сообщить об ошибке» должна бросить ошибку")
         } catch let error as LLMChunkingError {
             guard case .malformedOutput = error else { return XCTFail("ожидалась malformedOutput") }
@@ -596,7 +626,7 @@ final class LLMChunkingTests: XCTestCase {
         var bounded = configuration
         bounded.maxChunkSize = 64
         let long = String(repeating: "очень длинный фрагмент. ", count: 20)
-        let chat = ScriptedChat(answers: ["[\"\(long)\"]"])
+        let chat = ScriptedChat(answers: [#"{"starts": []}"#])
 
         let chunks = try await LLMChunker(configuration: bounded, chat: chat).chunks(from: long)
         XCTAssertGreaterThan(chunks.count, 1, "модель проигнорировала лимит — режем сами")
@@ -829,6 +859,10 @@ extension LLMChunkingTests {
 }
 
 /// 5 + — окно чанкинга против контекста модели.
+/// Окно и время — у шаблона, где модель **переписывает** текст (`{{TEXT}}`):
+/// у шаблона с номерами предложений ответ короткий при любом окне.
+private let rewritingPrompt = "Раздели текст на фрагменты, ответь JSON-объектом chunks.\n{{TEXT}}"
+
 final class LLMChunkingWindowTests: XCTestCase {
     /// Настройки по умолчанию: 2048 токенов на чанк. Окно считалось как
     /// «размер чанка × 4» — 28 672 символа, около 8192 токенов **одного
@@ -836,7 +870,7 @@ final class LLMChunkingWindowTests: XCTestCase {
     /// без ответа. Чанкинг с такими настройками падал всегда.
     func testTheDefaultSizedWindowNoLongerFillsTheWholeContext() {
         let configuration = ChunkingConfiguration(
-            strategy: .llmBased, sizeUnit: .tokens, maxChunkSize: 2_048, chatModel: "м"
+            strategy: .llmBased, sizeUnit: .tokens, maxChunkSize: 2_048, chatModel: "м", promptTemplate: rewritingPrompt
         )
         let wanted = max(configuration.maxSizeInCharacters * 4, 2_000)
         XCTAssertGreaterThan(TokenEstimator.estimatedTokens(String(repeating: "я", count: wanted)), 8_000)
@@ -864,12 +898,12 @@ final class LLMChunkingWindowTests: XCTestCase {
 
     /// Модель не сказала про контекст — ничего не выдумываем и не режем.
     func testWithoutAKnownContextTheWindowIsTheOneTheSettingsAskFor() async throws {
-        let chat = ScriptedChat(answers: [#"{"chunks":["а","б"]}"#], contextTokens: nil)
+        let chat = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#], contextTokens: nil)
         let configuration = ChunkingConfiguration(
-            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м"
+            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м", promptTemplate: rewritingPrompt
         )
         _ = try await LLMChunker(configuration: configuration, chat: chat)
-            .chunks(from: String(repeating: "текст ", count: 2_000))
+            .chunks(from: String(repeating: "Текст. ", count: 2_000))
         // 12 000 символов при окне 16 384 — один вызов.
         XCTAssertEqual(chat.counter.calls, 1)
     }
@@ -877,12 +911,12 @@ final class LLMChunkingWindowTests: XCTestCase {
     /// Тот же текст на модели с маленьким контекстом делится на больше окон —
     /// и ни один промпт не выходит за него.
     func testASmallContextMeansMoreWindowsAndNoOversizedPrompt() async throws {
-        let chat = ScriptedChat(answers: [#"{"chunks":["а","б"]}"#], contextTokens: 4_096)
+        let chat = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#], contextTokens: 4_096)
         let configuration = ChunkingConfiguration(
-            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м"
+            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м", promptTemplate: rewritingPrompt
         )
         _ = try await LLMChunker(configuration: configuration, chat: chat)
-            .chunks(from: String(repeating: "текст ", count: 2_000))
+            .chunks(from: String(repeating: "Текст. ", count: 2_000))
         XCTAssertGreaterThan(chat.counter.calls, 1, "окно обязано было уменьшиться")
         for prompt in chat.prompts.all {
             XCTAssertLessThanOrEqual(
@@ -897,11 +931,11 @@ final class LLMChunkingWindowTests: XCTestCase {
     func testAContextTooSmallIsRefusedBeforeTheRequest() async {
         let chat = ScriptedChat(answers: [#"{"chunks":["а"]}"#], contextTokens: 512)
         let configuration = ChunkingConfiguration(
-            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м"
+            strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096, chatModel: "м", promptTemplate: rewritingPrompt
         )
         do {
             _ = try await LLMChunker(configuration: configuration, chat: chat)
-                .chunks(from: String(repeating: "текст ", count: 2_000))
+                .chunks(from: String(repeating: "Текст. ", count: 2_000))
             XCTFail("ожидалась ошибка о нехватке контекста")
         } catch let error as LLMChunkingError {
             guard case .contextTooSmall = error else {
@@ -939,7 +973,7 @@ final class LLMRunawayAnswerTests: XCTestCase {
     private var configuration: ChunkingConfiguration {
         ChunkingConfiguration(
             strategy: .llmBased, sizeUnit: .characters, maxChunkSize: 4_096,
-            chatModel: "м", llmMaxRetries: 1
+            chatModel: "м", promptTemplate: rewritingPrompt, llmMaxRetries: 1
         )
     }
 
@@ -947,9 +981,9 @@ final class LLMRunawayAnswerTests: XCTestCase {
 
     /// Запрос без `max_tokens` — это запрос, который нечем остановить.
     func testEveryRequestCarriesATokenLimit() async throws {
-        let chat = ScriptedChat(answers: [#"{"chunks":["а","б"]}"#])
+        let chat = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#])
         _ = try await LLMChunker(configuration: configuration, chat: chat)
-            .chunks(from: String(repeating: "текст ", count: 500))
+            .chunks(from: String(repeating: "Текст. ", count: 500))
         XCTAssertNotNil(chat.seen.lastSettings?.maxTokens, "G3: предел задаёт приложение")
     }
 
@@ -976,9 +1010,9 @@ final class LLMRunawayAnswerTests: XCTestCase {
     func testAManualLimitIsLeftAlone() async throws {
         var manual = configuration
         manual.generation.maxTokens = 777
-        let chat = ScriptedChat(answers: [#"{"chunks":["а"]}"#])
+        let chat = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#])
         _ = try await LLMChunker(configuration: manual, chat: chat)
-            .chunks(from: String(repeating: "текст ", count: 500))
+            .chunks(from: String(repeating: "Текст. ", count: 500))
         XCTAssertEqual(chat.seen.lastSettings?.maxTokens, 777)
     }
 
@@ -994,7 +1028,7 @@ final class LLMRunawayAnswerTests: XCTestCase {
         let chat = LoopingChat()
 
         let chunks = try await LLMChunker(configuration: fallback, chat: chat)
-            .chunks(from: String(repeating: "текст ", count: 500))
+            .chunks(from: String(repeating: "Текст. ", count: 500))
 
         XCTAssertFalse(chunks.isEmpty, "откат обязан был сработать")
         XCTAssertEqual(chunks.first?.note, LLMChunker.recursiveFallbackNote)
@@ -1008,7 +1042,7 @@ final class LLMRunawayAnswerTests: XCTestCase {
         strict.onMalformedOutput = .retryThenFail
         do {
             _ = try await LLMChunker(configuration: strict, chat: LoopingChat())
-                .chunks(from: String(repeating: "текст ", count: 500))
+                .chunks(from: String(repeating: "Текст. ", count: 500))
             XCTFail("ожидалась ошибка")
         } catch let error as LLMChunkingError {
             guard case .malformedOutput = error else {
@@ -1025,13 +1059,13 @@ final class LLMRunawayAnswerTests: XCTestCase {
     /// после перезагрузки модели на 128 000: окно выросло вчетверо, а сто
     /// двадцать секунд остались теми же.
     func testTheWindowShrinksToWhatTheModelCanWriteInTime() async throws {
-        let text = String(repeating: "текст ", count: 2_400)
-        let roomy = ScriptedChat(answers: [#"{"chunks":["а"]}"#], contextTokens: 128_000)
+        let text = String(repeating: "Текст. ", count: 2_000)
+        let roomy = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#], contextTokens: 128_000)
         _ = try await LLMChunker(configuration: configuration, chat: roomy)
             .chunks(from: text)
 
         let measured = ScriptedChat(
-            answers: [#"{"chunks":["а"]}"#], contextTokens: 128_000, tokensPerSecond: 72
+            answers: [#"{"chunks":["Текст."]}"#], contextTokens: 128_000, tokensPerSecond: 72
         )
         _ = try await LLMChunker(configuration: configuration, chat: measured)
             .chunks(from: text)
@@ -1051,8 +1085,8 @@ final class LLMRunawayAnswerTests: XCTestCase {
 
     /// Скорость не измерена — ведём себя как раньше: выдумывать её нельзя.
     func testWithoutAMeasuredSpeedTheWindowIsUnchanged() async throws {
-        let text = String(repeating: "текст ", count: 2_400)
-        let unknown = ScriptedChat(answers: [#"{"chunks":["а"]}"#], contextTokens: 128_000)
+        let text = String(repeating: "Текст. ", count: 2_400)
+        let unknown = ScriptedChat(answers: [#"{"chunks":["Текст."]}"#], contextTokens: 128_000)
         _ = try await LLMChunker(configuration: configuration, chat: unknown)
             .chunks(from: text)
         let byContext = LLMChunker.windowLimit(
@@ -1070,11 +1104,11 @@ final class LLMRunawayAnswerTests: XCTestCase {
     /// разговор до прогона, а не три таймаута на каждом окне каждого файла.
     func testAModelTooSlowForTheTimeoutIsRefusedBeforeTheRequest() async {
         let slow = ScriptedChat(
-            answers: [#"{"chunks":["а"]}"#], contextTokens: 128_000, tokensPerSecond: 5
+            answers: [#"{"chunks":["Текст."]}"#], contextTokens: 128_000, tokensPerSecond: 5
         )
         do {
             _ = try await LLMChunker(configuration: configuration, chat: slow)
-                .chunks(from: String(repeating: "текст ", count: 500))
+                .chunks(from: String(repeating: "Текст. ", count: 500))
             XCTFail("ожидался отказ по времени")
         } catch let error as LLMChunkingError {
             guard case .tooSlowForTimeout = error else {

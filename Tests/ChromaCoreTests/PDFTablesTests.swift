@@ -183,7 +183,7 @@ final class OCRTableTests: XCTestCase {
         let document = try XCTUnwrap(PDFDocument(url: url))
         let page = try XCTUnwrap(document.page(at: 0))
         let image = try XCTUnwrap(VisionOCRExtractor.render(page))
-        let recognised = try await VisionOCRExtractor.recognise(image, languages: ["ru-RU"], timeout: 60)
+        let recognised = try await VisionOCRExtractor.recognise(image, languages: ["ru-RU"], deadline: .init(seconds: 60))
         try XCTSkipIf(recognised.confidence < 0.5, "распознавание на этой машине не справилось")
 
         let table = try XCTUnwrap(recognised.table, "таблица должна собраться из распознанных слов")

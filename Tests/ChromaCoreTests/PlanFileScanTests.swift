@@ -128,3 +128,58 @@ final class PlanFileScanTests: XCTestCase {
         XCTAssertTrue(scan.growing.isEmpty)
     }
 }
+
+/// Книга перечитывается, когда меняются поля источника (ревью): поля
+/// файла стоят в каждой её строке, а обновление полей без пересчёта векторов
+/// ходит только по документам.
+final class TableMetadataSignatureTests: XCTestCase {
+    private var folder: URL!
+
+    override func setUpWithError() throws {
+        folder = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cdbm-table-fields-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try "Артикул,Цена\nA-1,12\nA-2,8\n".write(
+            to: folder.appendingPathComponent("прайс.csv"), atomically: true, encoding: .utf8
+        )
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: folder)
+    }
+
+    func testAnUntouchedWorkbookIsReadAgainWhenTheSourceFieldsChange() async throws {
+        var source = DataSource(
+            name: "проверка", path: folder.path, fileExtensions: ["csv"], recursive: true,
+            mapping: .folderToCollection, collectionName: "test", embeddingModel: "model"
+        )
+        source.customMetadata = ["owner": "Ведомство А"]
+        let tables = TableManifestStore(directory: folder.appendingPathComponent("tables"))
+        let service = SourceSyncService(
+            manifests: ManifestStore(directory: folder.appendingPathComponent("manifests")),
+            tableManifests: tables
+        )
+        let url = folder.appendingPathComponent("прайс.csv")
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let manifest = TableFileManifest(
+            relativePath: "прайс.csv", collectionName: "test",
+            modifiedAt: try XCTUnwrap(attributes[.modificationDate] as? Date),
+            size: Int64(try XCTUnwrap(attributes[.size] as? Int)),
+            profilesSignature: TableSyncService.profilesSignature(
+                await service.tableProfiles(of: source), unmatchedSheetsAsText: source.unmatchedSheetsAsText
+            ),
+            metadataSignature: source.metadataSignature
+        )
+        tables.save(["прайс.csv": manifest], sourceID: source.id)
+
+        let before = try await service.plan(source: source, embeddingModel: "model")
+        XCTAssertEqual(before.items.first?.kind, .unchanged)
+
+        source.customMetadata = ["owner": "Ведомство Б"]
+        let after = try await service.plan(source: source, embeddingModel: "model")
+        guard case .changed(let reason)? = after.items.first?.kind else {
+            return XCTFail("книга с прежними полями должна перечитаться: \(String(describing: after.items.first?.kind))")
+        }
+        XCTAssertTrue(reason.contains("поля"), reason)
+    }
+}

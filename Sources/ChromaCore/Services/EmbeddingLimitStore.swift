@@ -20,9 +20,23 @@ public struct MeasuredInputLimit: Codable, Sendable, Hashable {
     /// Контекст, с которым модель была загружена в момент замера.
     ///
     /// Признак свежести: перезагрузили модель с другим контекстом — число
-    /// устарело и меряется заново. `nil` — рантайм не сказал; тогда сравнение
-    /// `nil == nil` считает запись годной, и это честно: другого признака нет.
+    /// устарело и меряется заново. `nil` — рантайм не сказал; см. `isFresh`.
     public let loadedContext: Int?
+
+    /// Сколько живёт замер, свежесть которого подтвердить нечем.
+    public static let unverifiedLifetime: TimeInterval = 7 * 24 * 3600
+
+    /// Годится ли число для модели, загруженной сейчас с таким контекстом.
+    ///
+    /// Оба контекста известны — сравниваются. Хотя бы один неизвестен —
+    /// сравнивать нечего, и раньше `nil == nil` объявлял запись свежей
+    /// **навсегда**: модель перезагружали с другим контекстом, рантайм
+    /// об этом молчал, и вчерашний предел жил вечно — ровно то, ради чего
+    /// признак заводили. Теперь у такой записи есть срок: неделя.
+    public func isFresh(loadedContext current: Int?, now: Date = Date()) -> Bool {
+        if let loadedContext, let current { return loadedContext == current }
+        return now.timeIntervalSince(measuredAt) < Self.unverifiedLifetime
+    }
 
     public init(model: String, characters: Int, measuredAt: Date = Date(), loadedContext: Int? = nil) {
         self.model = model

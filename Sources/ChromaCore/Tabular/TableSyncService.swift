@@ -14,6 +14,15 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
     /// edited profile would silently apply only to files that happened to
     /// change afterwards.
     public var profilesSignature: String
+    /// Подпись полей источника — уровней пути и своих полей, с
+    /// которой файл записан.
+    ///
+    /// Поля файла стоят в каждой строке и куске листа, а обновление полей
+    /// без пересчёта векторов ходит только по документам. Без этой
+    /// подписи книга, у которой на диске ничего не менялось, после правки
+    /// уровней пути оставалась бы с прежними значениями до следующего
+    /// сохранения самой книги.
+    public var metadataSignature: String
     /// Строки, которых больше нет в файле, — по листам.
     ///
     /// Ровно то же, что `pendingRemovals` у файлового манифеста, и по той же
@@ -40,6 +49,7 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         modifiedAt: Date = Date(),
         size: Int64 = 0,
         profilesSignature: String = "",
+        metadataSignature: String = "",
         pendingRemovals: [String: SheetRowRemoval] = [:],
         sheetsAwaitingWrite: Set<String> = []
     ) {
@@ -49,6 +59,7 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         self.modifiedAt = modifiedAt
         self.size = size
         self.profilesSignature = profilesSignature
+        self.metadataSignature = metadataSignature
         self.pendingRemovals = pendingRemovals
         self.sheetsAwaitingWrite = sheetsAwaitingWrite
     }
@@ -63,6 +74,9 @@ public struct TableFileManifest: Codable, Hashable, Sendable {
         modifiedAt = try container.decodeIfPresent(Date.self, forKey: .modifiedAt) ?? Date()
         size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
         profilesSignature = try container.decodeIfPresent(String.self, forKey: .profilesSignature) ?? ""
+        // Записанный до подписи полей — как записанный другими полями: один
+        // раз перечитывается.
+        metadataSignature = try container.decodeIfPresent(String.self, forKey: .metadataSignature) ?? ""
         pendingRemovals = try container.decodeIfPresent([String: SheetRowRemoval].self, forKey: .pendingRemovals) ?? [:]
         // Манифест, записанный до появления признака, читается как «ничего
         // не ждёт»: там и очищать листы было нечем.
@@ -155,12 +169,20 @@ public struct SheetProblem: Codable, Hashable, Sendable, Identifiable {
     public var reason: String
     /// Set when a saved profile nearly fits — what the offer should point at.
     public var closestProfileID: UUID?
+    /// Разряд для «Диагностики», если лист не про профиль. `nil` —
+    /// листу нужен профиль: так у всех проблем, кроме строки длиннее
+    /// контекста модели.
+    public var remedy: FileRemedy?
 
-    public init(relativePath: String, sheetName: String, reason: String, closestProfileID: UUID? = nil) {
+    public init(
+        relativePath: String, sheetName: String, reason: String,
+        closestProfileID: UUID? = nil, remedy: FileRemedy? = nil
+    ) {
         self.relativePath = relativePath
         self.sheetName = sheetName
         self.reason = reason
         self.closestProfileID = closestProfileID
+        self.remedy = remedy
     }
 }
 
@@ -245,6 +267,25 @@ public actor TableSyncService {
         /// overlap belong to the source, and a table pipeline that decided them
         /// on its own would disagree with the rest of the app.
         public var chunker: (@Sendable (String) async throws -> [TextChunk])?
+        /// Размер куска в знаках — тот же, по которому режет `chunker`
+        ///: шапка листа дописывается к кускам после нарезки и обязана
+        /// уложиться в тот же размер, а не вылезти за него.
+        public var chunkLimit: (@Sendable (TextChunk) -> Int?)?
+        /// Сколько документов записала очередная партия: табличный
+        /// файл пишется минутами, и счётчик хода без этого стоял, пока не
+        /// запишется весь файл, — экран выглядел зависшим.
+        public var onBatchWritten: (@Sendable (Int) -> Void)?
+        /// Лист, под который не подошёл ни один профиль, записывается
+        /// текстом — режимом «Документ», — а не пропадает.
+        public var unmatchedSheetsAsText: Bool
+        /// Поля файла, которые несёт каждый документ источника:
+        /// `file_name`, `file_id`, уровни пути, свои поля источника. Без них
+        /// лист книги не попадал под фильтр «ведомство», «год», «тип
+        /// документа», а в выдаче у него не было имени файла.
+        public var documentMetadata: ChromaMetadata
+        /// Подпись настроек, из которых `documentMetadata` собраны
+        /// (`DataSource.metadataSignature`): запоминается в манифесте файла.
+        public var metadataSignature: String
 
         public init(
             sourceID: UUID,
@@ -258,8 +299,17 @@ public actor TableSyncService {
             rowLimit: Int? = nil,
             batchSize: Int = 32,
             contextLength: Int? = nil,
-            chunker: (@Sendable (String) async throws -> [TextChunk])? = nil
+            chunker: (@Sendable (String) async throws -> [TextChunk])? = nil,
+            chunkLimit: (@Sendable (TextChunk) -> Int?)? = nil,
+            onBatchWritten: (@Sendable (Int) -> Void)? = nil,
+            unmatchedSheetsAsText: Bool = false,
+            documentMetadata: ChromaMetadata = [:],
+            metadataSignature: String = ""
         ) {
+            self.documentMetadata = documentMetadata
+            self.metadataSignature = metadataSignature
+            self.chunkLimit = chunkLimit
+            self.onBatchWritten = onBatchWritten
             self.contextLength = contextLength
             self.sourceID = sourceID
             self.relativePath = relativePath
@@ -272,6 +322,7 @@ public actor TableSyncService {
             self.rowLimit = rowLimit
             self.batchSize = batchSize
             self.chunker = chunker
+            self.unmatchedSheetsAsText = unmatchedSheetsAsText
         }
 
         /// Назначенный профиль, если он ещё существует.
@@ -286,14 +337,25 @@ public actor TableSyncService {
 
     /// A stable fingerprint of a source's profiles, so a change to any of them
     /// makes every table file worth looking at again.
-    public static func profilesSignature(_ profiles: [TableProfile]) -> String {
-        profiles
+    public static func profilesSignature(_ profiles: [TableProfile], unmatchedSheetsAsText: Bool = false) -> String {
+        // Схема идентификаторов строк — тоже рецепт: когда она меняется, каждый
+        // табличный файл обязан быть перечитан один раз, иначе неизменившиеся
+        // книги остались бы под прежними (сталкивавшимися) id навсегда.
+        // Запись неразмеченных листов текстом — тоже: включили —
+        // книги, где такие листы есть, должны быть прочитаны снова.
+        "ids:\(Self.rowIdentityScheme)\u{1}render:\(SheetRenderer.version)\u{1}" + (unmatchedSheetsAsText ? "unmatched:text\u{1}" : "") + profiles
             .flatMap { profile in
                 profile.variants.map { "\(profile.name)\u{0}\($0.sheets.title)\u{0}\($0.mapping.signature)" }
             }
             .sorted()
             .joined(separator: "\u{1}")
     }
+
+    /// Версия схемы идентификаторов строк. Вторая — с файлом и настоящим
+    /// листом в идентификаторе; третья — объединения разложены и вбок
+    ///: строки с такими ячейками читаются иначе, и неизменившиеся
+    /// книги обязаны быть перечитаны, чтобы правило дошло и до них.
+    static let rowIdentityScheme = 3
 
     // MARK: - Reading
 
@@ -305,15 +367,17 @@ public actor TableSyncService {
         url: URL,
         allowApplicationExport: Bool = false,
         limits: XLSXReader.Limits = XLSXReader.Limits()
-    ) async throws -> (sheets: [(sheet: SheetInfo, rows: [SheetRow])], warnings: [XLSXWarning], temporary: URL?) {
+    ) async throws -> (sheets: [(sheet: SheetInfo, rows: [SheetRow])], warnings: [String], temporary: URL?) {
         switch TabularFormat.of(url) {
         case .workbook:
             let reader = try XLSXReader(url: url)
-            return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], nil)
+            let read = try Self.collect(reader.sheets) { try reader.rowsAndMerges(of: $0, limits: limits) }
+            return (read.sheets, read.warnings, nil)
 
         case .openDocument:
             let reader = try ODSReader(url: url)
-            return (try Self.collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }, [], nil)
+            let read = try Self.collect(reader.sheets) { try reader.rowsAndMerges(of: $0, limits: limits) }
+            return (read.sheets, read.warnings, nil)
 
         case .delimited:
             let (rows, _) = try DelimitedTableReader.rows(url: url)
@@ -326,23 +390,23 @@ public actor TableSyncService {
         // у которых внутри другой поток.
         case .legacyExcel:
             if let reader = try? XLSReader(url: url) {
-                return (
-                    try Self.collect(reader.sheets) {
-                        try reader.rows(of: $0, limits: XLSReader.Limits(maxRows: limits.maxRows))
-                    },
-                    [], nil
-                )
+                let read = try Self.collect(reader.sheets) {
+                    try reader.rowsAndMerges(of: $0, limits: XLSReader.Limits(maxRows: limits.maxRows))
+                }
+                return (read.sheets, read.warnings, nil)
             }
             let (reader, temporary) = try await NumbersReader()
                 .workbook(at: url, allowApplicationExport: allowApplicationExport)
-            return (try Self.readExported(reader, temporary: temporary, limits: limits), [], temporary)
+            let read = try Self.readExported(reader, temporary: temporary, limits: limits)
+            return (read.sheets, read.warnings, temporary)
 
         // `.numbers` читается только так: формат закрыт, и открывает его
         // приложение, которому он принадлежит.
         case .numbers:
             let (reader, temporary) = try await NumbersReader()
                 .workbook(at: url, allowApplicationExport: allowApplicationExport)
-            return (try Self.readExported(reader, temporary: temporary, limits: limits), [], temporary)
+            let read = try Self.readExported(reader, temporary: temporary, limits: limits)
+            return (read.sheets, read.warnings, temporary)
 
         case .legacyBinary:
             throw TabularError.legacyBinaryFormat(url.pathExtension.lowercased())
@@ -359,20 +423,37 @@ public actor TableSyncService {
     /// временных файлов навсегда; здесь он убирается и в этом случае.
     private static func readExported(
         _ reader: XLSXReader, temporary: URL, limits: XLSXReader.Limits
-    ) throws -> [(sheet: SheetInfo, rows: [SheetRow])] {
+    ) throws -> (sheets: [(sheet: SheetInfo, rows: [SheetRow])], warnings: [String]) {
         do {
-            return try collect(reader.sheets) { try reader.rows(of: $0, limits: limits) }
+            return try collect(reader.sheets) { try reader.rowsAndMerges(of: $0, limits: limits) }
         } catch {
             try? FileManager.default.removeItem(at: temporary)
             throw error
         }
     }
 
+    /// - Parameter merges: объединённые ячейки листа; листу они
+    ///   записываются в `SheetInfo.merges`.
+    /// Листы с их строками; объединения — тем же чтением, что и строки
+    ///: отдельный проход ради них перечитывал XML листа, а у ODS —
+    /// весь `content.xml` на каждый лист.
+    ///
+    /// Оговорки читалки — с именем листа. Раньше они терялись
+    /// здесь же: лист, обрезанный пределом строк, и формулы без значения
+    /// проходили молча.
     private static func collect(
         _ sheets: [SheetInfo],
-        _ read: (SheetInfo) throws -> (rows: [SheetRow], warnings: [XLSXWarning])
-    ) rethrows -> [(sheet: SheetInfo, rows: [SheetRow])] {
-        try sheets.map { ($0, try read($0).rows) }
+        _ read: (SheetInfo) throws -> (rows: [SheetRow], warnings: [XLSXWarning], merges: [XLSXReader.MergedRange])
+    ) rethrows -> (sheets: [(sheet: SheetInfo, rows: [SheetRow])], warnings: [String]) {
+        var warnings: [String] = []
+        let result = try sheets.map { sheet in
+            let found = try read(sheet)
+            var info = sheet
+            info.merges = found.merges
+            warnings += found.warnings.map { String(localized: "лист «\(sheet.name)»: \($0.text)") }
+            return (info, found.rows)
+        }
+        return (result, warnings)
     }
 
     // MARK: - Planning
@@ -410,19 +491,34 @@ public actor TableSyncService {
         let skipped = Set(zip(sheets, claims).compactMap { entry, claim in
             claim.match.mapping == nil && claim.shape.mode == .skip ? entry.sheet.name : nil
         })
+        let fallbacks = zip(sheets, claims).map { entry, claim in
+            TableSyncService.textFallback(
+                sheet: entry.sheet, shape: claim.shape, match: claim.match, allowed: context.unmatchedSheetsAsText
+            )
+        }
         let coverage = SheetCoverage(
-            indexed: claims.filter { $0.match.mapping != nil }.count,
+            indexed: zip(claims, fallbacks).filter { $0.match.mapping != nil || $1 != nil }.count,
             total: sheets.count - skipped.count,
             skipped: skipped
         )
 
         for (index, entry) in sheets.enumerated() {
             let (shape, match) = claims[index]
+            // Лист без подходящего профиля записывается текстом —
+            // в документном проходе; здесь только оговорка: записей
+            // с колонками у него не будет.
+            if let reason = fallbacks[index] {
+                looseMatches.append(String(localized: "\(entry.sheet.name): \(reason) — записан текстом (режим «Документ»): фильтров по колонкам у него нет; чтобы строки стали записями, сохраните подходящий листу профиль и переиндексируйте лист на экране «Таблицы»"))
+                continue
+            }
 
-            let mapping: TableMapping
+            var mapping: TableMapping
             switch match {
             case .matched(_, let variant):
                 mapping = variant.mapping
+                // Лист — этот, а не тот, на котором профиль размечали: от
+                // него зависят и `sheet_name` строки, и её идентификатор.
+                mapping.sheetName = entry.sheet.name
                 // Совпало не точно — сказать об этом. Недостающая колонка
                 // метаданных не мешает разобрать строку, но фильтра по ней
                 // у этих записей не будет, и узнавать об этом по пустой
@@ -485,7 +581,10 @@ public actor TableSyncService {
                 manifest: manifest.sheets[entry.sheet.name] ?? SheetManifest(sheetName: entry.sheet.name),
                 sourceID: context.sourceID,
                 sourceFile: context.relativePath,
-                coverage: coverage
+                coverage: coverage,
+                sheetIndex: index,
+                merges: entry.sheet.merges,
+                shared: context.documentMetadata
             )
             if let limit = context.rowLimit { sheetPlan = sheetPlan.limitedToFirstRows(limit) }
             plans.append((entry.sheet.name, mapping, sheetPlan))
@@ -505,8 +604,7 @@ public actor TableSyncService {
         manifest: inout TableFileManifest,
         context: Context,
         chroma: any SyncDatabase,
-        embeddings: EmbeddingProvider,
-        progress: @Sendable (Int, Int) -> Void = { _, _ in }
+        embeddings: EmbeddingProvider
     ) async throws -> TableSyncReport {
         var report = TableSyncReport()
         report.relativePath = context.relativePath
@@ -527,10 +625,48 @@ public actor TableSyncService {
             try Task.checkCancellation()
             guard let claimed = mapping(for: entry, index: index, context: context),
                   claimed.mapping.mode == .document else { continue }
-            let written = try await writeRendered(
-                entry: entry, mapping: claimed.mapping, layout: claimed.layout, manifest: &manifest,
-                context: context, chroma: chroma, embeddings: embeddings, coverage: coverage
-            )
+            // Та же граница, что у строк: сменилась разметка — это
+            // переиндексация с копией, предложенная отдельно. Раньше лист,
+            // переведённый в «документ», молча стирал все свои строки по id
+            // и писал куски на их место — без корзины и без вопроса.
+            if let previous = manifest.sheets[entry.sheet.name]?.mappingSignature,
+               !previous.isEmpty, previous != claimed.mapping.signature {
+                report.sheetsNeedingReindex.append(entry.sheet.name)
+                log(.warning, "Таблицы",
+                    "Лист «\(entry.sheet.name)» файла \(context.relativePath): сопоставление изменилось — нужна переиндексация листа (экран «Таблицы», кнопка «Переиндексировать лист»), автоматически ничего не пересчитывается")
+                continue
+            }
+            // Пробный прогон на выборке строк лист-документ целиком
+            // не пишет: выборка существует ровно затем, чтобы не платить за всё.
+            if context.rowLimit != nil {
+                report.warnings.append(String(localized: "лист «\(entry.sheet.name)» разбирается как документ — в пробный прогон на выборке строк он не входит"))
+                report.sheetsSkipped.append(entry.sheet.name)
+                continue
+            }
+            let written: (added: Int, reembedded: Int, unchanged: Int, split: Int)
+            do {
+                written = try await writeRendered(
+                    entry: entry, mapping: claimed.mapping, layout: claimed.layout, manifest: &manifest,
+                    context: context, chroma: chroma, embeddings: embeddings, coverage: coverage,
+                    sheetIndex: index
+                )
+            } catch let unsendable as UnsendableSheet {
+                // Тем же правилом, что пустой чанк файла: в отчёт и «требуют
+                // решения», а не молча.
+                report.problems.append(SheetProblem(
+                    relativePath: context.relativePath, sheetName: entry.sheet.name,
+                    reason: unsendable.reason, remedy: .retry
+                ))
+                report.sheetsSkipped.append(entry.sheet.name)
+                log(.warning, "Таблицы", "Лист «\(entry.sheet.name)» файла \(context.relativePath) пропущен: \(unsendable.reason)")
+                continue
+            }
+            if written.split > 0 {
+                // Как у файлов: нарезка подвинулась — это видно в сводке.
+                report.warnings.append(String(localized: "лист «\(entry.sheet.name)»: кусков, не влезавших в контекст модели, дорезано по предложениям: \(written.split)"))
+                log(.warning, "Таблицы",
+                    "Лист «\(entry.sheet.name)» файла \(context.relativePath): кусков, не влезавших в контекст модели, дорезано по предложениям: \(written.split.plainDigits). Уменьшите размер чанка, если это повторяется.")
+            }
             report.sheetsIndexed.append(entry.sheet.name)
             // Лист записан — ждать его больше нечего.
             manifest.noteSheetWritten(entry.sheet.name)
@@ -538,9 +674,6 @@ public actor TableSyncService {
             report.rowsReembedded += written.reembedded
             report.rowsUnchanged += written.unchanged
         }
-
-        let total = plans.reduce(0) { $0 + $1.plan.writes }
-        var written = 0
 
         for (sheetName, mapping, sheetPlan) in plans {
             try Task.checkCancellation()
@@ -569,7 +702,7 @@ public actor TableSyncService {
                 let verdict = ContextBudget.check(oversized.0.text, contextLength: context.contextLength)
                 let reason = String(localized: "строка \(oversized.0.id) длиннее контекста модели (≈\(TokenEstimator.estimatedTokens(oversized.0.text)) токенов): \(verdict.message ?? "")")
                 report.problems.append(SheetProblem(
-                    relativePath: context.relativePath, sheetName: sheetName, reason: reason
+                    relativePath: context.relativePath, sheetName: sheetName, reason: reason, remedy: .retry
                 ))
                 report.sheetsSkipped.append(sheetName)
                 log(.warning, "Таблицы", "Лист «\(sheetName)» файла \(context.relativePath) пропущен: \(reason)")
@@ -580,8 +713,6 @@ public actor TableSyncService {
             }) {
                 try Task.checkCancellation()
                 try await write(batch, context: context, chroma: chroma, embeddings: embeddings)
-                written += batch.count
-                progress(written, total)
             }
 
             // Metadata-only rows need no vector at all: the text they carry is
@@ -605,11 +736,12 @@ public actor TableSyncService {
             // текст тот же, считать его заново незачем.
             if !sheetPlan.metadataOnly.isEmpty {
                 let previousIDs = sheetPlan.metadataOnly.map(\.previousID)
-                let stored = Dictionary(
+                let storedRecords = Dictionary(
                     try await chroma.documents(collectionID: context.collectionID, ids: previousIDs)
-                        .map { ($0.id, $0.metadata) },
+                        .map { ($0.id, $0) },
                     uniquingKeysWith: { first, _ in first }
                 )
+                let stored = storedRecords.mapValues(\.metadata)
                 let movedIDs = sheetPlan.metadataOnly.filter { $0.previousID != $0.document.id }.map(\.previousID)
                 let vectors = movedIDs.isEmpty
                     ? [:]
@@ -624,7 +756,12 @@ public actor TableSyncService {
                         updates.append(.replacingMetadata(
                             id: document.id, metadata: metadata, previous: stored[previousID] ?? nil
                         ))
-                    } else if let vector = vectors[previousID], !vector.isEmpty {
+                    } else if let vector = vectors[previousID], !vector.isEmpty,
+                              storedRecords[previousID]?.document == document.text {
+                        // Вектор переезжает, только если под прежним id лежит
+                        // **этот** текст. Под id, который прежде делили строки
+                        // разных файлов, лежит текст того, кто записался
+                        // последним, — и его вектор чужой.
                         moved.append(EmbeddedRecord(
                             id: document.id, document: document.text, embedding: vector, metadata: metadata
                         ))
@@ -645,8 +782,6 @@ public actor TableSyncService {
                     try Task.checkCancellation()
                     try await write(batch, context: context, chroma: chroma, embeddings: embeddings)
                 }
-                written += sheetPlan.metadataOnly.count
-                progress(written, total)
             }
 
             // Only now the previous document of a row whose identity changed —
@@ -670,7 +805,11 @@ public actor TableSyncService {
             manifest.sheets[sheetName] = sheetManifest
 
             report.sheetsIndexed.append(sheetName)
-            manifest.noteSheetWritten(sheetName)
+            // Выборка — не весь лист: лист, ждущий записи, ждёт
+            // и дальше, а список исчезнувших строк выборка не трогает —
+            // в её плане их нет вовсе, и пустой список значил бы «вернулись».
+            let sample = context.rowLimit != nil
+            if !sample { manifest.noteSheetWritten(sheetName) }
             report.rowsAdded += sheetPlan.added.count
             report.rowsReembedded += sheetPlan.reembedded.count
             report.rowsMetadataOnly += sheetPlan.metadataOnly.count
@@ -680,7 +819,9 @@ public actor TableSyncService {
             // отчёт живёт до конца прогона, а решать человек будет потом.
             // Вернулись строки на место — список чистится сам, как у файлов
             //: пустой `disappeared` и есть «решать больше нечего».
-            if sheetPlan.disappeared.isEmpty {
+            if sample {
+                // Решение о строках — по полному чтению листа, не по выборке.
+            } else if sheetPlan.disappeared.isEmpty {
                 manifest.pendingRemovals[sheetName] = nil
             } else {
                 manifest.pendingRemovals[sheetName] = SheetRowRemoval(
@@ -733,7 +874,14 @@ public actor TableSyncService {
         }
 
         manifest.collectionName = context.collectionName
-        manifest.profilesSignature = TableSyncService.profilesSignature(context.profiles)
+        // Подписи — знак «файл записан по этим правилам». После выборки это
+        // неправда: следующий полный прогон обязан открыть файл.
+        if context.rowLimit == nil {
+            manifest.profilesSignature = TableSyncService.profilesSignature(
+                context.profiles, unmatchedSheetsAsText: context.unmatchedSheetsAsText
+            )
+            manifest.metadataSignature = context.metadataSignature
+        }
         return report
     }
 
@@ -764,6 +912,7 @@ public actor TableSyncService {
             )
         }
         try await chroma.upsert(collectionID: context.collectionID, records: records)
+        context.onBatchWritten?(records.count)
     }
 
     /// The fields every document of a source carries, whatever produced it.
@@ -787,8 +936,48 @@ extension TableSyncService {
             sheet: entry.sheet, rows: entry.rows, index: index,
             profiles: context.profiles, assigned: context.assignedProfile
         )
-        guard let mapping = match.mapping else { return nil }
+        guard var mapping = match.mapping else {
+            // Ни один профиль не подошёл — лист записывается текстом, если
+            // источник так велит. Разметка — документная: шапка
+            // из этого файла, без ролей колонок и без ключа.
+            guard TableSyncService.textFallback(
+                sheet: entry.sheet, shape: shape, match: match, allowed: context.unmatchedSheetsAsText
+            ) != nil else { return nil }
+            let fallback = TableMapping(
+                sheetName: entry.sheet.name, mode: .document, headerRow: shape.headerRow, columns: shape.columns
+            )
+            return (fallback, SheetLayout(shape: shape))
+        }
+        mapping.sheetName = entry.sheet.name
         return (mapping, SheetLayout(shape: shape))
+    }
+
+    /// Почему лист, не размеченный ни одним профилем, записывается текстом,
+    /// или `nil` — не записывается.
+    ///
+    /// **Что было.** По лист с другим набором колонок не читается
+    /// «как получится» и уходит в «требуют решения». Правило про **записи**:
+    /// полусопоставленный лист дал бы строки, у которых молча нет колонки,
+    /// по которой фильтруют. Но и сам лист при этом в базу не попадал вовсе:
+    /// один общий профиль «Налоговая» на папку с ФЭО отправил в диагностику
+    /// 2413 листов, и их цифры не находились ни по одному вопросу.
+    ///
+    /// **Как теперь.** Такой лист записывается режимом «Документ» — текстом
+    /// с шапкой в каждом куске. Колонок-фильтров он не обещает, поэтому
+    /// не нарушается, а текст ищется. Скрытый лист и лист, который
+    /// автоопределение велит пропустить, не записываются, как и раньше.
+    static func textFallback(
+        sheet: SheetInfo, shape: SheetShape, match: TableProfileMatch, allowed: Bool
+    ) -> String? {
+        guard allowed, !sheet.isHidden, shape.mode != .skip else { return nil }
+        switch match {
+        case .matched:
+            return nil
+        case .ambiguous(let candidates):
+            return String(localized: "листу подходит несколько профилей: \(candidates.map(\.name).joined(separator: ", "))")
+        case .needsDecision(let reason, _, _, _):
+            return reason
+        }
     }
 
     /// Каким профилем читается лист и по какой шапке.
@@ -901,6 +1090,12 @@ extension TableSyncService {
         return (auto, automatic)
     }
 
+    /// Лист-документ, кусок которого не отправить модели и после дорезки
+    ///: пустой.
+    struct UnsendableSheet: Error {
+        let reason: String
+    }
+
     /// Writes a «документ»-mode sheet: rendered, chunked, header repeated.
     ///
     /// Chunks are identified by sheet and position, so re-running rewrites the
@@ -914,28 +1109,55 @@ extension TableSyncService {
         context: Context,
         chroma: any SyncDatabase,
         embeddings: EmbeddingProvider,
-        coverage: SheetCoverage? = nil
-    ) async throws -> (added: Int, reembedded: Int, unchanged: Int) {
+        coverage: SheetCoverage? = nil,
+        /// Место листа в книге.
+        sheetIndex: Int? = nil
+    ) async throws -> (added: Int, reembedded: Int, unchanged: Int, split: Int) {
         // This file's header row: the one repeated in every chunk must be the
         // one this file actually has.
-        let rendered = SheetRenderer.render(rows: entry.rows, headerRow: layout.headerRow)
+        let rendered = SheetRenderer.render(rows: entry.rows, headerRow: layout.headerRow, merges: entry.sheet.merges)
         guard !rendered.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         }
 
         let raw = try await context.chunker?(rendered.text)
             ?? [TextChunk(index: 0, text: rendered.text)]
-        let chunks = SheetRenderer.repeatingHeader(rendered.header, in: raw)
+        var chunks = SheetRenderer.repeatingHeader(rendered.header, in: raw)
+        // Шапка, дописанная после нарезки, — в размер куска: кусок,
+        // который вылез за него, делится по строкам, и шапка — в каждой части.
+        if let limit = context.chunkLimit {
+            chunks = TableChunks.fitted(chunks, in: rendered.text, limit: limit)
+        }
+        // Кусок длиннее контекста модели ушёл бы в неё и молча обрезался
+        //: кусок вырастает после нарезки — шапкой и строкой,
+        // которую нарезка не делит, — а без нарезчика лист и вовсе один
+        // кусок. Он дорезается, как кусок файла: лист-документ — это
+        // текст, нарезанный стратегией источника, и пропускать его целиком
+        // из-за одного куска — ровно то, от чего ушёл у файлов
+        // (ревью…).
+        let fitted = OversizeChunks.fitted(chunks, contextLength: context.contextLength)
+        chunks = fitted.chunks
+        // Пустой кусок дорезкой не лечится — как и у файлов.
+        if let blocked = chunks.first(where: {
+            ContextBudget.check($0.text, contextLength: context.contextLength).blocksSending
+        }) {
+            let verdict = ContextBudget.check(blocked.text, contextLength: context.contextLength)
+            throw UnsendableSheet(reason: String(localized: "кусок \(blocked.index + 1) листа не отправляется модели: \(verdict.message ?? "")"))
+        }
 
         var sheetManifest = manifest.sheets[entry.sheet.name] ?? SheetManifest(sheetName: entry.sheet.name)
         var added = 0, reembedded = 0, unchanged = 0
         var pending: [(TableRowDocument, String?)] = []
         var metadataOnly: [TableRowDocument] = []
+        /// Тот же текст под другим id — записанное по прежней схеме
+        /// идентификаторов: переезжает со своим вектором.
+        var relocated: [(document: TableRowDocument, previousID: String)] = []
         var records: [String: TableRowRecord] = [:]
 
         for chunk in chunks {
             let id = RowMapper.identifier(
                 sourceID: context.sourceID,
+                sourceFile: context.relativePath,
                 sheetName: entry.sheet.name,
                 key: "chunk-\(chunk.index)",
                 rowContent: ""
@@ -947,6 +1169,14 @@ extension TableSyncService {
                 "chunk_index": .int(chunk.index),
                 "chunk_estimated_tokens": .int(chunk.estimatedTokens),
             ]
+            if let sheetIndex { metadata["sheet_index"] = .int(sheetIndex) }
+            // Форма (бланк) — строками текста, а не сеткой: агенту
+            // видно, что колонок у этого текста нет и складывать по ним
+            // нечего.
+            if let layout = SheetRenderer.layoutValue(rendered.layout) { metadata[SheetRenderer.layoutKey] = .string(layout) }
+            if chunk.repeatedHeaderLength > 0 {
+                metadata[TableChunkHeaders.lengthKey] = .int(chunk.repeatedHeaderLength)
+            }
             if let note = chunk.note { metadata["extraction_warnings"] = .string(note) }
             // Книга в базе не целиком — это верно и для листа,
             // разобранного документом, а не строками.
@@ -954,6 +1184,8 @@ extension TableSyncService {
                 metadata["sheets_indexed"] = .int(coverage.indexed)
                 metadata["sheets_total"] = .int(coverage.total)
             }
+            // Поля файла — до хеша, как и у строк.
+            metadata = context.documentMetadata.merging(metadata) { _, own in own }
 
             let document = TableRowDocument(id: id, text: chunk.text, metadata: metadata, rowKey: nil)
             let identity = TableRowRecord.identity(rowKey: "chunk-\(chunk.index)", rowNumber: chunk.index)
@@ -964,6 +1196,11 @@ extension TableSyncService {
             )
             records[identity] = record
 
+            if let previous = sheetManifest.rows[identity], previous.textHash == record.textHash,
+               previous.documentID != id {
+                relocated.append((document, previous.documentID))
+                continue
+            }
             if let previous = sheetManifest.rows[identity], previous.textHash == record.textHash {
                 unchanged += 1
                 // Текст тот же, а метаданные — нет: книга стала полной или
@@ -996,6 +1233,35 @@ extension TableSyncService {
             )
         }
 
+        if !relocated.isEmpty {
+            // Вектор переезжает, только если под прежним id лежит **этот**
+            // текст: прежний id мог делить кусок другого файла, и тогда
+            // вектор под ним чужой — такой кусок считается заново.
+            let previousIDs = relocated.map(\.previousID)
+            let stored = Dictionary(
+                try await chroma.documents(collectionID: context.collectionID, ids: previousIDs)
+                    .map { ($0.id, $0.document) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let vectors = try await chroma.embeddings(collectionID: context.collectionID, ids: previousIDs)
+            var moved: [EmbeddedRecord] = []
+            for (document, previousID) in relocated {
+                if let vector = vectors[previousID], !vector.isEmpty, stored[previousID] == document.text {
+                    moved.append(EmbeddedRecord(
+                        id: document.id, document: document.text, embedding: vector,
+                        metadata: enriched(document.metadata, context: context)
+                    ))
+                    unchanged += 1
+                } else {
+                    pending.append((document, previousID))
+                    reembedded += 1
+                }
+            }
+            if !moved.isEmpty {
+                try await chroma.upsert(collectionID: context.collectionID, records: moved)
+            }
+        }
+
         for batch in stride(from: 0, to: pending.count, by: context.batchSize).map({
             Array(pending[$0..<min($0 + context.batchSize, pending.count)])
         }) {
@@ -1004,8 +1270,12 @@ extension TableSyncService {
         }
 
         // A sheet that got shorter leaves chunks nothing refers to; they go by
-        // explicit id, after the new ones are written.
-        let stale = sheetManifest.rows.filter { records[$0.key] == nil }.map(\.value.documentID)
+        // explicit id, after the new ones are written. Прежние id
+        // переехавших кусков — туда же: под ними остались копии.
+        let alive = Set(records.values.map(\.documentID))
+        let stale = (sheetManifest.rows.filter { records[$0.key] == nil }.map(\.value.documentID)
+            + relocated.map(\.previousID))
+            .filter { !alive.contains($0) }
         if !stale.isEmpty {
             try await chroma.deleteDocuments(collectionID: context.collectionID, ids: stale)
         }
@@ -1014,6 +1284,6 @@ extension TableSyncService {
         sheetManifest.mappingSignature = mapping.signature
         sheetManifest.headerRow = layout.headerRow
         manifest.sheets[entry.sheet.name] = sheetManifest
-        return (added, reembedded, unchanged)
+        return (added, reembedded, unchanged, fitted.split)
     }
 }

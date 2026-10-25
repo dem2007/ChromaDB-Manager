@@ -18,28 +18,19 @@ struct SourcesScreen: View {
     @ObservedObject var autoSync: AutoSyncCoordinator
     /// Разрез экрана: «Источники», «Диагностика», «Стенд».
     var tab: Int = 0
-    /// Перейти на другую вкладку этого же экрана. Нужен карточке
-    /// находок: диагностика — соседняя вкладка, и открывать поверх неё лист
-    /// с тем же содержимым значило показывать одно и то же двумя способами.
+    /// Перейти на другую вкладку этого же экрана. Им пользуется итог
+    /// синхронизации: «Все в «Диагностике»».
     var openTab: (Int) -> Void = { _ in }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                switch tab {
-                case 1:
-                    DiagnosticsSection(model: model)
-                case 2:
-                    TestBenchSection(embeddings: embeddings)
-                default:
-                    SourcesSection(
-                        model: model, embeddings: embeddings,
-                        autoSync: autoSync, openDiagnostics: { openTab(1) }
-                    )
-                }
-            }
-            .padding(.top, 8)
-            .pageContentPadding()
+        switch tab {
+        case 1:
+            DiagnosticsSection(model: model)
+        case 2:
+            TestBenchSection(embeddings: embeddings)
+        default:
+            // Тип Б: список и инспектор — без общей прокрутки.
+            SourcesSection(model: model, embeddings: embeddings, autoSync: autoSync, openDiagnostics: { openTab(1) })
         }
     }
 }

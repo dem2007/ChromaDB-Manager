@@ -24,7 +24,7 @@ public final class TableManifestStore: @unchecked Sendable {
     public func load(sourceID: UUID) -> [String: TableFileManifest] {
         queue.sync {
             let url = fileURL(for: sourceID)
-            guard let data = GuardedJSONFile<[String: TableFileManifest]>.readDataWithRetry(at: url) else {
+            guard let data = JSONFileVersions.readDataWithRetry(at: url) else {
                 if FileManager.default.fileExists(atPath: url.path) {
                     log(.error, "Таблицы", "Манифест таблиц есть, но не читается — строки будут проиндексированы заново.")
                 }
@@ -52,7 +52,7 @@ public final class TableManifestStore: @unchecked Sendable {
                 let data = try encoder.encode(manifests)
 
                 let destination = fileURL(for: sourceID)
-                GuardedJSONFile<[String: TableFileManifest]>.keepPreviousVersion(of: destination, unless: data)
+                JSONFileVersions.keepPreviousVersion(of: destination, unless: data)
                 let temporary = directory.appendingPathComponent(".\(sourceID.uuidString)-tables.tmp")
                 FileManager.default.createFile(atPath: temporary.path, contents: nil)
                 let handle = try FileHandle(forWritingTo: temporary)
@@ -66,8 +66,9 @@ public final class TableManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Манифест таблиц и его прежняя версия.
     public func remove(sourceID: UUID) {
-        queue.sync { try? FileManager.default.removeItem(at: fileURL(for: sourceID)) }
+        queue.sync { JSONFileVersions.remove(fileURL(for: sourceID)) }
     }
 }
 

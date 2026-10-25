@@ -103,6 +103,74 @@ final class PDFFragmentFinderTests: XCTestCase {
         XCTAssertNil(PDFFragmentFinder.selection(for: location, in: pdf))
     }
 
+    /// Ячейка таблицы на соседней странице не опережает предложение куска,
+    /// найденное на другой соседней: ячейки там — после текста.
+    func testATableCellOnANeighbourDoesNotBeatTheTextOnAnotherOne() throws {
+        let pdf = try document(pages: [
+            "Спецификация: Контроллер Альфа Плюс 7848R поставляется в составе сервера.",
+            "Раз.",
+            "Сервисная поддержка оборудования комплекса длится три года с даты подписания акта.",
+        ])
+        let chunk = """
+        Сервисная поддержка оборудования комплекса длится три года с даты подписания акта.
+        | № | Наименование |
+        | --- | --- |
+        | 1 | Контроллер Альфа Плюс 7848R |
+        """
+        let location = try XCTUnwrap(PDFFragmentFinder.locate(chunk: chunk, in: pdf, startingAt: 2))
+        XCTAssertEqual(location.pageIndex, 2)
+        XCTAssertNotEqual(location.strategy, .tableCells)
+    }
+
+    /// Названная страница — раньше соседних: кусок находится там, где он
+    /// начинается, а не его хвост на следующей. И находится целиком —
+    /// таблица на названной странице, текст на следующей.
+    func testTheTableOnTheHintedPageBeatsTheTailOnTheNextOne() throws {
+        let pdf = try document(pages: [
+            "12. Контроллер тип 5 Контроллер Альфа 7718R 13. Контроллер тип 6 Контроллер Альфа 7414R",
+            "Требования к условиям замены Товара приведены в разделе девятом настоящего договора.",
+        ])
+        let chunk = """
+        | № | Наименование | Значение |
+        | --- | --- | --- |
+        | 12. | Контроллер тип 5 | Контроллер Альфа 7718R |
+        | 13. | Контроллер тип 6 | Контроллер Альфа 7414R |
+        Требования к условиям замены Товара приведены в разделе девятом настоящего договора.
+        """
+        let location = try XCTUnwrap(PDFFragmentFinder.locate(chunk: chunk, in: pdf, startingAt: 1))
+        XCTAssertEqual(location.pageIndex, 0)
+        XCTAssertEqual(location.strategy, .allParts)
+        XCTAssertEqual(location.end?.pageIndex, 1, "подсветка переходит на следующую страницу")
+        XCTAssertFalse(location.pageDiffersFromMetadata)
+        let selection = try XCTUnwrap(PDFFragmentFinder.selection(for: location, in: pdf))
+        XCTAssertEqual(selection.pages.count, 2)
+    }
+
+    /// Окно из трёх страниц не возвращает (ревью…): хвост
+    /// куска на следующей странице, найденный самым длинным предложением,
+    /// не опережает таблицу на названной. PDFKit читает таблицу колонками,
+    /// частей по порядку набирается меньше половины, и таблицу находят её
+    /// ячейки — на названной странице, как и до окна.
+    func testTheTailSentenceOnTheNextPageDoesNotBeatTheHintedTable() throws {
+        let columns: [[String]] = [
+            (1...5).map { "Контроллер тип \($0) первой поставки" },
+            (1...5).map { "Альфа Плюс 77\($0)8R с частотой 3,\($0) ГГц" },
+            (1...5).map { "Гарантия поставщика \($0)6 месяцев с даты" },
+            (1...5).map { "Склад заказчика в городе номер \($0)" },
+        ]
+        let page = columns.map { $0.joined(separator: " ") }.joined(separator: "\n")
+        let tail = "Поставка партиями. Требования к замене Товара приведены в разделе девятом."
+        let pdf = try document(pages: [page, tail])
+        var chunk = "| № | Наименование | Значение | Гарантия | Склад |\n| --- | --- | --- | --- | --- |\n"
+        for row in 0..<5 {
+            chunk += "| \(row + 1). | " + columns.map { $0[row] }.joined(separator: " | ") + " |\n"
+        }
+        chunk += tail
+        let location = try XCTUnwrap(PDFFragmentFinder.locate(chunk: chunk, in: pdf, startingAt: 1))
+        XCTAssertEqual(location.pageIndex, 0, "таблица на названной странице, а не хвост на следующей")
+        XCTAssertEqual(location.strategy, .tableCells)
+    }
+
     /// Номер за пределами документа не должен ронять просмотр — страница
     /// прижимается к последней.
     func testAPageNumberBeyondTheDocumentIsClamped() throws {

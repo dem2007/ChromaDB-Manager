@@ -429,7 +429,7 @@ final class MCPFileSectionTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = outcome else {
+        guard let error = outcome.inputRefusal else {
             return XCTFail("незнакомое «as» принято молча")
         }
         XCTAssertTrue(error.message.contains("«text»"), error.message)
@@ -1439,3 +1439,54 @@ final class MCPFileSectionTests: XCTestCase {
     }
 }
 
+
+extension MCPFileSectionTests {
+    /// Агенту по сети путь на этом Маке не называется: значение ставит
+    /// прокси, знающий, кто на том конце.
+    func testARemoteCallerDoesNotLearnLocalPaths() async throws {
+        struct Located: MCPToolBackend {
+            var inner: Backend
+            func collections(allowed: [String]) async throws -> [MCPCollectionSummary] {
+                try await inner.collections(allowed: allowed)
+            }
+            func describe(collection: String) async throws -> MCPCollectionDescription {
+                try await inner.describe(collection: collection)
+            }
+            func search(_ request: MCPSearchRequest) async throws -> MCPSearchAnswer {
+                try await inner.search(request)
+            }
+            func documents(_ request: MCPDocumentsRequest) async throws -> MCPDocumentsAnswer {
+                try await inner.documents(request)
+            }
+            func add(_ request: MCPAddRequest) async throws -> MCPAddAnswer {
+                try await inner.add(request)
+            }
+            func delete(_ request: MCPDeleteRequest) async throws -> MCPDeleteAnswer {
+                try await inner.delete(request)
+            }
+            func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk? {
+                MCPFileOnDisk(path: "/Users/someone/Документы/тз.md", bytes: 1234)
+            }
+        }
+        let backend = Located(inner: Backend(chunks: (0..<4).map { chunk($0, heading: "Раздел") }))
+        let client = ExternalClient(
+            name: "агент", keyHash: ClientKey.hash(key), keyPrefix: String(key.prefix(4)),
+            permissions: ClientPermissions(collections: ["заметки"], requestsPerMinute: 600, burst: 600)
+        )
+        let access = AccessController()
+        await access.setClients([client])
+        let service = MCPToolService(backend: backend, access: access)
+        let arguments = JSONValue.object([
+            "collection": .string("заметки"), "file": .string("папка/тз.md"), "as": .string("text"),
+        ])
+        let key = self.key
+        let remote = try await MCPCallContext.$revealsLocalPaths.withValue(false) {
+            try await service.call(name: "get_file", arguments: arguments, key: key).get()
+        }
+        XCTAssertNil(remote["structuredContent"]?["sourcePath"])
+        XCTAssertFalse(remote.jsonString?.contains("/Users/someone") ?? true)
+
+        let local = try await service.call(name: "get_file", arguments: arguments, key: key).get()
+        XCTAssertEqual(local["structuredContent"]?["sourcePath"]?.stringValue, "/Users/someone/Документы/тз.md")
+    }
+}

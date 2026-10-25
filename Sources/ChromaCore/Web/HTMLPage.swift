@@ -296,8 +296,8 @@ public enum HTMLParser {
             // пробелом: колонки от слов становились неотличимы, и шапку
             // таблицы нельзя было ни узнать, ни повторить в куске.
             if name == "table" {
-                let rows = tableRows(of: element)
-                if rows.count > 1 {
+                let table = spannedTable(of: element)
+                if Set(table.cells.map(\.row)).count > 1 {
                     builder.breakLine("\n\n")
                     builder.sawTable = true
                     // Ссылки из ячеек — **до** выхода: дальше по дереву обход
@@ -305,7 +305,7 @@ public enum HTMLParser {
                     // в таблице. Без этого обход сайта переставал их видеть,
                     // и страницы товаров молча не индексировались.
                     for href in links(in: element) { builder.link(href) }
-                    builder.append(TableText.render(rows))
+                    builder.append(table.rendered())
                     builder.breakLine("\n\n")
                     return
                 }
@@ -355,29 +355,88 @@ public enum HTMLParser {
         return result
     }
 
-    /// Строки таблицы: по ячейке на клетку, вложенные таблицы разворачиваются
-    /// в текст своей клетки.
-    private static func tableRows(of table: XMLElement) -> [[String]] {
-        var rows: [[String]] = []
-        func walk(_ element: XMLElement) {
+    /// Таблица с объединениями: по ячейке на клетку, вложенные таблицы
+    /// разворачиваются в текст своей клетки.
+    ///
+    /// Ячейки раскладываются по занятым клеткам, как это делает браузер
+    ///. Раньше `rowspan` и `colspan` не читались вовсе, и в строке
+    /// под объединённой ячейкой все значения съезжали влево: в документе
+    /// о приёмке под «Количество» стояла единица измерения, а под
+    /// «Стоимость с налогом» — сумма налога.
+    static func spannedTable(of table: XMLElement) -> SpannedTable {
+        var cells: [SpannedTable.Cell] = []
+        var occupied: [Int: Set<Int>] = [:]
+        var row = 0
+        /// Строки шапки: из `<thead>` или целиком из `<th>`, подряд сверху.
+        var header = 0
+        var headerOpen = true
+
+        func span(_ cell: XMLElement, _ attribute: String) -> Int {
+            let raw = cell.attribute(forName: attribute)?.stringValue ?? "1"
+            // Браузер ограничивает размах так же: огромный `rowspan` из
+            // битой разметки не должен растянуть таблицу на тысячи строк.
+            return min(max(1, Int(raw.trimmingCharacters(in: .whitespaces)) ?? 1), 1000)
+        }
+
+        // Строк в таблице — столько, сколько `<tr>` с ячейками. `rowspan`
+        // дальше последней строки браузер обрезает; без этого битая или
+        // враждебная страница с `rowspan="1000" colspan="1000"` давала
+        // миллион занятых клеток на одну ячейку.
+        func isRow(_ node: XMLElement) -> Bool {
+            (node.children ?? []).contains { child in
+                ["td", "th"].contains(((child as? XMLElement)?.name ?? "").lowercased())
+            }
+        }
+        func countRows(_ element: XMLElement) -> Int {
+            (element.children ?? []).reduce(0) { total, child in
+                guard let node = child as? XMLElement else { return total }
+                let name = (node.name ?? "").lowercased()
+                if name == "tr" { return total + (isRow(node) ? 1 : 0) }
+                return name == "table" ? total : total + countRows(node)
+            }
+        }
+        let height = countRows(table)
+
+        func addRow(_ tr: XMLElement, inHead: Bool) {
+            var column = 0
+            var allHeadings = true
+            var sawCell = false
+            for child in tr.children ?? [] {
+                guard let cell = child as? XMLElement else { continue }
+                let kind = (cell.name ?? "").lowercased()
+                guard kind == "td" || kind == "th" else { continue }
+                sawCell = true
+                if kind == "td" { allHeadings = false }
+                while occupied[row]?.contains(column) == true { column += 1 }
+                let rows = min(span(cell, "rowspan"), max(1, height - row))
+                let columns = span(cell, "colspan")
+                cells.append(SpannedTable.Cell(
+                    text: plainText(of: cell), row: row, column: column,
+                    rowSpan: rows, columnSpan: columns
+                ))
+                for r in row..<(row + rows) {
+                    for c in column..<(column + columns) { occupied[r, default: []].insert(c) }
+                }
+                column += columns
+            }
+            guard sawCell else { return }
+            if headerOpen, inHead || allHeadings { header = row + 1 } else { headerOpen = false }
+            row += 1
+        }
+
+        func walk(_ element: XMLElement, inHead: Bool) {
             for child in element.children ?? [] {
                 guard let node = child as? XMLElement else { continue }
                 let name = (node.name ?? "").lowercased()
                 if name == "tr" {
-                    let cells = (node.children ?? []).compactMap { cell -> String? in
-                        guard let cell = cell as? XMLElement,
-                              ["td", "th"].contains((cell.name ?? "").lowercased())
-                        else { return nil }
-                        return plainText(of: cell)
-                    }
-                    if !cells.isEmpty { rows.append(cells) }
-                } else {
-                    walk(node)
+                    addRow(node, inHead: inHead)
+                } else if name != "table" {
+                    walk(node, inHead: inHead || name == "thead")
                 }
             }
         }
-        walk(table)
-        return rows
+        walk(table, inHead: false)
+        return SpannedTable(cells: cells, headerRows: header > 0 ? header : nil)
     }
 
     private static let blockElements: Set<String> = [
@@ -419,7 +478,8 @@ public enum HTMLParser {
     ///
     /// Порядок источников кодировки — как у браузера: заголовок ответа,
     /// затем объявление в самой странице, затем UTF-8. Если UTF-8 не сошёлся —
-    /// windows-1251: русские сайты в ней ещё живут, и молча испорченный текст
+    /// windows-1251, KOI8-R или CP866, что похоже на русский текст: русские
+    /// сайты в них ещё живут, и молча испорченный текст
     /// хуже, чем текст, прочитанный по догадке, о которой сказано в логе.
     static func decode(_ data: Data, contentType: String?) -> String {
         if let name = charset(inContentType: contentType),
@@ -434,7 +494,12 @@ public enum HTMLParser {
             return text
         }
         if let utf8 = String(data: data, encoding: .utf8) { return utf8 }
-        if let cp1251 = String(data: data, encoding: .windowsCP1251) { return cp1251 }
+        // Без объявления — та же догадка, что у текстовых файлов: KOI8-R,
+        // прочитанный как windows-1251, тоже «читается».
+        if let guess = DelimitedTableReader.singleByteCyrillic(data),
+           let text = String(data: data, encoding: guess.encoding) {
+            return text
+        }
         return String(decoding: data, as: UTF8.self)
     }
 

@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import ChromaCore
 
 /// the local model is the scarcest resource in the app, so the same text is
@@ -141,25 +142,63 @@ final class EmbeddingCacheTests: XCTestCase {
 
     // MARK: - Size
 
-    func testEvictionRemovesWhatWasUsedLongestAgo() async {
-        // Room for a handful of 8-component vectors (32 bytes each).
-        let cache = await makeCache(limitBytes: 400)
+    /// Предел — про место в файле: векторы по 4 КБ, как у модели
+    /// на 1024 измерения, ложатся цепочками страниц, и сумма векторов
+    /// меньше файла. После вытеснения и сам файл на диске не больше предела.
+    func testEvictionRemovesWhatWasUsedLongestAgo() async throws {
+        let cache = await makeCache()
         for index in 0..<5 {
-            await cache.store(model: "m", text: "текст-\(index)", vector: vector(Double(index + 1)))
+            await cache.store(model: "m", text: "текст-\(index)", vector: vector(Double(index + 1), dimension: 1024))
         }
         // Used now, so it must survive the sweep even though it is the oldest.
         _ = await cache.vector(model: "m", text: "текст-0")
 
-        for index in 5..<20 {
-            await cache.store(model: "m", text: "текст-\(index)", vector: vector(Double(index + 1)))
+        for index in 5..<300 {
+            await cache.store(model: "m", text: "текст-\(index)", vector: vector(Double(index + 1), dimension: 1024))
         }
-        await cache.setLimit(bytes: 200)
+        let full = await cache.statistics()
+        XCTAssertGreaterThan(full.fileBytes, full.bytes, "файл больше суммы векторов — потому предел и считается по файлу")
+
+        let limit: Int64 = 600_000
+        await cache.setLimit(bytes: limit)
 
         let statistics = await cache.statistics()
-        XCTAssertLessThanOrEqual(statistics.bytes, 200)
+        XCTAssertLessThanOrEqual(statistics.fileBytes, limit)
         XCTAssertGreaterThan(statistics.entries, 0, "кэш не должен опустошаться целиком")
-        let recentlyUsed = await cache.vector(model: "m", text: "текст-19")
+        let onDisk = try FileManager.default.attributesOfItem(
+            atPath: directory.appendingPathComponent("cache.sqlite3").path
+        )[.size] as? NSNumber
+        XCTAssertLessThanOrEqual(onDisk?.int64Value ?? .max, limit, "освобождённое место обязано вернуться диску")
+        let recentlyUsed = await cache.vector(model: "m", text: "текст-299")
         XCTAssertNotNil(recentlyUsed, "последняя запись должна пережить вытеснение")
+        let oldest = await cache.vector(model: "m", text: "текст-1")
+        XCTAssertNil(oldest, "давно не нужная запись вытесняется первой")
+    }
+
+    /// Файл, созданный прежней сборкой без возврата места, перестраивается
+    /// при открытии — один раз.
+    func testAnOldFileLearnsToGiveSpaceBack() async throws {
+        let url = directory.appendingPathComponent("cache.sqlite3")
+        let first = EmbeddingCache(fileURL: url)
+        await first.open()
+        await first.store(model: "m", text: "текст", vector: vector(1, dimension: 1024))
+        // Как у прежней сборки: режим выключен.
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        sqlite3_exec(handle, "PRAGMA auto_vacuum = NONE; VACUUM;", nil, nil, nil)
+        sqlite3_close(handle)
+
+        let reopened = EmbeddingCache(fileURL: url)
+        await reopened.open()
+        let kept = await reopened.vector(model: "m", text: "текст")
+        XCTAssertNotNil(kept, "перестройка не теряет записей")
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        var statement: OpaquePointer?
+        sqlite3_prepare_v2(handle, "PRAGMA auto_vacuum", -1, &statement, nil)
+        sqlite3_step(statement)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
+        sqlite3_finalize(statement)
+        sqlite3_close(handle)
     }
 
     func testClearingEmptiesIt() async {

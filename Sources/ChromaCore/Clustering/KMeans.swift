@@ -66,33 +66,62 @@ public struct VectorSet: Sendable {
     /// направления, а разной длины они быть не могут — это уже находка
     /// инспектора, а не работа для кластеризации.
     public init(vectors: [[Double]], dimension: Int) {
-        self.dimension = dimension
-        var values: [Double] = []
-        values.reserveCapacity(vectors.count * dimension)
-        var kept: [Int] = []
-        kept.reserveCapacity(vectors.count)
-        for (index, vector) in vectors.enumerated() where vector.count == dimension {
+        var builder = Builder(dimension: dimension, expected: vectors.count)
+        for vector in vectors { builder.append(vector) }
+        self = builder.build()
+    }
+
+    /// Набор, собираемый по одному вектору.
+    ///
+    /// Поиск тем держал выборку дважды: массивом массивов, как она пришла
+    /// из базы, и плоским набором, построенным из него, — 160 МБ на десять
+    /// тысяч векторов по 1024 числа. Здесь каждый вектор кладётся в набор
+    /// сразу, нормированным, и пришедший массив можно отпустить.
+    public struct Builder: Sendable {
+        public let dimension: Int
+        private var values: [Double] = []
+        private var kept: [Int] = []
+        private var offered = 0
+        private var unit: [Double]
+
+        public init(dimension: Int, expected: Int = 0) {
+            self.dimension = dimension
+            unit = [Double](repeating: 0, count: max(0, dimension))
+            values.reserveCapacity(expected * dimension)
+            kept.reserveCapacity(expected)
+        }
+
+        /// Сколько векторов предложено, взятых и нет.
+        public var offeredCount: Int { offered }
+
+        /// Взят ли вектор: нулевой и не той длины — нет.
+        @discardableResult
+        public mutating func append(_ vector: [Double]) -> Bool {
+            let index = offered
+            offered += 1
+            guard vector.count == dimension, dimension > 0 else { return false }
             var squares = 0.0
             vDSP_svesqD(vector, 1, &squares, vDSP_Length(dimension))
             let length = squares.squareRoot()
-            guard length > 0, length.isFinite else { continue }
+            guard length > 0, length.isFinite else { return false }
             var scale = 1 / length
-            var unit = [Double](repeating: 0, count: dimension)
             vDSP_vsmulD(vector, 1, &scale, &unit, 1, vDSP_Length(dimension))
-            guard unit.allSatisfy(\.isFinite) else { continue }
+            guard unit.allSatisfy(\.isFinite) else { return false }
             values.append(contentsOf: unit)
             kept.append(index)
+            return true
         }
-        self.values = values
-        self.count = kept.count
-        self.keptIndexes = kept
+
+        public func build() -> VectorSet {
+            VectorSet(values: values, dimension: dimension, count: kept.count, keptIndexes: kept)
+        }
     }
 
-    init(values: [Double], dimension: Int, count: Int) {
+    init(values: [Double], dimension: Int, count: Int, keptIndexes: [Int]? = nil) {
         self.values = values
         self.dimension = dimension
         self.count = count
-        self.keptIndexes = Array(0..<count)
+        self.keptIndexes = keptIndexes ?? Array(0..<count)
     }
 
     public func vector(at index: Int) -> [Double] {

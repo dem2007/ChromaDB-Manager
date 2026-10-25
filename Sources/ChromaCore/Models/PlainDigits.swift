@@ -9,3 +9,19 @@ public extension BinaryInteger {
     /// components as «1 024». Ports, PIDs and dimensions go through this.
     var plainDigits: String { String(describing: self) }
 }
+
+public extension TimeInterval {
+    /// Секунды для сообщения: целые и от десяти — целыми, остальные —
+    /// с десятыми.
+    ///
+    /// `Int(seconds)` отбрасывал дробь, и таймаут в полсекунды назывался
+    /// «не ответила за 0 с» — числом, которое ничего не объясняет, а
+    /// полторы секунды — одной.
+    var secondsText: String {
+        guard self > 0 else { return Int(self).plainDigits }
+        let tenths = (self * 10).rounded() / 10
+        return tenths >= 10 || tenths == tenths.rounded()
+            ? Int(self.rounded()).plainDigits
+            : String(format: "%.1f", tenths)
+    }
+}

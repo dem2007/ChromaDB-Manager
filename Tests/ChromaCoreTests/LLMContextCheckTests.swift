@@ -96,11 +96,28 @@ final class LLMContextCheckTests: XCTestCase {
 
     // MARK: - Время
 
+    /// Предел по времени — у шаблона, где модель **переписывает** текст
+    /// (`{{TEXT}}`): номера границ пишутся за секунды при любом окне.
+    private var rewriting: ChunkingConfiguration {
+        var legacy = configuration
+        legacy.promptTemplate = "Раздели текст на фрагменты, ответь JSON-массивом строк.\n{{TEXT}}"
+        return legacy
+    }
+
+    func testBoundaryNumbersAreNotHeldBackByTheClock() async {
+        let check = await LLMChunker.contextCheck(
+            configuration: configuration, model: "chat-model",
+            chat: ContextOnlyChat(loaded: 128_000, maximum: 128_000, tokensPerSecond: 3)
+        )
+        XCTAssertTrue(check.fits, check.summary)
+        XCTAssertFalse(check.timeIsTheLimit, check.summary)
+    }
+
     /// Тот самый случай: контекста после перезагрузки на 128 000 хватает
     /// с четырёхкратным запасом, а ста двадцати секунд при 72 ток/с — нет.
     func testAWideContextStillLosesToTheClock() async {
         let check = await LLMChunker.contextCheck(
-            configuration: configuration, model: "chat-model",
+            configuration: rewriting, model: "chat-model",
             chat: ContextOnlyChat(loaded: 128_000, maximum: 128_000, tokensPerSecond: 72)
         )
         XCTAssertTrue(check.fits, "работать можно, просто окнами поменьше")
@@ -115,7 +132,7 @@ final class LLMContextCheckTests: XCTestCase {
     /// Быстрая модель ничего не теряет: предел по времени просто не срабатывает.
     func testAFastModelIsNotHeldBackByTheClock() async {
         let check = await LLMChunker.contextCheck(
-            configuration: configuration, model: "chat-model",
+            configuration: rewriting, model: "chat-model",
             chat: ContextOnlyChat(loaded: 131_072, maximum: 131_072, tokensPerSecond: 5_000)
         )
         XCTAssertFalse(check.timeIsTheLimit, check.summary)
@@ -138,7 +155,7 @@ final class LLMContextCheckTests: XCTestCase {
     /// Совсем медленная модель — отказ до прогона, и совет про время.
     func testAModelThatCannotFinishInTimeDoesNotFit() async {
         let check = await LLMChunker.contextCheck(
-            configuration: configuration, model: "chat-model",
+            configuration: rewriting, model: "chat-model",
             chat: ContextOnlyChat(loaded: 131_072, maximum: 131_072, tokensPerSecond: 3)
         )
         XCTAssertFalse(check.fits)

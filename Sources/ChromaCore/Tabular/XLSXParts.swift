@@ -226,12 +226,7 @@ extension XLSXReader {
                 result.dateStyles.insert(index)
                 continue
             }
-            // Своя маска главнее встроенной: id перекрыт именно ради неё.
-            if let mask, let unit = maskUnit(mask) {
-                result.units[index] = unit
-            } else if let unit = builtInUnits[formatID] {
-                result.units[index] = unit
-            }
+            if let unit = numberFormat(mask: mask, formatID: formatID) { result.units[index] = unit }
         }
         return result
     }
@@ -274,6 +269,65 @@ extension XLSXReader {
     /// разбирается как обычно.
     static let builtInUnits: [Int: NumberUnit] = [9: .percent, 10: .percent]
 
+    /// Знаки после запятой у встроенных числовых форматов: 1 — `0`,
+    /// 2 — `0.00`, 3 — `#,##0`, 4 — `#,##0.00`, 9 и 10 — проценты, 37–40 —
+    /// бухгалтерские. 11 и 48 — экспоненциальные, их число знаков к виду
+    /// записи не относится.
+    static let builtInDecimals: [Int: Int] = [1: 0, 2: 2, 3: 0, 4: 2, 9: 0, 10: 2, 37: 0, 38: 0, 39: 2, 40: 2]
+
+    /// Как формат ячейки показывает число: единица и знаки после
+    /// запятой. `nil` — формат ничего не меняет.
+    ///
+    /// Своя маска главнее встроенной: id перекрыт именно ради неё.
+    static func numberFormat(mask: String?, formatID: Int) -> NumberUnit? {
+        let decimals = mask.map(maskDecimals) ?? builtInDecimals[formatID]
+        if var unit = mask.flatMap(maskUnit) ?? builtInUnits[formatID] {
+            unit.decimals = decimals
+            return unit
+        }
+        return decimals.map { NumberUnit(suffix: "", decimals: $0) }
+    }
+
+    /// Сколько знаков после запятой показывает маска: `#,##0.00` — 2,
+    /// `0` — 0, `0.0" кг"` — 1. `nil` — маска числа не показывает («General»,
+    /// текст `@`, дата), пишет его экспонентой или дробью: у `# ?/?`
+    /// десятичных знаков нет, а округлять 0,25 до нуля нельзя — книга
+    /// показывает «1/4» (ревью).
+    static func maskDecimals(_ mask: String) -> Int? {
+        guard !mask.isEmpty, mask != "General", !maskIsDate(mask) else { return nil }
+        let section = mask.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? mask
+        var insideQuotes = false
+        var insideBrackets = false
+        var escaped = false
+        var sawPoint = false
+        var sawDigit = false
+        var decimals = 0
+        for character in section {
+            if escaped { escaped = false; continue }
+            if insideBrackets {
+                if character == "]" { insideBrackets = false }
+                continue
+            }
+            if insideQuotes {
+                if character == "\"" { insideQuotes = false }
+                continue
+            }
+            switch character {
+            case "\\", "*", "_": escaped = true
+            case "\"": insideQuotes = true
+            case "[": insideBrackets = true
+            case "E", "e", "@", "/": return nil
+            case ".": sawPoint = true
+            case "0", "#", "?":
+                sawDigit = true
+                if sawPoint { decimals += 1 }
+            default: break
+            }
+        }
+        return sawDigit ? decimals : nil
+    }
+
     /// Единица измерения из маски формата.
     ///
     /// Берётся первая секция маски: секции за `;` описывают отрицательные
@@ -292,12 +346,21 @@ extension XLSXReader {
         var bracket = ""
         var insideBrackets = false
         var escaped = false
+        /// Символ после `*` и `_` — заполнение и отступ его шириной, а не
+        /// литерал. В бухгалтерском формате `_-* #,##0.00\ "₽"_-` он и
+        /// становился подписью: сумма читалась «- 4182783 ₽-», с минусом
+        /// впереди, как отрицательная.
+        var padding = false
 
         func append(_ text: String) {
             if sawNumber { after += text } else { before += text }
         }
 
         for character in section {
+            if padding {
+                padding = false
+                continue
+            }
             if escaped {
                 escaped = false
                 // Экранированный символ — литерал: `\ ` или `\-`.
@@ -333,7 +396,11 @@ extension XLSXReader {
             case "*", "_":
                 // Заполнение и отступ шириной символа — оформление, не подпись.
                 // Следующий символ относится к ним и в подпись не идёт.
-                escaped = true
+                if insideQuotes { append(String(character)) } else { padding = true }
+            case "@":
+                // Место для текста ячейки, а не литерал: без этого число в
+                // ячейке с форматом «Текстовый» читалось «@ 4820» (ревью).
+                if insideQuotes { append("@") }
             default:
                 if insideQuotes { append(String(character)) }
                 else if !character.isWhitespace, !character.isNumber { append(String(character)) }
@@ -360,11 +427,9 @@ final class SheetParser: NSObject, XMLParserDelegate {
     private let dateStyles: Set<Int>
     /// Индекс стиля → единица измерения.
     private let unitStyles: [Int: NumberUnit]
-    /// Объединения вниз, найденные до разбора строк: в файле они
+    /// Объединения, найденные до разбора строк: в файле они
     /// объявлены **после** данных, и потоковый проход о них иначе не узнал бы.
-    private let verticalMerges: [Int: [XLSXReader.MergedRange]]
-    /// Действующие объединения: колонка → (значение, последняя строка).
-    private var spans: [Int: (value: CellValue, lastRow: Int)] = [:]
+    private var mergeFill: MergeFill
     private let epoch: Date
     private let uses1904: Bool
     private let limit: Int
@@ -376,7 +441,8 @@ final class SheetParser: NSObject, XMLParserDelegate {
     private var formulasWithoutValue = 0
     private var phantomDates = 0
     private var rowsEmitted = 0
-    private var stopped = false
+    /// Разбор остановлен нами — пределом строк или вызывающим.
+    private(set) var stopped = false
 
     private var rowNumber = 0
     private var cells: [Int: CellValue] = [:]
@@ -386,12 +452,17 @@ final class SheetParser: NSObject, XMLParserDelegate {
     private var sawFormula = false
     private var text = ""
     private var capturing = false
+    /// Текст ячейки `inlineStr`: кусков `<r><t>` в `<is>` бывает
+    /// несколько — по куску на оформление, — а фонетика `<rPh>` в текст
+    /// не входит. Так же, как в таблице общих строк.
+    private var inline: String?
+    private var insidePhonetic = false
 
     init(sharedStrings: [String], dateStyles: Set<Int>, unitStyles: [Int: NumberUnit] = [:],
-         verticalMerges: [XLSXReader.MergedRange] = [],
+         merges: [XLSXReader.MergedRange] = [],
          epoch: Date, uses1904: Bool,
          limit: Int, onRow: @escaping (SheetRow) -> Bool) {
-        self.verticalMerges = Dictionary(grouping: verticalMerges, by: \.firstRow)
+        self.mergeFill = MergeFill(merges)
         self.sharedStrings = sharedStrings
         self.dateStyles = dateStyles
         self.unitStyles = unitStyles
@@ -429,6 +500,10 @@ final class SheetParser: NSObject, XMLParserDelegate {
             if let reference = attributes["ref"], let range = XLSXReader.MergedRange(reference: reference) {
                 mergedRanges.append(range)
             }
+        case "is":
+            inline = ""
+        case "rPh":
+            insidePhonetic = true
         case "v", "t":
             text = ""
             capturing = true
@@ -444,6 +519,15 @@ final class SheetParser: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?,
                 qualifiedName: String?) {
         switch localName(name) {
+        case "t" where inline != nil:
+            capturing = false
+            if !insidePhonetic { inline? += text }
+            text = ""
+        case "rPh":
+            insidePhonetic = false
+        case "is":
+            cells[columnIndex] = value(from: inline ?? "")
+            inline = nil
         case "v", "t":
             capturing = false
             cells[columnIndex] = value(from: text)
@@ -461,20 +545,10 @@ final class SheetParser: NSObject, XMLParserDelegate {
                 parser.abortParsing()
                 return
             }
-            // Объединение вниз относится к каждой строке диапазона.
-            // Верхняя ячейка приходит первой, поэтому запомнить её и
-            // подставлять дальше — всё, что нужно.
-            for range in verticalMerges[rowNumber] ?? [] {
-                if let value = cells[range.firstColumn], !value.isEmpty {
-                    spans[range.firstColumn] = (value, range.lastRow)
-                }
-            }
-            if !spans.isEmpty {
-                spans = spans.filter { $0.value.lastRow >= rowNumber }
-                for (column, span) in spans where cells[column] == nil {
-                    cells[column] = span.value
-                }
-            }
+            // Объединение относится к каждой своей клетке — вниз и вбок
+            //. Верхняя ячейка приходит первой, поэтому
+            // запомнить её и подставлять дальше — всё, что нужно.
+            mergeFill.fill(row: rowNumber, cells: &cells)
             if !onRow(SheetRow(number: rowNumber, cells: cells)) {
                 stopped = true
                 parser.abortParsing()

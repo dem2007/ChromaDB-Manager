@@ -28,6 +28,21 @@ final class SearchProfileStoreTests: XCTestCase {
         XCTAssertEqual(profile.poolSize(nResults: 7, stages: []), 7)
     }
 
+    /// Ненастроенная коллекция Qwen3-Embedding ищет с приставкой своей
+    /// модели; у другой модели и без модели приставки нет, а
+    /// сохранённый профиль решает сам.
+    func testTheDefaultCarriesTheQueryPrefixOfTheModel() {
+        let profiles = store()
+        XCTAssertEqual(profiles.defaultProfile(for: "b2", model: "text-embedding-qwen3-embedding-4b").queryPrefix, SearchProfile.qwen3QueryPrefix)
+        XCTAssertEqual(profiles.defaultProfile(for: "b2", model: "text-embedding-qwen3-embedding-0.6b").queryPrefix, SearchProfile.qwen3QueryPrefix)
+        XCTAssertEqual(profiles.defaultProfile(for: "b2", model: "text-embedding-nomic-embed-text-v1.5").queryPrefix, "")
+        XCTAssertEqual(profiles.defaultProfile(for: "b2").queryPrefix, "")
+        XCTAssertEqual(profiles.effectiveProfile(for: "b2", model: "text-embedding-qwen3-embedding-4b").queryPrefix, SearchProfile.qwen3QueryPrefix)
+
+        profiles.save(SearchProfile(name: "без приставки", collectionName: "b2", isDefault: true))
+        XCTAssertEqual(profiles.defaultProfile(for: "b2", model: "text-embedding-qwen3-embedding-4b").queryPrefix, "", "сохранённый профиль не переписывается")
+    }
+
     func testAnUntouchedDefaultIsNotWrittenToDisk() {
         _ = store().defaultProfile(for: "заметки")
         XCTAssertFalse(

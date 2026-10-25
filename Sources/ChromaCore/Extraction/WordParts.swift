@@ -23,18 +23,25 @@ public enum WordParts {
         public var links: [String]
         /// Номера сносок, на которые абзац ссылается.
         public var footnotes: [String]
+        /// Номера замечаний рецензентов, отмеченных в абзаце.
+        public var comments: [String]
         /// Весь текст абзаца набран жирным.
         public var isBold: Bool
         /// Кегль, если он задан прямо в прогонах. `nil` — взят из стиля,
         /// и тогда сравнивать не с чем.
         public var size: Double?
+        /// Строка оглавления (стиль «toc N»): в тексте документа она не
+        /// нужна — те же заголовки стоят на своих местах.
+        public var isTableOfContents: Bool
 
         public init(
             text: String, headingLevel: Int? = nil, marker: String? = nil,
             isHidden: Bool = false, cell: Cell? = nil,
-            links: [String] = [], footnotes: [String] = [],
-            isBold: Bool = false, size: Double? = nil
+            links: [String] = [], footnotes: [String] = [], comments: [String] = [],
+            isBold: Bool = false, size: Double? = nil, isTableOfContents: Bool = false
         ) {
+            self.isTableOfContents = isTableOfContents
+            self.comments = comments
             self.isBold = isBold
             self.size = size
             self.text = text
@@ -73,12 +80,22 @@ public enum WordParts {
         public var column: Int
         /// Продолжение объединённой вниз ячейки: своего значения у неё нет.
         public var isVerticalContinuation: Bool
+        /// Сколько колонок сетки занимает ячейка.
+        public var columnSpan: Int
+        /// Строка помечена в файле как шапка таблицы — повторяемая на каждой
+        /// странице (`w:tblHeader`).
+        public var isHeaderRow: Bool
 
-        public init(table: Int, row: Int, column: Int, isVerticalContinuation: Bool = false) {
+        public init(
+            table: Int, row: Int, column: Int, isVerticalContinuation: Bool = false,
+            columnSpan: Int = 1, isHeaderRow: Bool = false
+        ) {
             self.table = table
             self.row = row
             self.column = column
             self.isVerticalContinuation = isVerticalContinuation
+            self.columnSpan = max(1, columnSpan)
+            self.isHeaderRow = isHeaderRow
         }
     }
 

@@ -116,16 +116,35 @@ public struct MultiCollectionSearch: Sendable {
         /// список, который никто не переранжировал, выданный за
         /// переранжированный, хуже отсутствия стадии.
         public let rerankNote: String?
+        /// То же для агента, по-английски: ответ MCP читает модель,
+        /// а `rerankNote` писался человеку у экрана.
+        public let rerankAgentNote: String?
 
         public init(
             hits: [RetrievalHit], collections: [CollectionReport],
-            embeddingCalls: Int, seconds: Double, rerankNote: String? = nil
+            embeddingCalls: Int, seconds: Double, rerankNote: String? = nil,
+            rerankAgentNote: String? = nil
         ) {
             self.hits = hits
             self.collections = collections
             self.embeddingCalls = embeddingCalls
             self.seconds = seconds
             self.rerankNote = rerankNote
+            self.rerankAgentNote = rerankAgentNote
+        }
+
+        /// Итог одной строкой для агента — по-английски. `line` — для журнала
+        /// и экрана; в ответ MCP он уходил как есть, и модель получала
+        /// русскую строку посреди английского ответа.
+        public var agentLine: String {
+            let answered = collections.filter { $0.failure == nil }
+            let failed = collections.filter { $0.failure != nil }
+            var text = "Searched \(answered.count.plainDigits) collections, found \(hits.count.plainDigits), query vectors computed \(embeddingCalls.plainDigits)"
+            if !failed.isEmpty {
+                text += "; did not answer: \(failed.map(\.name).joined(separator: ", "))"
+            }
+            if let rerankAgentNote { text += "; \(rerankAgentNote)" }
+            return text + "."
         }
 
         public var line: String {
@@ -174,6 +193,8 @@ public struct MultiCollectionSearch: Sendable {
         /// Профиль, чьими настройками спрашивают. `nil` — не спрашивают.
         public let profile: SearchProfile?
         public let note: String?
+        /// То же — для агента, по-английски.
+        public var agentNote: String? = nil
     }
 
     /// Правило одно: **все** выбранные коллекции должны просить одного и того
@@ -191,10 +212,18 @@ public struct MultiCollectionSearch: Sendable {
             let silent = targets
                 .filter { !RerankStage.Settings(profile: $0.profile).enabled }
                 .map(\.collectionName)
-            return RerankPlan(profile: nil, note: String(localized: "переранжирование просят не все коллекции (без него: \(silent.joined(separator: ", "))) — выдача слита рангами"))
+            return RerankPlan(
+                profile: nil,
+                note: String(localized: "переранжирование просят не все коллекции (без него: \(silent.joined(separator: ", "))) — выдача слита рангами"),
+                agentNote: "not every collection asks for reranking (without it: \(silent.joined(separator: ", "))), so the lists were merged by rank"
+            )
         }
         guard Set(asking.map { RerankStage.Settings(profile: $0.profile) }).count == 1 else {
-            return RerankPlan(profile: nil, note: String(localized: "коллекции просят разного переранжирования — выдача слита рангами"))
+            return RerankPlan(
+                profile: nil,
+                note: String(localized: "коллекции просят разного переранжирования — выдача слита рангами"),
+                agentNote: "the collections ask for different reranking, so the lists were merged by rank"
+            )
         }
         return RerankPlan(profile: asking[0].profile, note: nil)
     }
@@ -267,6 +296,7 @@ public struct MultiCollectionSearch: Sendable {
 
         var fused = Self.fuse(lists, k: fusionK, limit: poolLimit)
         var note = plan.note
+        var agentNote = plan.agentNote
 
         if let profile = plan.profile {
             if let rerank, rerank.isReady(for: profile.rerankMode) {
@@ -274,23 +304,26 @@ public struct MultiCollectionSearch: Sendable {
                     let result = try await rerank.run(fused, profile: profile, query: query)
                     fused = result.hits
                     note = result.note
+                    agentNote = "the merged list was reranked by the model"
                 } catch {
                     // Та же осторожность, что у конвейера: модель, которая
                     // отказала, не забирает с собой поиск — список остаётся
                     // слитым рангами, а причина попадает в ответ.
                     note = String(localized: "переранжирование не выполнено: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+                    agentNote = "the merged list was not reranked: " + ((error as? MCPReadableError)?.mcpReason ?? "the model did not answer")
                 }
             } else {
                 note = profile.rerankMode == .crossEncoder
                     ? String(localized: "переранжировать нечем: прямой вызов модели этому поиску не передан")
                     : String(localized: "переранжировать нечем: чат-модель этому поиску не передана")
+                agentNote = "the merged list was not reranked: no model is connected to this search for that"
             }
         }
 
         return Answer(
             hits: Array(fused.prefix(max(1, nResults))), collections: reports,
             embeddingCalls: calls, seconds: Date().timeIntervalSince(started),
-            rerankNote: note
+            rerankNote: note, rerankAgentNote: agentNote
         )
     }
 

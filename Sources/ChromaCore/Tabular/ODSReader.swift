@@ -47,31 +47,73 @@ public struct ODSReader {
         limits: XLSXReader.Limits = XLSXReader.Limits(),
         _ onRow: @escaping (SheetRow) -> Bool
     ) throws -> [XLSXWarning] {
+        try parse(sheet, limit: limits.maxRows, onRow: onRow).warnings
+    }
+
+    public func rows(of sheet: SheetInfo, limits: XLSXReader.Limits = XLSXReader.Limits()) throws -> (rows: [SheetRow], warnings: [XLSXWarning]) {
+        let read = try rowsAndMerges(of: sheet, limits: limits)
+        return (read.rows, read.warnings)
+    }
+
+    /// Строки листа и его объединения — за один разбор `content.xml`
+    ///. У ODS объединения объявлены на верхней левой ячейке —
+    /// `number-rows-spanned` и `number-columns-spanned`; все листы лежат
+    /// в одном файле, и разбирать его ради объединений второй раз на каждый
+    /// лист незачем.
+    public func rowsAndMerges(
+        of sheet: SheetInfo, limits: XLSXReader.Limits = XLSXReader.Limits()
+    ) throws -> (rows: [SheetRow], warnings: [XLSXWarning], merges: [XLSXReader.MergedRange]) {
+        var result: [SheetRow] = []
+        let delegate = try parse(sheet, limit: limits.maxRows) { result.append($0); return true }
+        return (result, delegate.warnings, delegate.merges)
+    }
+
+    private func parse(_ sheet: SheetInfo, limit: Int, onRow: @escaping (SheetRow) -> Bool) throws -> ODSParser {
         let data = try container.read("content.xml")
-        let delegate = ODSParser(tableName: sheet.name, limit: limits.maxRows, onRow: onRow)
+        let delegate = ODSParser(tableName: sheet.name, limit: limit, onRow: onRow)
         let parser = XMLParser(data: data)
         parser.delegate = delegate
         parser.shouldProcessNamespaces = false
         parser.parse()
-        return delegate.warnings
-    }
-
-    public func rows(of sheet: SheetInfo, limits: XLSXReader.Limits = XLSXReader.Limits()) throws -> (rows: [SheetRow], warnings: [XLSXWarning]) {
-        var result: [SheetRow] = []
-        let warnings = try forEachRow(of: sheet, limits: limits) { result.append($0); return true }
-        return (result, warnings)
+        try XLSXReader.checkParsed(parser, stopped: delegate.finished, sheet: sheet.name)
+        return delegate
     }
 
     // MARK: - Table list
 
+    /// Листы книги и скрыт ли каждый.
+    ///
+    /// Скрытость листа ODF пишет не на самом листе, а в его стиле —
+    /// `style:table-properties table:display="false"`. Атрибута
+    /// `table:visibility` у листа ODF не знает (он бывает у строк
+    /// и колонок), и по нему каждый лист читался видимым: служебный лист,
+    /// скрытый в LibreOffice, индексировался вопреки
     static func tableNames(_ data: Data) -> [(name: String, isHidden: Bool)] {
         final class Delegate: NSObject, XMLParserDelegate {
-            var tables: [(name: String, isHidden: Bool)] = []
+            var tables: [(name: String, style: String?, visibility: String)] = []
+            var hiddenStyles: Set<String> = []
+            private var tableStyle: String?
+
             func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?,
                         qualifiedName: String?, attributes: [String: String]) {
-                guard name == "table:table" else { return }
-                let visibility = attributes["table:visibility"] ?? "visible"
-                tables.append((attributes["table:name"] ?? "", visibility != "visible"))
+                switch name {
+                case "style:style":
+                    tableStyle = attributes["style:family"] == "table" ? attributes["style:name"] : nil
+                case "style:table-properties":
+                    if let tableStyle, attributes["table:display"] == "false" { hiddenStyles.insert(tableStyle) }
+                case "table:table":
+                    tables.append((
+                        attributes["table:name"] ?? "", attributes["table:style-name"],
+                        attributes["table:visibility"] ?? "visible"
+                    ))
+                default:
+                    break
+                }
+            }
+
+            func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?,
+                        qualifiedName: String?) {
+                if name == "style:style" { tableStyle = nil }
             }
         }
         let delegate = Delegate()
@@ -79,7 +121,10 @@ public struct ODSReader {
         parser.delegate = delegate
         parser.shouldProcessNamespaces = false
         parser.parse()
-        return delegate.tables
+        return delegate.tables.map { table in
+            let hidden = table.visibility != "visible" || table.style.map(delegate.hiddenStyles.contains) == true
+            return (table.name, hidden)
+        }
     }
 }
 
@@ -97,8 +142,11 @@ final class ODSParser: NSObject, XMLParserDelegate {
 
     private(set) var warnings: [XLSXWarning] = []
     private var insideTable = false
-    private var finished = false
+    /// Разбор остановлен нами: лист кончился, предел строк или вызывающий.
+    private(set) var finished = false
     private var rowsEmitted = 0
+    /// Внутри примечания к ячейке: его абзацы — не значение ячейки.
+    private var annotationDepth = 0
 
     private var rowNumber = 0
     private var cells: [Int: CellValue] = [:]
@@ -108,13 +156,13 @@ final class ODSParser: NSObject, XMLParserDelegate {
     private var cellValue: CellValue = .empty
     private var cellRepeat = 1
     private var rowSpan = 1
-    /// Объединения вниз, ещё действующие: колонка → (значение, последняя
-    /// строка диапазона)..
-    ///
-    /// ODS объявляет их на верхней ячейке — `table:number-rows-spanned`, —
-    /// а строки идут по порядку, так что запомнить и подставлять хватает.
-    private var spans: [Int: (value: CellValue, lastRow: Int)] = [:]
-    private var sidewaysMerges = 0
+    /// Объединения, ещё действующие. ODS объявляет их на
+    /// верхней ячейке — `table:number-rows-spanned` и
+    /// `number-columns-spanned`, — а строки идут по порядку, так что
+    /// запомнить и подставлять хватает.
+    private var mergeFill = MergeFill()
+    /// Объединения листа — для шапки в несколько строк.
+    private(set) var merges: [XLSXReader.MergedRange] = []
     private var capturingText = false
     private var paragraphs: [String] = []
     private var text = ""
@@ -136,21 +184,35 @@ final class ODSParser: NSObject, XMLParserDelegate {
             guard insideTable else { return }
             cells = [:]
             column = 0
-            rowRepeat = min(Self.repetition(attributes["table:number-rows-repeated"]), Self.repetitionLimit)
+            // Повтор — полностью: предел ограничивает, сколько строк
+            // выдаётся, а не насколько сдвигается счёт.
+            rowRepeat = Self.repetition(attributes["table:number-rows-repeated"])
 
         case "table:table-cell", "table:covered-table-cell":
             guard insideTable else { return }
-            cellRepeat = min(Self.repetition(attributes["table:number-columns-repeated"]), Self.repetitionLimit)
+            cellRepeat = Self.repetition(attributes["table:number-columns-repeated"])
             paragraphs = []
             // A covered cell is the part of a merge that is not the top-left:
             // its value lives in the anchor, and reading it as a value of its
             // own would duplicate the anchor's across the range.
             cellValue = name == "table:covered-table-cell" ? .empty : Self.value(of: attributes)
             rowSpan = Self.repetition(attributes["table:number-rows-spanned"])
-            if Self.repetition(attributes["table:number-columns-spanned"]) > 1 { sidewaysMerges += 1 }
+            let columnSpan = Self.repetition(attributes["table:number-columns-spanned"])
+            if rowSpan > 1 || columnSpan > 1 {
+                // Строка ячейки — следующая за уже выданными.
+                let range = XLSXReader.MergedRange(
+                    firstRow: rowNumber + 1, lastRow: rowNumber + rowSpan,
+                    firstColumn: column, lastColumn: column + columnSpan - 1
+                )
+                merges.append(range)
+                mergeFill.add(range)
+            }
+
+        case "office:annotation":
+            annotationDepth += 1
 
         case "text:p":
-            guard insideTable else { return }
+            guard insideTable, annotationDepth == 0 else { return }
             text = ""
             capturingText = true
 
@@ -166,8 +228,14 @@ final class ODSParser: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName: String?) {
         guard !finished else { return }
         switch name {
+        case "office:annotation":
+            annotationDepth = max(0, annotationDepth - 1)
+
         case "text:p":
-            guard insideTable else { return }
+            // Примечание к ячейке LibreOffice пишет внутрь ячейки, перед её
+            // текстом, и оно приклеивалось к значению: «примечание\nзначение»
+            // — в тексте, метаданных, названии колонки и ключе строки.
+            guard insideTable, annotationDepth == 0 else { return }
             capturingText = false
             paragraphs.append(text)
             text = ""
@@ -181,30 +249,29 @@ final class ODSParser: NSObject, XMLParserDelegate {
                 cellValue = joined.isEmpty ? .empty : .text(joined)
             }
             if !cellValue.isEmpty {
-                for offset in 0..<cellRepeat { cells[column + offset] = cellValue }
-                // Объединено вниз — значение относится ко всем строкам
-                // диапазона, а не к одной верхней.
-                if rowSpan > 1 {
-                    for offset in 0..<cellRepeat {
-                        spans[column + offset] = (cellValue, rowNumber + rowSpan)
-                    }
-                }
+                for offset in 0..<min(cellRepeat, Self.repetitionLimit) { cells[column + offset] = cellValue }
             }
             rowSpan = 1
             column += cellRepeat
 
         case "table:table-row":
             guard insideTable else { return }
-            for _ in 0..<rowRepeat {
+            // Выдаётся не больше предела, а счёт строк идёт на весь повтор:
+            // после трёх тысяч пустых строк данные стояли под номером 1035
+            // вместо 3011 — и `row_number`, и просмотр указывали не туда.
+            let emitted = min(rowRepeat, Self.repetitionLimit)
+            defer { rowNumber += rowRepeat - emitted }
+            for _ in 0..<emitted {
                 rowNumber += 1
                 guard !finished else { break }
                 rowsEmitted += 1
-                // Действующие объединения вниз подставляются в строку до её
-                // выдачи; истёкшие забываются.
-                spans = spans.filter { $0.value.lastRow >= rowNumber }
-                for (column, span) in spans where cells[column] == nil {
-                    cells[column] = span.value
-                }
+                // Действующие объединения подставляются в строку до её
+                // выдачи — вниз и вбок; истёкшие забываются.
+                // В копию: у повторённой строки подставленное в первую из
+                // повторов иначе оставалось и в следующих — за концом
+                // объединения.
+                var cells = cells
+                mergeFill.fill(row: rowNumber, cells: &cells)
                 if rowsEmitted > limit {
                     finished = true
                     warnings.append(.rowLimitReached(limit: limit))
@@ -220,9 +287,6 @@ final class ODSParser: NSObject, XMLParserDelegate {
             cells = [:]
 
         case "table:table":
-            if insideTable, sidewaysMerges > 0 {
-                warnings.append(.mergedSideways(cells: sidewaysMerges))
-            }
             // The requested table is over; nothing after it is of interest.
             if insideTable {
                 insideTable = false

@@ -37,15 +37,24 @@ public enum PortUtility {
     /// *whose* server answered: with the port already taken, our own process
     /// dies with `AddrInUse` while the port keeps replying — and the app would
     /// happily report a running server that is somebody else's database.
+    ///
+    /// Привязка — с `SO_REUSEADDR`, как у самого `chroma` (tokio ставит его
+    /// на Unix). Без него проверка была строже настоящей привязки: сервер,
+    /// остановленный при открытых соединениях клиента, оставляет на порту
+    /// их «хвосты» (FIN_WAIT, TIME_WAIT) на полминуты, и бэкап, гасящий
+    /// и поднимающий сервер, получал «адрес занят» там, где `chroma run`
+    /// поднимается спокойно (проверено на 1.0.0). Живой слушатель
+    /// конфликтует и так — его проверка по-прежнему видит.
     public static func isAvailable(host: String, port: Int) -> Bool {
         let socketFD = socket(AF_INET, SOCK_STREAM, 0)
         guard socketFD >= 0 else { return true }
         defer { close(socketFD) }
+        var reuse: Int32 = 1
+        setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
 
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = UInt16(port).bigEndian
-        // Deliberately no SO_REUSEADDR: the conflict is what we are testing for.
         address.sin_addr.s_addr = host == "0.0.0.0" ? INADDR_ANY : inet_addr(host)
 
         let result = withUnsafePointer(to: &address) { pointer -> Int32 in
@@ -734,10 +743,22 @@ public final class ChromaProcessManager: ObservableObject {
         if process.isRunning {
             log(.warning, "Сервер", "Сервер не завершился по SIGTERM — отправляем SIGKILL")
             kill(process.processIdentifier, SIGKILL)
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            // Ждём смерти, а не фиксированную паузу: процесс в непрерываемом
+            // вводе-выводе переживает и SIGKILL, а следом за остановкой
+            // бэкап копирует папку базы — из-под живого процесса.
+            for _ in 0..<20 where process.isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
         }
 
         ManagedProcessRegistry.shared.unregister(process.processIdentifier)
+        if process.isRunning {
+            // Не забываем и не объявляем остановленным: процесс жив,
+            // держит папку базы, и следующий запуск обязан его найти.
+            log(.error, "Сервер", "Сервер (PID \(process.processIdentifier.plainDigits)) не завершился и по SIGKILL — запись сохранена")
+            state = .failed(String(localized: "сервер не завершился и по SIGKILL"))
+            return
+        }
         RunningServerStore.forget(pid: process.processIdentifier)
         adopted = nil
         self.process = nil

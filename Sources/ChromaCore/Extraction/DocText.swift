@@ -19,12 +19,22 @@ extension DocPartsReader {
         var isCell = false
         /// Метка конца строки таблицы: текста не несёт, но закрывает строку.
         var isRowEnd = false
+        /// Абзац стоит в таблице. Не то же, что `isCell`: ячейка из двух
+        /// абзацев кончается меткой ячейки только у второго.
+        var isInTable = false
+        /// Ячейки строки — у метки конца строки.
+        var rowCells: [TableCellDefinition]?
         var istd = 0
         var outline: Int?
+        /// Список и уровень, заданные прямо в абзаце.
+        var listInstance: Int?
+        var listLevel: Int?
         var isBold = false
         var size: Double?
         /// Абзац оказался пустым потому, что весь его текст скрыт.
         var isHidden = false
+        /// Абзац закрыт разрывом раздела, а не знаком абзаца.
+        var endsSection = false
         /// Знаки документа, из которых абзац собран.
         ///
         /// Нужны ровно за тем, чтобы поставить сноску при её абзаце: таблица
@@ -35,12 +45,64 @@ extension DocPartsReader {
         var footnotes: [String] = []
     }
 
+    /// Ячейки таблицы — на общую сетку колонок.
+    ///
+    /// В `.doc` сетки нет: у каждой строки свои границы ячеек, а ячейка,
+    /// растянутая на две колонки соседней строки, — просто широкая ячейка.
+    /// Общая сетка — объединение границ всех строк; ячейка встаёт на ту
+    /// колонку, где начинается, и занимает столько, сколько границ внутри
+    /// неё. Без описания строки (битый файл) остаётся счёт по порядку.
+    static func placeOnGrid(
+        _ paragraphs: inout [Paragraph],
+        placed: [(index: Int, row: Int, ordinal: Int)],
+        rows: [Int: [TableCellDefinition]]
+    ) {
+        guard !rows.isEmpty else { return }
+        /// Границы, расходящиеся меньше чем на столько (в двадцатых долях
+        /// пункта, то есть на пункт), — одна граница: Word хранит их
+        /// с округлением, и у строк одной колонки они дрожат.
+        let tolerance = 20
+        var edges: [Int] = []
+        for cells in rows.values {
+            for cell in cells { edges.append(cell.left); edges.append(cell.right) }
+        }
+        edges.sort()
+        var grid: [Int] = []
+        for edge in edges where grid.last.map({ edge - $0 > tolerance }) ?? true { grid.append(edge) }
+        func gridIndex(_ edge: Int) -> Int {
+            grid.indices.min { abs(grid[$0] - edge) < abs(grid[$1] - edge) } ?? 0
+        }
+        for item in placed {
+            guard let cells = rows[item.row], item.ordinal < cells.count,
+                  var cell = paragraphs[item.index].cell else { continue }
+            let definition = cells[item.ordinal]
+            let start = gridIndex(definition.left)
+            let end = gridIndex(definition.right)
+            cell.column = start
+            cell.columnSpan = max(1, end - start)
+            cell.isVerticalContinuation = definition.continuesAbove
+            paragraphs[item.index].cell = cell
+        }
+    }
+
     /// Всё, что нужно экстрактору, одним проходом по потокам.
     public func read() -> Document? {
         guard let text = characters() else { return nil }
         let characterProperties = characterRuns()
         let paragraphProperties = paragraphRuns()
         let styles = styleTable()
+        let numbering = numberingTable()
+        var counter = DocxPartsReader.NumberingCounter(restartsSharedCount: true)
+        /// Номер абзаца по счёту документа. Считаются и пустые, и скрытые
+        /// абзацы — Word их считает, — но не метки конца строки таблицы.
+        func marker(of paragraph: RawParagraph) -> String? {
+            // Разрыв раздела в строке без текста — не пункт: Word его
+            // не нумерует и не считает, хотя свойства абзаца у него есть —
+            // стоит он обычно перед заголовком и берёт его стиль.
+            guard !(paragraph.endsSection && paragraph.text.isEmpty) else { return nil }
+            guard let (numID, indent) = Self.numbering(of: paragraph, styles: styles, table: numbering) else { return nil }
+            return counter.next(numID: numID, indent: indent, table: numbering)
+        }
 
         func bounds(_ part: DocFIB.Subdocument) -> Range<Int> {
             let start = min(max(0, fib.start(of: part)), text.units.count)
@@ -109,31 +171,50 @@ extension DocPartsReader {
         var row = 0
         var column = 0
         var inTable = false
+        /// Абзацы текущей таблицы: где в документе и в какой по счёту
+        /// ячейке своей строки. Колонка сетки становится известна только
+        /// в конце таблицы — из границ всех её строк.
+        var placed: [(index: Int, row: Int, ordinal: Int)] = []
+        var definitions: [Int: [TableCellDefinition]] = [:]
+        func finishTable() {
+            Self.placeOnGrid(&document.paragraphs, placed: placed, rows: definitions)
+            placed = []
+            definitions = [:]
+        }
         for paragraph in body {
-            if paragraph.isCell {
+            if paragraph.isCell || paragraph.isInTable {
                 inTable = true
                 document.hasTables = true
                 // Конец строки — это метка, а не ячейка: у неё нет ни текста,
                 // ни места в строке, и считать её ячейкой значит добавлять
-                // таблице пустую колонку справа.
+                // таблице пустую колонку справа. Зато она несёт описание
+                // строки — границы ячеек и их объединения.
                 if paragraph.isRowEnd {
+                    if let cells = paragraph.rowCells { definitions[row] = cells }
                     row += 1
                     column = 0
                     continue
                 }
+                placed.append((document.paragraphs.count, row, column))
                 document.paragraphs.append(assembled(
-                    paragraph, styles: styles, cell: Cell(table: table, row: row, column: column)
+                    paragraph, styles: styles, cell: Cell(table: table, row: row, column: column),
+                    marker: marker(of: paragraph)
                 ))
-                column += 1
+                // Абзац внутри ячейки, не последний в ней, кончается знаком
+                // абзаца, а не меткой ячейки: ячейка ещё не закрыта. Раньше
+                // такой абзац считался текстом вне таблицы и рвал её надвое.
+                if paragraph.isCell { column += 1 }
                 continue
             }
             if inTable {
+                finishTable()
                 table += 1
                 row = 0
                 column = 0
                 inTable = false
             }
             if paragraph.isHidden { document.hiddenParagraphs += 1 }
+            let number = marker(of: paragraph)
             guard !paragraph.text.isEmpty else {
                 // Ссылка на сноску в пустом абзаце принадлежит тому, что было
                 // до неё, — то же правило, что у `.docx`.
@@ -142,8 +223,10 @@ extension DocPartsReader {
                 }
                 continue
             }
-            document.paragraphs.append(assembled(paragraph, styles: styles, cell: nil))
+            document.paragraphs.append(assembled(paragraph, styles: styles, cell: nil, marker: number))
         }
+
+        if inTable { finishTable() }
 
         // MARK: Колонтитулы
 
@@ -201,19 +284,42 @@ extension DocPartsReader {
     }
 
     /// Разобранный абзац — в абзац документа.
-    private func assembled(_ paragraph: RawParagraph, styles: DocStyleTable, cell: Cell?) -> Paragraph {
+    private func assembled(
+        _ paragraph: RawParagraph, styles: DocStyleTable, cell: Cell?, marker: String? = nil
+    ) -> Paragraph {
         Paragraph(
             text: paragraph.text,
             // Уровень, поставленный прямо в абзаце, главнее стиля: человек
             // поставил его руками — то же правило, что у `.docx` (11.4.1).
             headingLevel: paragraph.outline.map { $0 + 1 } ?? styles.headingLevel(of: paragraph.istd),
+            marker: marker,
             isHidden: false,
             cell: cell,
             links: paragraph.links,
             footnotes: paragraph.footnotes,
             isBold: paragraph.isBold,
-            size: paragraph.size
+            size: paragraph.size,
+            isTableOfContents: cell == nil && styles.isTableOfContents(paragraph.istd)
         )
+    }
+
+    /// Список и уровень абзаца — то же правило, что у `.docx`: свойство
+    /// самого абзаца главнее стиля, экземпляр 0 снимает нумерацию стиля,
+    /// а уровень абзаца, нумерованного стилем, — тот, что связан с этим
+    /// стилем в определении списка (`rgistdPara`).
+    static func numbering(
+        of paragraph: RawParagraph, styles: DocStyleTable, table: DocxPartsReader.NumberingTable
+    ) -> (numID: String, indent: Int)? {
+        let style = styles.resolved(paragraph.istd)
+        guard let instance = paragraph.listInstance ?? style?.listInstance, instance > 0 else { return nil }
+        let numID = String(instance)
+        guard table.instances[numID] != nil else { return nil }
+        if let level = paragraph.listLevel { return (numID, level) }
+        if paragraph.listInstance == nil {
+            let linked = table.indent(numID: numID, paragraphStyle: String(paragraph.istd))
+            return (numID, linked ?? style?.listLevel ?? 0)
+        }
+        return (numID, style?.listLevel ?? 0)
     }
 
     // MARK: - Абзацы из знаков
@@ -242,7 +348,7 @@ extension DocPartsReader {
 
         var paragraphStart = range.lowerBound
 
-        func close(at offset: Int, isCell: Bool, upTo index: Int) {
+        func close(at offset: Int, isCell: Bool, upTo index: Int, endsSection: Bool = false) {
             let properties = Self.run(at: offset, in: paragraphs, start: { $0.start }, end: { $0.end })
             let style = styles.resolved(properties?.istd ?? 0)
             let styleIsBold = style?.isBold ?? false
@@ -257,11 +363,16 @@ extension DocPartsReader {
             paragraph.links = links
             paragraph.isCell = isCell
             paragraph.isRowEnd = properties?.isRowEnd ?? false
+            paragraph.isInTable = isCell || (properties?.isInTable ?? false)
+            paragraph.rowCells = properties?.rowCells
             paragraph.istd = properties?.istd ?? 0
             paragraph.outline = properties?.outline
+            paragraph.listInstance = properties?.listInstance
+            paragraph.listLevel = properties?.listLevel
             paragraph.isBold = weighted > 0 && bold == weighted
             paragraph.size = sizes.max { $0.value < $1.value }.map { Double($0.key) / 2 }
             paragraph.isHidden = paragraph.text.isEmpty && hidden > 0
+            paragraph.endsSection = endsSection
             paragraph.cpRange = paragraphStart..<max(paragraphStart, index + 1)
             result.append(paragraph)
             paragraphStart = index + 1
@@ -291,6 +402,19 @@ extension DocPartsReader {
             // и посчитать пропущенное становится нечем.
             if unit != 0x0D, unit != 0x07, run?.isHidden == true {
                 hidden += 1
+                continue
+            }
+
+            // Разрыв раздела — тоже конец абзаца: Word ставит его
+            // вместо знака абзаца, и свойства следующего абзаца начинаются
+            // сразу за ним. Читать его пробелом значило склеивать абзацы
+            // разных стилей: подпись рисунка в конце альбомного раздела
+            // и заголовок «4.2.1.2» после него становились одним
+            // заголовком, а заголовок пропадал из структуры и из нумерации.
+            // Разрыв страницы внутри абзаца — тот же знак, но граница
+            // свойств абзаца за ним не проходит.
+            if unit == 0x0C, Self.endsParagraphProperties(at: index, text: text, paragraphs: paragraphs) {
+                close(at: offset, isCell: false, upTo: index, endsSection: true)
                 continue
             }
 
@@ -335,6 +459,16 @@ extension DocPartsReader {
             close(at: text.offsets[range.upperBound - 1], isCell: false, upTo: range.upperBound - 1)
         }
         return result
+    }
+
+    /// Кончаются ли на этом знаке свойства абзаца: следующий знак лежит
+    /// уже за их границей.
+    static func endsParagraphProperties(at index: Int, text: Characters, paragraphs: [ParagraphRun]) -> Bool {
+        let offset = text.offsets[index]
+        guard let properties = run(at: offset, in: paragraphs, start: { $0.start }, end: { $0.end }) else { return false }
+        guard index + 1 < text.offsets.count else { return true }
+        let next = text.offsets[index + 1]
+        return next >= properties.end || next < properties.start
     }
 
     /// Знак текста — в знаки строки. `nil` — служебный знак, которому в базе

@@ -207,7 +207,16 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     ///
     /// В файл **не** записывается: этого ключа нет в `CodingKeys`, а
     /// значит синтезированный кодировщик его не видит.
-    public private(set) var unknownSettings: [String] = []
+    ///
+    /// И в сравнении профилей не участвует: это сведение о файле, а не
+    /// настройка поиска. Синтезированное равенство его видело — профиль,
+    /// прочитанный из файла с незнакомым ключом, был «не равен» такому же,
+    /// собранному в коде, хотя ищут они одинаково.
+    public private(set) var unknownSettings: [String] {
+        get { unknownSettingsStorage.value }
+        set { unknownSettingsStorage.value = newValue }
+    }
+    private var unknownSettingsStorage = NotCompared<[String]>(value: [])
 
     // MARK: - Stage 1: candidates
 
@@ -686,5 +695,35 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
             return requested
         }
         return max(requested, max(minimumCandidates, requested * max(1, candidateMultiplier)))
+    }
+}
+
+/// Значение, которое не участвует в равенстве и хеше владельца.
+struct NotCompared<Value: Sendable>: Hashable, Sendable {
+    var value: Value
+    static func == (_: Self, _: Self) -> Bool { true }
+    func hash(into _: inout Hasher) {}
+}
+
+public extension SearchProfile {
+    /// Приставка запроса Qwen3-Embedding: запрос идёт в модель с
+    /// инструкцией, документ — как есть.
+    static let qwen3QueryPrefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+
+    /// Приставка, которую требует модель коллекции, — у ненастроенной
+    /// коллекции она стоит в профиле сразу.
+    ///
+    /// решил, что приставка — свойство модели, а не настройка опыта, но
+    /// в умолчание она так и не попала: новая коллекция получала профиль с
+    /// пустой приставкой, и прогон 23 октября по «Базе 2» шёл без неё на всех
+    /// семи вариантах — как и поиск агентов через MCP. Приставка дала там не
+    /// меньше +0,03…0,04 nDCG@10 у 4B, в — +0,10.
+    ///
+    /// Только Qwen3-Embedding. У nomic приставка нужна и документу
+    /// (`search_document: `), а он записан без неё: одна половина пары
+    /// разводила бы векторы, а не сводила.
+    static func queryPrefix(forModel model: String?) -> String {
+        guard let model = model?.lowercased(), model.contains("qwen3-embedding") else { return "" }
+        return qwen3QueryPrefix
     }
 }

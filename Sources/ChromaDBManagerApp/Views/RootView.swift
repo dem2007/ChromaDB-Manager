@@ -76,15 +76,15 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     /// Строка под заголовком экрана: о чём этот экран, одним предложением.
     var subtitle: String {
         switch self {
-        case .overview: return String(localized: "Куда подключено приложение и что из этого работает")
+        case .overview: return String(localized: "Подключение и что работает")
         case .collections: return String(localized: "Документы, поиск и правила метаданных")
-        case .sources: return String(localized: "Папки, сайты и репозитории, которые становятся коллекциями")
-        case .models: return String(localized: "Подключение к LM Studio, выбор модели и кэш векторов")
-        case .evaluation: return String(localized: "Наборы запросов, варианты поиска и прогоны")
-        case .trash: return String(localized: "Удалённые документы, которые ещё можно вернуть")
-        case .clients: return String(localized: "Ключи внешних клиентов и доступ агентов через MCP")
-        case .security: return String(localized: "Что открыто наружу и на каких условиях")
-        case .environment: return String(localized: "Движок, резервные копии и данные приложения")
+        case .sources: return String(localized: "Папки, сайты и репозитории")
+        case .models: return String(localized: "LM Studio, модели и кэш векторов")
+        case .evaluation: return String(localized: "Наборы запросов, варианты и прогоны")
+        case .trash: return String(localized: "Удалённое, что можно вернуть")
+        case .clients: return String(localized: "Ключи клиентов и доступ по MCP")
+        case .security: return String(localized: "Что открыто наружу")
+        case .environment: return String(localized: "Движок, копии и данные приложения")
         case .tasks: return String(localized: "Очередь длительных операций")
         case .logs: return String(localized: "События приложения и журнал доступа")
         }
@@ -97,14 +97,19 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     /// на экране нет вовсе.
     var tabs: [String] {
         switch self {
+        // Вкладки «Сервер» нет (v6 B1): строка процесса с кнопками — в
+        // «Состояние → Сейчас», запуск при старте — в Настройках.
         case .overview: return [
-            String(localized: "Состояние"), String(localized: "Подключение"), String(localized: "Сервер"),
+            String(localized: "Состояние"), String(localized: "Подключение"),
         ]
         case .sources: return [
             String(localized: "Источники"), String(localized: "Диагностика"), String(localized: "Стенд"),
         ]
+        // Подключение к LM Studio — своей вкладкой (v3): форма над
+        // таблицей моделей была узкой полосой над широкой таблицей.
         case .models: return [
-            String(localized: "Модели"), String(localized: "Кэш"), String(localized: "Замеры"),
+            String(localized: "Модели"), String(localized: "Подключение"),
+            String(localized: "Кэш"), String(localized: "Замеры"),
         ]
         // «Проверки» влились в «Установку»: проверка и установка — один
         // разговор, и держать их на разных вкладках значило просить человека
@@ -113,9 +118,10 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             String(localized: "Установка"), String(localized: "Резервные копии"),
             String(localized: "Управление данными"),
         ]
+        // «Хранение» — в окне «Настройки».
         case .logs: return [
             String(localized: "События"), String(localized: "Доступ"),
-            String(localized: "Хранение"), String(localized: "Сервер"),
+            String(localized: "Сервер"),
         ]
         // Три разреза одной темы, как в макете: чем прогонять, что прогонять
         // и что получилось.
@@ -123,15 +129,15 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             String(localized: "Набор запросов"), String(localized: "Варианты"),
             String(localized: "Прогоны"),
         ]
-        // Ключи — кто ходит, MCP — как ходят агенты, журнал — что делали.
+        // Ключи — кто ходит, MCP — как ходят агенты. Что делали — в «Логи →
+        // Доступ»: журнал был здесь вторым экземпляром.
         case .clients: return [
-            String(localized: "Ключи"), String(localized: "MCP"), String(localized: "Журнал"),
+            String(localized: "Ключи"), String(localized: "MCP"),
         ]
-        // Сводка — что сейчас открыто, «Доступ по сети» — где это решается,
-        // «Уведомления» — о чём предупреждать.
+        // Сводка — что сейчас открыто, «Доступ по сети» — где это решается.
+        // «Уведомления» — в окне «Настройки».
         case .security: return [
             String(localized: "Сводка"), String(localized: "Доступ по сети"),
-            String(localized: "Уведомления"),
         ]
         // У «Коллекций» вкладки свои и живут они у выбранной коллекции:
         // «Документы» и «Поиск» — это стороны одной коллекции, а не разделы
@@ -168,36 +174,24 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 }
 
-/// Время работы сервера — в отдельной вьюхе, и это не украшательство.
-///
-/// `ChromaProcessManager.uptime` обновляется **раз в секунду**, пока сервер
-/// запущен. Пока это поле читал `RootView`, каждое такое обновление
-/// перестраивало его `body` — а вместе с ним и `content`, то есть тело
-/// открытого раздела. Любая работа, которую экран делает при отрисовке,
-/// оплачивалась заново каждую секунду, вечно; отсюда «интерфейс подтормаживает»
-/// на тяжёлых разделах при полностью простаивающем приложении.
-///
-/// Наблюдение за менеджером процесса живёт здесь, и перерисовывается раз
-/// в секунду только эта надпись.
-private struct ServerUptimeLabel: View {
-    @EnvironmentObject private var processManager: ChromaProcessManager
-
-    var body: some View {
-        if processManager.isRunning, let uptime = processManager.uptime {
-            Text("· \(processManager.state.title) · \(RootView.uptimeText(uptime))")
-                .font(Theme.Font.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
 struct RootView: View {
     @EnvironmentObject private var app: AppEnvironment
     @EnvironmentObject private var settings: SettingsStore
-    // Стартуем со статуса окружения: пока движок не найден, остальное бессмысленно.
-    @State private var selection: SidebarSection? = .overview
-    /// Открытая вкладка каждого раздела.
-    @State private var tabs: [SidebarSection: Int] = [:]
+    /// Открытый раздел — помнит окно: после перезапуска человек там, где был.
+    @SceneStorage("section") private var sectionID = SidebarSection.overview.rawValue
+    /// Открытая вкладка каждого раздела — своя, и она переживает переход на
+    /// соседний раздел и обратно. Ключ у каждого раздела отдельный:
+    /// `@SceneStorage` хранит только простые значения.
+    @SceneStorage("tab.overview") private var overviewTab = 0
+    @SceneStorage("tab.environment") private var environmentTab = 0
+    @SceneStorage("tab.sources") private var sourcesTab = 0
+    // Новый ключ: у «Кэша» и «Замеров» сдвинулись номера, прежний
+    // сохранённый индекс открыл бы не ту вкладку.
+    @SceneStorage("tab.models.v3") private var modelsTab = 0
+    @SceneStorage("tab.evaluation") private var evaluationTab = 0
+    @SceneStorage("tab.clients") private var clientsTab = 0
+    @SceneStorage("tab.security") private var securityTab = 0
+    @SceneStorage("tab.logs") private var logsTab = 0
 
     @StateObject private var environmentModel = EnvironmentViewModel()
     @StateObject private var connectionModel = ConnectionViewModel()
@@ -214,98 +208,95 @@ struct RootView: View {
     @ObservedObject private var reembedding = AppEnvironment.shared.reembedding
     /// Что бросили на окно и о чём ещё не спросили.
     @State private var droppedItems: DroppedItems?
+    /// «Новая коллекция…» из строки меню: лист открывает сам экран коллекций.
+    @State private var newCollectionRequested = false
+    @State private var newClientRequested = false
+    /// Поиск журнала доступа — «Клиенты → Показать в журнале» кладёт сюда
+    /// имя клиента.
+    @State private var accessQuery = ""
+    /// «Остановить сервер…» из строки меню ждёт подтверждения.
+    @State private var confirmingServerStop = false
+    /// Мост к строке меню: один на окно. `@State`, а не `@StateObject`: окну
+    /// незачем перерисовываться, когда меняется доступность пунктов меню.
+    @State private var commandCenter = MainWindowCommandCenter()
 
     var body: some View {
         NavigationSplitView {
-            VStack(alignment: .leading, spacing: 0) {
-                // Имя приложения и одна строка о том, куда оно подключено:
-                // в макете это первое, что видно, и отвечает на вопрос
-                // «с чем я сейчас работаю» до открытия любого раздела.
-                // Имя приложения и точка состояния рядом с ним. Строка «куда
-                // подключено» жила здесь же, но она слово в слово повторяла
-                // статусную строку внизу окна — а та ещё и полнее.
-                HStack(spacing: 7) {
-                    Text("ChromaDB Manager")
-                        .font(Theme.Font.control.weight(.semibold))
-                    Circle()
-                        .fill(connectionColor)
-                        .frame(width: 7, height: 7)
-                        .help(app.connection.title)
-                }
-                // Отступ слева тот же, что у рубрик «База», «Данные» — имя
-                // приложения встаёт на одну вертикаль с ними, а не висит
-                // отдельно; сверху — воздух, чтобы оно не липло к кнопкам окна.
-                .padding(.horizontal, 15)
-                .padding(.top, 14)
-                .padding(.bottom, 12)
-
-                // Группы вместо плоского списка: рубрика говорит, где искать,
-                // и двенадцать пунктов перестают быть одной длинной колонкой
-                //.
-                List(selection: $selection) {
-                    ForEach(SidebarGroup.allCases) { group in
-                        Section {
-                            ForEach(group.sections) { section in
-                                Label(section.title, systemImage: section.icon)
-                                    .font(Theme.Font.control)
-                                    .tag(section)
-                            }
-                        } header: {
-                            Text(group.title)
-                                .font(Theme.Font.sectionLabel)
-                                .kerning(0.6)
-                                .textCase(.uppercase)
-                                .foregroundStyle(Theme.Palette.caption)
+            // Группы вместо плоского списка: рубрика говорит, где искать,
+            // и двенадцать пунктов перестают быть одной длинной колонкой
+            //. Шрифт, размер значков и выделение — системные: их
+            // задаёт настройка «Размер значков в боковой панели» и акцент.
+            List(selection: selectionBinding) {
+                ForEach(SidebarGroup.allCases) { group in
+                    Section(group.title) {
+                        ForEach(group.sections) { section in
+                            Label(section.title, systemImage: section.icon)
+                                .help(section.subtitle)
+                                // Находки диагностики — бейджем у раздела, а не
+                                // числом в сегменте (v3): сегмент с числом
+                                // был шире соседних. Ноль бейдж не рисует.
+                                .badge(section == .sources ? sourcesModel.problemCount : 0)
+                                // `tag` — последним: модификатор после него
+                                // оборачивает строку, и список терял выбор.
+                                .tag(section)
                         }
                     }
                 }
-                .listStyle(.sidebar)
-                // Сплошная синяя строка — не то, как macOS отмечает выбранный
-                // пункт. Подкрашивание списка приглушает выделение до мягкой
-                // вставки из макета, а выбор с клавиатуры продолжает работать —
-                // чего нарисованный руками фон стоил бы.
-                .tint(Theme.Palette.navSelection)
             }
-            .navigationSplitViewColumnWidth(
-                min: 220, ideal: Theme.Size.sidebarWidth, max: 300
-            )
+            .listStyle(.sidebar)
+            .sidebarColumnWidth()
+            // Состояние подключения — внизу боковой панели: видно с любого
+            // раздела, и нижняя строка окна, повторявшая его, больше не нужна.
+            // `bottomBar`, а не голый `safeAreaInset`: при низком окне список
+            // уезжает под строку, и без фона «Логи» просвечивали сквозь неё.
+            .bottomBar {
+                ConnectionStatusFooter(collectionsModel: collectionsModel, autoSync: autoSync)
+            }
         } detail: {
             VStack(spacing: 0) {
-                screenHeader
                 settingsAlarm
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Divider()
-                statusBar
             }
-            // Заголовок один, и он в системной полосе окна: полоса всё равно
-            // есть у каждого окна macOS, и пустой она была местом, которое
-            // ничего не говорит, — а над содержимым стояла вторая строка того
-            // же назначения.
-            //
-            // Своим элементом тулбара, а не `navigationTitle`: системный
-            // заголовок прижат к краю окна и не совпадает по левому краю ни
-            // с подписью под ним, ни с карточками. Здесь отступ наш, и он тот
-            // же, что у содержимого.
-            .navigationTitle("")
-            // Заголовок рисуется своим видом в титульной полосе окна, а не
-            // элементом тулбара: элемент система кладёт на «стеклянную»
-            // подложку с тенью и своим отступом, а нужен просто текст,
-            // стоящий ровно над первой карточкой.
-            .background(TitlebarTitle(text: (selection ?? .overview).title))
+            // Заголовок — системный, в полосе окна; подзаголовка нет (v3):
+            // рядом с вкладками он обрезался. О чём раздел — подсказка у
+            // пункта сайдбара.
+            .navigationTitle(currentSection.title)
+            // Вкладки — слева, на месте заголовка: так они не сдвигаются,
+            // когда у вкладки другие кнопки справа.
+            .hidesToolbarTitle(!currentSection.tabs.isEmpty || currentSection == .collections)
+            .toolbar {
+                // Вкладки раздела — сегментами в тулбаре, всегда на одном
+                // месте, а не в содержимом, где их высота зависит от экрана.
+                if !currentSection.tabs.isEmpty {
+                    ToolbarItem(placement: .navigation) {
+                        sectionTabs
+                    }
+                }
+            }
         }
-        // Волосяная линия под титульной полосой — системный разделитель:
-        // macOS рисует его, когда под полосой есть содержимое. У нас там
-        // заголовок экрана на том же полотне, и линия делит не два слоя,
-        // а один.
-        .toolbarBackground(.hidden, for: .windowToolbar)
-        // System button geometry everywhere: 7pt corners, not capsules.
-        .chromaControlShape()
-        // Полосы прокрутки во всех окнах приложения — накладные, чтобы они не
-        // меняли ширину содержимого. Одно место на всё приложение:
-        // экраны, вкладки, листы и панели.
-        .background(WindowScrollerStyle().frame(width: 0, height: 0))
+        .mainWindowMinimumSize()
+        .focusedSceneObject(commandCenter)
+        .onAppear { commandCenter.perform = { perform($0) } }
+        .onChange(of: commandState, initial: true) { _, state in
+            commandCenter.update(state)
+        }
+        .confirmationDialog(
+            String(localized: "Остановить сервер ChromaDB?"),
+            isPresented: $confirmingServerStop
+        ) {
+            Button(String(localized: "Остановить"), role: .destructive) {
+                Task { await serverModel.stop(app) }
+            }
+            Button(String(localized: "Отменить"), role: .cancel) {}
+        } message: {
+            Text("Пока сервер стоит, недоступны коллекции, поиск и агенты. Данные не трогаются: база — это папка на диске.")
+        }
         .task { await startUp() }
+        // Находки диагностики — сразу, а не когда впервые откроют список
+        // «Источников»: по ним бейдж в сайдбаре, и «Диагностика», открытая
+        // первой, иначе говорила «замечаний нет».
+        .task { sourcesModel.refreshManifests(app) }
         // файлы и папки можно бросить прямо на окно. Приложение не
         // решает за человека, что с ними делать, — оно спрашивает.
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -325,7 +316,7 @@ struct RootView: View {
                         // И первая вкладка раздела: брошенное подхватывает
                         // список источников, и с «Диагностики» или «Стенда»
                         // его не было на экране — не открывалось ничего.
-                        tabs[.sources] = 0
+                        setTab(0, for: .sources)
                         sourcesModel.pendingDrop = urls
                     },
                     addDocuments: { urls, collectionName in
@@ -466,64 +457,142 @@ struct RootView: View {
         embeddingsModel.startAutomaticRefresh(app)
     }
 
-    /// Шапка экрана: строка о том, чему посвящён раздел, и его вкладки.
-    ///
-    /// Имя раздела отсюда уехало **в заголовок окна**: системная
-    /// полоса окна пустовала, а над содержимым стояла ещё одна строка того же
-    /// назначения. Подпись осталась здесь — она про содержимое, а не про
-    /// место в приложении, и в заголовок окна не помещается.
-    @ViewBuilder
-    private var screenHeader: some View {
-        let section = selection ?? .overview
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(section.subtitle)
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.caption)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 8)
-            }
-            if !section.tabs.isEmpty {
-                SegmentedSelector(
-                    options: Array(section.tabs.enumerated()).map { ($0.offset, $0.element) },
-                    selection: Binding(
-                        get: { tabs[section] ?? 0 },
-                        set: { tabs[section] = $0 }
-                    )
-                )
-                .padding(.top, 14)
-            }
-        }
-        .padding(.horizontal, Theme.contentPadding)
-        .padding(.top, 4)
-        .padding(.bottom, section.tabs.isEmpty ? 10 : 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
+    /// Открытый раздел; `nil` у списка — это «ничего не выбрано», и тогда
+    /// показывается «Обзор».
+    private var selection: SidebarSection? {
+        get { SidebarSection(rawValue: sectionID) }
+        nonmutating set { sectionID = (newValue ?? .overview).rawValue }
     }
 
-    /// Открытая вкладка каждого раздела — своя, и она переживает переход на
-    /// соседний раздел и обратно: человек вернулся туда, где был.
-    private var openTab: Int { tabs[selection ?? .overview] ?? 0 }
+    private var selectionBinding: Binding<SidebarSection?> {
+        Binding(get: { selection }, set: { selection = $0 })
+    }
 
-    /// Цвет точки состояния подключения — один на оба места, где она есть.
-    private var connectionColor: Color {
-        switch app.connection {
-        case .connected: return Theme.Palette.running
-        case .connecting: return Theme.Palette.attention
-        case .failed: return Theme.Palette.danger
-        case .disconnected: return Theme.Palette.stopped
+    private var currentSection: SidebarSection { selection ?? .overview }
+
+    /// Вкладки раздела — нативным сегментом.
+    private var sectionTabs: some View {
+        let section = currentSection
+        return Picker(String(localized: "Раздел"), selection: Binding(
+            get: { tab(for: section) },
+            set: { setTab($0, for: section) }
+        )) {
+            ForEach(Array(section.tabs.enumerated()), id: \.offset) { index, title in
+                Text(title).tag(index)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private func tab(for section: SidebarSection) -> Int {
+        switch section {
+        // Вкладки «Сервер» больше нет — сохранённый индекс 2 ведёт на «Состояние».
+        case .overview: return overviewTab < 2 ? overviewTab : 0
+        case .environment: return environmentTab
+        case .sources: return sourcesTab
+        case .models: return modelsTab
+        case .evaluation: return evaluationTab
+        // Вкладки «Журнал» больше нет — сохранённый индекс 2 ведёт на «Ключи».
+        case .clients: return clientsTab < 2 ? clientsTab : 0
+        // Вкладки «Уведомления» больше нет — сохранённый индекс 2 ведёт на «Сводку».
+        case .security: return securityTab < 2 ? securityTab : 0
+        // Вкладки «Хранение» больше нет: прежний индекс 3 («Сервер») стал 2.
+        case .logs: return logsTab == 3 ? 2 : logsTab
+        case .collections, .trash, .tasks: return 0
+        }
+    }
+
+    private func setTab(_ index: Int, for section: SidebarSection) {
+        switch section {
+        case .overview: overviewTab = index
+        case .environment: environmentTab = index
+        case .sources: sourcesTab = index
+        case .models: modelsTab = index
+        case .evaluation: evaluationTab = index
+        case .clients: clientsTab = index
+        case .security: securityTab = index
+        case .logs: logsTab = index
+        case .collections, .trash, .tasks: break
+        }
+    }
+
+    /// Открытая вкладка текущего раздела.
+    private var openTab: Int { tab(for: currentSection) }
+
+    /// Что из команд строки меню доступно сейчас.
+    private var commandState: MainWindowCommandState {
+        let connected = app.connection.isConnected
+        var state = MainWindowCommandState()
+        state.canConnect = !connected && app.connection != .connecting
+        state.canDisconnect = connected
+        // Сервер своего процесса — только у локальной базы; у внешнего
+        // сервера управлять нечем. Подключена локальная база — значит,
+        // её сервер работает.
+        state.isServerRunning = connected && settings.configuration.mode == .localDatabase
+        state.canBackUp = !environmentModel.isBusy && environmentModel.backupTarget(app) != nil
+        if currentSection == .collections, let collection = collectionsModel.selected {
+            state.hasCollection = true
+            state.canSearch = collection.isBound && !collectionsModel.isQuerying
+            state.canAddDocuments = collection.isBound
+            state.canReembed = collection.isBound && (collection.documentCount ?? 0) > 0
+        }
+        state.tabs = currentSection.tabs
+        return state
+    }
+
+    /// Команда строки меню — тем же путём, что кнопка на экране.
+    private func perform(_ command: MainWindowCommand) {
+        switch command {
+        case .newCollection:
+            selection = .collections
+            newCollectionRequested = true
+        case .newSource:
+            selection = .sources
+            setTab(0, for: .sources)
+            sourcesModel.addSource(app)
+        case .newClientKey:
+            selection = .clients
+            setTab(0, for: .clients)
+            newClientRequested = true
+        case .connect:
+            Task {
+                await app.connect()
+                await collectionsModel.refresh(app)
+            }
+        case .disconnect:
+            Task { await app.disconnect() }
+        case .restartServer:
+            Task { await serverModel.restart(app, collectionsModel: collectionsModel) }
+        case .stopServer:
+            confirmingServerStop = true
+        case .backUp:
+            // Копию видно там, где копии живут: ход и итог — на вкладке.
+            selection = .environment
+            setTab(1, for: .environment)
+            environmentModel.makeBackupNow(app)
+        case .search:
+            collectionsModel.pendingSearchTab = true
+            Task { await collectionsModel.runQuery(app) }
+        case .addDocuments:
+            collectionsModel.beginAddingDocument(app)
+        case .export:
+            collectionsModel.showExportSheet = true
+        case .reembed:
+            guard let collection = collectionsModel.selected else { return }
+            reembedding.begin(collection: collection, app: app)
+        case .selectTab(let index):
+            setTab(index, for: currentSection)
         }
     }
 
     @ViewBuilder
     private var content: some View {
-        switch selection ?? .overview {
+        switch currentSection {
         case .overview:
             switch openTab {
             case 1:
                 ConnectionView(model: connectionModel, collectionsModel: collectionsModel)
-            case 2:
-                ServerView(model: serverModel, collectionsModel: collectionsModel)
             default:
                 OverviewView(
                     server: serverModel, collectionsModel: collectionsModel,
@@ -534,17 +603,20 @@ struct RootView: View {
                     // раздел, но на вкладку, открытую в прошлый раз.
                     go: { section, tab in
                         selection = section
-                        if let tab { tabs[section] = tab }
+                        if let tab { setTab(tab, for: section) }
                     }
                 )
             }
         case .collections:
-            CollectionsView(model: collectionsModel, embeddingsModel: embeddingsModel, reembedding: reembedding)
+            CollectionsView(
+                model: collectionsModel, embeddingsModel: embeddingsModel, reembedding: reembedding,
+                newCollectionRequested: $newCollectionRequested
+            )
         case .sources:
             SourcesScreen(
                 model: sourcesModel, embeddings: embeddingsModel,
                 autoSync: autoSync, tab: openTab,
-                openTab: { index in tabs[.sources] = index }
+                openTab: { index in setTab(index, for: .sources) }
             )
         case .models:
             EmbeddingsView(
@@ -554,20 +626,32 @@ struct RootView: View {
         case .evaluation:
             EvaluationView(
                 model: evaluationModel, tab: openTab,
-                openTab: { index in tabs[.evaluation] = index }
+                openTab: { index in setTab(index, for: .evaluation) }
             )
         case .trash:
             TrashView(model: trashModel)
         case .clients:
-            ClientsView(model: clientsModel, mcp: app.mcp, tab: openTab)
+            ClientsView(
+                model: clientsModel, mcp: app.mcp, tab: openTab,
+                newClientRequested: $newClientRequested,
+                showInJournal: { client in
+                    // Журнал доступа — в «Логах», отобранный по клиенту.
+                    accessQuery = client.name
+                    selection = .logs
+                    setTab(1, for: .logs)
+                }
+            )
         case .security:
-            SecurityView(model: securityModel, serverModel: serverModel, tab: openTab)
+            SecurityView(
+                model: securityModel, serverModel: serverModel, tab: openTab,
+                openTab: { index in setTab(index, for: .security) }
+            )
         case .environment:
             EnvironmentStatusView(model: environmentModel, tab: openTab)
         case .tasks:
             TasksView(sources: sourcesModel)
         case .logs:
-            LogsView(reembedding: reembedding, serverModel: serverModel, tab: openTab)
+            LogsView(reembedding: reembedding, serverModel: serverModel, tab: openTab, auditSearch: $accessQuery)
         }
     }
 
@@ -582,113 +666,53 @@ struct RootView: View {
     /// пропустит ровно тогда, когда отойдёт от машины.
     @ViewBuilder
     private var settingsAlarm: some View {
-        if let loss = settings.loss {
-            VStack(alignment: .leading, spacing: 8) {
-                MessageBanner(kind: .error, text: loss.message) { settings.acknowledgeLoss() }
+        if let rewrite = settings.foreignRewrite {
+            // Настройки переписала другая сборка: что пропало
+            // и одна кнопка, чтобы вернуть.
+            VStack(alignment: .leading) {
+                HStack(alignment: .top) {
+                    Notice(.warning, String(localized: "Настройки переписаны другой версией приложения — скорее всего, запускалась старая копия. Пропало: \(rewrite.lost.prefix(6).joined(separator: "; "))\(rewrite.lost.count > 6 ? "…" : "")."))
+                    Spacer()
+                    Button(String(localized: "Вернуть")) { settings.restoreForeignLosses() }
+                        .buttonStyle(.borderedProminent)
+                    Button(String(localized: "Оставить как есть")) { settings.acceptForeignRewrite() }
+                }
+                Text("Возвращается только пропавшее, ничего из изменённого не затирается. Старые копии приложения лучше не запускать: они переписывают настройки по-своему.")
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
+            Divider()
+        } else if let loss = settings.loss {
+            VStack(alignment: .leading) {
+                HStack(alignment: .top) {
+                    Notice(.warning, loss.message)
+                    Spacer()
+                    Button(String(localized: "Понятно")) { settings.acknowledgeLoss() }
+                }
                 if let snapshot = loss.snapshot {
-                    HStack(spacing: 12) {
-                        Button("Показать снимок в Finder") {
+                    HStack {
+                        Text("Снимок остаётся на диске, пока его не удалят вручную.")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(String(localized: "Показать снимок в Finder")) {
                             NSWorkspace.shared.activateFileViewerSelecting([snapshot])
                         }
-                        Text("Снимок остаётся на диске, пока его не удалят вручную.")
-                            .font(Theme.Font.caption).foregroundStyle(.secondary)
-                        Spacer()
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
+            .padding()
+            Divider()
         } else if settings.recoveredFromPreviousCopy {
-            VStack(alignment: .leading, spacing: 8) {
-                MessageBanner(
-                    kind: .warning,
-                    text: String(localized: "Файла настроек на месте не оказалось — они подняты из копии «как было». Проверьте, всё ли на месте: правки, сделанные последними, могли в копию не попасть.")
-                ) { settings.acknowledgeRecovery() }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-        }
-    }
-
-    private var statusBar: some View {
-        HStack(spacing: 12) {
-            // Точка та же, что и везде: плоская, восьми пунктов, цвет несёт
-            // состояние. Эмодзи 🟢 рисуется шрифтом — он объёмный, с бликом,
-            // и меняет вид от системы к системе; рядом с плоскими точками
-            // карточек это выглядело как чужая деталь.
-            Circle()
-                .fill(connectionColor)
-                .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-            Text(app.connection.title)
-                .font(Theme.Font.caption)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            // a permanent badge, not a checkbox buried in the profile —
-            // the point is that nobody wonders why a write was refused.
-            if app.connection.isReadOnly {
-                Label(String(localized: "только чтение"), systemImage: "lock.fill")
-                    .font(Theme.Font.tableHeader)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: Theme.Radius.chip))
-                    .foregroundStyle(.orange)
-                    .help(String(localized: "Подключение открыто только для чтения: запись, импорт и синхронизация отклоняются."))
-            }
-
-            // Настройки не сохраняются — это состояние, при котором любая
-            // правка исчезнет после перезапуска. Значок постоянный: узнавать об
-            // этом по пропавшим источникам — ровно то, что уже случилось.
-            if settings.persistenceProblem != nil {
-                Label(String(localized: "настройки не сохраняются"), systemImage: "exclamationmark.triangle.fill")
-                    .font(Theme.Font.tableHeader)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Color.red.opacity(0.18), in: RoundedRectangle(cornerRadius: Theme.Radius.chip))
-                    .foregroundStyle(.red)
-                    .help(settings.persistenceProblem ?? "")
-            }
-
-            if let activity = autoSync.activity {
-                // Automatic work is never invisible.
-                HStack(spacing: 4) {
-                    ProgressView().controlSize(.small)
-                    Text(activity).font(Theme.Font.caption).lineLimit(1).truncationMode(.middle)
+            VStack(alignment: .leading) {
+                HStack(alignment: .top) {
+                    Notice(.warning, String(localized: "Файла настроек на месте не оказалось — они подняты из копии «как было». Проверьте, всё ли на месте: правки, сделанные последними, могли в копию не попасть."))
+                    Spacer()
+                    Button(String(localized: "Понятно")) { settings.acknowledgeRecovery() }
                 }
-            } else if settings.configuration.automaticSyncPaused,
-                      settings.configuration.dataSources.contains(where: { $0.triggers.isAnyEnabled }) {
-                Text("· автоиндексация на паузе")
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(.orange)
             }
-
-            ServerUptimeLabel()
-
-            Spacer()
-
-            Text(String(localized: "Режим: \(settings.configuration.mode.title)"))
-                .font(Theme.Font.caption)
-                .foregroundStyle(.secondary)
-
-            if case .connecting = app.connection {
-                ProgressView().controlSize(.small)
-            } else {
-                Button {
-                    Task {
-                        await app.reconnect()
-                        await collectionsModel.refresh(app)
-                    }
-                } label: {
-                    Label(String(localized: "Переподключиться"), systemImage: "arrow.clockwise")
-                        .labelStyle(.iconOnly)
-                }
-                .buttonStyle(.borderless)
-                .help(String(localized: "Переподключиться к ChromaDB"))
-            }
+            .padding()
+            Divider()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     static func uptimeText(_ interval: TimeInterval) -> String {

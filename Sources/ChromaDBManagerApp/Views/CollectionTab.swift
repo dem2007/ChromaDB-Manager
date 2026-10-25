@@ -10,14 +10,17 @@ import ChromaCore
 /// какой кнопкой лежит какая его половина.
 ///
 /// Порядок — по тому, как часто открывают. «Документы» и «Поиск» — каждый
-/// день; «Обзор» и «Темы» — когда разбираются, что вообще накопилось;
-/// «Правила» — реже всего, но там же, а не за отдельной кнопкой.
+/// день; «Обзор» — когда разбираются, что вообще накопилось и о чём оно;
+/// «Метаданные» — реже всего, но там же, а не за отдельной кнопкой.
+///
+/// Вкладок четыре, а не пять (v3): при пяти сегменты вытесняли из тулбара
+/// всё остальное. «Темы» ушли в «Обзор» — они о содержании коллекции, как и
+/// её состав; «Правила» стали «Метаданными» вместе со служебными полями.
 enum CollectionTab: String, CaseIterable, Identifiable {
     case documents
     case search
     case overview
-    case topics
-    case rules
+    case metadata
 
     var id: String { rawValue }
 
@@ -26,8 +29,7 @@ enum CollectionTab: String, CaseIterable, Identifiable {
         case .documents: return String(localized: "Документы")
         case .search: return String(localized: "Поиск")
         case .overview: return String(localized: "Обзор")
-        case .topics: return String(localized: "Темы")
-        case .rules: return String(localized: "Правила")
+        case .metadata: return String(localized: "Метаданные")
         }
     }
 }

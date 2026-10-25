@@ -1,7 +1,7 @@
 ---
 name: chromadb-manager
 description: Query the ChromaDB Manager document base over MCP.
-version: 3.1.0
+version: 3.3.0
 author: Max, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -159,14 +159,15 @@ right.
 
 ## Reading a document
 
-A whole document is reachable. **Reading it as chunks is not** — that is the
-default shape of `get_file`, it carries about a fifth of its own size as
-document text, and on a specification of 1281 chunks it would take some three
-hundred calls. Ask for it plainly and the answer opens with the verdict — how
-many chunks the file holds, how many fit here, how many calls it would take —
-and carries `fitsInOneAnswer` and `callsToFinish` — counted over what is left
-from where you are, so the last page says nothing.
-The verdict names the two shapes below; take one of them.
+A whole document is reachable. **Reading it as chunks is not**: with
+`"as": "chunks"` (or with `fields`) an answer carries less than half the
+document text that the same answer carries as text, and a specification of
+1281 chunks would take over two hundred calls. Every chunk page carries
+`fitsInOneAnswer` and `callsToFinish`, counted over what is left from where you
+are; one that cannot finish the file in ten calls opens with the verdict — how
+many chunks the file holds, how many are here, how many calls are left — and
+the last page says nothing. The verdict names the two shapes below; take one of
+them.
 
 ### Whole: `sourcePath`
 
@@ -177,44 +178,66 @@ come from a file (written by an agent, taken from the web) or the file is gone.
 
 ### Whole: text, and it is the default
 
-Reading a file gives continuous text, not a list of chunks: no ids, no
-per-chunk metadata, no mirror in `structuredContent`. Measured on answers of
-the same size: **6 960 characters of the document as chunks against 20 880 as
-text**. On a real specification that is some eighty calls instead of three
-hundred and eighty — and the outline states the number for the file in hand.
+A `get_file` call without `as`, `outline` or `fields` gives continuous text,
+not a list of chunks: no ids, no per-chunk metadata, no mirror in
+`structuredContent`. Measured on answers of the same size: **9 280 characters
+of the document as chunks against 20 880 as text**. On a real specification of
+1281 chunks that is about a hundred calls — and the outline states the number
+for the file in hand.
 
 ```json
 {"collection": "<collection>", "file_id": "<file_id>"}
 ```
 
 Ask for `"as": "chunks"` when you need the ids to fetch with `get_documents`,
-or the metadata of each chunk; passing `fields` selects chunks on its own,
-since text has no metadata to project.
+or the metadata of each chunk; passing `fields` without `as` selects chunks on
+its own, since text has no metadata to project.
 
 What comes back:
 
-- **the document described once**, on the first page only — `document` in the
-  structured answer and one line in the text: chunks, sections, tokens, pages,
-  bytes, modified, language, extraction warnings. Keep it; later pages do not
-  repeat it. Neither the disk path nor the chunk count is in it — `sourcePath`
-  and `totalChunks` carry those on every page;
+- **the document described once**, on the first page only — one line in the
+  text, `Document: …`, with chunks, sections, tokens, pages, bytes, modified,
+  language and extraction warnings, and `document` in the structured answer
+  with the same facts except the chunk count. Keep it; later pages do not
+  repeat it. On every page `totalChunks` carries the chunk count and
+  `sourcePath` the place on disk;
 - **then text alone**, carrying only `[chunk N]` marks — and
   `[chunk N · section]` where the section changes — so you always know where
   you are and what to cite. **Strip the marks before quoting;**
 - `[end of document]` (or `[end of section «…»]`) when there is no more;
-- `hasMore` and `nextOffset` while there is. `offset` counts chunks;
+- `hasMore` and `nextOffset` while there is, and a note near the top: which
+  chunks are here, the offset to continue from, and about how many more pages
+  it takes at this rate. `offset` counts chunks. Text pages carry no
+  `fitsInOneAnswer` or `callsToFinish` — the note is the count;
 - overlapping chunks joined without the repeats — across page boundaries too,
   so pages pasted together repeat nothing — and a note saying how many
   characters were trimmed at the seams;
 - an offset past the end says so, instead of answering `hasMore: false` as if
   the document were finished — and still names `sourcePath`;
-- `limit` and `fields` do not apply here: the page is filled to the answer
-  budget and the text carries no metadata to project. The answer says so if you
-  passed them.
+- unset, `limit` lets the page fill the answer budget — which is what you
+  want. Set, it caps the chunks per page, and a page that stopped at your
+  `limit` rather than at the budget says so; the key's ceiling trims it, also
+  with a note. Do not pass a small `limit` to text: it only makes more calls;
+- `fields` together with `"as": "text"` does not apply — the text carries no
+  metadata to project — and the answer says so.
 
 Pass `heading` too and you get one section as text. There `offset` counts
 chunks **inside the section**, while the `[chunk N]` marks stay the document's
 own numbering — the answer says so.
+
+**A table read as text** (a spreadsheet, or a table indexed row by row):
+
+- rows come in the workbook's order — sheet by sheet, then by row number — and
+  each mark gives the row's address: `[chunk N · <sheet>, row R]`;
+- the row's own columns follow its text as `column: value; …` — prices and
+  quantities live in metadata, and this is where you see them;
+- columns identical in every row of the file — or of the section, with
+  `heading` — (a year, a client) are named once in a note, `Every table row
+  here also carries: …`; they apply to each row;
+- a table header repeated at the top of a chunk is shown once, at the first
+  chunk of the page, and a note says how many repeats were dropped;
+- a workbook not indexed whole, or a table that stayed flat text, is named in
+  a `Warning:` note — see «Notes in the answer are data» below.
 
 ### Part: the map first
 
@@ -239,6 +262,9 @@ one answer; the document itself fits nowhere.
   `totalChunks` and `estimatedTokens` are always the **file's**, even when one
   section was asked for; the size and weight of that section come separately,
   as `chunksInSection` and `estimatedTokensInSection`;
+- the price of reading the file whole as text: `charactersEstimate` and
+  `callsToReadWhole`. The calls are a lower bound — a page stops at the last
+  chunk that fits whole — so expect up to a fifth more;
 - `outline_depth` defaults to **1** — the top level, which is what a map is for.
   A specification has hundreds of sub-headings and listing them all gives a
   wall, not a map;
@@ -259,7 +285,7 @@ one answer; the document itself fits nowhere.
 
 ```json
 {"collection": "<collection>", "file_id": "<file_id>",
- "heading": "<heading from the map>", "limit": 20}
+ "heading": "<heading from the map>"}
 ```
 
 - a heading brings **its subsections with it**: asking for a chapter gives the
@@ -272,11 +298,13 @@ one answer; the document itself fits nowhere.
   non-breaking space or a line break inside a heading is invisible on screen;
   the map prints the typeable form and the selector accepts it. A miss names
   the nearest sections instead of sending you back to the map you copied from;
-- a section too big to finish in ten calls says so in its **first line**, with
-  `sectionFitsInOneAnswer` and `callsToFinishSection` in the structured answer —
-  counted over what is **left**, so the last page of a long section says nothing.
-  Take that seriously: reading 8 chunks of a 47-chunk section and moving on is
-  how a review ends up covering 4 % of a document;
+- how much of the section is left is in the note near the top of each page —
+  the chunks shown, the offset to continue from and about how many more pages.
+  As chunks (`"as": "chunks"`) a section too big to finish in ten calls says
+  so in its **first line**, with `sectionFitsInOneAnswer` and
+  `callsToFinishSection`. Either way the count is of what is **left**. Take it
+  seriously: reading 8 chunks of a 47-chunk section and moving on is how a
+  review ends up covering 4 % of a document;
 - a section is a unit you can reason about and name to a person. «Chunks 200 to
   203» is neither;
 - an offset past the end of a file or of a section says exactly that, and does
@@ -329,6 +357,17 @@ projection, and fifty-six rows fit in one answer instead of eight.
 Compare numbers with numbers: `2026` and `"2026"` are different conditions, and
 the second returns nothing.
 
+A sheet indexed as a document is sometimes a printed form rather than a table:
+an invoice, an act or a budget template laid out on a grid. Its chunks carry
+`table_layout`. `form` means the whole sheet is written as lines of the form
+(«label | value | code», each merged field once). `mixed` means a form with a
+real table inside: the table keeps its grid and header, and the rest is lines.
+Form lines have no columns, because a value's place in the line is its place on
+the blank, not a column. Do not sum, compare or filter form lines by position;
+read them as text. A document sheet without the field is an ordinary table.
+Forms inside Word and HTML documents are written the same way, without the
+field.
+
 ## Pitfalls
 
 - **A word that is not there.** `contains` compares substrings literally. An
@@ -341,11 +380,14 @@ the second returns nothing.
 - **The answer is cut off.** The answer budget counts metadata alongside text.
   Look at `fields` before you look at ceilings.
 - **`get_documents` returns an arbitrary order.** Pages are turned with the
-  `offset` from the answer. Only `get_file` keeps the order of chunks.
+  `offset` from the answer. Only `get_file` keeps the order of chunks — up to
+  20 000 chunks in a file; beyond that the answer says the order is not the
+  document's.
 - **Never count from fragments.** A fragment is a piece of a file. One table row
   is one position; an enumeration inside a cell adds no positions.
-- **Notes in the answer are data.** If it says the table arrived as flat text or
-  the book was not indexed whole, no total may be built on that answer.
+- **Notes in the answer are data.** If it says the table stayed flat text or
+  the workbook is not indexed whole, no total may be built on that answer. Every
+  reading tool says it, `get_file` as text included.
 - **Build `$or` explicitly.** The application adds its own conditions beside the
   root and does not break your logic, but `{"field": "А"}` and `{"field": "Б"}`
   as two calls is not the same as one `$or`.
@@ -365,9 +407,10 @@ Five calls on any collection the key can reach — no particular corpus required
 3. `search` on the same topic — far fewer files than `M`.
 4. `get_file` with `outline` on a `file_id` from those answers — the sections
    come back with their chunk ranges and token weights.
-5. `get_file` with `as: "text"` on the same `file_id` — the first line describes
-   the document, the text carries `[chunk N]` marks, and `sourcePath` names the
-   file on disk if it came from one.
+5. `get_file` on the same `file_id`, with nothing else — it answers as text:
+   the header and the `Document: …` line describe it, the text carries
+   `[chunk N]` marks, and `sourcePath` names the file on disk if it came from
+   one.
 
 The gap between the second and the third is the reason coverage is asked of
 `collect_mentions`. The fourth and fifth are the two ways to hold a document:

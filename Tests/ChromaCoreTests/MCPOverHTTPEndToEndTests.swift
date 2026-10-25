@@ -93,7 +93,7 @@ final class MCPOverHTTPEndToEndTests: XCTestCase {
 
     private func request(id: Int, method: String) -> String {
         """
-        {"jsonrpc":"2.0","id":\(id),"method":"\(method)","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"\(MCPProtocol.version)"}}}
+        {"jsonrpc":"2.0","id":\(id),"method":"\(method)","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"\(MCPProtocol.version)","io.modelcontextprotocol/clientCapabilities":{}}}}
         """
     }
 

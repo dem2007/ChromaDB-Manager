@@ -24,9 +24,14 @@ public struct ContextEnricher: Sendable {
 
     public typealias Completion = @Sendable (_ prompt: String, _ model: String) async throws -> String
 
+    /// Сколько отказов подряд — и модель считается молчащей до конца
+    /// прогона.
+    public static let silenceLimit = 3
+
     private let model: String
     private let complete: Completion
     private let log: LogHandler
+    private let silence = Silence()
 
     public init(model: String, log: @escaping LogHandler = noopLogHandler, complete: @escaping Completion) {
         self.model = model
@@ -34,11 +39,43 @@ public struct ContextEnricher: Sendable {
         self.log = log
     }
 
+    /// Отказы подряд — на весь прогон: обогатитель один на прогон, и файлов
+    /// в нём сотни.
+    private final class Silence: @unchecked Sendable {
+        private let lock = NSLock()
+        private var streak = 0
+        private(set) var gaveUp = false
+
+        var isOver: Bool { lock.withLock { gaveUp } }
+
+        func answered() { lock.withLock { streak = 0 } }
+
+        /// `true` — именно этот отказ исчерпал терпение.
+        func failed() -> Bool {
+            lock.withLock {
+                streak += 1
+                guard !gaveUp, streak >= ContextEnricher.silenceLimit else { return false }
+                gaveUp = true
+                return true
+            }
+        }
+    }
+
     /// Промпт: документ, где находится фрагмент, и сам фрагмент.
     ///
     /// Просит **не пересказывать**: пересказанный фрагмент в векторе — это тот
     /// же фрагмент другими словами, а нужен контекст, которого в нём нет.
-    public static func prompt(documentTitle: String?, headingPath: String?, text: String) -> String {
+    ///
+    /// **Документ — в запросе**. Раньше модель видела только название
+    /// файла, путь раздела и сам фрагмент: сказать, «о чём документ», ей было
+    /// не из чего, и ответ сводился к пересказу фрагмента. У Anthropic модель
+    /// видит документ целиком; локальной модели целого ТЗ не прочесть, и она
+    /// получает его начало и оглавление (`documentContext`). Общая для всех
+    /// кусков файла часть стоит в запросе первой, фрагмент — последним:
+    /// одинаковое начало запросов движок модели может не пересчитывать.
+    public static func prompt(
+        documentTitle: String?, headingPath: String?, text: String, documentContext: String? = nil
+    ) -> String {
         var lines = [
             "Ты помогаешь искать по базе документов.",
             "Напиши не больше \(sentenceLimit) предложений о том, о чём документ и какое место в нём занимает фрагмент ниже.",
@@ -48,6 +85,10 @@ public struct ContextEnricher: Sendable {
         ]
         if let documentTitle, !documentTitle.isEmpty {
             lines.append("Документ: \(documentTitle)")
+        }
+        if let documentContext, !documentContext.isEmpty {
+            lines.append(documentContext)
+            lines.append("")
         }
         if let headingPath, !headingPath.isEmpty {
             lines.append("Раздел: \(headingPath)")
@@ -69,19 +110,26 @@ public struct ContextEnricher: Sendable {
     ///   занимает фрагмент», и без раздела модель отвечает на неё догадкой.
     public func enriched(
         chunks: [TextChunk], texts: [String], documentTitle: String?,
-        headingPaths: [Int: String] = [:]
+        headingPaths: [Int: String] = [:], documentContext: String? = nil
     ) async throws -> [String] {
         guard chunks.count == texts.count else { return texts }
         var result = texts
         for (index, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
+            // Модель не ответила несколько раз подряд — дальше без контекста
+            //. Иначе каждый из тысяч чанков ждал полный срок, и прогон
+            // папки шёл часами, не обогатив ничего, — тот же случай, что
+            // у LLM-нарезки.
+            guard !silence.isOver else { break }
             let prompt = Self.prompt(
                 documentTitle: documentTitle,
                 headingPath: headingPaths[chunk.index],
-                text: chunk.text
+                text: chunk.text,
+                documentContext: documentContext
             )
             do {
                 let answer = try await complete(prompt, model)
+                silence.answered()
                 guard let context = Self.cleaned(answer) else { continue }
                 result[index] = context + "\n\n" + texts[index]
             } catch is CancellationError {
@@ -89,6 +137,10 @@ public struct ContextEnricher: Sendable {
             } catch {
                 log(.warning, "Чанкинг",
                     "Контекст для чанка \(chunk.index) не получен: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+                if silence.failed() {
+                    log(.warning, "Чанкинг",
+                        "Модель \(model) не ответила \(Self.silenceLimit) раза подряд — обогащение контекстом до конца прогона выключено, фрагменты уходят в эмбеддинг как есть")
+                }
             }
         }
         return result
@@ -96,6 +148,40 @@ public struct ContextEnricher: Sendable {
 
     /// Ответ модели, приведённый к строке контекста: без пустых строк,
     /// без обрамляющих кавычек, не длиннее предела.
+    /// Сколько знаков начала документа идёт в запрос.
+    public static let openingLength = 1_200
+    /// Сколько знаков оглавления идёт в запрос.
+    public static let outlineLength = 1_500
+
+    /// Документ для запроса: его начало (название, преамбула, предмет) и
+    /// оглавление — заголовки двух верхних уровней. `nil`, если сказать нечего.
+    public static func documentContext(of document: ExtractedDocument) -> String? {
+        var parts: [String] = []
+        let text = document.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+            var opening = String(text.prefix(openingLength))
+            if text.count > openingLength {
+                // До конца последней целой строки, а не посреди слова.
+                if let cut = opening.lastIndex(where: \.isNewline), opening.distance(from: opening.startIndex, to: cut) > openingLength / 2 {
+                    opening = String(opening[..<cut])
+                }
+                opening += " …"
+            }
+            parts.append("Начало документа:\n" + opening)
+        }
+        let top = document.structure.map(\.level).min() ?? 1
+        var outline: [String] = []
+        var length = 0
+        for node in document.structure where node.level <= top + 1 {
+            let line = String(repeating: "  ", count: node.level - top) + node.title
+            guard length + line.count <= outlineLength else { break }
+            outline.append(line)
+            length += line.count + 1
+        }
+        if outline.count > 1 { parts.append("Оглавление документа:\n" + outline.joined(separator: "\n")) }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
     static func cleaned(_ answer: String) -> String? {
         // Кавычки снимаются с **каждой** строки, а не с готовой склейки: модель
         // нередко берёт в кавычки каждое предложение, и тогда у собранной

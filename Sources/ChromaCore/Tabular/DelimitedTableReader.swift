@@ -104,11 +104,17 @@ public enum TextEncodingGuess: String, Codable, Hashable, Sendable, CaseIterable
     case windows1251
     case utf16LE
     case utf16BE
+    /// Старые русские кодировки: KOI8-R — почта и Unix, CP866 — DOS и
+    /// выгрузки старых учётных программ.
+    case koi8R
+    case cp866
 
     public var encoding: String.Encoding {
         switch self {
         case .utf8, .utf8WithBOM: return .utf8
         case .windows1251: return .windowsCP1251
+        case .koi8R: return Self.legacy(.KOI8_R)
+        case .cp866: return Self.legacy(.dosRussian)
         case .utf16LE: return .utf16LittleEndian
         case .utf16BE: return .utf16BigEndian
         }
@@ -121,7 +127,13 @@ public enum TextEncodingGuess: String, Codable, Hashable, Sendable, CaseIterable
         case .windows1251: return "Windows-1251"
         case .utf16LE: return "UTF-16 LE"
         case .utf16BE: return "UTF-16 BE"
+        case .koi8R: return "KOI8-R"
+        case .cp866: return "CP866 (DOS)"
         }
+    }
+
+    private static func legacy(_ encoding: CFStringEncodings) -> String.Encoding {
+        String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(encoding.rawValue)))
     }
 }
 
@@ -174,8 +186,69 @@ public enum DelimitedTableReader {
         // Windows-1251 rather than Latin-1. Latin-1 decodes *any* byte, so it
         // never fails and silently turns Cyrillic into «Ïðèâåò» — a fallback
         // that always succeeds is a fallback that hides the problem.
-        if String(data: data, encoding: .windowsCP1251) != nil { return .windows1251 }
-        return nil
+        return singleByteCyrillic(data)
+    }
+
+    /// Однобайтовая русская кодировка — по тому, какой из прочтений текст
+    /// похож на русский.
+    ///
+    /// Windows-1251, KOI8-R и CP866 принимают почти любой байт, поэтому
+    /// «прочиталось» ничего не говорит: файл в KOI8-R, прочитанный как
+    /// Windows-1251, — «рТЙЧЕФ, НЙТ!» вместо «Привет, мир!», и такой текст
+    /// индексировался и не находился ни по одному слову. Верное прочтение
+    /// узнаётся по самому тексту: в русском тексте буквы в основном строчные,
+    /// частые буквы — «о», «е», «а», «и», «н», «т», а заглавная посреди
+    /// слова и псевдографика — признак чужой кодировки. При равенстве —
+    /// Windows-1251, самая частая.
+    static func singleByteCyrillic(_ data: Data) -> TextEncodingGuess? {
+        // Оценки хватает по началу файла: кодировка у файла одна.
+        let sample = data.prefix(64 * 1024)
+        var best: (guess: TextEncodingGuess, score: Int)?
+        for guess in [TextEncodingGuess.windows1251, .koi8R, .cp866] {
+            guard let text = String(data: sample, encoding: guess.encoding) else { continue }
+            let score = russianScore(text)
+            // KOI8-R и CP866 — только по явным признакам русского текста:
+            // без них (английский текст в cp1252 с «умными» кавычками) CP866
+            // читал кавычки заглавными «У», «Ф» и выигрывал у Windows-1251,
+            // для которой кавычки на тех же местах.
+            if guess != .windows1251, score <= 0 { continue }
+            if best == nil || score > best!.score { best = (guess, score) }
+        }
+        // Обрезанная выборка могла разрезать знак — весь файл проверяется
+        // отдельно.
+        guard let best, String(data: data, encoding: best.guess.encoding) != nil else {
+            return String(data: data, encoding: .windowsCP1251) != nil ? .windows1251 : nil
+        }
+        return best.guess
+    }
+
+    /// Насколько текст похож на русский: частые строчные буквы — в плюс,
+    /// заглавная после строчной и знаки вне букв и пунктуации — в минус.
+    static func russianScore(_ text: String) -> Int {
+        let frequent = Set("оеаинтсрвлкмдпу")
+        var score = 0
+        var previousLower = false
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            guard value >= 0x80 else { previousLower = false; continue }
+            let isCyrillic = (0x0410...0x044F).contains(value) || value == 0x0401 || value == 0x0451
+            if isCyrillic {
+                let character = Character(scalar)
+                if character.isLowercase {
+                    score += frequent.contains(character) ? 2 : 1
+                    previousLower = true
+                } else {
+                    if previousLower { score -= 3 }
+                    previousLower = false
+                }
+            } else {
+                // Псевдографика, «Ґ», «ў», «Џ» и прочее, чем чужая кодировка
+                // читает русские буквы. Кавычки «» и тире — обычный текст.
+                if !"«»—–…№".unicodeScalars.contains(scalar) { score -= 2 }
+                previousLower = false
+            }
+        }
+        return score
     }
 
     public static func decode(_ data: Data, as guess: TextEncodingGuess) -> String? {
@@ -303,6 +376,13 @@ public enum DelimitedTableReader {
         // article numbers and phone numbers lose their meaning as integers.
         let digits = trimmed.hasPrefix("-") ? String(trimmed.dropFirst()) : trimmed
         if digits.count > 1, digits.hasPrefix("0"), !digits.hasPrefix("0.") {
+            return .text(trimmed)
+        }
+        // Длинный ряд цифр — номер, а не количество: расчётный счёт
+        // в двадцать цифр уходил в базу как «4.070281090000001e+19», номер
+        // карты в шестнадцать — с потерей последних цифр. Точнее пятнадцати
+        // знаков число с плавающей точкой не держит.
+        if digits.count > 15, digits.allSatisfy({ $0.isASCII && $0.isNumber }) {
             return .text(trimmed)
         }
         if let value = Int(trimmed) { return .number(Double(value)) }

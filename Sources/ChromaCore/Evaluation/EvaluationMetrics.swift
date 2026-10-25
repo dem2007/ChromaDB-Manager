@@ -94,6 +94,9 @@ public struct VariantMetrics: Identifiable, Hashable, Sendable {
     public let recall: [Int: MetricScore]
     public let ndcg: [Int: MetricScore]
     public let mrr: MetricScore
+    /// Знаков в первых `k` на один полезный результат — цена
+    /// попадания. Меньше — лучше.
+    public let charactersPerUseful: [Int: MetricScore]
     /// Only cells that actually called the model — a reused vector is not a
     /// fast one, and averaging it in as zero would make every variant after the
     /// first look quicker than it is.
@@ -195,6 +198,12 @@ public enum EvaluationMetrics {
         /// знаков, 483 фрагмента) это и было теми 1097 мс, которые расчёт
         /// метрик занимал при каждой отметке.
         private let matchedFragments: [Key: Set<UUID>]
+        /// Сколько знаков читает агент по каждому результату — его текст и
+        /// присоединённый к нему контекст. Считается здесь же, один
+        /// раз: цену попадания спрашивают на каждом `k` после каждой отметки,
+        /// и пересчёт знаков всей выдачи повторялся бы на каждое нажатие.
+        /// Нет ключа — у результата нет текста.
+        private let characterCounts: [Key: Int]
         /// Ключи прогона по запросам — чтобы отметка пересчитывала свой
         /// запрос, а не весь прогон.
         private let keysByQuery: [UUID: [Key]]
@@ -211,6 +220,7 @@ public enum EvaluationMetrics {
 
         public init(results: [EvaluationResult], truth: [UUID: EvaluationQuery]) {
             var texts: [Key: String] = [:]
+            var counts: [Key: Int] = [:]
             var keysByQuery: [UUID: [Key]] = [:]
             var seen: Set<Key> = []
             for result in results {
@@ -221,6 +231,7 @@ public enum EvaluationMetrics {
                     }
                     guard texts[key] == nil, let text = hit.text else { continue }
                     texts[key] = ExpectedFragment.normalised(text)
+                    counts[key] = text.count + (hit.contextCharacters ?? 0)
                 }
             }
 
@@ -235,6 +246,7 @@ public enum EvaluationMetrics {
             self.grades = grades
             self.normalisedTexts = texts
             self.matchedFragments = matched
+            self.characterCounts = counts
             self.keysByQuery = keysByQuery
             self.knownFragments = known
         }
@@ -243,12 +255,14 @@ public enum EvaluationMetrics {
             grades: [Key: RelevanceGrade],
             normalisedTexts: [Key: String],
             matchedFragments: [Key: Set<UUID>],
+            characterCounts: [Key: Int],
             keysByQuery: [UUID: [Key]],
             knownFragments: [UUID: Set<UUID>]
         ) {
             self.grades = grades
             self.normalisedTexts = normalisedTexts
             self.matchedFragments = matchedFragments
+            self.characterCounts = characterCounts
             self.keysByQuery = keysByQuery
             self.knownFragments = knownFragments
         }
@@ -278,7 +292,7 @@ public enum EvaluationMetrics {
             }
             return GradeIndex(
                 grades: grades, normalisedTexts: normalisedTexts, matchedFragments: matched,
-                keysByQuery: keysByQuery, knownFragments: known
+                characterCounts: characterCounts, keysByQuery: keysByQuery, knownFragments: known
             )
         }
 
@@ -333,6 +347,12 @@ public enum EvaluationMetrics {
             normalisedTexts[Key(query: query, variant: variant, document: document)]
         }
 
+        /// Сколько знаков агент читает по этому результату: текст и контекст
+        /// при нём. `nil` — текста у результата нет.
+        public func characters(query: UUID, variant: UUID, document: String) -> Int? {
+            characterCounts[Key(query: query, variant: variant, document: document)]
+        }
+
         /// Фрагменты эталона, встретившиеся в тексте этого результата.
         public func matched(query: UUID, variant: UUID, document: String) -> Set<UUID> {
             matchedFragments[Key(query: query, variant: variant, document: document)] ?? []
@@ -372,10 +392,12 @@ public enum EvaluationMetrics {
         var hitRate: [Int: MetricScore] = [:]
         var recall: [Int: MetricScore] = [:]
         var ndcg: [Int: MetricScore] = [:]
+        var charactersPerUseful: [Int: MetricScore] = [:]
         for k in ks {
             hitRate[k] = hitRateScore(results: results, truth: truth, grades: grades, k: k)
             recall[k] = recallScore(results: results, truth: truth, grades: grades, k: k)
             ndcg[k] = ndcgScore(results: results, truth: truth, grades: grades, k: k)
+            charactersPerUseful[k] = charactersPerUsefulScore(results: results, truth: truth, grades: grades, k: k)
         }
 
         var marked = 0
@@ -394,6 +416,7 @@ public enum EvaluationMetrics {
             recall: recall,
             ndcg: ndcg,
             mrr: mrrScore(results: results, truth: truth, grades: grades),
+            charactersPerUseful: charactersPerUseful,
             embeddingLatency: LatencySummary.of(results.compactMap(\.embeddingSeconds)),
             searchLatency: LatencySummary.of(results.map(\.searchSeconds)),
             coverage: MarkingCoverage(marked: marked, total: total),
@@ -545,6 +568,61 @@ public enum EvaluationMetrics {
             return .inapplicable(String(localized: "ни у одного запроса нет эталона с релевантным документом"))
         }
         return MetricScore(value: total / Double(applicable), queries: applicable)
+    }
+
+    /// Сколько текста в первых `k` приходится на один полезный результат
+    ///.
+    ///
+    /// **Зачем.** hit rate и nDCG засчитывают кусок, если он **содержит**
+    /// эталон, а крупный кусок содержит его чаще просто потому, что он
+    /// крупный: ответ разделом в 7 000 знаков по попаданию почти всегда
+    /// «лучше» куска в 1 000. Агент же читает выдачу целиком и платит за
+    /// каждый знак — и текста результата, и присоединённых к нему соседей или
+    /// раздела-родителя. Эта мера — цена попадания: все эти знаки первых `k`,
+    /// делённые на число полезных результатов среди них. Так разбор считал её
+    /// вручную — 1 544 знака у плоской нарезки против 8 506 у ответа
+    /// родителем — и так сравниваются нарезки разного размера, которые по
+    /// попаданию в лоб не сравнить. Chroma мерит то же долей полезного текста
+    /// в выдаче.
+    ///
+    /// **По всем запросам разом**, а не средним по запросам: запрос без
+    /// единого полезного результата в первых `k` делил бы на ноль, а
+    /// выброшенный — скрыл бы, что знаки на него потрачены. Его знаки остаются
+    /// в числителе. «Частично» — полезный, как и в hit rate. Неразмеченный
+    /// результат идёт в знаки, но не в полезные: прочитать его агенту всё
+    /// равно придётся. Поэтому на прогоне, размеченном не до конца, число
+    /// завышено — об этом говорит охват разметки рядом. Прогоны, записанные
+    /// до того, как стенд стал хранить объём контекста, знают только текст
+    /// результатов.
+    static func charactersPerUsefulScore(
+        results: [EvaluationResult], truth: [UUID: EvaluationQuery],
+        grades: GradeIndex? = nil, k: Int
+    ) -> MetricScore {
+        let grades = grades ?? GradeIndex(results: results, truth: truth)
+        var applicable = 0
+        var characters = 0
+        var useful = 0
+        for result in results {
+            guard let query = truth[result.queryID], query.hasRelevantGroundTruth else { continue }
+            applicable += 1
+            for hit in result.hits.prefix(k) {
+                // Без текста знаки не сосчитать, а ноль за них занизил бы цену.
+                guard let count = grades.characters(query: result.queryID, variant: result.variantID, document: hit.id) else {
+                    return .inapplicable(String(localized: "у части результатов прогона не сохранён текст — знаки не сосчитать"))
+                }
+                characters += count
+                if grades.grade(query: result.queryID, variant: result.variantID, document: hit.id)?.isHit == true {
+                    useful += 1
+                }
+            }
+        }
+        guard applicable > 0 else {
+            return .inapplicable(String(localized: "ни у одного запроса нет эталона с релевантным документом"))
+        }
+        guard useful > 0 else {
+            return .inapplicable(String(localized: "в первых \(k) нет ни одного полезного результата — делить знаки не на что"))
+        }
+        return MetricScore(value: Double(characters) / Double(useful), queries: applicable)
     }
 
     /// Gains of the expectations this result did not satisfy — what the ideal

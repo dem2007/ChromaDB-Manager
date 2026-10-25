@@ -91,7 +91,7 @@ public enum ChromaError: LocalizedError {
         case .serverTooOld(let endpoint):
             return String(localized: "Сервер по адресу \(endpoint) отвечает по API v1, который удалён из ChromaDB. Требуется ChromaDB 1.0 или новее.")
         case .api(let status, let code, let message):
-            return String(localized: "ChromaDB вернула ошибку \(status)\(code.map { " (\($0))" } ?? ""): \(message)")
+            return String(localized: "ChromaDB вернула ошибку \(status)\(Self.codeSuffix(code)): \(message)")
         case .decoding(let details):
             return String(localized: "Не удалось разобрать ответ ChromaDB: \(details)")
         case .resetForbidden:
@@ -111,10 +111,15 @@ public enum ChromaError: LocalizedError {
         case .readOnly(let operation):
             return String(localized: "Подключение открыто только для чтения: «\(operation)» не выполняется.")
         case .timedOut(let operation, let seconds):
-            return String(localized: "\(operation.title): сервер не ответил за \(Int(seconds)) с.")
+            return String(localized: "\(operation.title): сервер не ответил за \(seconds.secondsText) с.")
         case .partialWrite(let failure):
             return String(localized: "Записано \(failure.written) из \(failure.total); сбой на части \(failure.failedBatch) из \(failure.batchCount): \(failure.reason)")
         }
+    }
+
+    /// Код ошибки сервера в скобках — одна запись на оба текста.
+    static func codeSuffix(_ code: String?) -> String {
+        code.map { " (\($0))" } ?? ""
     }
 
     public var recoverySuggestion: String? {
@@ -155,7 +160,7 @@ extension ChromaError: MCPReadableError {
         case .serverTooOld(let endpoint):
             return "the server at \(endpoint) speaks the removed v1 API; ChromaDB 1.0 or newer is required"
         case .api(let status, let code, let message):
-            return "ChromaDB answered with an error \(status.plainDigits)\(code.map { " (\($0))" } ?? ""): «\(message)»"
+            return "ChromaDB answered with an error \(status.plainDigits)\(Self.codeSuffix(code)): «\(message)»"
         case .decoding(let what):
             return "the answer of ChromaDB could not be read: «\(what)»"
         case .resetForbidden:
@@ -175,7 +180,7 @@ extension ChromaError: MCPReadableError {
         case .readOnly(let operation):
             return "this connection is open for reading only, so «\(operation)» is refused"
         case .timedOut(let operation, let seconds):
-            return "ChromaDB did not answer in \(Int(seconds).plainDigits) seconds (\(operation.rawValue))"
+            return "ChromaDB did not answer in \(seconds.secondsText) seconds (\(operation.rawValue))"
         case .partialWrite(let write):
             return "the write went in partially: \(write.written.plainDigits) of \(write.total.plainDigits) documents, batch \(write.failedBatch.plainDigits) failed"
         }
@@ -377,20 +382,58 @@ public actor ChromaClient {
 
     // MARK: - Collections
 
-    public func listCollections(withCounts: Bool = true) async throws -> [ChromaCollection] {
+    public func listCollections(withCounts: Bool = false) async throws -> [ChromaCollection] {
         var collections = try await request([ChromaCollection].self, method: "GET", path: endpoint.collectionsPath, operation: .metadata)
         // Rebuilt rather than merged: a name that is no longer on the server
         // must not survive in the cache, and this is the one call the refresh
         // button makes (rule 3).
+        let previous = collectionIDs
         collectionIDs.removeAll(keepingCapacity: true)
-        retiredIDs.removeAll(keepingCapacity: true)
-        for index in collections.indices {
-            collectionIDs[collections[index].name] = collections[index].id
-            if withCounts {
-                collections[index].documentCount = try? await count(collectionID: collections[index].id)
-            }
+        for collection in collections {
+            collectionIDs[collection.name] = collection.id
+        }
+        // Имя, сменившее id, оставляет прежний id отставленным: экраны держат
+        // старые объекты коллекций, и их id должен найти имя — иначе спасался
+        // только тот, ради кого список перечитали, а соседняя пересозданная
+        // коллекция падала.
+        for (name, old) in previous where collectionIDs[name].map({ $0 != old }) ?? false {
+            retiredIDs[old] = name
+        }
+        // Отставленные живут, пока жива коллекция с их именем под другим id:
+        // этим и ограничены. Раньше список стирался целиком — а перечитывается
+        // он не только кнопкой, но и каждым поиском имени и каждым спасением
+        // устаревшего id, и помнил в итоге одно последнее.
+        retiredIDs = retiredIDs.filter { old, name in
+            collectionIDs[name].map { $0 != old } ?? false
+        }
+        if withCounts {
+            collections = await counted(collections)
         }
         return collections
+    }
+
+    /// Счёт документов — параллельно, по нескольку за раз: по одному это
+    /// круг до сервера на каждую коллекцию, и на удалённом сервере список
+    /// из полусотни обновлялся секундами.
+    private func counted(_ collections: [ChromaCollection]) async -> [ChromaCollection] {
+        var result = collections
+        let width = 8
+        await withTaskGroup(of: (Int, Int?).self) { group in
+            var next = 0
+            func enqueue() {
+                guard next < collections.count else { return }
+                let index = next
+                let id = collections[index].id
+                next += 1
+                group.addTask { (index, try? await self.count(collectionID: id)) }
+            }
+            for _ in 0..<width { enqueue() }
+            while let (index, count) = await group.next() {
+                result[index].documentCount = count
+                enqueue()
+            }
+        }
+        return result
     }
 
     public func collection(named name: String) async throws -> ChromaCollection {
@@ -581,6 +624,8 @@ public actor ChromaClient {
     public func updateDocuments(collectionID: String, updates: [DocumentUpdate]) async throws {
         try refuseIfReadOnly("правка документов")
         guard !updates.isEmpty else { return }
+        // Правка метаданных — тоже изменение: порядок и путь куска живут в них.
+        defer { onCollectionChanged(collectionID) }
         var body: [String: Any] = ["ids": updates.map(\.id)]
         if updates.contains(where: { $0.document != nil }) {
             body["documents"] = updates.map { $0.document as Any? ?? NSNull() }
@@ -601,13 +646,28 @@ public actor ChromaClient {
                 return object
             }
         }
+        // Частями по пределу сервера — как запись и удаление. Правка листа
+        // таблицы или пачки путей уходила одним запросом на любое число
+        // документов, и предел, объявленный сервером, соблюдался везде,
+        // кроме неё. Правка повторяема, так что при сбое на середине её
+        // можно просто повторить целиком.
+        let limits = await writeLimits()
+        let step = limits.maxRecords
         try await retryingStaleID(collectionID) { id in
-            _ = try await requestRaw(
-                method: "POST",
-                path: "\(endpoint.collectionsPath)/\(id)/update",
-                body: body,
-                operation: .write
-            )
+            for start in stride(from: 0, to: updates.count, by: step) {
+                try Task.checkCancellation()
+                let end = min(start + step, updates.count)
+                let slice = body.mapValues { value -> Any in
+                    guard let list = value as? [Any] else { return value }
+                    return Array(list[start..<end])
+                }
+                _ = try await requestRaw(
+                    method: "POST",
+                    path: "\(endpoint.collectionsPath)/\(id)/update",
+                    body: slice,
+                    operation: .write
+                )
+            }
         }
         log(.info, "ChromaDB", "Обновлено документов: \(updates.count)")
     }
@@ -695,6 +755,34 @@ public actor ChromaClient {
         return found
     }
 
+    /// Кого известить, что коллекция изменилась.
+    ///
+    /// Нужен тем, кто что-то о коллекции помнит между вызовами. Точка одна
+    /// нарочно: писать в базу умеют и индексация, и синхронизация таблиц,
+    /// и импорт, и восстановление из корзины, и агент через MCP — а проходят
+    /// они все через этот клиент, и вешать по обработчику на каждый путь
+    /// значило бы завести пять мест, где о новом пути забудут.
+    ///
+    /// Извещает при любом исходе — и при сбое, и при отмене: оборванная
+    /// запись успела изменить то, что успела. Записи мимо клиента — через
+    /// прокси или чужим клиентом той же базы — сюда не попадают: их ловят
+    /// журнал доступа, счёт документов и срок жизни у того, кто помнит.
+    ///
+    /// Подписчики — по имени: прежде слот был один, и второй, кто захотел бы
+    /// знать о записи, молча вытеснил бы первого — кэш которого продолжал бы
+    /// отдавать вчерашнее. Повторная подписка под тем же именем заменяет
+    /// свою же, а не копится.
+    private var collectionObservers: [String: @Sendable (String) -> Void] = [:]
+
+    /// Подписаться на изменения коллекций; `nil` — отписаться.
+    public func observeCollectionChanges(as name: String, _ handler: (@Sendable (String) -> Void)?) {
+        collectionObservers[name] = handler
+    }
+
+    private func onCollectionChanged(_ collectionID: String) {
+        for handler in collectionObservers.values { handler(collectionID) }
+    }
+
     public func add(collectionID: String, records: [EmbeddedRecord]) async throws {
         try await write(collectionID: collectionID, records: records, operation: "add")
     }
@@ -714,6 +802,8 @@ public actor ChromaClient {
     private func write(collectionID: String, records: [EmbeddedRecord], operation: String) async throws {
         try refuseIfReadOnly("запись документов")
         guard !records.isEmpty else { return }
+        // И при сбое: оборванная запись успела изменить то, что успела.
+        defer { onCollectionChanged(collectionID) }
         let limits = await writeLimits()
         let batches = try BatchSplitter.split(records, limits: limits)
 
@@ -769,6 +859,7 @@ public actor ChromaClient {
     public func deleteDocuments(collectionID: String, ids: [String]) async throws {
         try refuseIfReadOnly("удаление документов")
         guard !ids.isEmpty else { return }
+        defer { onCollectionChanged(collectionID) }
         let limits = await writeLimits()
         try await retryingStaleID(collectionID) { resolvedID in
             var index = 0
@@ -804,6 +895,7 @@ public actor ChromaClient {
         }
         var body: [String: Any] = ["where": clause]
         if let documentClause = try filter.whereDocumentClause() { body["where_document"] = documentClause }
+        defer { onCollectionChanged(collectionID) }
 
         let data = try await retryingStaleID(collectionID) { id in
             try await requestRaw(
@@ -1083,7 +1175,10 @@ public actor ChromaClient {
                 ?? retiredIDs[collectionID] else {
                 throw ChromaError.collectionNotFound(subject)
             }
-            collectionIDs.removeValue(forKey: name)
+            // Имя из кэша не вынимается до ответа: на ожидании этот же
+            // устаревший id может прийти вторым вызовом, и он обязан найти
+            // имя, а не упасть, пока первый спасает. Список коллекций ниже
+            // перестроит кэш сам.
             let fresh = try await collection(named: name).id
             collectionIDs[name] = fresh
             guard fresh != collectionID else { throw ChromaError.collectionNotFound(name) }

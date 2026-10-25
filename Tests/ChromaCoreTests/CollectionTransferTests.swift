@@ -682,3 +682,32 @@ func XCTAssertThrowsErrorAsync<T>(
         XCTFail("ожидалась ошибка", file: file, line: line)
     } catch {}
 }
+
+extension CollectionTransferTests {
+    /// Пакет без векторов в коллекцию **без** привязанной модели: векторы
+    /// посчитает модель пакета, и сверка размерности нужна та же, что у
+    /// пакета с векторами.
+    func testAPackageWithoutVectorsIsCheckedAgainstAnUnboundCollection() async throws {
+        let source = Source()
+        source.documents = documents(3)
+        let exported = try await exportPackage(source, options: CollectionExporter.Options(includesEmbeddings: false))
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+        XCTAssertFalse(manifest.includesEmbeddings)
+
+        let unbound = ChromaCollection(
+            id: "cid", name: "чужая",
+            metadata: [CollectionBindingKeys.dimension: .int(768)]
+        )
+        XCTAssertThrowsError(try CollectionImporter.problems(manifest: manifest, target: unbound)) { error in
+            XCTAssertEqual(error as? TransferError, .dimensionMismatch(expected: 768, got: 4))
+        }
+        // Той же размерности — не запрет, а предупреждение о модели.
+        let sameSize = ChromaCollection(
+            id: "cid", name: "чужая", metadata: [CollectionBindingKeys.dimension: .int(4)]
+        )
+        let warnings = try CollectionImporter.problems(manifest: manifest, target: sameSize)
+        XCTAssertTrue(warnings.contains { $0.contains("не привязана модель") }, "\(warnings)")
+        // Коллекция со своей моделью пересчитывает пакет ею — сверять нечего.
+        XCTAssertEqual(try CollectionImporter.problems(manifest: manifest, target: collection(dimension: 768)), [])
+    }
+}

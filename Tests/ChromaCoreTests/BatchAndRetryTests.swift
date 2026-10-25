@@ -361,7 +361,11 @@ final class RetryPolicyTests: XCTestCase {
         XCTAssertEqual(timeouts[.fetch], 30)
         XCTAssertEqual(timeouts[.query], 60)
         XCTAssertEqual(timeouts[.write], 120)
-        XCTAssertEqual(timeouts[.management], 15, "управление коллекциями идёт по классу метаданных")
+        // удаление большой коллекции идёт на сервере десятки секунд.
+        XCTAssertEqual(timeouts[.management], TimeoutSettings.managementFloor, "создать или удалить коллекцию — не меньше пяти минут")
+        var slowWrites = TimeoutSettings()
+        slowWrites.write = 900
+        XCTAssertEqual(slowWrites[.management], 900, "и не меньше срока записи")
     }
 
     /// A hand-edited config must not be able to switch timeouts off.

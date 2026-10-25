@@ -434,7 +434,10 @@ final class PlannedChunksTests: XCTestCase {
             of: markdown, fileExtension: "md", pipeline: ChunkingPipeline(configuration: settings),
             ocrPipeline: pipeline, configuration: settings
         )
-        XCTAssertEqual(chunks.count, 3, "заголовок документа плюс два раздела: \(chunks.map(\.text))")
+        // Заголовок документа без своего текста — начало первого раздела,
+        // а не отдельный кусок.
+        XCTAssertEqual(chunks.count, 2, "два раздела: \(chunks.map(\.text))")
+        XCTAssertTrue(chunks[0].text.hasPrefix("# Руководство\n\n## Установка"), chunks[0].text)
     }
 
     /// Текстовый слой без оглавления — тот же случай: дело не в OCR.

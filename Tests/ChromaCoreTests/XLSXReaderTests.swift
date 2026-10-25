@@ -383,13 +383,58 @@ final class XLSXReaderTests: XCTestCase {
         XCTAssertEqual(rows[0].value(at: 0).displayText, "48 кг")
     }
 
-    /// Маска без единицы не выдумывает её: `#,##0.00` — просто число.
+    /// Маска без единицы не выдумывает её: `#,##0.00` — число с двумя
+    /// знаками после запятой, но без подписи.
     func testAPlainMaskLeavesTheNumberAlone() throws {
         var builder = XLSXFixtureBuilder()
         builder.customNumberMask = "#,##0.00"
         builder.sheets = [.init(name: "Лист", rows: [[.measured(12)]])]
         let rows = try readRows(builder)
-        XCTAssertEqual(rows[0].value(at: 0), .number(12))
+        XCTAssertEqual(rows[0].value(at: 0), .measured(12, NumberUnit(suffix: "", decimals: 2)))
+        XCTAssertEqual(rows[0].value(at: 0).displayText, "12")
+        XCTAssertEqual(RowMapper.metadataValue(rows[0].value(at: 0)), .int(12))
+    }
+
+    /// Знаков после запятой — сколько показывает формат: в книге
+    /// ФЭО стоимость человеко-месяца «552,32», а в текст шло
+    /// «552.31665911856». В метаданных остаётся само число.
+    func testTheFormatDecidesHowManyDecimalsTheTextShows() throws {
+        var builder = XLSXFixtureBuilder()
+        builder.customNumberMask = "#,##0.00"
+        builder.sheets = [.init(name: "Лист", rows: [[.measured(552.31665911856)]])]
+        let cell = try readRows(builder)[0].value(at: 0)
+        XCTAssertEqual(cell.displayText, "552.32")
+        guard case .double(let stored)? = RowMapper.metadataValue(cell) else { return XCTFail("в метаданных — число") }
+        XCTAssertEqual(stored, 552.3166, accuracy: 0.0001, "в метаданных — само число, не округлённое по формату")
+    }
+
+    /// Бухгалтерский формат: `_-` и `* ` — отступ и заполнение, а не
+    /// подпись. Сумма — «4182783 ₽», а не «- 4182783 ₽-».
+    func testAccountingPaddingIsNotPartOfTheUnit() {
+        let unit = XLSXReader.maskUnit(#"_-* #,##0.00\ "₽"_-;\-* #,##0.00\ "₽"_-;_-* "-"??\ "₽"_-;_-@_-"#)
+        XCTAssertEqual(unit?.prefix, "")
+        XCTAssertEqual(unit?.suffix, "₽")
+        XCTAssertEqual(XLSXReader.maskUnit(#"_-* #,##0"р."_-"#)?.suffix, "р.")
+        XCTAssertNil(XLSXReader.maskUnit(#"_-* #,##0.00\ _₽_-"#), "₽ после подчёркивания — отступ его шириной, не подпись")
+    }
+
+    func testMaskDecimals() {
+        XCTAssertEqual(XLSXReader.maskDecimals("#,##0.00"), 2)
+        XCTAssertEqual(XLSXReader.maskDecimals("0"), 0)
+        XCTAssertEqual(XLSXReader.maskDecimals("0.0\" кг\""), 1)
+        XCTAssertEqual(XLSXReader.maskDecimals("[$₽-419]#,##0.000"), 3)
+        XCTAssertEqual(XLSXReader.maskDecimals("0.00%"), 2)
+        XCTAssertNil(XLSXReader.maskDecimals("General"))
+        XCTAssertNil(XLSXReader.maskDecimals("0.00E+00"), "экспонента — не знаки после запятой")
+        XCTAssertNil(XLSXReader.maskDecimals("dd.mm.yyyy"))
+        XCTAssertNil(XLSXReader.maskDecimals("@"))
+        XCTAssertNil(XLSXReader.maskDecimals("# ?/?"), "у дроби десятичных знаков нет — округлять нельзя")
+        XCTAssertNil(XLSXReader.maskDecimals("?/100"))
+        XCTAssertNil(XLSXReader.maskUnit("@"), "место для текста — не подпись")
+        // Встроенный формат 4 — `#,##0.00`, им и записаны суммы ФЭО.
+        XCTAssertEqual(XLSXReader.numberFormat(mask: nil, formatID: 4), NumberUnit(suffix: "", decimals: 2))
+        XCTAssertEqual(XLSXReader.numberFormat(mask: nil, formatID: 10), NumberUnit(scale: 100, suffix: "%", decimals: 2))
+        XCTAssertNil(XLSXReader.numberFormat(mask: nil, formatID: 0), "«Общий» число не трогает")
     }
 
     /// Цвет и условие в скобках — оформление, а не подпись.
@@ -432,17 +477,9 @@ extension XLSXReaderTests {
         return builder
     }
 
-    /// Off by default: in a data table a merged cell is usually a heading, and
-    /// copying it into every cell would invent values nobody typed.
-    func testMergedCellsAreNotSpreadByDefault() throws {
+    /// объединение вбок — значение в каждой колонке диапазона.
+    func testASidewaysMergeReachesEveryColumnOfItsRange() throws {
         let rows = try readRows(mergedFixture())
-        XCTAssertEqual(rows[0].value(at: 0), .text("Итого за квартал"))
-        XCTAssertEqual(rows[0].value(at: 1), .empty)
-    }
-
-    func testMergedCellsSpreadWhenAsked() throws {
-        let reader = try XLSXReader(url: try write(mergedFixture()))
-        let rows = try reader.rows(of: reader.sheets[0], limits: .init(spreadMergedCells: true)).rows
         XCTAssertEqual(rows[0].value(at: 0), .text("Итого за квартал"))
         XCTAssertEqual(rows[0].value(at: 1), .text("Итого за квартал"))
         XCTAssertEqual(rows[1].value(at: 1), .number(62), "строки вне диапазона не трогаются")
@@ -489,12 +526,14 @@ extension XLSXReaderTests {
         ])
     }
 
-    /// Объединение вбок так и остаётся в первой колонке — и об этом говорится.
-    func testASidewaysMergeIsReportedRatherThanSpread() throws {
+    /// Потоковый проход раскладывает вбок так же, как полное чтение, —
+    /// и без оговорки: раскладывать больше нечего утаивать.
+    func testTheStreamingPassSpreadsSidewaysToo() throws {
         let reader = try XLSXReader(url: try write(mergedFixture()))
-        let result = try reader.rows(of: reader.sheets[0])
-        XCTAssertEqual(result.rows[0].value(at: 1), .empty)
-        XCTAssertEqual(result.warnings, [.mergedSideways(cells: 1)])
+        var seen: [CellValue] = []
+        let warnings = try reader.forEachRow(of: reader.sheets[0]) { seen.append($0.value(at: 1)); return true }
+        XCTAssertEqual(seen, [.text("Итого за квартал"), .number(62)])
+        XCTAssertEqual(warnings, [])
     }
 
     func testMergeRangesAreFoundWithoutParsingTheWholeSheet() {
@@ -515,4 +554,28 @@ extension XLSXReaderTests {
         XCTAssertEqual(range?.lastRow, 5)
         XCTAssertNil(XLSXReader.MergedRange(reference: "B2"))
     }
+
+    // MARK: - Хвост двоичной дроби
+
+    /// Число — пятнадцатью значащими цифрами, как его показывает книга: хвост
+    /// двоичной дроби — погрешность вычисления, а не данные.
+    func testANumberLosesTheBinaryTail() {
+        XCTAssertEqual(CellValue.number(98097.29999999997).displayText, "98097.3")
+        XCTAssertEqual(CellValue.number(111.12385200000001).displayText, "111.123852")
+        XCTAssertEqual(CellValue.number(22.008271521990608).displayText, "22.0082715219906")
+        XCTAssertEqual(CellValue.number(0.1 + 0.2).displayText, "0.3")
+        XCTAssertEqual(CellValue.number(4820).displayText, "4820")
+        XCTAssertEqual(CellValue.number(-1.5).displayText, "-1.5")
+        XCTAssertEqual(CellValue.measured(0.15, NumberUnit(scale: 100, suffix: "%")).displayText, "15 %")
+    }
+
+    /// В метаданные число идёт тем же, что и в текст: фильтр
+    /// `= 98097.3` находит строку, а агент не видит мусорных разрядов.
+    func testMetadataLosesTheBinaryTailToo() {
+        XCTAssertEqual(RowMapper.metadataValue(.number(98097.29999999997)), .double(98097.3))
+        XCTAssertEqual(RowMapper.metadataValue(.number(5753.999999999999)), .int(5754))
+        XCTAssertEqual(RowMapper.metadataValue(.number(4820)), .int(4820))
+        XCTAssertEqual(RowMapper.metadataValue(.measured(0.15, .percent)), .int(15))
+    }
 }
+

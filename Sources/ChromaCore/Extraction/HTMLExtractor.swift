@@ -10,13 +10,29 @@ import UniformTypeIdentifiers
 /// Document-based и Hierarchical чанкинг.
 public struct HTMLExtractor: DocumentTextExtractor {
     public let id = "html"
+    /// 5 — записи нумерованной таблицы — одной строкой.
+    ///
+    /// 4 — `rowspan` и `colspan` раскладываются по клеткам: раньше
+    /// они не читались, и значения под объединённой ячейкой съезжали влево —
+    /// в документе о приёмке под «Стоимость с налогом» стояла сумма налога.
+    ///
     /// 3 — пункты перечислений получают маркер, а адреса ссылок доходят
     /// до метаданных чанка: до этого пункт `<li>` приходил
     /// голым текстом, и правило «вводная фраза списка» его не узнавало.
     ///
     /// 2 — таблицы страницы приходят разметкой Markdown, а не ячейками через
     /// пробел, и ставится `has_tables`.
-    public let version = 3
+    ///
+    /// 7 — знаки нормализуются, а версия в документе совпадает
+    /// с версией экстрактора: прежде туда писалась 3.
+    ///
+    /// 8 — таблица вёрстки (бланк, форма) пишется строками текста, а не
+    /// сеткой.
+    ///
+    /// 9 — подпись во всю ширину таблицы один раз; `<thead>` глубже трёх
+    /// строк — не шапка.
+    public static let currentVersion = 9
+    public var version: Int { Self.currentVersion }
 
     public init() {}
 
@@ -51,7 +67,9 @@ public struct HTMLExtractor: DocumentTextExtractor {
         if let language = page.language, !language.isEmpty { metadata["language"] = language }
         if let summary = page.summary, !summary.isEmpty { metadata["description"] = summary }
 
-        return ExtractedDocument(
+        // Нормализация здесь, а не только в реестре: веб-страницы приходят
+        // сюда мимо него.
+        return TextNormalization.normalized(ExtractedDocument(
             plainText: text,
             structure: page.headings,
             links: page.placedLinks,
@@ -60,9 +78,12 @@ public struct HTMLExtractor: DocumentTextExtractor {
             structureSource: page.headings.isEmpty ? .none : .headings,
             containerFormat: "html",
             extractorID: "html",
-            extractorVersion: 3,
+            // Версия — та же, что у экстрактора: записанная в манифест
+            // меньшая версия делала каждый неизменённый HTML-файл
+            // «устаревшим» на каждой синхронизации.
+            extractorVersion: HTMLExtractor.currentVersion,
             hasTables: page.hasTables,
             documentMetadata: metadata
-        )
+        ))
     }
 }

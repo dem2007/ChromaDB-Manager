@@ -103,8 +103,8 @@ public final class SearchProfileStore {
     /// which E0.1 defines as the search of stage 2 exactly. It keeps the chosen
     /// profile's **name**, so the diagnostics panel does not claim a search ran
     /// under settings it ignored.
-    public func effectiveProfile(for collectionName: String) -> SearchProfile {
-        let profile = defaultProfile(for: collectionName)
+    public func effectiveProfile(for collectionName: String, model: String? = nil) -> SearchProfile {
+        let profile = defaultProfile(for: collectionName, model: model)
         guard !isPipelineEnabled(for: collectionName) else { return profile }
         return SearchProfile.plain(collectionName: collectionName, name: profile.name)
     }
@@ -124,10 +124,14 @@ public final class SearchProfileStore {
     /// off — the search of stage 2, unchanged. It is **not** written to
     /// disk: a file full of untouched defaults would make «этой коллекции
     /// что-то настраивали» unanswerable.
-    public func defaultProfile(for collectionName: String) -> SearchProfile {
+    ///
+    /// Приставку запроса, которую требует модель коллекции, такой профиль
+    /// несёт сразу: это не стадия, а то, как модель кодирует запрос.
+    /// Без модели — пустая, как и раньше.
+    public func defaultProfile(for collectionName: String, model: String? = nil) -> SearchProfile {
         profiles(for: collectionName).first { $0.isDefault }
             ?? profiles(for: collectionName).first
-            ?? SearchProfile(collectionName: collectionName)
+            ?? SearchProfile(collectionName: collectionName, queryPrefix: SearchProfile.queryPrefix(forModel: model))
     }
 
     public func profile(id: UUID) -> SearchProfile? {

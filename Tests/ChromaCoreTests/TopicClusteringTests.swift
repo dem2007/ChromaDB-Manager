@@ -492,6 +492,34 @@ final class TopicClusteringTests: XCTestCase {
         XCTAssertNil(TopicClustering.parse(#"{"summary":"есть описание, нет названия"}"#))
     }
 
+    /// Рассуждение модели — не описание темы (v6: «The user wants a short
+    /// title…» в описании).
+    func testReasoningIsNotASummary() {
+        let reasoning = #"{"title":"Эксплуатация оборудования связи","summary":"The user wants a short title (2-5 words) and a one-sentence description for a group of documents."}"#
+        let parsed = TopicClustering.parse(reasoning)
+        XCTAssertEqual(parsed?.title, "Эксплуатация оборудования связи")
+        XCTAssertNil(parsed?.summary)
+
+        let thinking = "<think>{\"title\":\"черновик\"}</think>{\"title\":\"Договоры\",\"summary\":\"Тексты договоров.\"}"
+        XCTAssertEqual(TopicClustering.parse(thinking)?.title, "Договоры")
+        XCTAssertEqual(TopicClustering.parse(thinking)?.summary, "Тексты договоров.")
+
+        XCTAssertEqual(TopicClustering.plausibleSummary("  Регламенты обслуживания сети. "), "Регламенты обслуживания сети.")
+        XCTAssertNil(TopicClustering.plausibleSummary("We need to produce JSON with a title."))
+        XCTAssertNil(TopicClustering.plausibleSummary(String(repeating: "слово ", count: 100)))
+    }
+
+    /// Сохранённый раньше отчёт с рассуждением в описании читается без него —
+    /// значит, и экспорт его не повторит.
+    func testStoredReasoningIsDroppedOnDecode() throws {
+        let stored = #"{"id":0,"title":"Связь","summary":"The user wants a short title.","isNamed":true,"documentCount":1,"share":0.2,"averageDistance":0.1,"examples":[]}"#
+        let topic = try JSONDecoder().decode(Topic.self, from: Data(stored.utf8))
+        XCTAssertEqual(topic.title, "Связь")
+        XCTAssertNil(topic.summary)
+        let clean = #"{"id":0,"title":"Связь","summary":"Регламенты связи.","isNamed":true,"documentCount":1,"share":0.2,"averageDistance":0.1,"examples":[]}"#
+        XCTAssertEqual(try JSONDecoder().decode(Topic.self, from: Data(clean.utf8)).summary, "Регламенты связи.")
+    }
+
     // MARK: - Отчёт
 
     func testTheReportReadsAsATableAndNamesTheUnassigned() async throws {
@@ -630,4 +658,17 @@ final class ClusteringStaysWithinItsPermissionTests: XCTestCase {
         XCTAssertTrue(text.contains("InspectionReader"))
         XCTAssertTrue(text.contains("public static func fit("))
     }
+
+    /// набор, собранный по одному вектору, — тот же, что из массива.
+    func testTheBuilderGivesTheSameSetAsTheArray() {
+        let vectors: [[Double]] = [[3, 4], [0, 0], [1, 0, 0], [0, 2]]
+        let whole = VectorSet(vectors: vectors, dimension: 2)
+        var builder = VectorSet.Builder(dimension: 2)
+        for vector in vectors { builder.append(vector) }
+        let built = builder.build()
+        XCTAssertEqual(built.values, whole.values)
+        XCTAssertEqual(built.keptIndexes, [0, 3])
+        XCTAssertEqual(built.count, 2)
+    }
 }
+

@@ -136,7 +136,9 @@ public extension LLMChunker {
             wanted: wantedWindow(for: configuration),
             tokensPerSecond: speed,
             allowedByTime: speed.map {
-                windowLimitByTime(timeout: configuration.llmTimeout, tokensPerSecond: $0)
+                windowLimitByTime(
+                    timeout: configuration.llmTimeout, tokensPerSecond: $0, numbered: usesNumbering(prompt)
+                )
             }
         )
     }

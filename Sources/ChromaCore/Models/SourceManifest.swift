@@ -254,13 +254,13 @@ public final class ManifestStore {
     public func load(sourceID: UUID) -> SourceManifest {
         queue.sync {
             let url = fileURL(for: sourceID)
-            guard let data = GuardedJSONFile<SourceManifest>.readDataWithRetry(at: url) else {
+            guard let data = JSONFileVersions.readDataWithRetry(at: url) else {
                 // Нет файла — источник новый, это норма. Файл есть, но не
                 // прочитался — совсем другое дело: сейчас будет переиндексирован
                 // весь источник, и знать об этом надо заранее, а не по счёту
                 // за час работы модели.
                 if FileManager.default.fileExists(atPath: url.path) {
-                    log(.error, "Источники", "Манифест источника есть, но не читается — источник будет проиндексирован заново. Рядом лежит \(url.deletingPathExtension().lastPathComponent).previous.json, если он вам нужен.")
+                    log(.error, "Источники", "Манифест источника есть, но не читается — источник будет проиндексирован заново. Рядом лежит \(JSONFileVersions.previousVersionURL(of: url).lastPathComponent), если он вам нужен.")
                 }
                 return SourceManifest(sourceID: sourceID)
             }
@@ -299,7 +299,7 @@ public final class ManifestStore {
                 let destination = fileURL(for: manifest.sourceID)
                 // Прежний манифест остаётся рядом: он стоит часов работы модели
                 //.
-                GuardedJSONFile<SourceManifest>.keepPreviousVersion(of: destination, unless: data)
+                JSONFileVersions.keepPreviousVersion(of: destination, unless: data)
                 // Temporary file in the same directory, flushed to the platter,
                 // then swapped in. `Data.write(.atomic)` does the swap but does
                 // not promise the bytes reached the disk before it.
@@ -316,9 +316,11 @@ public final class ManifestStore {
         }
     }
 
+    /// Манифест источника и его прежняя версия: прежняя оставалась
+    /// на диске навсегда.
     public func remove(sourceID: UUID) {
         queue.sync {
-            try? FileManager.default.removeItem(at: fileURL(for: sourceID))
+            JSONFileVersions.remove(fileURL(for: sourceID))
         }
     }
 }

@@ -71,10 +71,7 @@ public final class GuardedJSONFile<Value: Codable>: @unchecked Sendable {
         return encoder
     }
 
-    public var previousURL: URL {
-        url.deletingLastPathComponent()
-            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".previous.json")
-    }
+    public var previousURL: URL { JSONFileVersions.previousVersionURL(of: url) }
 
     // MARK: - Чтение
 
@@ -205,6 +202,46 @@ public final class GuardedJSONFile<Value: Codable>: @unchecked Sendable {
         problem = nil
     }
 
+    /// Уже сохранённая копия ровно этого содержимого, если она есть.
+    private func existingRescue(matching data: Data) -> URL? {
+        let directory = url.deletingLastPathComponent()
+        let prefix = url.deletingPathExtension().lastPathComponent + ".unreadable-"
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil
+        )) ?? []
+        return files.first {
+            $0.lastPathComponent.hasPrefix(prefix) && (try? Data(contentsOf: $0)) == data
+        }
+    }
+
+    /// System error descriptions end in a full stop; ours add another one.
+    static func tidy(_ reason: String) -> String {
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasSuffix(".") ? trimmed : trimmed + "."
+    }
+}
+
+/// Действия над файлом настроек или манифеста, которым не нужен тип его
+/// содержимого: где лежит прежняя версия, как её сохранить и стереть, как
+/// прочитать байты с повтором.
+///
+/// Отдельным типом, а не статикой `GuardedJSONFile<Value>`: у обобщённого
+/// класса каждый вызов обязан назвать `Value`, и путь манифеста таблиц
+/// вычислялся через `GuardedJSONFile<SourceManifest>` — тип ни на что не
+/// влиял, но читался как зависимость, которой нет.
+public enum JSONFileVersions {
+    /// Где лежит прежняя версия файла: `<name>.previous.json` рядом с ним.
+    public static func previousVersionURL(of url: URL) -> URL {
+        url.deletingLastPathComponent()
+            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".previous.json")
+    }
+
+    /// Стереть файл вместе с его прежней версией.
+    public static func remove(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: previousVersionURL(of: url))
+    }
+
     /// Reads bytes with the same retry as `read`, for files whose writing path
     /// is its own (the manifests fsync and swap — a guard that replaced their
     /// write would take that guarantee away).
@@ -234,26 +271,6 @@ public final class GuardedJSONFile<Value: Codable>: @unchecked Sendable {
     /// Keeps the current contents of `url` beside it as `<name>.previous.json`.
     public static func keepPreviousVersion(of url: URL, unless data: Data) {
         guard let current = try? Data(contentsOf: url), current != data else { return }
-        let previous = url.deletingLastPathComponent()
-            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".previous.json")
-        try? current.write(to: previous, options: .atomic)
-    }
-
-    /// System error descriptions end in a full stop; ours add another one.
-    /// Уже сохранённая копия ровно этого содержимого, если она есть.
-    private func existingRescue(matching data: Data) -> URL? {
-        let directory = url.deletingLastPathComponent()
-        let prefix = url.deletingPathExtension().lastPathComponent + ".unreadable-"
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil
-        )) ?? []
-        return files.first {
-            $0.lastPathComponent.hasPrefix(prefix) && (try? Data(contentsOf: $0)) == data
-        }
-    }
-
-    static func tidy(_ reason: String) -> String {
-        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.hasSuffix(".") ? trimmed : trimmed + "."
+        try? current.write(to: previousVersionURL(of: url), options: .atomic)
     }
 }

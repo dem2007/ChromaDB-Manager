@@ -7,6 +7,11 @@ import ChromaCore
 /// order is the point: D1.2 makes the cost mandatory before the start, because
 /// a set of twenty queries against four variants is eighty searches and up to
 /// eighty calls to a local model that nothing else can use meanwhile.
+///
+/// «Набор запросов» — тип Б: набор выбирается в тулбаре, запросы — таблица.
+/// «Варианты» — форма: варианты, стоимость, «Прогнать». «Прогоны» — три
+/// части сегментами над содержимым: история (таблица), отчёт (форма) и
+/// разметка (сетка выдач вариантов рядом).
 struct EvaluationView: View {
     @EnvironmentObject private var app: AppEnvironment
     @ObservedObject var model: EvaluationViewModel
@@ -19,31 +24,40 @@ struct EvaluationView: View {
     @StateObject private var viewer = DocumentViewerViewModel()
     /// Раскрыт ли промпт оценки — по той же причине, что и таймауты.
     @State private var showingJudgePrompt = false
+    /// Выбранные запросы набора.
+    @State private var selectedQueries: Set<UUID> = []
+    /// Часть вкладки «Прогоны».
+    @SceneStorage("evaluation.runsPart") private var runsPart = RunsPart.history.rawValue
+    @State private var selectedRun: UUID?
+    /// Порядок, ширины и видимость колонок — помнит окно (v3).
+    @SceneStorage("table.runs.v4") private var runColumns: TableColumnCustomization<EvaluationRunSummary>
+    @SceneStorage("table.queries.v3") private var queryColumns: TableColumnCustomization<EvaluationQuery>
+    /// Сохранённый прогон, ждущий подтверждения удаления.
+    @State private var runPendingDeletion: EvaluationRunSummary?
+
+    enum RunsPart: String, CaseIterable, Identifiable {
+        case history, report, marking
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .history: return String(localized: "История")
+            case .report: return String(localized: "Отчёт")
+            case .marking: return String(localized: "Разметка")
+            }
+        }
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                banners
-
-                switch tab {
-                case 1:
-                    variantsCard
-                    runCard
-                    finishedRunNote
-                case 2:
-                    if model.lastRun != nil { reportCard }
-                    if model.lastRun != nil { judgeCard }
-                    if let run = model.lastRun { resultsCard(run) }
-                    if !model.runs.isEmpty { historyCard }
-                    if model.lastRun == nil && model.runs.isEmpty { noRunsCard }
-                default:
-                    setCard
-                }
-
-                howItWorks
+        VStack(spacing: 0) {
+            banners
+            switch tab {
+            case 1:
+                variantsForm
+            case 2:
+                runsTab
+            default:
+                setTab
             }
-            .padding(.top, 4)
-            .pageContentPadding()
         }
         .task { await model.load(app) }
         .sheet(isPresented: Binding(
@@ -81,7 +95,7 @@ struct EvaluationView: View {
             titleVisibility: .visible
         ) {
             Button(String(localized: "Удалить набор"), role: .destructive) { model.deleteSet(app) }
-            Button(String(localized: "Отмена"), role: .cancel) { model.setPendingDeletion = nil }
+            Button(String(localized: "Отменить"), role: .cancel) { model.setPendingDeletion = nil }
         } message: {
             if let set = model.setPendingDeletion {
                 Text("Вместе с набором исчезнет его эталон: \(set.line). Сохранённые прогоны останутся — они хранят свои запросы целиком.")
@@ -96,13 +110,30 @@ struct EvaluationView: View {
             titleVisibility: .visible
         ) {
             Button(String(localized: "Удалить"), role: .destructive) { model.removeQuery(app) }
-            Button(String(localized: "Отмена"), role: .cancel) { model.queryPendingDeletion = nil }
+            Button(String(localized: "Отменить"), role: .cancel) { model.queryPendingDeletion = nil }
         } message: {
             if let query = model.queryPendingDeletion {
                 Text(query.hasGroundTruth
                      ? "«\(query.text)» — вместе с запросом исчезнут и его отметки эталона."
                      : "«\(query.text)»")
             }
+        }
+        // Сохранённый прогон — часы работы модели; удаляется с вопросом.
+        .confirmationDialog(
+            runPendingDeletion.map { String(localized: "Удалить прогон «\($0.name)»?") } ?? "",
+            isPresented: Binding(
+                get: { runPendingDeletion != nil },
+                set: { if !$0 { runPendingDeletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Удалить прогон"), role: .destructive) {
+                if let summary = runPendingDeletion { model.removeRun(summary, app: app) }
+                runPendingDeletion = nil
+            }
+            Button(String(localized: "Отменить"), role: .cancel) { runPendingDeletion = nil }
+        } message: {
+            Text("Прогон удалится вместе с выдачей и метриками. Эталон набора останется: отметки живут в наборе, а не в прогоне.")
         }
         // 5 требует предупредить дважды: о стоимости и о том, что оценка
         // модели не истина. Оба предупреждения — в этом окне, до первого
@@ -116,7 +147,7 @@ struct EvaluationView: View {
             titleVisibility: .visible
         ) {
             Button(String(localized: "Оценить")) { model.startJudgement(app) }
-            Button(String(localized: "Отмена"), role: .cancel) { model.cancelPendingJudgement() }
+            Button(String(localized: "Отменить"), role: .cancel) { model.cancelPendingJudgement() }
         } message: {
             if let cost = model.pendingJudgement {
                 Text("\(cost.line).\n\nПока идёт оценка, модель занята только этим. Её вывод — мнение модели, а не истина: он не попадает ни в эталон, ни в метрики, и принимать его нужно по одному, вручную.")
@@ -124,381 +155,614 @@ struct EvaluationView: View {
         }
     }
 
+    /// Сообщения — строками над содержимым, как на остальных экранах.
     @ViewBuilder
     private var banners: some View {
-        if let error = model.errorMessage {
-            MessageBanner(kind: .error, text: error) { model.errorMessage = nil }
-        }
-        if let status = model.statusMessage {
-            MessageBanner(kind: .info, text: status) { model.statusMessage = nil }
-        }
-        if let exported = model.exportMessage {
-            MessageBanner(kind: .info, text: exported) { model.exportMessage = nil }
-        }
-        // Эталон разметки — часы ручной работы. Если файл наборов не
-        // прочитался, приложение ничего в него не пишет, и знать об этом надо
-        // до, а не после разметки.
-        if let problem = app.querySets.persistenceProblem {
-            MessageBanner(kind: .error, text: problem)
+        let problem = app.querySets.persistenceProblem
+        if model.errorMessage != nil || model.statusMessage != nil || model.exportMessage != nil || problem != nil {
+            VStack(alignment: .leading) {
+                if let error = model.errorMessage {
+                    dismissible(Notice(.warning, error)) { model.errorMessage = nil }
+                }
+                if let status = model.statusMessage {
+                    dismissible(Notice(.info, status)) { model.statusMessage = nil }
+                }
+                if let exported = model.exportMessage {
+                    dismissible(Notice(.info, exported)) { model.exportMessage = nil }
+                }
+                // Эталон разметки — часы ручной работы. Если файл наборов не
+                // прочитался, приложение ничего в него не пишет, и знать об
+                // этом надо до, а не после разметки.
+                if let problem {
+                    Notice(.warning, problem)
+                }
+            }
+            .padding()
+            Divider()
         }
     }
 
-    /// Прогон закончился на соседней вкладке — сказать об этом и увести туда.
-    ///
-    /// Без этой строки завершившийся прогон выглядел бы так, будто ничего не
-    /// произошло: результаты живут на «Прогонах», а нажимали кнопку здесь.
-    @ViewBuilder
-    private var finishedRunNote: some View {
-        if let run = model.lastRun, !model.isRunning {
-            HStack(spacing: 12) {
-                Circle().fill(Theme.Palette.running)
-                    .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-                Text("Готов прогон «\(run.name)» — результаты и метрики на вкладке «Прогоны».")
-                    .font(Theme.Font.control)
-                Spacer(minLength: 8)
-                Button(String(localized: "Открыть прогон")) { openTab(2) }
-                    .buttonStyle(.chromaNormal)
-            }
-            .padding(.horizontal, Theme.Padding.rowHorizontal)
-            .padding(.vertical, Theme.Padding.rowVertical)
-            .background(Theme.Palette.running.opacity(0.09))
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.banner))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.banner)
-                    .strokeBorder(Theme.Palette.running.opacity(0.24), lineWidth: 1)
-            )
-        }
-    }
-
-    private var noRunsCard: some View {
-        SectionCard(
-            title: String(localized: "Прогонов пока нет"),
-            subtitle: String(localized: "Прогон хранится целиком — с датой, версией приложения и полными параметрами вариантов.")
-        ) {
-            Text("Соберите набор запросов, добавьте хотя бы один вариант и нажмите «Прогнать» на вкладке «Варианты».")
-                .font(Theme.Font.body).foregroundStyle(Theme.Palette.captionText)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var howItWorks: some View {
-        HowItWorks(screen: "evaluation") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Один набор запросов, несколько вариантов — и одна и та же выдача, сохранённая целиком. Вектор запроса считается один раз на модель и переиспользуется всеми вариантами с той же моделью.")
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Вариант — это коллекция плюс профиль поиска. Метрика расстояния и модель берутся из самой коллекции: сравнить другую модель или стратегию можно только по уже существующим коллекциям, потому что модель привязана к коллекции навсегда.")
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    // MARK: - Оценка чат-моделью
-
-    /// Необязательный режим, выключенный по умолчанию.
-    ///
-    /// Карточка стоит **после** отчёта и до результатов: оценка модели — это
-    /// подсказка разметчику, а не источник чисел в таблице выше. Порядок на
-    /// экране и есть это утверждение.
-    private var judgeCard: some View {
-        SectionCard(
-            title: String(localized: "Оценка чат-моделью (необязательно)"),
-            subtitle: String(localized: "Модель проходит по каждому результату каждого варианта и говорит, отвечает ли он на запрос. Это подсказка для разметки, а не разметка: в эталон и в метрики оценка модели не попадает — её можно только принять вручную.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle("Включить режим", isOn: Binding(
-                    get: { app.settings.configuration.modelJudgeEnabled },
-                    set: { enabled in
-                        app.settings.configuration.modelJudgeEnabled = enabled
-                        Task { await model.updateJudgeCost(app) }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .fixedSize()
-
-                if app.settings.configuration.modelJudgeEnabled {
-                    judgeSettings
-                }
-
-                if let set = model.judgements {
-                    // Причина провала показывается **всегда**, а не только
-                    // когда оценки есть. Прежнее условие прятало объяснение
-                    // ровно в том случае, когда оно единственное, что можно
-                    // сказать: «модель не ответила на 40 из 40» и ноль
-                    // оценок — это одно событие, а не два.
-                    if !set.judgements.isEmpty {
-                        Text(set.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    if !set.note.isEmpty {
-                        Text(set.note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var judgeSettings: some View {
-        Picker("Модель", selection: Binding(
-            get: { app.settings.configuration.modelJudgeModel },
-            set: { newValue in
-                app.settings.configuration.modelJudgeModel = newValue
-                Task { await model.updateJudgeCost(app) }
-            }
-        )) {
-            Text("не выбрана").tag(String?.none)
-            ForEach(model.chatModels) { item in
-                Text(item.id).tag(Optional(item.id))
-            }
-        }
-        .frame(maxWidth: 460, alignment: .leading)
-
-        DisclosureGroup(isExpanded: $showingJudgePrompt) {
-            VStack(alignment: .leading, spacing: 6) {
-                TextEditor(text: Binding(
-                    get: { app.settings.configuration.modelJudgePrompt.text },
-                    set: { app.settings.configuration.modelJudgePrompt.text = $0 }
-                ))
-                .font(Theme.Font.mono)
-                .frame(height: 150)
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.Palette.border))
-
-                Text("Подстановки \(JudgePrompt.queryPlaceholder) и \(JudgePrompt.documentPlaceholder) обязательны. Форма ответа задана схемой и не редактируется: разбор ответа написан ровно под неё.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                if let problem = app.settings.configuration.modelJudgePrompt.problem {
-                    Text(problem).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                }
-                if !app.settings.configuration.modelJudgePrompt.isDefault {
-                    Button("Вернуть исходный промпт") {
-                        app.settings.configuration.modelJudgePrompt = JudgePrompt()
-                    }
-                    .controlSize(.small)
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            Text("Промпт оценки").togglesDisclosure($showingJudgePrompt)
-        }
-        .font(Theme.Font.body)
-        // Промпт входит в отпечаток оценки: правленый — это новые вызовы.
-        // Без пересчёта стоимость оставалась прежней («оценивать нечего»),
-        // и кнопка «Оценить моделью» не включалась после правки промпта.
-        .onChange(of: app.settings.configuration.modelJudgePrompt.fingerprint) { _, _ in
-            Task { await model.updateJudgeCost(app) }
-        }
-
-        if let cost = model.judgeCost {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Перед стартом").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                Text(cost.line).font(Theme.Font.body).copyable(cost.line)
-                if cost.isLong {
-                    Text("Пока идёт оценка, локальная модель занята: синхронизация, чанкинг и поиск встанут в очередь за ней.")
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                }
-            }
-        }
-
-        if let progress = model.judgeProgress {
-            VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
-                Text(progress.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            }
-        }
-
+    private func dismissible<Content: View>(_ content: Content, hide: @escaping () -> Void) -> some View {
         HStack {
-            Button("Оценить моделью") { Task { await model.requestJudgement(app) } }
-                .disabled(model.isJudging
-                          || app.settings.configuration.modelJudgeModel == nil
-                          || (model.judgeCost?.calls ?? 0) == 0)
-            if model.isJudging {
-                Button("Отменить") { model.cancelJudgement() }
-                Text("Отмена сохраняет уже полученные оценки.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            } else if let cost = model.judgeCost, cost.calls == 0, cost.alreadyJudged > 0 {
-                // Условие на посчитанной стоимости, а не на «nil ?? 0»:
-                // «ещё не считали» — не то же самое, что «нечего делать»,
-                // и первое, показанное как второе, — уже знакомая ошибка.
-                Text("Всё оценено этой редакцией промпта. Правка промпта делает оценки заново.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            }
+            content
             Spacer()
+            Button(String(localized: "Скрыть"), action: hide)
+                .buttonStyle(.borderless)
         }
     }
 
-    /// Оценка модели у одного результата — рядом с кнопками разметки, но
-    /// заметно другой: курсив, серым, со словом «модель». Спутать её с
-    /// собственной отметкой человека нельзя.
-    @ViewBuilder
-    private func judgementRow(queryID: UUID, variantID: UUID, hit: EvaluationHit) -> some View {
-        if let judgement = model.judgement(queryID: queryID, variantID: variantID, hit: hit) {
-            let accepted = model.grade(queryID: queryID, variantID: variantID, hit: hit) == judgement.grade
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("модель: \(judgement.grade.title)")
-                        .font(Theme.Font.micro).italic()
-                        .foregroundStyle(Theme.Palette.captionText)
-                    if accepted {
-                        Text("принято").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    } else {
-                        Button("принять") {
-                            model.acceptJudgement(judgement, hit: hit, app: app)
+    // MARK: - Набор запросов
+
+    private var setTab: some View {
+        VStack(spacing: 0) {
+            if model.sets.isEmpty {
+                ContentUnavailableView {
+                    Label(String(localized: "Наборов пока нет"), systemImage: "list.bullet.rectangle")
+                } description: {
+                    Text("Основной способ наполнения — кнопка «В набор» в истории поиска на экране коллекции: двадцать запросов руками никто не пишет. Можно и создать набор здесь.")
+                } actions: {
+                    Button(String(localized: "Новый набор…")) { model.newSet() }
+                    Button(String(localized: "Импорт набора…")) { model.importSet(app) }
+                }
+            } else if let set = model.selectedSet {
+                if set.queries.isEmpty {
+                    ContentUnavailableView {
+                        Label(String(localized: "В наборе нет запросов"), systemImage: "text.magnifyingglass")
+                    } description: {
+                        Text("Выполните запрос на экране «Коллекции» и нажмите «В набор» под ним — или впишите запрос сами.")
+                    } actions: {
+                        Button(String(localized: "Добавить запрос…")) { model.newQuery() }
+                            .disabled(model.isRunning)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    queryTable(set)
+                }
+                setFooter(set)
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if tab == 0 {
+                    if !model.sets.isEmpty {
+                        Picker(String(localized: "Набор"), selection: Binding(
+                            get: { model.selectedSetID },
+                            set: { newValue in
+                                model.selectedSetID = newValue
+                                selectedQueries.removeAll()
+                                Task { await model.updateCost(app) }
+                            }
+                        )) {
+                            ForEach(model.sets) { set in
+                                Text(set.name).tag(Optional(set.id))
+                            }
                         }
-                        .buttonStyle(.borderless).controlSize(.small)
+                        .help(String(localized: "Набор запросов"))
+                    }
+                    Button {
+                        model.newQuery()
+                    } label: {
+                        Label(String(localized: "Добавить запрос…"), systemImage: "plus")
+                    }
+                    .help(String(localized: "Добавить запрос в набор"))
+                    .disabled(model.selectedSet == nil || model.isRunning)
+                    Menu {
+                        Button(String(localized: "Новый набор…")) { model.newSet() }
+                        Button(String(localized: "Переименовать…")) { model.renameSet() }
+                            .disabled(model.selectedSet == nil)
+                        Divider()
+                        Button(String(localized: "Экспорт набора…")) { model.exportSet(app) }
+                            .disabled(model.selectedSet == nil)
+                        Button(String(localized: "Импорт набора…")) { model.importSet(app) }
+                        Divider()
+                        Button(String(localized: "Удалить набор…"), role: .destructive) { model.requestSetDeletion() }
+                            .disabled(model.selectedSet == nil)
+                    } label: {
+                        Label(String(localized: "Ещё"), systemImage: "ellipsis.circle")
                     }
                 }
-                if !judgement.reason.isEmpty {
-                    Text(judgement.reason)
-                        .font(Theme.Font.micro).italic()
-                        .foregroundStyle(Theme.Palette.captionText)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Запросы набора: текст, эталон, теги — правка и удаление из меню.
+    private func queryTable(_ set: QuerySet) -> some View {
+        Table(set.queries, selection: $selectedQueries, columnCustomization: $queryColumns) {
+            TableColumn(String(localized: "Запрос")) { query in
+                Text(query.text)
+                    .lineLimit(1)
+                    .help(query.text)
+            }
+            .customizationID("query")
+            TableColumn(String(localized: "Эталон")) { query in
+                let marks = query.fragments.count + query.documents.count
+                Text(marks == 0
+                     ? String(localized: "нет")
+                     : RussianCount.phrase(marks, "отметка", "отметки", "отметок"))
+                    .foregroundStyle(marks == 0 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            }
+            // С потолком: растянутая на широком окне колонка не отдавала
+            // место обратно, и в узком появлялась горизонтальная прокрутка.
+            // Тянется и сжимается «Запрос».
+            .width(min: 80, ideal: 110, max: 140)
+            .customizationID("reference")
+            TableColumn(String(localized: "Теги и фильтр")) { query in
+                Text(Self.queryExtras(query))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .width(min: 100, ideal: 200, max: 280)
+            .customizationID("extras")
+        }
+        .contextMenu(forSelectionType: UUID.self) { ids in
+            if ids.count == 1, let id = ids.first, let query = set.queries.first(where: { $0.id == id }) {
+                Button(String(localized: "Править…")) { model.editQuery(query) }
+                    .disabled(model.isRunning)
+                Divider()
+                Button(String(localized: "Удалить…"), role: .destructive) { model.queryPendingDeletion = query }
+                    .disabled(model.isRunning)
+            }
+        } primaryAction: { ids in
+            if let id = ids.first, let query = set.queries.first(where: { $0.id == id }), !model.isRunning {
+                model.editQuery(query)
+            }
+        }
+        .onDeleteCommand {
+            if selectedQueries.count == 1, let id = selectedQueries.first,
+               let query = set.queries.first(where: { $0.id == id }), !model.isRunning {
+                model.queryPendingDeletion = query
+            }
+        }
+    }
+
+    private func setFooter(_ set: QuerySet) -> some View {
+        // Внизу — только счёт; заметка набора (бывает длинной, с путями к
+        // документам) — в «?» (v6).
+        let about = String(localized: "Набор принадлежит задаче, а не коллекции: один и тот же набор гоняется по разным вариантам. Запросы без эталона всё равно прогоняются — их выдачу можно разметить прямо в результатах.")
+        return TableFooter(
+            set.line,
+            help: set.note.isEmpty ? about : "\(set.note)\n\n\(about)"
+        )
+    }
+
+    /// Что известно про запрос, кроме текста и эталона.
+    private static func queryExtras(_ query: EvaluationQuery) -> String {
+        var parts: [String] = []
+        if query.filter != nil { parts.append(String(localized: "с фильтром")) }
+        if !query.tags.isEmpty { parts.append(query.tags.joined(separator: ", ")) }
+        if !query.comment.isEmpty { parts.append(query.comment) }
+        return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+    }
+
+    // MARK: - Варианты и прогон
+
+    /// Вариантов нет — пустое состояние на всю вкладку, без формы и без
+    /// секции «Прогон» с неактивной кнопкой (v6 B3).
+    @ViewBuilder
+    private var variantsForm: some View {
+        if model.variants.isEmpty {
+            ContentUnavailableView {
+                Label(String(localized: "Вариантов нет"), systemImage: "square.split.2x1")
+            } description: {
+                Text(model.collections.isEmpty
+                     ? String(localized: "Нет подключения к базе или в ней нет коллекций.")
+                     : String(localized: "Добавьте хотя бы один — сравнивать можно и два профиля поиска одной коллекции, это не требует клонирования."))
+            } actions: {
+                Button(String(localized: "Добавить вариант…")) { model.beginVariant(app) }
+                    .disabled(model.isRunning || model.collections.isEmpty)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            variantsAndRunForm
+        }
+    }
+
+    private var variantsAndRunForm: some View {
+        Form {
+            // Прогон закончился — сказать об этом и увести к результатам.
+            if let run = model.lastRun, !model.isRunning {
+                Section {
+                    LabeledContent {
+                        Button(String(localized: "Открыть прогон")) {
+                            runsPart = RunsPart.report.rawValue
+                            openTab(2)
+                        }
+                    } label: {
+                        StatusLabel(.ok, String(localized: "Готов прогон «\(run.name)»"))
+                    }
+                }
+            }
+
+            Section {
+                ForEach(model.variants) { variant in
+                    LabeledContent {
+                        Button(String(localized: "Убрать")) { model.removeVariant(variant, app: app) }
+                            .disabled(model.isRunning)
+                    } label: {
+                        Text(variant.name)
+                        Text(variant.note.isEmpty ? variant.line : "\(variant.line) · \(variant.note)")
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button(String(localized: "Добавить вариант…")) { model.beginVariant(app) }
+                        .disabled(model.isRunning || model.collections.isEmpty)
+                }
+            } header: {
+                SectionHeader(
+                    String(localized: "Варианты"),
+                    help: String(localized: "Вариант — это коллекция плюс профиль поиска. Метрика расстояния и модель берутся из самой коллекции — их нельзя выбрать здесь. Чтобы сравнить другую модель или стратегию, склонируйте коллекцию: «Коллекции» → «Пересчитать векторы…» → «Клонировать».")
+                )
+            } footer: {
+                if model.collections.isEmpty {
+                    Notice(.warning, String(localized: "Нет подключения к базе или в ней нет коллекций."))
+                }
+            }
+
+            Section {
+                if let cost = model.cost {
+                    LabeledContent(String(localized: "Стоимость")) {
+                        Text(cost.line).copyable(cost.line)
+                    }
+                } else {
+                    Text("Выберите набор и хотя бы один вариант — тогда здесь появится стоимость прогона.")
+                        .foregroundStyle(.secondary)
+                }
+                if let progress = model.progress {
+                    ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1))) {
+                        Text(progress.line)
+                    }
+                }
+                HStack {
+                    Spacer()
+                    if model.isRunning {
+                        Button(String(localized: "Остановить")) { model.cancel() }
+                            .help(String(localized: "Отмена сохраняет уже полученные результаты и помечает прогон неполным."))
+                    }
+                    // Без Return (v4 A7): кнопку по Return macOS красит синим, а
+                    // выделенная бывает только в листах; прогон — долгий, его
+                    // не запускают нечаянным нажатием в поле.
+                    Button(String(localized: "Прогнать")) { model.run(app) }
+                        .disabled(!model.canRun)
+                }
+            } header: {
+                Text("Прогон")
+            } footer: {
+                if let cost = model.cost, cost.isLong {
+                    Notice(.warning, String(localized: "Прогон длинный: пока он идёт, локальная модель занята — синхронизация и поиск встанут в очередь за ним."))
+                } else {
+                    Text("Вектор запроса считается один раз на модель и переиспользуется всеми вариантами с той же моделью.")
+                }
+            }
+
+            Section {
+                HowItWorks(screen: "evaluation", String(localized: "Один набор запросов, несколько вариантов — и одна и та же выдача, сохранённая целиком. Вектор запроса считается один раз на модель и переиспользуется всеми вариантами с той же моделью. Вариант — это коллекция плюс профиль поиска. Метрика расстояния и модель берутся из самой коллекции: сравнить другую модель или стратегию можно только по уже существующим коллекциям, потому что модель привязана к коллекции навсегда."))
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var variantSheet: some View {
+        SheetForm(
+            cancel: { model.draft = nil },
+            confirmTitle: String(localized: "Добавить"),
+            confirm: { Task { await model.addVariant(app) } }
+        ) {
+            if let draft = model.draft {
+                Section {
+                    Picker(String(localized: "Коллекция"), selection: Binding(
+                        get: { draft.collectionName },
+                        set: { name in
+                            model.draft?.collectionName = name
+                            model.draft?.profileID = nil
+                            model.draft?.name = name
+                        }
+                    )) {
+                        ForEach(model.collections) { collection in
+                            Text(collection.name).tag(collection.name)
+                        }
+                    }
+                    Picker(String(localized: "Профиль поиска"), selection: Binding(
+                        get: { model.draft?.profileID },
+                        set: { model.draft?.profileID = $0 }
+                    )) {
+                        Text("Действующий для коллекции").tag(UUID?.none)
+                        ForEach(model.profiles(for: draft.collectionName, app: app)) { profile in
+                            Text(profile.name).tag(Optional(profile.id))
+                        }
+                    }
+                    StepperRow("n_results", value: Binding(
+                        get: { model.draft?.nResults ?? 10 },
+                        set: { model.draft?.nResults = $0 }
+                    ), in: 1...50)
+                    TextField(String(localized: "Название в отчёте"), text: Binding(
+                        get: { model.draft?.name ?? "" },
+                        set: { model.draft?.name = $0 }
+                    ))
+                } header: {
+                    SectionHeader(
+                        String(localized: "Новый вариант"),
+                        help: String(localized: "Название варианта становится заголовком колонки в отчёте. Понятное имя («512 символов», «с переранжированием») читается через месяц, имя коллекции — нет.")
+                    )
+                } footer: {
+                    Text("Вариант — это коллекция плюс профиль поиска: их и сравнивает прогон.")
                 }
             }
         }
     }
 
-    // MARK: - Набор и запрос: формы
+    // MARK: - Набор и запрос: листы
 
     private var setSheet: some View {
-        SheetShell(
-            title: model.setDraft?.isNew == true
-                ? String(localized: "Новый набор")
-                : String(localized: "Переименовать набор"),
-            subtitle: String(localized: "Набор принадлежит задаче, а не коллекции: один и тот же набор гоняется по разным вариантам."),
-            width: 460,
-            height: nil,
-            scrolls: false
+        SheetForm(
+            cancel: { model.setDraft = nil },
+            confirmTitle: String(localized: "Сохранить"),
+            confirmDisabled: (model.setDraft?.name ?? "").trimmingCharacters(in: .whitespaces).isEmpty,
+            confirm: { model.saveSet(app) }
         ) {
-            TextField(String(localized: "Название"), text: Binding(
-                get: { model.setDraft?.name ?? "" },
-                set: { model.setDraft?.name = $0 }
-            ))
-            .textFieldStyle(.roundedBorder)
-            TextField(String(localized: "Заметка"), text: Binding(
-                get: { model.setDraft?.note ?? "" },
-                set: { model.setDraft?.note = $0 }
-            ), axis: .vertical)
-            .textFieldStyle(.roundedBorder)
-            .lineLimit(2...4)
-        } actions: {
-            Button(String(localized: "Отмена")) { model.setDraft = nil }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Сохранить")) { model.saveSet(app) }
-                .buttonStyle(.chromaPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled((model.setDraft?.name ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+            Section {
+                TextField(String(localized: "Название"), text: Binding(
+                    get: { model.setDraft?.name ?? "" },
+                    set: { model.setDraft?.name = $0 }
+                ))
+                TextField(String(localized: "Заметка"), text: Binding(
+                    get: { model.setDraft?.note ?? "" },
+                    set: { model.setDraft?.note = $0 }
+                ), axis: .vertical)
+                .lineLimit(2...4)
+            } header: {
+                Text(model.setDraft?.isNew == true
+                     ? String(localized: "Новый набор")
+                     : String(localized: "Переименовать набор"))
+            } footer: {
+                Text("Набор принадлежит задаче, а не коллекции: один и тот же набор гоняется по разным вариантам.")
+            }
         }
     }
 
     private var querySheet: some View {
-        SheetShell(
-            title: model.queryDraft?.isNew == true
-                ? String(localized: "Новый запрос")
-                : String(localized: "Правка запроса"),
-            subtitle: model.queryDraft?.isNew == false
-                ? String(localized: "Эталон запроса правка не трогает: отметки релевантности — отдельная работа.")
-                : String(localized: "Запрос набора: его текст и, если нужно, фильтр по метаданным."),
-            width: 560,
-            height: nil,
-            scrolls: false
+        SheetForm(
+            width: .wide,
+            cancel: { model.queryDraft = nil },
+            confirmTitle: String(localized: "Сохранить"),
+            confirmDisabled: (model.queryDraft?.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty,
+            confirm: { model.saveQuery(app) }
         ) {
-            TextField(String(localized: "Текст запроса"), text: Binding(
-                get: { model.queryDraft?.text ?? "" },
-                set: { model.queryDraft?.text = $0 }
-            ), axis: .vertical)
-            .textFieldStyle(.roundedBorder)
-            .lineLimit(2...5)
-
-            TextField(String(localized: "Теги через запятую"), text: Binding(
-                get: { model.queryDraft?.tags ?? "" },
-                set: { model.queryDraft?.tags = $0 }
-            ))
-            .textFieldStyle(.roundedBorder)
-            TextField(String(localized: "Комментарий"), text: Binding(
-                get: { model.queryDraft?.comment ?? "" },
-                set: { model.queryDraft?.comment = $0 }
-            ))
-            .textFieldStyle(.roundedBorder)
-
-            queryFilterEditor
-        } actions: {
-            Button(String(localized: "Отмена")) { model.queryDraft = nil }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Сохранить")) { model.saveQuery(app) }
-                .buttonStyle(.chromaPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled((model.queryDraft?.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+            Section {
+                TextField(String(localized: "Текст запроса"), text: Binding(
+                    get: { model.queryDraft?.text ?? "" },
+                    set: { model.queryDraft?.text = $0 }
+                ), axis: .vertical)
+                .lineLimit(2...5)
+                TextField(String(localized: "Теги через запятую"), text: Binding(
+                    get: { model.queryDraft?.tags ?? "" },
+                    set: { model.queryDraft?.tags = $0 }
+                ))
+                TextField(String(localized: "Комментарий"), text: Binding(
+                    get: { model.queryDraft?.comment ?? "" },
+                    set: { model.queryDraft?.comment = $0 }
+                ))
+            } header: {
+                Text(model.queryDraft?.isNew == true
+                     ? String(localized: "Новый запрос")
+                     : String(localized: "Правка запроса"))
+            } footer: {
+                Text(model.queryDraft?.isNew == false
+                     ? String(localized: "Эталон запроса правка не трогает: отметки релевантности — отдельная работа.")
+                     : String(localized: "Запрос набора: его текст и, если нужно, фильтр по метаданным."))
+            }
+            queryFilterSection
         }
     }
 
     /// Фильтр — тот же редактор, что на экране поиска, а не его копия.
-    @ViewBuilder
-    private var queryFilterEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Toggle("Применять фильтр", isOn: Binding(
+    private var queryFilterSection: some View {
+        Section {
+            Toggle(String(localized: "Применять фильтр"), isOn: Binding(
                 get: { model.queryDraft?.filter != nil },
                 set: { model.queryDraft?.filter = $0 ? (model.queryDraft?.filter ?? DocumentFilter()) : nil }
             ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .fixedSize()
-
             if model.queryDraft?.filter != nil {
-                ScrollView {
-                    FilterNodeEditor(
-                        node: Binding(
-                            get: { model.queryDraft?.filter?.root ?? .group(.and, []) },
-                            set: { model.queryDraft?.filter?.root = $0 }
-                        ),
-                        knownFields: model.filterFields(app),
-                        depth: 0,
-                        onRemove: nil
-                    )
-                }
-                .frame(maxHeight: 220)
+                FilterNodeEditor(
+                    node: Binding(
+                        get: { model.queryDraft?.filter?.root ?? .group(.and, []) },
+                        set: { model.queryDraft?.filter?.root = $0 }
+                    ),
+                    knownFields: model.filterFields(app),
+                    depth: 0,
+                    onRemove: nil
+                )
+            }
+        } header: {
+            Text("Фильтр")
+        } footer: {
+            if model.queryDraft?.filter != nil {
                 Text("Фильтр применяется вместе с запросом, как на экране поиска. Поля предлагаются по схемам всех коллекций — набор не привязан к одной.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
             }
         }
+    }
+
+    // MARK: - Прогоны
+
+    private var runsTab: some View {
+        VStack(spacing: 0) {
+            switch RunsPart(rawValue: runsPart) ?? .history {
+            case .history:
+                historyTable
+            case .report:
+                if model.lastRun != nil {
+                    reportForm
+                } else {
+                    noOpenRun
+                }
+            case .marking:
+                if let run = model.lastRun {
+                    markingPane(run)
+                } else {
+                    noOpenRun
+                }
+            }
+        }
+        // Часть прогонов — меню в тулбаре, как в «Замерах» (v6 B2): второй
+        // ряд сегментов под тулбаром был другим видом переключателя.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Picker(String(localized: "Показать"), selection: $runsPart) {
+                    ForEach(RunsPart.allCases) { part in
+                        Text(part.title).tag(part.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .help(model.lastRun.map { String(localized: "Открыт «\($0.name)»") }
+                      ?? String(localized: "История, отчёт и разметка прогонов"))
+            }
+        }
+    }
+
+    private var noOpenRun: some View {
+        ContentUnavailableView {
+            Label(String(localized: "Прогон не открыт"), systemImage: "chart.bar.doc.horizontal")
+        } description: {
+            Text(model.runs.isEmpty
+                 ? String(localized: "Соберите набор запросов, добавьте хотя бы один вариант и нажмите «Прогнать» на вкладке «Варианты».")
+                 : String(localized: "Откройте прогон в «Истории» — двойным щелчком."))
+        } actions: {
+            if !model.runs.isEmpty {
+                Button(String(localized: "Показать историю")) { runsPart = RunsPart.history.rawValue }
+            }
+        }
+        // Во всю высоту: иначе стопка центрируется, и переключатель частей
+        // висит посреди окна.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Сохранённые прогоны — таблица; «Открыть» — двойной щелчок.
+    @ViewBuilder
+    private var historyTable: some View {
+        if model.runs.isEmpty {
+            ContentUnavailableView {
+                Label(String(localized: "Прогонов пока нет"), systemImage: "chart.bar.doc.horizontal")
+            } description: {
+                Text("Прогон хранится целиком — с датой, версией приложения и полными параметрами вариантов. Соберите набор, добавьте вариант и нажмите «Прогнать» на вкладке «Варианты».")
+            }
+        } else {
+            Table(model.runs, selection: $selectedRun, columnCustomization: $runColumns) {
+                // Название, дата, набор, число запросов; варианты — главная
+                // колонка, без ширины: в ней самый длинный текст (v6 B2).
+                TableColumn(String(localized: "Название")) { summary in
+                    HStack {
+                        let title = summary.name.isEmpty
+                            ? summary.startedAt.formatted(date: .abbreviated, time: .shortened)
+                            : summary.name
+                        Text(title).lineLimit(1).help(title)
+                        if summary.id == model.lastRun?.id {
+                            Text("открыт").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .width(min: 120, ideal: 200, max: 320)
+                .customizationID("name")
+                TableColumn(String(localized: "Дата")) { summary in
+                    HStack {
+                        Text(summary.startedAt.formatted(date: .abbreviated, time: .shortened))
+                        if !summary.isComplete {
+                            StatusLabel(.warning, String(localized: "неполный"))
+                        }
+                    }
+                }
+                .width(min: 110, ideal: 140, max: 220)
+                .customizationID("date")
+                TableColumn(String(localized: "Набор")) { summary in
+                    Text(summary.querySetName).foregroundStyle(.secondary).lineLimit(1)
+                        .help(summary.querySetName)
+                }
+                .width(min: 100, ideal: 160, max: 220)
+                .customizationID("set")
+                TableColumn(String(localized: "Запросов")) { summary in
+                    Text(summary.queryCount.formatted()).monospacedDigit()
+                }
+                .width(min: 60, ideal: 80, max: 110)
+                .alignment(.numeric)
+                .customizationID("count")
+                TableColumn(String(localized: "Варианты")) { summary in
+                    Text(summary.variantNames.joined(separator: ", "))
+                        .foregroundStyle(.secondary).lineLimit(1)
+                        .help(summary.variantNames.joined(separator: ", "))
+                }
+                .customizationID("variants")
+            }
+            .contextMenu(forSelectionType: UUID.self) { ids in
+                if let id = ids.first, let summary = model.runs.first(where: { $0.id == id }) {
+                    Button(String(localized: "Открыть")) { open(summary) }
+                    Divider()
+                    Button(String(localized: "Удалить…"), role: .destructive) { runPendingDeletion = summary }
+                }
+            } primaryAction: { ids in
+                if let id = ids.first, let summary = model.runs.first(where: { $0.id == id }) {
+                    open(summary)
+                }
+            }
+            .onDeleteCommand {
+                if let id = selectedRun, let summary = model.runs.first(where: { $0.id == id }) {
+                    runPendingDeletion = summary
+                }
+            }
+        }
+    }
+
+    private func open(_ summary: EvaluationRunSummary) {
+        model.openRun(summary, app: app)
+        runsPart = RunsPart.report.rawValue
     }
 
     // MARK: - Отчёт
 
-    private var reportCard: some View {
-        SectionCard(
-            title: String(localized: "Отчёт"),
-            subtitle: String(localized: "Лучшее значение в столбце выделено — но только когда вариантов больше одного и значения различаются: «лучший из одинаковых» это не вывод.")
-        ) {
-            VStack(alignment: .leading, spacing: 14) {
+    private var reportForm: some View {
+        Form {
+            Section {
                 ksControl
                 if let table = model.table(app) { metricTable(table) }
-                // Оговорка стоит сразу под таблицей, а не в примечаниях внизу:
-                // она про то, как читать числа, которые человек видит сейчас.
+            } header: {
+                SectionHeader(
+                    String(localized: "Отчёт"),
+                    help: String(localized: "Лучшее значение в столбце выделено — но только когда вариантов больше одного и значения различаются: «лучший из одинаковых» это не вывод. Метрики — набором чисел, и намеренно без единой «общей оценки качества»: одно число прячет, какая из его частей сдвинулась.")
+                )
+            } footer: {
+                // Оговорка сразу под таблицей: она про то, как читать числа,
+                // которые человек видит сейчас.
                 if let caveat = model.lengthCaveat {
-                    Text(caveat).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
+                    Notice(.warning, caveat)
                 }
-                divergentBlock
-                comparisonBlock
-                HStack(spacing: 8) {
-                    Button("Экспорт в Markdown") { model.export(markdown: true, app: app) }
-                    Button("Экспорт в JSON") { model.export(markdown: false, app: app) }
+            }
+
+            metricsSections
+            divergentSection
+            comparisonSection
+            judgeSection
+
+            Section {
+                HStack {
+                    Spacer()
+                    Button(String(localized: "Экспорт в Markdown…")) { model.export(markdown: true, app: app) }
+                    Button(String(localized: "Экспорт в JSON…")) { model.export(markdown: false, app: app) }
                 }
-                .controlSize(.small)
             }
         }
+        .formStyle(.grouped)
     }
 
     /// Настройка k. Стоит над таблицей, потому что меняет её столбцы.
     private var ksControl: some View {
-        HStack(spacing: 8) {
-            Text("Считать @k для:").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            ForEach([1, 3, 5, 10, 20], id: \.self) { k in
-                let chosen = model.ks(app).contains(k)
-                Button("@\(k)") { toggleK(k) }
-                    .buttonStyle(.chromaChoice(chosen ? Theme.Palette.accent : nil))
-                    .controlSize(.small)
+        LabeledContent(String(localized: "Считать @k для")) {
+            HStack {
+                ForEach([1, 3, 5, 10, 20], id: \.self) { k in
+                    Toggle("@\(k)", isOn: Binding(
+                        get: { model.ks(app).contains(k) },
+                        set: { _ in toggleK(k) }
+                    ))
+                    .toggleStyle(.button)
+                }
             }
-            Spacer()
         }
     }
 
@@ -513,497 +777,382 @@ struct EvaluationView: View {
             current.insert(k)
         }
         app.settings.configuration.evaluationKs = EvaluationMetrics.sanitisedKs(Array(current))
-        model.refreshMetrics(app)
+        model.refreshForChangedKs(app)
     }
 
+    /// Метрики строками, варианты колонками — сеткой в строке формы.
     private func metricTable(_ table: EvaluationReport.Table) -> some View {
-        ScrollView(.horizontal, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 0) {
-                    Text("Метрика").font(Theme.Font.caption).bold()
-                        .frame(width: 150, alignment: .leading)
+        ScrollView(.horizontal) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                GridRow {
+                    Text("Метрика").bold()
                     ForEach(Array(table.variantNames.enumerated()), id: \.offset) { _, name in
-                        Text(name).font(Theme.Font.caption).bold()
-                            .frame(width: 170, alignment: .leading).lineLimit(1)
+                        Text(name).bold().lineLimit(1)
                     }
                 }
-                .padding(.vertical, 4)
                 Divider()
                 ForEach(table.columns) { column in
-                    HStack(spacing: 0) {
-                        Text(column.title).font(Theme.Font.caption)
-                            .frame(width: 150, alignment: .leading)
+                    GridRow {
+                        Text(column.title)
                         ForEach(Array(column.cells.enumerated()), id: \.offset) { _, cell in
                             Text(cell.text)
-                                .font(Theme.Font.caption).monospacedDigit()
-                                // Полужирный, а не цвет: цветом в этом экране
-                                // уже размечены оценки релевантности, и второй
-                                // смысл того же цвета читался бы как первый.
+                                .monospacedDigit()
+                                // Полужирный, а не цвет: цветом на этом экране
+                                // уже размечены оценки релевантности.
                                 .fontWeight(cell.isBest ? .bold : .regular)
                                 .foregroundStyle(cell.value == nil ? Color.secondary : Color.primary)
-                                .frame(width: 170, alignment: .leading)
                         }
                     }
-                    .padding(.vertical, 3)
-                    Divider().opacity(0.4)
                 }
             }
         }
     }
 
-    private var divergentBlock: some View {
+    /// Подробности метрик по варианту: задержки, охват, оговорки.
+    @ViewBuilder
+    private var metricsSections: some View {
+        ForEach(model.metrics, id: \.variantID) { variantMetrics in
+            Section {
+                LabeledContent("hit rate", value: Self.line("", variantMetrics.hitRate).trimmingCharacters(in: .whitespaces))
+                LabeledContent("recall", value: Self.line("", variantMetrics.recall).trimmingCharacters(in: .whitespaces))
+                LabeledContent("nDCG", value: Self.line("", variantMetrics.ndcg).trimmingCharacters(in: .whitespaces))
+                LabeledContent("MRR", value: "\(variantMetrics.mrr.text)\(Self.basis(variantMetrics.mrr))")
+                // Цена попадания: сколько знаков агент прочтёт на
+                // один полезный результат. Меньше — лучше.
+                LabeledContent(
+                    String(localized: "Знаков на полезный"),
+                    value: Self.line("", variantMetrics.charactersPerUseful, scale: .characters).trimmingCharacters(in: .whitespaces)
+                )
+                if let latency = variantMetrics.searchLatency {
+                    LabeledContent(String(localized: "Поиск"), value: latency.line)
+                }
+                if let latency = variantMetrics.embeddingLatency {
+                    LabeledContent(
+                        String(localized: "Вектор запроса"),
+                        value: String(localized: "\(latency.line) (посчитан \(RussianCount.phrase(latency.samples, "раз", "раза", "раз")))")
+                    )
+                }
+            } header: {
+                Text(variantMetrics.variantName)
+            } footer: {
+                VStack(alignment: .leading) {
+                    ForEach(variantMetrics.truncatedKs, id: \.self) { k in
+                        if let note = variantMetrics.note(for: k) {
+                            Notice(.warning, note)
+                        }
+                    }
+                    if let reason = Self.firstReason(variantMetrics) {
+                        Text("«—» значит «неприменима»: \(reason)")
+                    }
+                    if variantMetrics.coverage.isComplete {
+                        Text(variantMetrics.coverage.line)
+                    } else {
+                        Notice(.warning, variantMetrics.coverage.line + String(localized: " — метрики предварительные"))
+                    }
+                }
+            }
+        }
+    }
+
+    private var divergentSection: some View {
         let rows = model.rows
         let divergent = EvaluationReport.mostDivergent(rows)
         let shown = model.showAllQueries ? rows : divergent
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(model.showAllQueries ? "Все запросы" : "Где варианты разошлись сильнее всего")
-                    .font(Theme.Font.control).bold()
-                Spacer()
-                if !rows.isEmpty {
-                    Button(model.showAllQueries ? "только расхождения" : "показать все") {
-                        model.showAllQueries.toggle()
-                    }
-                    .controlSize(.small).buttonStyle(.borderless)
-                }
+        return Section {
+            if !rows.isEmpty {
+                Toggle(String(localized: "Показывать все запросы"), isOn: $model.showAllQueries)
             }
             if shown.isEmpty {
                 Text(model.showAllQueries
                      ? "Запросов нет."
                      : "Расхождений нет: на всех запросах варианты повели себя одинаково либо судить не по чему — разметки не хватает.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    .foregroundStyle(.secondary)
             } else {
                 ForEach(shown) { row in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(row.text).font(Theme.Font.caption).bold().lineLimit(2)
-                        HStack(spacing: 12) {
-                            // Имена берутся из прогона, а не из плана на экране:
-                            // у открытого сохранённого прогона план пуст, и
-                            // исходы исчезали, оставляя строку без вывода.
-                            // Найдено при открытии прогона после перезапуска.
-                            ForEach(Array(zip((model.lastRun?.variants ?? []).map(\.name), row.outcomes)), id: \.0) { name, outcome in
-                                Text("\(name): \(outcome.text)")
-                                    .font(Theme.Font.micro)
-                                    .foregroundStyle(Self.outcomeTint(outcome))
-                            }
+                    VStack(alignment: .leading) {
+                        Text(row.text).bold().lineLimit(2)
+                        // Имена берутся из прогона, а не из плана на экране:
+                        // у открытого сохранённого прогона план пуст.
+                        ForEach(Array(zip((model.lastRun?.variants ?? []).map(\.name), row.outcomes)), id: \.0) { name, outcome in
+                            outcomeLine(name: name, outcome: outcome)
                         }
                     }
-                    .padding(.vertical, 2)
                 }
             }
+        } header: {
+            Text(model.showAllQueries ? "Все запросы" : "Где варианты разошлись сильнее всего")
         }
     }
 
-    /// «Не нашёл» — оранжевым, потому что это вывод о варианте.
-    /// «Не размечено» — серым: это отсутствие вывода, и красить его как провал
-    /// значило бы обвинять вариант в том, чего никто не проверял.
-    private static func outcomeTint(_ outcome: EvaluationReport.QueryOutcome) -> Color {
+    /// «Не нашёл» — предупреждение: это вывод о варианте. «Не размечено» —
+    /// серым: это отсутствие вывода, и красить его как провал значило бы
+    /// обвинять вариант в том, чего никто не проверял.
+    @ViewBuilder
+    private func outcomeLine(name: String, outcome: EvaluationReport.QueryOutcome) -> some View {
+        let text = "\(name): \(outcome.text)"
         switch outcome {
-        case .found: return .primary
-        case .missed: return .orange
-        case .unmarked: return .secondary
-        case .failed: return .red
+        case .found: Text(text)
+        case .missed: StatusLabel(.warning, text)
+        case .unmarked: Text(text).foregroundStyle(.secondary)
+        case .failed: StatusLabel(.error, text)
         }
     }
 
-    private var comparisonBlock: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text("Сравнить с прогоном").font(Theme.Font.control).bold()
-                Picker("", selection: Binding(
-                    get: { model.comparisonRunID },
-                    set: { model.selectComparison($0, app: app) }
-                )) {
-                    Text("не сравнивать").tag(UUID?.none)
-                    ForEach(model.runs.filter { $0.id != model.lastRun?.id }) { summary in
-                        Text(summary.name).tag(UUID?.some(summary.id))
-                    }
+    private var comparisonSection: some View {
+        Section {
+            Picker(String(localized: "Сравнить с прогоном"), selection: Binding(
+                get: { model.comparisonRunID },
+                set: { model.selectComparison($0, app: app) }
+            )) {
+                Text("не сравнивать").tag(UUID?.none)
+                ForEach(model.runs.filter { $0.id != model.lastRun?.id }) { summary in
+                    Text(summary.name).tag(UUID?.some(summary.id))
                 }
-                .labelsHidden().frame(width: 260)
             }
             if let comparison = model.comparison {
-                if !comparison.onlyInBefore.isEmpty || !comparison.onlyInAfter.isEmpty {
-                    Text("Сопоставлены только варианты с совпадающим именем."
-                         + (comparison.onlyInBefore.isEmpty ? "" : " Только в «\(comparison.before)»: \(comparison.onlyInBefore.joined(separator: ", ")).")
-                         + (comparison.onlyInAfter.isEmpty ? "" : " Только в «\(comparison.after)»: \(comparison.onlyInAfter.joined(separator: ", "))."))
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.attention)
-                }
                 ForEach(comparison.variants) { item in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.variantName).font(Theme.Font.caption).bold()
+                    VStack(alignment: .leading) {
+                        Text(item.variantName).bold()
                         ForEach(item.deltas) { delta in
                             if delta.before != nil || delta.after != nil {
-                                Text("\(delta.title): \(delta.beforeText) → \(delta.afterText)"
-                                     + (delta.changeText.map { " (\($0))" } ?? ""))
-                                    .font(Theme.Font.micro).monospacedDigit()
-                                    .foregroundStyle(Self.deltaTint(delta))
+                                deltaLine(delta)
                             }
                         }
                     }
-                    .padding(.vertical, 2)
                 }
+            }
+        } header: {
+            Text("Сравнение")
+        } footer: {
+            if let comparison = model.comparison,
+               !comparison.onlyInBefore.isEmpty || !comparison.onlyInAfter.isEmpty {
+                Notice(.warning, "Сопоставлены только варианты с совпадающим именем."
+                       + (comparison.onlyInBefore.isEmpty ? "" : " Только в «\(comparison.before)»: \(comparison.onlyInBefore.joined(separator: ", ")).")
+                       + (comparison.onlyInAfter.isEmpty ? "" : " Только в «\(comparison.after)»: \(comparison.onlyInAfter.joined(separator: ", ")).")
+                )
             }
         }
     }
 
     /// Без вердикта — обычным цветом. «Не изменилось» это не «не улучшилось».
-    private static func deltaTint(_ delta: EvaluationReport.MetricDelta) -> Color {
+    @ViewBuilder
+    private func deltaLine(_ delta: EvaluationReport.MetricDelta) -> some View {
+        let text = "\(delta.title): \(delta.beforeText) → \(delta.afterText)"
+            + (delta.changeText.map { " (\($0))" } ?? "")
         switch delta.improved {
-        case true?: return .green
-        case false?: return .orange
-        default: return .secondary
+        case true?: StatusLabel(.ok, text).monospacedDigit()
+        case false?: StatusLabel(.warning, text).monospacedDigit()
+        default: Text(text).monospacedDigit().foregroundStyle(.secondary)
         }
     }
 
-    // MARK: - Набор
+    // MARK: - Оценка чат-моделью
 
-    private var setCard: some View {
-        SectionCard(
-            title: String(localized: "Набор запросов"),
-            subtitle: String(localized: "Основной способ наполнения — кнопка «В набор» в истории поиска на экране коллекции: двадцать запросов руками никто не пишет. Здесь можно добавить недостающий, поправить опечатку и перенести набор на другую машину.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                if model.sets.isEmpty {
-                    Text("Ни одного набора пока нет. Выполните запрос на экране «Коллекции» и нажмите «В набор» под ним — или создайте набор здесь и впишите запросы сами.")
-                        .font(Theme.Font.body).foregroundStyle(Theme.Palette.captionText)
-                } else {
-                    HStack(spacing: 8) {
-                        // Пустой заголовок, а не скрытый: скрытая подпись
-                        // всё равно держит колонку, и список отъезжал вправо.
-                        Picker("", selection: Binding(
-                            get: { model.selectedSetID },
-                            set: { newValue in
-                                model.selectedSetID = newValue
-                                Task { await model.updateCost(app) }
-                            }
-                        )) {
-                            ForEach(model.sets) { set in
-                                Text(set.name).tag(Optional(set.id))
-                            }
-                        }
-                        .labelsHidden()
-                        // Выравнивание по левому краю: кнопка меню уже рамки,
-                        // и без этого она вставала по центру, отъезжая вправо
-                        // от всего остального в карточке.
-                        .frame(minWidth: 160, idealWidth: 260, maxWidth: 260, alignment: .leading)
-                        Spacer()
-                    }
-
-                    if let set = model.selectedSet {
-                        Text(set.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        if !set.note.isEmpty {
-                            Text(set.note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        if set.markedQueryCount < set.queries.count {
-                            Text("Запросы без эталона всё равно прогоняются — их выдачу можно разметить прямо в результатах.")
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        queryList(set)
-                    }
+    /// Необязательный режим, выключенный по умолчанию. Стоит **после** отчёта:
+    /// оценка модели — подсказка разметчику, а не источник чисел в таблице.
+    private var judgeSection: some View {
+        Section {
+            Toggle(String(localized: "Оценивать чат-моделью"), isOn: Binding(
+                get: { app.settings.configuration.modelJudgeEnabled },
+                set: { enabled in
+                    app.settings.configuration.modelJudgeEnabled = enabled
+                    Task { await model.updateJudgeCost(app) }
                 }
-                setActions
+            ))
+            if app.settings.configuration.modelJudgeEnabled {
+                judgeSettings
             }
-        }
-    }
-
-    /// Запросы набора: текст, теги, эталон — и правка с удалением.
-    private func queryList(_ set: QuerySet) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Divider().padding(.vertical, 4)
-            if set.queries.isEmpty {
-                Text("В наборе нет запросов.").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            }
-            ForEach(set.queries) { query in
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(query.text).font(Theme.Font.body).lineLimit(2)
-                        Text(Self.queryLine(query)).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer(minLength: 8)
-                    Button(String(localized: "Править")) { model.editQuery(query) }
-                        .buttonStyle(.chromaSecondary).disabled(model.isRunning)
-                    Button(String(localized: "Удалить")) { model.queryPendingDeletion = query }
-                        .buttonStyle(.chromaSecondary).disabled(model.isRunning)
+        } header: {
+            SectionHeader(
+                String(localized: "Оценка чат-моделью"),
+                help: String(localized: "Модель проходит по каждому результату каждого варианта и говорит, отвечает ли он на запрос. Это подсказка для разметки, а не разметка: в эталон и в метрики оценка модели не попадает — её можно только принять вручную.")
+            )
+        } footer: {
+            // Причина провала — **всегда**, а не только когда оценки есть:
+            // «модель не ответила на 40 из 40» и ноль оценок — одно событие
+            //.
+            if let set = model.judgements {
+                VStack(alignment: .leading) {
+                    if !set.judgements.isEmpty { Text(set.line) }
+                    if !set.note.isEmpty { Notice(.warning, set.note) }
                 }
-                .padding(.vertical, 3)
-                Divider().opacity(0.4)
             }
         }
     }
 
-    /// Что известно про запрос, кроме текста. Эталон назван числом, потому что
-    /// именно он отличает запрос, по которому будут метрики, от остальных.
-    private static func queryLine(_ query: EvaluationQuery) -> String {
-        var parts: [String] = []
-        let marks = query.fragments.count + query.documents.count
-        parts.append(marks == 0
-                     ? String(localized: "эталона нет")
-                     : RussianCount.phrase(marks, "отметка эталона", "отметки эталона", "отметок эталона"))
-        if query.filter != nil { parts.append(String(localized: "с фильтром")) }
-        if !query.tags.isEmpty { parts.append(query.tags.joined(separator: ", ")) }
-        if !query.comment.isEmpty { parts.append(query.comment) }
-        return parts.joined(separator: " · ")
-    }
+    @ViewBuilder
+    private var judgeSettings: some View {
+        Picker(String(localized: "Модель"), selection: Binding(
+            get: { app.settings.configuration.modelJudgeModel },
+            set: { newValue in
+                app.settings.configuration.modelJudgeModel = newValue
+                Task { await model.updateJudgeCost(app) }
+            }
+        )) {
+            Text("не выбрана").tag(String?.none)
+            ForEach(model.chatModels) { item in
+                Text(item.id).tag(Optional(item.id))
+            }
+        }
 
-    private var setActions: some View {
-        HStack(spacing: 8) {
-            Button(String(localized: "Добавить запрос…")) { model.newQuery() }
-                .buttonStyle(.chromaPrimary)
-                .disabled(model.selectedSet == nil || model.isRunning)
+        DisclosureGroup(isExpanded: $showingJudgePrompt) {
+            TextEditor(text: Binding(
+                get: { app.settings.configuration.modelJudgePrompt.text },
+                set: { app.settings.configuration.modelJudgePrompt.text = $0 }
+            ))
+            .font(.body.monospaced())
+            .textArea()
+            Text("Подстановки \(JudgePrompt.queryPlaceholder) и \(JudgePrompt.documentPlaceholder) обязательны. Форма ответа задана схемой и не редактируется: разбор ответа написан ровно под неё.")
+                .foregroundStyle(.secondary)
+            if let problem = app.settings.configuration.modelJudgePrompt.problem {
+                Notice(.warning, problem)
+            }
+            if !app.settings.configuration.modelJudgePrompt.isDefault {
+                Button(String(localized: "Вернуть исходный промпт")) {
+                    app.settings.configuration.modelJudgePrompt = JudgePrompt()
+                }
+            }
+        } label: {
+            Text("Промпт оценки").togglesDisclosure($showingJudgePrompt)
+        }
+        // Промпт входит в отпечаток оценки: правленый — это новые вызовы.
+        .onChange(of: app.settings.configuration.modelJudgePrompt.fingerprint) { _, _ in
+            Task { await model.updateJudgeCost(app) }
+        }
+
+        if let cost = model.judgeCost {
+            LabeledContent(String(localized: "Стоимость")) {
+                Text(cost.line).copyable(cost.line)
+            }
+            if cost.isLong {
+                Notice(.warning, String(localized: "Пока идёт оценка, локальная модель занята: синхронизация, чанкинг и поиск встанут в очередь за ней."))
+            }
+        }
+
+        if let progress = model.judgeProgress {
+            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1))) {
+                Text(progress.line)
+            }
+        }
+
+        HStack {
+            if let cost = model.judgeCost, cost.calls == 0, cost.alreadyJudged > 0, !model.isJudging {
+                // «Ещё не считали» — не то же самое, что «нечего делать».
+                Text("Всё оценено этой редакцией промпта. Правка промпта делает оценки заново.")
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
-            Menu {
-                Button("Новый набор…") { model.newSet() }
-                Button("Переименовать…") { model.renameSet() }
-                    .disabled(model.selectedSet == nil)
-                Divider()
-                Button("Экспорт набора…") { model.exportSet(app) }
-                    .disabled(model.selectedSet == nil)
-                Button("Импорт набора…") { model.importSet(app) }
-                Divider()
-                Button("Удалить набор", role: .destructive) { model.requestSetDeletion() }
-                    .disabled(model.selectedSet == nil)
-            } label: {
-                Image(systemName: "ellipsis.circle")
+            if model.isJudging {
+                Button(String(localized: "Остановить")) { model.cancelJudgement() }
+                    .help(String(localized: "Отмена сохраняет уже полученные оценки."))
             }
-            .menuStyle(.borderlessButton)
-            .frame(width: 40)
+            Button(String(localized: "Оценить моделью…")) { Task { await model.requestJudgement(app) } }
+                .disabled(model.isJudging
+                          || app.settings.configuration.modelJudgeModel == nil
+                          || (model.judgeCost?.calls ?? 0) == 0)
         }
     }
 
-    // MARK: - Варианты
+    // MARK: - Разметка
 
-    private var variantsCard: some View {
-        SectionCard(
-            title: String(localized: "Варианты"),
-            subtitle: String(localized: "Метрика расстояния и модель берутся из самой коллекции — их нельзя выбрать здесь. Чтобы сравнить другую модель или стратегию, склонируйте коллекцию на экране «Эмбеддинги» → «Пересчёт векторов» → «Клонирование».")
-        ) {
-            VStack(alignment: .leading, spacing: 8) {
-                if model.variants.isEmpty {
-                    Text("Вариантов нет. Добавьте хотя бы один — сравнивать можно и два профиля поиска одной коллекции, это не требует клонирования.")
-                        .font(Theme.Font.body).foregroundStyle(Theme.Palette.captionText)
-                }
-                ForEach(model.variants) { variant in
-                    HStack(alignment: .top, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(variant.name).font(Theme.Font.body).bold()
-                            Text(variant.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                            if !variant.note.isEmpty {
-                                Text(variant.note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                            }
-                        }
-                        Spacer(minLength: 8)
-                        Button(String(localized: "Убрать")) { model.removeVariant(variant, app: app) }
-                            .buttonStyle(.chromaSecondary)
-                            .disabled(model.isRunning)
-                    }
-                    Divider()
-                }
-                HStack {
-                    Button(String(localized: "Добавить вариант")) { model.beginVariant(app) }
-                        .buttonStyle(.chromaPrimary)
-                        .disabled(model.isRunning || model.collections.isEmpty)
-                    if model.collections.isEmpty {
-                        Text("Нет подключения к базе или в ней нет коллекций.")
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-                }
-            }
-        }
-    }
-
-    private var variantSheet: some View {
-        SheetShell(
-            title: String(localized: "Новый вариант"),
-            subtitle: String(localized: "Вариант — это коллекция плюс профиль поиска: их и сравнивает прогон."),
-            help: String(localized: "Название варианта становится заголовком колонки в отчёте. Понятное имя («512 символов», «с переранжированием») читается через месяц, имя коллекции — нет."),
-            width: 460,
-            height: nil,
-            scrolls: false
-        ) {
-            if let draft = model.draft {
-                Picker(String(localized: "Коллекция"), selection: Binding(
-                    get: { draft.collectionName },
-                    set: { name in
-                        model.draft?.collectionName = name
-                        model.draft?.profileID = nil
-                        model.draft?.name = name
-                    }
-                )) {
-                    ForEach(model.collections) { collection in
-                        Text(collection.name).tag(collection.name)
-                    }
-                }
-                .font(Theme.Font.control)
-
-                Picker(String(localized: "Профиль поиска"), selection: Binding(
-                    get: { model.draft?.profileID },
-                    set: { model.draft?.profileID = $0 }
-                )) {
-                    Text("Действующий для коллекции").tag(UUID?.none)
-                    ForEach(model.profiles(for: draft.collectionName, app: app)) { profile in
-                        Text(profile.name).tag(Optional(profile.id))
-                    }
-                }
-                .font(Theme.Font.control)
-
-                Stepper(
-                    "n_results: \(model.draft?.nResults ?? 10)",
-                    value: Binding(
-                        get: { model.draft?.nResults ?? 10 },
-                        set: { model.draft?.nResults = $0 }
-                    ),
-                    in: 1...50
-                )
-
-                TextField(String(localized: "Название в отчёте"), text: Binding(
-                    get: { model.draft?.name ?? "" },
-                    set: { model.draft?.name = $0 }
-                ))
-                .textFieldStyle(.roundedBorder)
-            }
-        } actions: {
-            Button(String(localized: "Отмена")) { model.draft = nil }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Добавить")) { Task { await model.addVariant(app) } }
-                .buttonStyle(.chromaPrimary)
-                .keyboardShortcut(.defaultAction)
-        }
-    }
-
-    // MARK: - Прогон
-
-    private var runCard: some View {
-        SectionCard(
-            title: String(localized: "Прогон"),
-            subtitle: String(localized: "Вектор запроса считается один раз на модель и переиспользуется всеми вариантами с той же моделью.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                if let cost = model.cost {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Перед стартом").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        Text(cost.line).font(Theme.Font.body).copyable(cost.line)
-                        if cost.isLong {
-                            Text("Прогон длинный: пока он идёт, локальная модель занята — синхронизация и поиск встанут в очередь за ним.")
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                        }
-                    }
-                } else {
-                    Text("Выберите набор и хотя бы один вариант — тогда здесь появится стоимость прогона.")
-                        .font(Theme.Font.body).foregroundStyle(Theme.Palette.captionText)
-                }
-
-                if let progress = model.progress {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ProgressView(
-                            value: Double(progress.done),
-                            total: Double(max(progress.total, 1))
-                        )
-                        Text(progress.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                }
-
-                HStack {
-                    Button(String(localized: "Прогнать")) { model.run(app) }
-                        .buttonStyle(.chromaPrimary)
-                        .disabled(!model.canRun)
-                        .keyboardShortcut(.defaultAction)
-                    if model.isRunning {
-                        Button(String(localized: "Остановить")) { model.cancel() }
-                            .buttonStyle(.chromaSecondary)
-                        Text("Отмена сохраняет уже полученные результаты и помечает прогон неполным.")
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-                }
-            }
-        }
-    }
-
-    // MARK: - Результат
-
-    private func resultsCard(_ run: EvaluationRun) -> some View {
-        SectionCard(
-            title: run.name,
-            // Фактическое число вызовов эмбеддинга — часть подписи, а не
-            // сообщение, исчезающее вместе с сеансом: сравнить его с оценкой
-            // должно быть возможно и у прогона, открытого через месяц.
-            subtitle: run.line + String(localized: " · вызовов эмбеддинга: \(run.embeddingCalls)")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
+    /// Выдачи вариантов рядом — разметка прямо здесь.
+    private func markingPane(_ run: EvaluationRun) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading) {
+                // Фактическое число вызовов эмбеддинга — часть подписи: сравнить
+                // его с оценкой должно быть возможно и через месяц.
+                Text(run.line + String(localized: " · вызовов эмбеддинга: \(run.embeddingCalls)"))
+                    .foregroundStyle(.secondary)
                 if !run.note.isEmpty {
-                    MessageBanner(kind: .warning, text: run.note)
+                    Notice(.warning, run.note)
                 }
-                metricsBlock
-                Text("Отметка «релевантен / частично / нет» уходит в эталон набора как фрагмент найденного текста — она переживёт перенарезку и будет работать для других вариантов. Повторное нажатие той же оценки снимает её.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                HStack {
+                    Text("Отметка уходит в эталон набора как фрагмент найденного текста.")
+                        .foregroundStyle(.secondary)
+                    InfoButton(String(localized: "Отметка «релевантен / частично / нерелевантен» уходит в эталон набора как фрагмент найденного текста — она переживёт перенарезку и будет работать для других вариантов. Повторное нажатие той же оценки снимает её."))
+                }
+            }
+            .padding()
+            Divider()
 
-                // LazyVStack, а не VStack: прогон из пяти вариантов по десять
-                // результатов — это двести карточек с текстом и тремя кнопками
-                // каждая, и обычный стек строит их все до первого показа
-                // экрана. Ленивый строит только видимое.
-                // Одна горизонтальная прокрутка на всю карточку, а не своя
-                // у каждого запроса. Вложенных прокруток было столько
-                // же, сколько запросов, и колёсико трекпада металось между
-                // ними: страница дёргалась туда-сюда, а колонки соседних
-                // запросов стояли на разных сдвигах.
-                //
-                // Прокрутка **обеих** осей и своя высота — иначе ленивый стек
-                // не ленив вовсе. Горизонтальная прокрутка внутри
-                // страничной не ограничивает высоту: стек обязан назвать
-                // полную и потому строит все строки разом. Замерено на
-                // прогоне из 18 запросов по 3 варианта: 1200 мс раскладки
-                // против 105 мс — и второе не растёт с числом запросов.
-                //
-                // Высота — от видимой части страницы, а не число из головы:
-                // разметка идёт в этой панели, и на большом экране она обязана
-                // быть большой. Меньше 420 pt не бывает: ниже в панель не
-                // помещается даже один результат со строкой оценок.
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(run.queries) { query in
-                            VStack(alignment: .leading, spacing: 6) {
-                                // Место под две строки — всегда, и ширина по
-                                // сетке: длинный запрос иначе и высоту
-                                // блока менял, и содержимое панели растягивал
-                                // шире сетки.
-                                Text(query.text).font(Theme.Font.body).bold()
-                                    .lineLimit(2, reservesSpace: true)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .frame(width: Self.gridWidth(for: run), alignment: .leading)
-                                // Варианты — колонками рядом: различие
-                                // видно только тогда, когда выдачи стоят друг
-                                // напротив друга.
-                                comparisonGrid(run: run, query: query)
-                                Divider().frame(width: Self.gridWidth(for: run))
-                            }
-                            // Высота блока закреплена. Ленивый список
-                            // оценивает высоту ещё не построенного, и когда при
-                            // прокрутке **вверх** блок наконец строится, оценка
-                            // заменяется настоящей высотой — содержимое дёргает
-                            // назад на пару строк. Ровно это и было видно: вниз
-                            // катится гладко, вверх — перескакивает, когда в
-                            // поле зрения входит заголовок запроса.
-                            //
-                            // Разделитель для этого переехал **внутрь** блока:
-                            // закрепить можно только то, что является одним
-                            // видом, а не двумя подряд.
-                            .frame(height: blockHeight(run: run, query: query), alignment: .topLeading)
+            // LazyVStack, а не VStack: прогон из пяти вариантов по десять
+            // результатов — это двести ячеек, и обычный стек строит их все
+            // до первого показа. Одна прокрутка обеих осей на всю
+            // панель: иначе ленивый стек не ленив вовсе.
+            ScrollView([.horizontal, .vertical]) {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(run.queries) { query in
+                        VStack(alignment: .leading, spacing: 6) {
+                            // Место под две строки — всегда, и ширина по
+                            // сетке.
+                            Text(query.text).font(.body).bold()
+                                .lineLimit(2, reservesSpace: true)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(width: Self.gridWidth(for: run), alignment: .leading)
+                            // Теги и фильтр — что искать в выдаче:
+                            // «факт» ждёт одного значения, «раздел» — целого
+                            // куска, а фильтр говорит, где искал поиск.
+                            // Комментарий запроса сюда не идёт: в нём ответ,
+                            // и разметка по нему перестаёт быть слепой.
+                            let hint = Self.queryHint(query)
+                            Text(hint)
+                                .font(.subheadline).foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .help(hint)
+                                .frame(width: Self.gridWidth(for: run), height: Self.queryHintHeight, alignment: .leading)
+                            // Варианты — колонками рядом.
+                            comparisonGrid(run: run, query: query)
+                            Divider().frame(width: Self.gridWidth(for: run))
                         }
+                        // Высота блока закреплена: ленивый список
+                        // оценивает высоту ещё не построенного, и прокрутка
+                        // вверх перескакивала.
+                        .frame(height: blockHeight(run: run, query: query), alignment: .topLeading)
                     }
-                    // Место под полосы прокрутки. Панель листается по
-                    // обеим осям, полосы рисуются **поверх** содержимого — и
-                    // вертикальная накрывала значок «показать в источнике»
-                    // у правой колонки: он стоит вплотную к её краю,
-                    // и нажать было не на что. Отступ идёт содержимому, а не
-                    // панели: полоса стоит у края видимой части, и увести
-                    // из-под неё надо именно содержимое, когда оно долистано
-                    // до конца.
-                    .padding(.trailing, Self.scrollerClearance)
-                    .padding(.bottom, Self.scrollerClearance)
                 }
-                .containerRelativeFrame(.vertical) { height, _ in
-                    Self.paneHeight(for: run, container: height)
+                .padding()
+                // Место под полосы прокрутки: полосы рисуются поверх
+                // содержимого и накрывали значок «показать в источнике».
+                .padding(.trailing, Self.scrollerClearance)
+                .padding(.bottom, Self.scrollerClearance)
+            }
+            // Сетка уже панели стоит у левого края, а не посередине.
+            .defaultScrollAnchor(.topLeading)
+            // Панель занимает всё место под шапкой: разметка идёт здесь, и на
+            // большом экране она обязана быть большой.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: - Ячейка разметки
+
+    /// Оценка модели у одного результата — рядом с кнопками разметки, но
+    /// заметно другой: курсив, серым, со словом «модель». Спутать её с
+    /// собственной отметкой человека нельзя.
+    @ViewBuilder
+    private func judgementRow(queryID: UUID, variantID: UUID, hit: EvaluationHit) -> some View {
+        if let judgement = model.judgement(queryID: queryID, variantID: variantID, hit: hit) {
+            let accepted = model.grade(queryID: queryID, variantID: variantID, hit: hit) == judgement.grade
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("модель: \(judgement.grade.title)")
+                        .font(.caption).italic()
+                        .foregroundStyle(.secondary)
+                    if accepted {
+                        Text("принято").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Button("принять") {
+                            model.acceptJudgement(judgement, hit: hit, app: app)
+                        }
+                        .buttonStyle(.borderless).controlSize(.small)
+                    }
+                }
+                if !judgement.reason.isEmpty {
+                    Text(judgement.reason)
+                        .font(.caption).italic()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -1018,8 +1167,20 @@ struct EvaluationView: View {
     }
 
     /// Подпись запроса — ровно две строки, всегда. 32 pt при кегле
-    /// `Theme.Font.body`; сторож меряет.
+    /// `.body`; сторож меряет.
     static let queryTitleHeight: CGFloat = 32
+    /// Строка тегов и фильтра под подписью — одна строка `.subheadline`.
+    static let queryHintHeight: CGFloat = 14
+
+    /// Теги и фильтр запроса одной строкой.
+    static func queryHint(_ query: EvaluationQuery) -> String {
+        let tags = query.tags.isEmpty
+            ? String(localized: "без тегов")
+            : String(localized: "теги: \(query.tags.joined(separator: ", "))")
+        let filter = query.filter?.summary.map { String(localized: "фильтр: \($0)") }
+            ?? String(localized: "без фильтра")
+        return tags + " · " + filter
+    }
     /// Промежуток внутри блока и между рядами сетки — одно число, и оно
     /// стоит в обоих местах разметки.
     static let blockSpacing: CGFloat = 6
@@ -1046,32 +1207,8 @@ struct EvaluationView: View {
         let grid = Self.headerHeight(for: run)
             + rows * (Self.blockSpacing + Self.rowHeight(judged: model.judgements != nil))
         return Self.queryTitleHeight + Self.blockSpacing
+            + Self.queryHintHeight + Self.blockSpacing
             + grid + Self.blockSpacing + Self.dividerHeight
-    }
-
-    /// Высота панели выдачи.
-    ///
-    /// Не число из головы и не измерение содержимого: измерить его значит
-    /// построить всё целиком — ровно то, ради чего панель и заведена. Поэтому
-    /// оценка по числу строк — прогону из одного запроса незачем занимать
-    /// весь экран пустотой, а прогону из восемнадцати всё равно не хватит
-    /// никакой высоты.
-    ///
-    /// Потолок — видимая часть страницы **во весь рост**, за вычетом только
-    /// того, что панель никак не может занять: нижнего поля карточки и поля
-    /// страницы под ней. Разметка идёт здесь, и просили именно этого — чтобы
-    /// панель была размером с экран. Пол — 420 pt: ниже в панель не
-    /// помещается даже один результат со строкой оценок, и листать становится
-    /// нечем.
-    ///
-    /// 110 и 88 — не круглые числа: столько заняли в замере подпись запроса
-    /// с шапками колонок и одна строка результата (981 pt на запрос из
-    /// десяти строк).
-    static func paneHeight(for run: EvaluationRun, container: CGFloat) -> CGFloat {
-        let rows = run.results.map(\.hits.count).max() ?? 0
-        let estimate = CGFloat(run.queries.count) * (110 + CGFloat(rows) * 88)
-        let chrome = Theme.Padding.cardVertical + Theme.contentPadding
-        return max(420, min(container - chrome, estimate))
     }
 
     // MARK: - Ровные ряды
@@ -1083,11 +1220,12 @@ struct EvaluationView: View {
     /// с действительностью, и прокрутка подпрыгивает — та же беда, что
     /// чинили в для текста, но этажом выше.
     ///
-    /// Числа — из замера настоящей строки, а не из головы: 101 pt это
-    /// подпись с длиной куска, три строки текста и ряд оценок; 162 pt — то же
-    /// плюс мнение модели с тремя строками причины. Сторож —
+    /// Числа — из замера настоящей строки, а не из головы: 114 pt это
+    /// подпись с длиной куска, пять строк текста и ряд оценок; 172 pt — то же
+    /// плюс мнение модели с тремя строками причины (системные стили
+    /// `.caption` и `.subheadline`, переключатели-кнопки). Сторож —
     /// `ResultRowHeightTests`: он собирает строку и меряет.
-    static func rowHeight(judged: Bool) -> CGFloat { judged ? 162 : 101 }
+    static func rowHeight(judged: Bool) -> CGFloat { judged ? 172 : 114 }
 
     /// Высота шапки колонки — тоже одна на прогон.
     ///
@@ -1099,7 +1237,7 @@ struct EvaluationView: View {
         let needsNote = run.results.contains { result in
             !result.hits.isEmpty && result.hits.allSatisfy { $0.metadata == nil }
         }
-        return needsNote ? 66 : 34
+        return needsNote ? 62 : 32
     }
 
     /// Ширина сетки вариантов.
@@ -1170,25 +1308,25 @@ struct EvaluationView: View {
     /// Шапка колонки: чей это вариант и чем кончился его поиск.
     private func columnHeader(run: EvaluationRun, variant: EvaluationVariant, result: EvaluationResult?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(variant.name).font(Theme.Font.caption).bold()
+            Text(variant.name).font(.subheadline).bold()
             if let failure = result?.failure {
-                Text(failure).font(Theme.Font.caption).foregroundStyle(Theme.Palette.danger)
+                StatusLabel(.error, failure).font(.subheadline)
             } else if let result {
-                Text(Self.timing(result)).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Text(Self.timing(result)).font(.subheadline).foregroundStyle(.secondary)
                 // Один раз на столбец, а не у каждого результата: причина
                 // общая для всего прогона, и повторять её двадцать раз —
                 // это шум, из-за которого её перестают читать.
                 if !result.hits.isEmpty, result.hits.allSatisfy({ $0.metadata == nil }) {
                     Text("Прогон записан до того, как метаданные стали сохраняться: перехода к исходнику по нему нет. Прогоните набор заново.")
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if result.hits.isEmpty {
-                    Text("ничего не найдено").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    Text("ничего не найдено").font(.subheadline).foregroundStyle(.secondary)
                 }
             } else {
-                Text("не выполнялся").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Text("не выполнялся").font(.subheadline).foregroundStyle(.secondary)
             }
         }
         .frame(width: Self.columnWidth, height: Self.headerHeight(for: run), alignment: .topLeading)
@@ -1210,9 +1348,10 @@ struct EvaluationView: View {
             // коллекции родитель и его первый ребёнок начинаются одинаково, и
             // без этой строки два варианта выглядят одним и тем же результатом.
             Text(Self.rankLine(hit, card))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .font(.caption).foregroundStyle(.secondary)
                 .lineLimit(1)
-            // Место под три строки — всегда, даже если текст короче.
+            // Место под пять строк — всегда, даже если текст короче (
+            //).
             // Плавающая высота строки — это и есть «скачет при прокрутке»:
             // ленивый список оценивает высоту ещё не построенных кусков, и
             // каждая построенная строка сдвигает всё, что ниже.
@@ -1220,29 +1359,22 @@ struct EvaluationView: View {
             // Показывается окрестность совпадения с запросом, а не начало
             // куска: начало у родителя и ребёнка одно и то же.
             Text(card.snippet)
-                .font(Theme.Font.caption)
-                .lineLimit(3, reservesSpace: true)
+                .font(.subheadline)
+                .lineLimit(5, reservesSpace: true)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 4) {
                 ForEach(RelevanceGrade.allCases) { candidate in
-                    Button(candidate.title) {
+                    // Названия оценок не сокращаются никогда: «релеван…» и
+                    // «нерелева…» отличаются четырьмя буквами в начале.
+                    gradeButton(candidate, chosen: grade == candidate) {
                         model.mark(queryID: queryID, variantID: variantID, hit: hit, grade: candidate, app: app)
                     }
-                    // Цвет — самому стилю, а не через `.tint`:
-                    // капсульный стиль рисует заливку сам, и `.tint` до него
-                    // не доходил — отметка ставилась, кнопка не менялась.
-                    .buttonStyle(.chromaChoice(grade == candidate ? Self.tint(candidate) : nil))
-                    .controlSize(.small)
-                    // Названия оценок не сокращаются никогда: «релеван…» и
-                    // «нерелева…» отличаются четырьмя буквами в начале,
-                    // и промахнуться на них — обычное дело.
-                    .fixedSize()
                 }
                 if grade == nil {
                     // Ужимается первым: то же самое видно по тому, что ни
                     // одна из трёх кнопок не подсвечена.
                     Text("не размечено")
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).layoutPriority(-1)
                 }
                 Spacer(minLength: 4)
@@ -1266,7 +1398,8 @@ struct EvaluationView: View {
                             app: app
                         )
                     } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
+                        Label(String(localized: "Показать фрагмент в исходном документе"), systemImage: "doc.text.magnifyingglass")
+                            .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless).controlSize(.small)
                     .help(String(localized: "Показать фрагмент в исходном документе"))
@@ -1279,6 +1412,26 @@ struct EvaluationView: View {
         // не построенных запросах по построенным, и пока строки разной
         // высоты, прокрутка подпрыгивает.
         .frame(height: Self.rowHeight(judged: model.judgements != nil), alignment: .topLeading)
+    }
+
+    /// Кнопка оценки: выбранная залита цветом своей оценки, остальные —
+    /// обычные. Системные стили: `.borderedProminent` с цветом
+    /// оценки и `.bordered` без него — выбранное видно с первого взгляда, а не
+    /// по оттенку надписи. Повторное нажатие той же оценки снимает её — так
+    /// устроен `mark`.
+    @ViewBuilder
+    private func gradeButton(_ candidate: RelevanceGrade, chosen: Bool, action: @escaping () -> Void) -> some View {
+        let button = Button(candidate.title, action: action)
+            .controlSize(.small)
+            .fixedSize()
+        if chosen {
+            button
+                .buttonStyle(.borderedProminent)
+                .tint(Self.tint(candidate))
+        } else {
+            button
+                .buttonStyle(.bordered)
+        }
     }
 
     /// Заголовок строки результата: номер позиции и, если есть что сказать,
@@ -1301,55 +1454,12 @@ struct EvaluationView: View {
         }
     }
 
-    // MARK: - Метрики
+    // MARK: - Строки метрик
 
-    /// Метрики по вариантам — набором чисел, и намеренно без единой «общей
-    /// оценки качества»: одно число прячет, какая из его частей сдвинулась, и
-    /// создаёт уверенность, которой измерение не даёт.
-    @ViewBuilder
-    private var metricsBlock: some View {
-        if !model.metrics.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Метрики").font(Theme.Font.control).bold()
-                ForEach(model.metrics, id: \.variantID) { variantMetrics in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(variantMetrics.variantName).font(Theme.Font.body).bold()
-                        Text(Self.line("hit rate", variantMetrics.hitRate))
-                            .font(Theme.Font.caption).monospacedDigit()
-                        Text(Self.line("recall", variantMetrics.recall))
-                            .font(Theme.Font.caption).monospacedDigit()
-                        Text(Self.line("nDCG", variantMetrics.ndcg))
-                            .font(Theme.Font.caption).monospacedDigit()
-                        Text("MRR \(variantMetrics.mrr.text)\(Self.basis(variantMetrics.mrr))")
-                            .font(Theme.Font.caption).monospacedDigit()
-                        if let latency = variantMetrics.searchLatency {
-                            Text("поиск: \(latency.line)").font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        if let latency = variantMetrics.embeddingLatency {
-                            Text("вектор запроса: \(latency.line) (посчитан \(RussianCount.phrase(latency.samples, "раз", "раза", "раз")))")
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        ForEach(variantMetrics.truncatedKs, id: \.self) { k in
-                            if let note = variantMetrics.note(for: k) {
-                                Text(note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                            }
-                        }
-                        if let reason = Self.firstReason(variantMetrics) {
-                            Text("«—» значит «неприменима»: \(reason)")
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        Text(variantMetrics.coverage.line
-                             + (variantMetrics.coverage.isComplete ? "" : String(localized: " — метрики предварительные")))
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(variantMetrics.coverage.isComplete ? Theme.Palette.captionText : Theme.Palette.attention)
-                    }
-                }
-            }
-        }
-    }
-
-    private static func line(_ title: String, _ scores: [Int: MetricScore]) -> String {
-        let parts = scores.keys.sorted().map { k in "@\(k) \(scores[k]?.text ?? "—")" }
+    private static func line(
+        _ title: String, _ scores: [Int: MetricScore], scale: EvaluationReport.Scale = .ratio
+    ) -> String {
+        let parts = scores.keys.sorted().map { k in "@\(k) \(scale.text(scores[k]?.value))" }
         let queries = scores.values.compactMap { $0.value != nil ? $0.queries : nil }.max()
         let basis = queries.map { " · на \(RussianCount.phrase($0, "запросе", "запросах", "запросах"))" } ?? ""
         return "\(title) " + parts.joined(separator: " · ") + basis
@@ -1362,7 +1472,7 @@ struct EvaluationView: View {
 
     private static func firstReason(_ metrics: VariantMetrics) -> String? {
         let scores = Array(metrics.hitRate.values) + Array(metrics.recall.values)
-            + Array(metrics.ndcg.values) + [metrics.mrr]
+            + Array(metrics.ndcg.values) + [metrics.mrr] + Array(metrics.charactersPerUseful.values)
         return scores.first { $0.value == nil && $0.reason != nil }?.reason
     }
 
@@ -1376,29 +1486,5 @@ struct EvaluationView: View {
         parts.append(String(localized: "поиск \(Int(result.searchSeconds * 1000)) мс"))
         parts.append(RussianCount.phrase(result.hits.count, "результат", "результата", "результатов"))
         return parts.joined(separator: " · ")
-    }
-
-    // MARK: - Сохранённые прогоны
-
-    private var historyCard: some View {
-        SectionCard(
-            title: String(localized: "Сохранённые прогоны"),
-            subtitle: String(localized: "Прогон хранится целиком — с датой, версией приложения и полными параметрами вариантов.")
-        ) {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(model.runs) { summary in
-                    HStack(alignment: .top, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(summary.name).font(Theme.Font.body)
-                            Text(summary.line).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        Spacer(minLength: 8)
-                        Button("Открыть") { model.openRun(summary, app: app) }
-                        Button("Удалить") { model.removeRun(summary, app: app) }
-                    }
-                    Divider()
-                }
-            }
-        }
     }
 }

@@ -65,6 +65,16 @@ final class MCPService: ObservableObject {
     private final class ChannelState {
         let id = UUID()
         var key: String?
+        /// Запросы этого соединения, которые ещё в работе, — чтобы отмена
+        /// агента могла их остановить (`notifications/cancelled`).
+        var inFlight: [JSONRPCID: Task<Void, Never>] = [:]
+        /// Отменённые: ответ по ним не отправляется — сервер не вправе слать
+        /// по отменённому запросу ничего.
+        var cancelled: Set<JSONRPCID> = []
+        /// Версия, согласованная рукопожатием старой эпохи. У stdio нет
+        /// заголовков, и после `initialize` запросы версии не несут —
+        /// по ней сервер выбирает правила своей ревизии.
+        var negotiatedVersion: String?
         init() {}
     }
 
@@ -74,11 +84,30 @@ final class MCPService: ObservableObject {
         isReadOnly = app.settings.configuration.mcpReadOnly
         readOnlyFlag.value = isReadOnly
 
+        let backend = AppMCPBackend(app: app)
+        // Чужая запись — тоже запись. Через журнал доступа проходят
+        // и вызовы инструментов, и запросы, проброшенные прокси прямо
+        // в ChromaDB: агент, добавивший документы в обход нашего клиента
+        // базы, иначе оставил бы у кэша вчерашний порядок кусков. Коллекция
+        // в чужом запросе названа как попало — именем или идентификатором,
+        // — поэтому снимается всё: запись событие редкое.
+        //
+        // Вызовы инструментов MCP пропускаются: пишут они через наш клиент,
+        // и он уже снял ровно свою коллекцию, а отказ или сбой записи статуса
+        // не несёт — снимать по ним весь кэш значило бы вернуть полный обход
+        // на каждую страницу всем читающим. Отказ прокси (4xx) не записал
+        // ничего; а 5xx и 502 «сервер не ответил» могли записать — снимается.
+        app.audit.observeRecords(as: "mcp.chunkCache") { [cache = backend.chunkCache] entry in
+            guard entry.access.changesData, entry.transport != .mcp else { return }
+            if let status = entry.responseStatus, (400..<500).contains(status) { return }
+            cache.invalidateAll()
+        }
+
         let server = MCPServer(
             instructions: Self.instructions,
             serverVersion: SettingsTransferViewModel.appVersion,
             tools: MCPToolService(
-                backend: AppMCPBackend(app: app),
+                backend: backend,
                 access: app.proxy.access,
                 isReadOnlyServer: { [flag = readOnlyFlag] in flag.value },
                 // Тот же журнал доступа, что у прокси: вопрос «что делали
@@ -115,13 +144,19 @@ final class MCPService: ObservableObject {
             }
             channel.onMessage = { [weak self] message in
                 Task { @MainActor [weak self] in
-                    await self?.handle(message, from: channel, state: state, server: server)
+                    self?.dispatch(message, from: channel, state: state, server: server)
                 }
             }
             channel.onClose = { [weak self] error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.channels[ObjectIdentifier(channel)] = nil
+                    // Мост ушёл — его запросы отвечать некому. Разрыв связи
+                    // и есть отмена (как разрыв соединения по HTTP): иначе
+                    // обход коллекции или запись дорабатывали бы минутами
+                    // для агента, которого уже нет.
+                    for task in state.inFlight.values { task.cancel() }
+                    state.inFlight.removeAll()
                     let closing = self.connections.first { $0.id == state.id }
                     self.connections.removeAll { $0.id == state.id }
                     // Кто ушёл, сколько успел спросить и сколько прожил —
@@ -243,23 +278,67 @@ final class MCPService: ObservableObject {
         isServedOverHTTP = true
     }
 
+    /// Запускает обработку сообщения своей задачей и запоминает её за
+    /// запросом; отмену агента исполняет сразу.
+    ///
+    /// Отмена по stdio — единственный способ сказать «хватит» (`2026-07-28`,
+    /// «Cancellation»): закрыть отдельный поток там нечего. Сервер
+    /// **SHOULD** остановить работу и не отвечать — инструменты, бегущие
+    /// минутами (обход коллекции, чтение документа целиком), иначе
+    /// дорабатывали бы для того, кому ответ уже не нужен.
+    private func dispatch(
+        _ message: Data, from channel: MCPChannel, state: ChannelState, server: MCPServer
+    ) {
+        let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
+        if incoming?.method == MCPProtocol.cancelledNotification {
+            if let requestID = incoming?.params?["requestId"],
+               let id = try? JSONDecoder().decode(JSONRPCID.self, from: JSONEncoder().encode(requestID)),
+               let task = state.inFlight.removeValue(forKey: id) {
+                state.cancelled.insert(id)
+                task.cancel()
+            }
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.handle(message, from: channel, state: state, server: server)
+        }
+        if let id = incoming?.id { state.inFlight[id] = task }
+    }
+
     private func handle(
         _ message: Data, from channel: MCPChannel, state: ChannelState, server: MCPServer
     ) async {
         // Приветствие моста — не сообщение агента: ключ запоминается за
         // соединением, ответа на уведомление протокол не допускает.
-        if let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message),
-           incoming.method == MCPProtocol.helloNotification {
-            state.key = incoming.params?["key"]?.stringValue
+        let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
+        if incoming?.method == MCPProtocol.helloNotification {
+            state.key = incoming?.params?["key"]?.stringValue
+            // Мост помнит, о какой версии договорился агент: после перезапуска
+            // приложения он подключается заново, а `initialize` агент второй
+            // раз не пришлёт — без этого новое соединение считало бы клиента
+            // ревизии 2025-03-26 и отвечало бы ему по чужим правилам.
+            if let version = incoming?.params?["protocolVersion"]?.stringValue {
+                state.negotiatedVersion = MCPProtocol.negotiatedLegacyVersion(requested: version)
+            }
             await name(state)
             return
+        }
+        if incoming?.method == MCPProtocol.initializeMethod {
+            state.negotiatedVersion = MCPProtocol.negotiatedLegacyVersion(
+                requested: incoming?.params?["protocolVersion"]?.stringValue
+            )
         }
 
         callCount += 1
         note(call: message, for: state)
-        guard let response = await server.respond(to: message, key: state.key),
-              let encoded = try? response.encoded()
-        else { return }
+        let response = await server.respond(to: message, key: state.key, negotiatedVersion: state.negotiatedVersion)
+        if let id = incoming?.id {
+            state.inFlight[id] = nil
+            // Отменён, пока работал, — ответа нет.
+            if state.cancelled.remove(id) != nil { return }
+        }
+        guard let response, let encoded = try? response.encoded() else { return }
         channel.send(encoded)
     }
 
@@ -345,6 +424,13 @@ final class MCPService: ObservableObject {
 final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     private weak var app: AppEnvironment?
 
+    /// Обход файла — один раз на файл, а не на каждую страницу.
+    ///
+    /// Живёт у подложки, потому что обход делает она. Снимается по поколению
+    /// коллекции — клиент базы извещает о любой записи, правке и удалении, —
+    /// по журналу доступа, по счёту документов и по сроку жизни.
+    let chunkCache = MCPFileChunkCache()
+
     init(app: AppEnvironment) {
         self.app = app
     }
@@ -363,9 +449,29 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         }
     }
 
+    private let wiring = NSLock()
+    /// Слабой ссылкой, а не `ObjectIdentifier`: адрес освобождённого клиента
+    /// может достаться новому, и тот остался бы без подписки.
+    private weak var wiredClient: ChromaClient?
+
     private func client() async throws -> ChromaClient {
         guard let client = await MainActor.run(body: { app?.client }) else {
             throw BackendError.notConnected
+        }
+        // Подписка возобновляется на каждом новом клиенте: он пересоздаётся
+        // при переподключении к базе, и кэш, не узнавший о записи, отдавал бы
+        // вчерашний порядок кусков. А всё запомненное снимается:
+        // новый клиент мог уже писать до подписки, и база за ним может быть
+        // другой — с теми же идентификаторами коллекций после восстановления
+        // из копии.
+        let needsWiring = wiring.withLock { wiredClient !== client }
+        if needsWiring {
+            let cache = chunkCache
+            await client.observeCollectionChanges(as: "mcp.chunkCache") { [cache] collectionID in
+                cache.invalidate(collectionID: collectionID)
+            }
+            wiring.withLock { wiredClient = client }
+            cache.invalidateAll()
         }
         return client
     }
@@ -605,12 +711,16 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
             )
         }
 
-        var notes = [answer.line]
+        var notes = [answer.agentLine]
         if !missing.isEmpty {
             notes.append("Collections not found: \(missing.joined(separator: ", ")) — check the names with list_collections.")
         }
         for report in answer.collections where report.failure != nil {
-            notes.append("The collection «\(report.name)» did not answer: \(report.failure ?? "")")
+            // Причина писалась человеку у экрана и чаще всего по-русски —
+            // в английский ответ она идёт, только если она английская.
+            let reason = report.failure.flatMap(Self.agentReadable)
+            notes.append(reason.map { "The collection «\(report.name)» did not answer: \($0)" }
+                ?? "The collection «\(report.name)» did not answer.")
         }
 
         await MainActor.run {
@@ -652,7 +762,11 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
             collectionID: collection.id,
             limit: request.limit + 1,
             offset: request.offset,
-            filter: request.filter
+            filter: request.filter,
+            // Кому текст не нужен (оглавление, сбор по теме), тот его и не
+            // тянет: метаданные двадцати тысяч кусков — килобайты, тексты —
+            // мегабайты.
+            includeDocuments: request.needsText
         )
         return MCPDocumentsAnswer(
             documents: records.prefix(request.limit).map(Self.payload),
@@ -674,13 +788,39 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     private func orderedChunks(
         of collectionID: String, request: MCPDocumentsRequest, client: ChromaClient
     ) async throws -> MCPDocumentsAnswer {
-        let (scanned, overflowed) = try await MCPFileChunks.collect { limit, offset in
-            try await client.getDocuments(
-                collectionID: collectionID, limit: limit, offset: offset,
-                filter: request.filter, includeDocuments: false
-            ).map(Self.payload)
+        // Обход — самое дорогое, что здесь есть, и он не зависит от страницы:
+        // порядок кусков файла один и тот же, какую бы из них ни просили.
+        // Замер: 94 % времени чтения документа целиком уходило на то, чтобы
+        // девяносто шесть раз получить один и тот же список.
+        let key = MCPFileChunkCache.Key(collectionID: collectionID, filter: request.filter)
+        // Снимок поколения — до обхода: запись посреди обхода не даст
+        // запомнить то, что он видел до неё.
+        let ticket = chunkCache.ticket(for: key)
+        // Метка свежести — счёт документов коллекции. Один дешёвый запрос
+        // против двух полных обходов, и он не зависит от того, кого мы
+        // успели заметить: в базу можно записать и мимо приложения.
+        let stamp = (try? await client.count(collectionID: collectionID)) ?? -1
+        let ordered: [MCPDocumentPayload]
+        let overflowed: Bool
+        if stamp >= 0, let remembered = chunkCache.entry(for: key, stamp: stamp) {
+            ordered = remembered.documents
+            overflowed = remembered.overflowed
+        } else {
+            let (scanned, tooLong) = try await MCPFileChunks.collect { limit, offset in
+                try await client.getDocuments(
+                    collectionID: collectionID, limit: limit, offset: offset,
+                    filter: request.filter, includeDocuments: false
+                ).map(Self.payload)
+            }
+            overflowed = tooLong
+            ordered = tooLong ? scanned : MCPFileChunks.ordered(scanned)
+            if stamp >= 0 {
+                chunkCache.store(
+                    MCPFileChunkCache.Entry(documents: ordered, overflowed: tooLong),
+                    for: key, stamp: stamp, ticket: ticket
+                )
+            }
         }
-        let ordered = overflowed ? scanned : MCPFileChunks.ordered(scanned)
         let window = MCPFileChunks.page(ordered, offset: request.offset, limit: request.limit)
         guard !window.page.isEmpty else {
             return MCPDocumentsAnswer(
@@ -903,6 +1043,11 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
     /// Ответ чужой службы приходит вместе с телом JSON — оно попадает в лог
     /// целиком и там нужно, а модели от обрезанного посреди фигурной скобки
     /// блоба пользы нет. Берётся то, что перед ним.
+    /// Текст, годный в ответ агенту: без кириллицы.
+    static func agentReadable(_ text: String) -> String? {
+        text.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) } ? nil : text
+    }
+
     static func shortReason(_ note: String) -> String {
         let head = note.prefix(while: { $0 != "{" })
         let cleaned = head.trimmingCharacters(in: CharacterSet(charactersIn: " :\n\t"))
@@ -937,7 +1082,10 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         // выключенная. Промолчать о ней значит выдать агенту список, который
         // никто не переранжировал, за переранжированный.
         for stage in sorted where stage.failed {
-            let reason = stage.note.map(Self.shortReason)
+            // Заметка стадии пишется конвейером по-русски — для экрана.
+            // В английскую обвязку она идёт, только если английская сама:
+            // смешанный ответ модель пересказывает обрывками.
+            let reason = stage.note.map(Self.shortReason).flatMap(Self.agentReadable)
             lines.append(reason.map {
                 "Did not run: \(stage.stage.agentName) — \($0). The list was assembled without that stage."
             } ?? "Did not run: \(stage.stage.agentName). The list was assembled without that stage.")
@@ -1074,6 +1222,7 @@ enum MCPFieldSummary {
         case .double: return "float"
         case .bool: return "bool"
         case .null: return "null"
+        case .list: return "list"
         }
     }
 }

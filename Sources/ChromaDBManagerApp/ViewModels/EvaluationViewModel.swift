@@ -50,6 +50,12 @@ final class EvaluationViewModel: ObservableObject {
     private var cardCache: [EvaluationPreview.Key: EvaluationPreview.Card] = [:]
     /// Прогон, которому принадлежат посчитанные карточки.
     private var cardsRunID: UUID?
+    /// Редкость слов в выдаче прогона — вес слова при выборе окна карточки
+    ///. Считается в фоне: на прогоне в две тысячи результатов это
+    /// заметная доля секунды. Пока её нет, окна выбираются без весов, а
+    /// когда она готова, карточки пересчитываются.
+    private var rarity: EvaluationPreview.Rarity?
+    private var rarityTask: Task<Void, Never>?
     /// Строки детализации и оговорка о длине — тоже посчитанные, а не
     /// вычисляемые в `body`.
     @Published private(set) var rows: [EvaluationReport.QueryRow] = []
@@ -106,7 +112,12 @@ final class EvaluationViewModel: ObservableObject {
         // Сначала база — она нужна экрану, чтобы можно было добавить вариант.
         if let client = app.client {
             do {
+                // По имени, а не в порядке сервера: сервер отдаёт их
+                // как попало, и в выборе варианта нужную коллекцию из трёх
+                // десятков приходилось искать глазами. Порядок естественный:
+                // «docs_512» раньше «docs_1024», регистр не важен.
                 collections = try await client.listCollections(withCounts: false)
+                    .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             } catch {
                 errorMessage = app.describe(error)
             }
@@ -350,7 +361,7 @@ final class EvaluationViewModel: ObservableObject {
         do {
             let model = try await app.bindingService.requiredModel(for: collection)
             let profile = draft.profileID.flatMap { app.searchProfiles.profile(id: $0) }
-                ?? app.searchProfiles.effectiveProfile(for: collection.name)
+                ?? app.searchProfiles.effectiveProfile(for: collection.name, model: model)
             let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
             variants.append(EvaluationVariant(
                 name: name.isEmpty ? "\(collection.name) · \(profile.name)" : name,
@@ -552,6 +563,29 @@ final class EvaluationViewModel: ObservableObject {
         refreshComparison(app, changed: queryID)
     }
 
+    /// Сменился только набор `k`: индекс оценок от него не зависит — он
+    /// приводит выдачу к сравнимому виду и сверяет с эталоном, — и
+    /// пересобирать его не за что. Полная пересборка стоила секунды на
+    /// каждое нажатие на «@k».
+    func refreshForChangedKs(_ app: AppEnvironment) {
+        guard let run = lastRun, let index = grades else {
+            refreshMetrics(app)
+            return
+        }
+        let set = app.querySets.set(id: run.querySetID)
+        metrics = EvaluationMetrics.compute(run: run, set: set, ks: ks(app), grades: index)
+        if let after = lastRun, let before = comparisonRun, let beforeIndex = comparisonGrades {
+            comparison = EvaluationReport.compare(
+                before: before, after: after,
+                beforeSet: app.querySets.set(id: before.querySetID),
+                afterSet: set,
+                ks: ks(app),
+                beforeGrades: beforeIndex,
+                afterGrades: index
+            )
+        }
+    }
+
     /// Пересчёт метрик по тому, что размечено сейчас.
     /// Всё, что зависит от прогона и эталона, считается **здесь** — один раз
     /// на изменение, а не в `body` на каждую перерисовку.
@@ -564,6 +598,8 @@ final class EvaluationViewModel: ObservableObject {
             comparison = nil
             cardCache = [:]
             cardsRunID = nil
+            rarityTask?.cancel()
+            rarity = nil
             rows = []
             lengthCaveat = nil
             return
@@ -578,6 +614,7 @@ final class EvaluationViewModel: ObservableObject {
         if cardsRunID != run.id {
             cardCache = [:]
             cardsRunID = run.id
+            countRarity(of: run)
         }
         metrics = EvaluationMetrics.compute(run: run, set: set, ks: ks(app), grades: index)
         rows = EvaluationReport.queryRows(run: run, set: set, grades: index)
@@ -862,9 +899,22 @@ final class EvaluationViewModel: ObservableObject {
     func card(queryID: UUID, variantID: UUID, hit: EvaluationHit, query: String) -> EvaluationPreview.Card {
         let key = EvaluationPreview.Key(query: queryID, variant: variantID, document: hit.id)
         if let ready = cardCache[key] { return ready }
-        let card = EvaluationPreview.card(for: hit, query: query)
+        let card = EvaluationPreview.card(for: hit, query: query, rarity: rarity)
         cardCache[key] = card
         return card
+    }
+
+    private func countRarity(of run: EvaluationRun) {
+        rarityTask?.cancel()
+        rarity = nil
+        rarityTask = Task { [weak self] in
+            let counted = await Task.detached(priority: .userInitiated) { EvaluationPreview.Rarity(run: run) }.value
+            guard let self, !Task.isCancelled, self.cardsRunID == run.id else { return }
+            self.rarity = counted
+            // Карточки без весов — выбросить: экран спросит их заново.
+            self.cardCache = [:]
+            self.objectWillChange.send()
+        }
     }
 
     /// Оценка, уже стоящая у этого результата, — `nil` значит «не размечено».

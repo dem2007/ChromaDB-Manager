@@ -108,12 +108,11 @@ final class AdaptiveMinimumTests: XCTestCase {
         let lone = chunker(minimum: 128).chunks(from: source).filter { $0.text.count < 128 }
         XCTAssertTrue(lone.isEmpty, "остались короткие: \(lone.map(\.text))")
 
-        // И то же самое до правила — чтобы было видно, что изменилось именно
-        // оно, а не текст примера. Через `blocks`, а не через настройку:
-        // `minChunkSize` не опускается ниже 32 знаков (`converted`), и нулём
-        // правило не выключить.
+        // До правила минимума заголовки были отдельными кусками. С
+        // абзацы набираются до своего размера, и заголовок встаёт к своему
+        // абзацу уже здесь — правило минимума остаётся страховкой.
         let before = chunker(minimum: 128).blocks(from: source).flatMap { $0 }.filter { $0.count < 128 }
-        XCTAssertEqual(before.count, 2, "до правила заголовки были отдельными кусками")
+        XCTAssertTrue(before.isEmpty, "заголовок набирается со своим абзацем: \(before)")
     }
 
     /// Ни одного знака не теряется: документ должен собираться из чанков.

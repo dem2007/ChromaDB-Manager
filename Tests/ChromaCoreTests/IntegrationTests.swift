@@ -2502,7 +2502,7 @@ final class ChromaIntegrationTests: XCTestCase {
         XCTAssertEqual(seeding.terminationStatus, 0, "скрипт наполнения должен отработать без ошибок")
 
         let client = ChromaClient(endpoint: endpoint)
-        let collections = try await client.listCollections()
+        let collections = try await client.listCollections(withCounts: true)
         let demo = try XCTUnwrap(collections.first { $0.name == "cdbm_demo" })
         XCTAssertGreaterThan(demo.documentCount ?? 0, 0, "документы чужой базы должны быть видны")
         // The app has to admit it does not know the model rather than guess one.

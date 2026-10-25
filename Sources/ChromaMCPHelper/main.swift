@@ -119,6 +119,16 @@ let pending = PendingReplies()
 final class AppLink: @unchecked Sendable {
     private var channel: MCPChannel?
     private let lock = NSLock()
+    /// Версия, которую агент назвал в `initialize`. Повторяется приложению
+    /// при каждом подключении: перезапущенное приложение иначе её не знает,
+    /// а второй `initialize` агент не пришлёт.
+    private var negotiatedVersion: String?
+
+    func remember(version: String?) {
+        lock.lock()
+        negotiatedVersion = version
+        lock.unlock()
+    }
 
     /// Отправляет сообщение приложению. Возвращает `false`, если связи нет.
     func send(_ message: Data) -> Bool {
@@ -165,9 +175,11 @@ final class AppLink: @unchecked Sendable {
             // сообщение: так сообщения агента доезжают до приложения байт
             // в байт, и мост по-прежнему ничего в них не меняет.
             if let key = ProcessInfo.processInfo.environment["CHROMADB_MCP_KEY"], !key.isEmpty {
+                var params: [String: JSONValue] = ["key": .string(key)]
+                if let negotiatedVersion { params["protocolVersion"] = .string(negotiatedVersion) }
                 if let hello = try? JSONRPCOutgoing.notification(
                     method: MCPProtocol.helloNotification,
-                    params: .object(["key": .string(key)])
+                    params: .object(params)
                 ).encoded() {
                     channel.send(hello)
                 }
@@ -207,13 +219,15 @@ func answerForTheApp() {
 /// получивший ответа, зависает, и человек видит не причину, а таймаут.
 /// На уведомление ответить нечем — по JSON-RPC у него нет идентификатора,
 /// и отвечать на него запрещено.
-func refuse(_ incoming: JSONRPCIncoming?) {
+func refuse(_ incoming: JSONRPCIncoming?, message: Data) {
     let error = JSONRPCError(
         code: JSONRPCError.internalError,
         message: MCPConnector.ConnectError.appNotRunning.localizedDescription
     )
     guard let incoming else {
-        output.write(.unidentifiedFailure(error))
+        // Не разобралось — тот же ответ, что дало бы приложение: не JSON —
+        // ошибка разбора, JSON, но не запрос, — неверный запрос.
+        output.write(.unidentifiedFailure(MCPServer.unreadable(message)))
         return
     }
     guard let id = incoming.id else { return }
@@ -228,7 +242,18 @@ func refuse(_ incoming: JSONRPCIncoming?) {
 func forward(_ message: Data) {
     let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: message)
     if let id = incoming?.id { pending.sent(id) }
-    if !link.send(message) { refuse(incoming) }
+    if incoming?.method == MCPProtocol.initializeMethod {
+        link.remember(version: incoming?.params?["protocolVersion"]?.stringValue)
+    }
+    // Отменённый запрос ответа больше не ждёт: сервер не вправе слать по нему
+    // ничего (`2026-07-28`, «Cancellation»). Без этого мост, потеряв связь
+    // с приложением, ответил бы за него отказом — на то, что агент отменил.
+    if incoming?.method == MCPProtocol.cancelledNotification,
+       let requestID = incoming?.params?["requestId"],
+       let id = try? JSONDecoder().decode(JSONRPCID.self, from: JSONEncoder().encode(requestID)) {
+        pending.answered(id)
+    }
+    if !link.send(message) { refuse(incoming, message: message) }
 }
 
 // Чтение стандартного ввода блокирующим циклом.
@@ -250,7 +275,7 @@ while true {
         log("строка длиннее допустимого — соединение прекращено: \(error)")
         output.write(.unidentifiedFailure(JSONRPCError(
             code: JSONRPCError.invalidRequest,
-            message: "Сообщение превышает допустимую длину"
+            message: "The message exceeds the maximum line length"
         )))
         break
     }

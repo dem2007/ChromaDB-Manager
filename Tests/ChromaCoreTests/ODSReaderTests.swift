@@ -21,11 +21,15 @@ struct ODSFixtureBuilder {
         case repeated(Cell, times: Int)
         /// The non-anchor part of a merge.
         case covered
+        /// Ячейка с примечанием: LibreOffice пишет его внутрь ячейки, до текста.
+        case annotated(Cell, note: String)
     }
 
     struct Table {
         var name: String
         var isHidden = false
+        /// Скрыт так, как скрывает LibreOffice: стилем листа.
+        var hiddenByStyle = false
         var rows: [[Cell]]
         /// Rows written once with `number-rows-repeated`.
         var rowRepeats: [Int]?
@@ -37,7 +41,8 @@ struct ODSFixtureBuilder {
         var body = ""
         for table in tables {
             let visibility = table.isHidden ? " table:visibility=\"collapse\"" : ""
-            body += "<table:table table:name=\"\(Self.escape(table.name))\"\(visibility)>"
+            let style = table.hiddenByStyle ? " table:style-name=\"ta2\"" : " table:style-name=\"ta1\""
+            body += "<table:table table:name=\"\(Self.escape(table.name))\"\(visibility)\(style)>"
             for (index, cells) in table.rows.enumerated() {
                 let repeats = table.rowRepeats?[index] ?? 1
                 let attribute = repeats > 1 ? " table:number-rows-repeated=\"\(repeats)\"" : ""
@@ -53,7 +58,13 @@ struct ODSFixtureBuilder {
         <office:document-content \
         xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" \
         xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" \
-        xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">\
+        xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" \
+        xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" \
+        xmlns:dc="http://purl.org/dc/elements/1.1/">\
+        <office:automatic-styles>\
+        <style:style style:name="ta1" style:family="table"><style:table-properties table:display="true"/></style:style>\
+        <style:style style:name="ta2" style:family="table"><style:table-properties table:display="false"/></style:style>\
+        </office:automatic-styles>\
         <office:body><office:spreadsheet>\(body)</office:spreadsheet></office:body>\
         </office:document-content>
         """
@@ -71,6 +82,10 @@ struct ODSFixtureBuilder {
             return xml(for: inner, repeats: times)
         case .covered:
             return "<table:covered-table-cell\(attribute)/>"
+        case .annotated(let inner, let note):
+            let annotation = "<office:annotation><dc:creator>Автор</dc:creator><text:p>\(escape(note))</text:p></office:annotation>"
+            return xml(for: inner, repeats: repeats)
+                .replacingOccurrences(of: "<text:p>", with: annotation + "<text:p>", options: [], range: nil)
         case .empty:
             return "<table:table-cell\(attribute)/>"
         case .string(let value):
@@ -285,8 +300,8 @@ final class ODSReaderTests: XCTestCase {
         XCTAssertEqual(rows[4].value(at: 0), .text("Профиль"), "за диапазоном — своё значение")
     }
 
-    /// Объединение вбок остаётся как есть — и об этом говорится.
-    func testASidewaysSpanIsReported() throws {
+    /// Объединение вбок — значение в каждой колонке диапазона.
+    func testASidewaysSpanReachesEveryColumn() throws {
         var builder = ODSFixtureBuilder()
         builder.tables = [.init(name: "Лист", rows: [
             [.spanning(.string("Итого за квартал"), rows: 1, columns: 2), .covered],
@@ -297,8 +312,9 @@ final class ODSReaderTests: XCTestCase {
         let warnings = try ODSReader(url: url).forEachRow(of: ODSReader(url: url).sheets[0]) {
             result.append($0); return true
         }
-        XCTAssertEqual(result[0].value(at: 1), .empty)
-        XCTAssertEqual(warnings, [.mergedSideways(cells: 1)])
+        XCTAssertEqual(result[0].value(at: 1), .text("Итого за квартал"))
+        XCTAssertEqual(result[1].value(at: 1), .number(62))
+        XCTAssertEqual(warnings, [])
     }
 
     /// ODS сам говорит, что это проценты, — и раньше это знание выбрасывалось:
@@ -339,6 +355,22 @@ final class ODSReaderTests: XCTestCase {
         ])]
         let rows = try rows(builder)
         XCTAssertEqual(SheetModeDetector.suggest(rows: rows).mode, .dataTable)
+    }
+
+    /// Строка, повторённая `number-rows-repeated`, — несколько строк, и
+    /// объединение, кончившееся на первой из них, во вторую не заходит.
+    func testASpanEndsInsideRepeatedRows() throws {
+        var builder = ODSFixtureBuilder()
+        builder.tables = [.init(name: "Лист", rows: [
+            [.spanning(.string("Крепёж"), rows: 2, columns: 1), .string("Болт")],
+            [.covered, .empty],
+            [.string("Профиль"), .string("Уголок")],
+        ], rowRepeats: [1, 3, 1])]
+        let rows = try rows(builder)
+        XCTAssertEqual(rows.map(\.number), [1, 2, 3, 4, 5])
+        XCTAssertEqual(rows[1].value(at: 0), .text("Крепёж"))
+        XCTAssertEqual(rows[2].value(at: 0), .empty, "объединение кончилось на второй строке")
+        XCTAssertEqual(rows[3].value(at: 0), .empty)
     }
 }
 

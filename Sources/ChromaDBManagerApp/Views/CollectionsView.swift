@@ -8,10 +8,19 @@ struct CollectionsView: View {
     @ObservedObject var model: CollectionsViewModel
     @ObservedObject var embeddingsModel: EmbeddingsViewModel
     @ObservedObject var reembedding: ReembeddingViewModel
+    /// Просьба открыть лист «Новая коллекция» извне — из строки меню (⌘N).
+    /// Флагом, а не счётчиком: экран может появиться уже после просьбы, и
+    /// тогда её надо подхватить при появлении, а не при изменении.
+    @Binding var newCollectionRequested: Bool
     /// Активно ли окно: от этого зависит, каким цветом система залила
     /// выбранную строку списка, — а значит, и каким цветом писать по ней.
     /// Открытая сторона выбранной коллекции.
     @State private var tab: CollectionTab = .documents
+    /// Ширина колонки списка — по ней поле поиска в тулбаре.
+    @State private var listColumnWidth: CGFloat = 260
+    /// Капсула тулбара добавляет поля по краям: столько отнимается от ширины
+    /// колонки, чтобы капсула кончалась у её края, а не заходила за него.
+    private static let searchFieldInset: CGFloat = 36
     @State private var isCreatingCollection = false
     /// просмотр исходника — своё состояние экрана, а не раздел меню.
     @StateObject private var viewer = DocumentViewerViewModel()
@@ -21,7 +30,6 @@ struct CollectionsView: View {
     /// перенос коллекции пакетом.
     @StateObject private var transfer = TransferViewModel()
 
-    @State private var expandedDocumentID: String?
     @State private var metadataEditorID: String?
     @State private var metadataDraft = MetadataDraft()
     /// Документ, у которого правят теги и заметку, и сами поля.
@@ -33,23 +41,36 @@ struct CollectionsView: View {
     @State private var marksEditorFromHit = false
     @State private var marksTags = ""
     @State private var marksNote = ""
+    /// Выбранные строки таблицы документов.
+    @State private var selectedDocumentIDs: Set<String> = []
+    /// Инспектор документа справа (тип Б): подробности выбранной строки.
+    @SceneStorage("collections.inspector") private var showsInspector = true
+    /// Порядок, ширины и видимость колонок документов — помнит окно (v3).
+    @SceneStorage("table.documents.v11") private var documentColumns: TableColumnCustomization<DocumentRecord>
+    @State private var showingFilter = false
+    @State private var documentsToDelete: [DocumentRecord] = []
+    /// Результаты, у которых раскрыты метаданные.
+    @State private var hitsWithMetadata: Set<String> = []
+    @State private var confirmingHistoryClear = false
+    @State private var confirmingSchemaDeletion = false
+    /// Удаление профиля поиска — с подтверждением: его настройки
+    /// человек подбирал сам, и вернуть их нечем.
+    @State private var confirmingProfileDeletion = false
+    /// Удаление коллекции без копии в корзине ждёт подтверждения.
+    @State private var confirmingDeleteWithoutTrash = false
 
     var body: some View {
-        // Экран из макета: слева карточка со списком коллекций — она общая
-        // для всего экрана; справа выбранная коллекция и её стороны. Разделителя
-        // между колонками нет: карточки лежат на полотне, а не в двух панелях
-        //.
-        VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-            banners
-            HStack(alignment: .top, spacing: 18) {
-                collectionListCard
-                    .frame(width: Theme.Size.objectListWidth)
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
+        // Свой список в разделе — `SectionSplit`, а не третья колонка
+        // навигации: список коллекций слева, выбранная коллекция справа.
+        SectionSplit {
+            collectionListColumn
+        } detail: {
+            // Тулбар — у детали, а не у всего экрана: macOS 26 делит
+            // тулбар по колонкам, и повешенный на экран целиком он
+            // доставался колонке списка.
+            detail
+                .toolbar { collectionToolbar }
         }
-        .padding(.horizontal, Theme.contentPadding)
-        .padding(.bottom, Theme.contentPadding)
         .task {
             await model.refresh(app)
             if embeddingsModel.models.isEmpty {
@@ -76,7 +97,9 @@ struct CollectionsView: View {
             // «Показать существующий» opens that row rather than leaving the
             // user to find it in the list.
             guard let identifier else { return }
-            expandedDocumentID = identifier
+            tab = .documents
+            selectedDocumentIDs = [identifier]
+            showsInspector = true
             model.documentIDToReveal = nil
         }
         .sheet(isPresented: $model.showAddDocumentSheet) { documentSheet }
@@ -86,6 +109,39 @@ struct CollectionsView: View {
         .sheet(isPresented: $model.showImportSheet) { importSheet }
         .sheet(isPresented: $model.showProfileEditor) { profileSheet }
         .sheet(isPresented: $isCreatingCollection) { createCollectionSheet }
+        .sheet(isPresented: $showingFilter) { filterSheet }
+        .sheet(isPresented: Binding(
+            get: { metadataEditorID != nil },
+            set: { if !$0 { metadataEditorID = nil } }
+        )) { metadataSheet }
+        // Теги и заметка из таблицы документов; у выдачи поиска — свой
+        // редактор рядом с результатом (до перевода вкладки «Поиск»).
+        .sheet(isPresented: Binding(
+            get: { marksEditorID != nil && !marksEditorFromHit },
+            set: { if !$0 { marksEditorID = nil; marksEditorCollection = nil } }
+        )) { marksSheet }
+        .confirmationDialog(
+            documentsToDelete.count == 1
+                ? String(localized: "Удалить документ?")
+                : String(localized: "Удалить документы: \(documentsToDelete.count.plainDigits)?"),
+            isPresented: Binding(get: { !documentsToDelete.isEmpty }, set: { if !$0 { documentsToDelete = [] } }),
+            titleVisibility: .visible,
+            presenting: documentsToDelete
+        ) { chosen in
+            Button(String(localized: "Удалить"), role: .destructive) {
+                Task {
+                    for document in chosen { await model.deleteDocument(document, app: app) }
+                    selectedDocumentIDs = []
+                }
+            }
+            Button(String(localized: "Отменить"), role: .cancel) {}
+        } message: { _ in
+            Text(settings.configuration.trashEnabled
+                 ? String(localized: "Документы уйдут в корзину — их можно будет вернуть.")
+                 : String(localized: "Корзина выключена — удаление необратимо."))
+        }
+        .onAppear { takeNewCollectionRequest() }
+        .onChange(of: newCollectionRequested) { _, _ in takeNewCollectionRequest() }
         .sheet(isPresented: $model.showExportSheet) {
             TransferSheet(
                 model: transfer, mode: .export, collection: model.selected,
@@ -120,453 +176,499 @@ struct CollectionsView: View {
         }
     }
 
+    /// Сообщения экрана — строкой над содержимым выбранной коллекции.
     @ViewBuilder
     private var banners: some View {
         if model.errorMessage != nil || model.statusMessage != nil {
-            VStack(spacing: 8) {
+            VStack(alignment: .leading) {
                 if let error = model.errorMessage {
-                    MessageBanner(kind: .error, text: error) { model.errorMessage = nil }
+                    HStack {
+                        Notice(.warning, error)
+                        Spacer()
+                        Button(String(localized: "Скрыть")) { model.errorMessage = nil }
+                            .buttonStyle(.borderless)
+                    }
                 }
                 if let status = model.statusMessage {
-                    MessageBanner(kind: .success, text: status) { model.statusMessage = nil }
+                    HStack {
+                        Notice(.info, status)
+                        Spacer()
+                        Button(String(localized: "Скрыть")) { model.statusMessage = nil }
+                            .buttonStyle(.borderless)
+                    }
                 }
             }
+            .padding()
+            Divider()
         }
     }
 
     // MARK: - Список коллекций
 
-    /// Список — карточка, а не панель окна.
+    /// Список коллекций — системный `List(selection:)`.
     ///
-    /// В макете это отдельная карточка слева: поиск наверху, строки посередине,
-    /// «Новая коллекция…» внизу. Действия, относящиеся ко **всей базе** —
-    /// обновить список, сбросить базу, — живут в её подвале: это единственное
-    /// место экрана, которое говорит о базе целиком, а не об одной коллекции.
-    private var collectionListCard: some View {
+    /// Выбор идёт через `select(_:app:)`: всё, что относится к выбранной
+    /// коллекции, — выключатель умного поиска, профили, фильтры, выдача, —
+    /// обязано смениться вместе с ней.
+    /// Поиск коллекций — над их списком, а не в тулбаре: в тулбаре
+    /// он стоял рядом с вкладками выбранной коллекции и читался как поиск
+    /// по её документам.
+    /// Поиск коллекций — в полосе тулбара над их списком: тулбар
+    /// macOS 26 делится по колонкам, и поле, повешенное на колонку списка,
+    /// встаёт над ней, а не рядом с вкладками коллекции, где оно читалось
+    /// как поиск по документам. Своя строка поиска под тулбаром
+    /// давала вторую линию, не совпадавшую с линией соседней колонки.
+    private var collectionListColumn: some View {
         VStack(spacing: 0) {
-            listSearchField
-            Rectangle().fill(Theme.Palette.rowDivider).frame(height: 1)
             collectionList
-            Rectangle().fill(Theme.Palette.rowDivider).frame(height: 1)
             listFooter
         }
-        .background(Theme.Palette.card)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.Radius.card)
-                .strokeBorder(Theme.Palette.border, lineWidth: 1)
-        )
-        .shadow(
-            color: .black.opacity(Theme.Shadow.cardOpacity),
-            radius: Theme.Shadow.cardRadius,
-            y: Theme.Shadow.cardY
-        )
-    }
-
-    /// Поиск и порядок над списком.
-    ///
-    /// Порядок — в меню, поиск — полем: искать хочется на каждом втором
-    /// открытии, а менять порядок раз в месяц, и то, что делают чаще, не
-    /// должно требовать лишнего нажатия.
-    private var listSearchField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(Theme.Palette.captionText).font(Theme.Font.caption)
-            TextField(String(localized: "Поиск по имени"), text: $model.collectionSearch)
-                .textFieldStyle(.plain)
-                .font(Theme.Font.control)
-            if !model.collectionSearch.isEmpty {
-                Button {
-                    model.collectionSearch = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(Theme.Palette.captionText)
-                }
-                .buttonStyle(.borderless)
-            }
-
-            Menu {
-                Picker(String(localized: "Порядок"), selection: Binding(
-                    get: { app.settings.configuration.collectionListOrder },
-                    set: { app.settings.configuration.collectionListOrder = $0 }
-                )) {
-                    ForEach(CollectionListOrder.allCases) { order in
-                        Text(order.title).tag(order)
+        // Поле поиска — ровно по ширине колонки: элемент тулбара
+        // своей ширины не знает, а колонку тянут мышью.
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { listColumnWidth = $0 }
+        // Своё поле, а не `.searchable`: системное встаёт к правому краю окна,
+        // над выбранной коллекцией, и сдвигает её действия.
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField(String(localized: "Найти коллекцию"), text: $model.collectionSearch)
+                        .textFieldStyle(.plain)
+                    if !model.collectionSearch.isEmpty {
+                        Button {
+                            model.collectionSearch = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(String(localized: "Очистить поиск"))
                     }
                 }
-                .pickerStyle(.inline)
-            } label: {
-                Image(systemName: "arrow.up.arrow.down")
+                .padding(.horizontal, 8)
+                .frame(width: max(120, listColumnWidth - Self.searchFieldInset))
+                .help(String(localized: "Поиск по именам коллекций"))
             }
-            .menuStyle(.borderlessButton)
-            .frame(width: 28)
-            .help(String(localized: "Порядок списка: \(app.settings.configuration.collectionListOrder.title)"))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-    }
-
-    /// Подвал списка: создать коллекцию — и то, что относится ко всей базе.
-    private var listFooter: some View {
-        HStack(spacing: 8) {
-            Button(String(localized: "Новая коллекция…")) {
-                isCreatingCollection = true
-            }
-            .buttonStyle(.chromaNormal)
-            .disabled(!app.connection.isConnected)
-            Spacer(minLength: 0)
-            if model.isLoadingCollections { ProgressView().controlSize(.small) }
-            Menu {
-                Button(String(localized: "Обновить список")) {
-                    Task { await model.refresh(app) }
-                }
-                .disabled(!app.connection.isConnected)
-                Divider()
-                Button(String(localized: "Сбросить базу…"), role: .destructive) {
-                    model.showResetSheet = true
-                }
-                .disabled(!app.connection.isConnected)
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .frame(width: 30)
-            .help(String(localized: "Обновить список коллекций, сбросить базу"))
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
     }
 
     private var collectionList: some View {
-        VStack(spacing: 0) {
-            // Через `select(_:app:)`, а не мимо него. Раньше здесь стояли две
-            // строчки — присвоить id и подгрузить документы, — и всё остальное,
-            // что относится к выбранной коллекции, оставалось от предыдущей:
-            // выключатель «умный поиск», список профилей, действующий профиль,
-            // сохранённые фильтры, выдача и панель диагностики. На экране
-            // переключатель показывал «включено», а поиск шёл по plain-профилю
-            // соседней коллекции — отсюда «настройки профиля не работают» и
-            // «с выключенной галочкой ровно те же результаты».
-            // Выделение рисует сам список, а не система.
-            //
-            // С системным `List(selection:)` фон и текст меняются в разные
-            // моменты: подсветку AppKit анимирует, а цвет текста SwiftUI
-            // ставит мгновенно — на переходе строка успевает побыть тёмным
-            // текстом на синем и белым на белом. Это и есть моргание, и оно
-            // не лечится тем, когда именно записан выбор: рисуют его двое.
-            // Своя заливка означает один проход — один цвет.
-            List {
-                ForEach(model.visibleCollections(app)) { collection in
-                    collectionRow(collection)
-                        // В макете строки списка разделяет воздух, а не линии:
-                        // линия через всю колонку спорит с рамкой карточки.
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(
-                            RoundedRectangle(cornerRadius: Theme.Radius.row)
-                                .fill(model.selectedID == collection.id
-                                      ? Theme.Palette.accent
-                                      : Color.clear)
-                                .padding(.vertical, 1)
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            guard model.selectedID != collection.id else { return }
-                            model.selectedID = collection.id
-                            Task { await model.select(collection, app: app) }
-                        }
-                }
+        List(selection: Binding(
+            get: { model.selectedID },
+            set: { id in
+                guard let id, id != model.selectedID,
+                      let collection = model.collections.first(where: { $0.id == id }) else { return }
+                model.selectedID = id
+                Task { await model.select(collection, app: app) }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .overlay {
-                if model.visibleCollections(app).isEmpty && !model.isLoadingCollections {
-                    VStack(spacing: 6) {
-                        // «Ничего не нашлось» и «коллекций нет» — разные
-                        // сообщения: первое про строку поиска, второе про базу,
-                        // и предлагать создать коллекцию человеку, который
-                        // просто опечатался в поиске, незачем.
-                        if model.collections.isEmpty {
-                            Text(String(localized: "Коллекций нет"))
-                                .font(Theme.Font.control)
-                                .foregroundStyle(Theme.Palette.secondaryText)
-                            Text(String(localized: "Создайте первую кнопкой внизу."))
-                                .font(Theme.Font.caption)
-                                .foregroundStyle(Theme.Palette.captionText)
-                                .multilineTextAlignment(.center)
-                        } else {
-                            Text(String(localized: "Ничего не нашлось"))
-                                .font(Theme.Font.control)
-                                .foregroundStyle(Theme.Palette.secondaryText)
-                            Text(String(localized: "Из \(model.collections.count) коллекций ни одна не подходит под «\(model.collectionSearch)»."))
-                                .font(Theme.Font.caption)
-                                .foregroundStyle(Theme.Palette.captionText)
-                                .multilineTextAlignment(.center)
-                        }
+        )) {
+            ForEach(model.visibleCollections(app)) { collection in
+                collectionRow(collection)
+                    .tag(collection.id)
+            }
+        }
+        .overlay {
+            if model.visibleCollections(app).isEmpty && !model.isLoadingCollections {
+                // «Ничего не нашлось» и «коллекций нет» — разные сообщения:
+                // первое про строку поиска, второе про базу.
+                if model.collections.isEmpty {
+                    ContentUnavailableView {
+                        Label(String(localized: "Коллекций нет"), systemImage: "square.stack.3d.up")
+                    } description: {
+                        Text("Создайте первую кнопкой «+» внизу или добавьте источник — он создаст её сам.")
                     }
-                    .padding(.horizontal, 12)
+                } else {
+                    ContentUnavailableView.search(text: model.collectionSearch)
                 }
             }
         }
     }
 
-    /// Строка списка — как в макете: имя и одна строка фактов под ним.
-    ///
-    /// Модель коллекции из строки убрана: она стоит в подписи под именем
-    /// выбранной коллекции справа, а один и тот же факт не показывается
-    /// дважды. Остаётся только её отсутствие — это уже не факт, а состояние,
-    /// с которым нужно что-то делать.
-    ///
-    /// На выбранной строке цвета меняются: система заливает её акцентным
-    /// синим, и серая подпись на нём не читается вовсе, а оранжевая пометка
-    /// перестаёт быть заметной. Пока окно неактивно, заливка бледно-серая —
-    /// там как раз нужны обычные цвета, и потому смотрим на `controlActiveState`,
-    /// а не только на сам факт выбора.
-    private func collectionRow(_ collection: ChromaCollection) -> some View {
-        let isHighlighted = model.selectedID == collection.id
-        return VStack(alignment: .leading, spacing: 3) {
-            Text(collection.name)
-                .font(Theme.Font.control.weight(.medium))
-                .foregroundStyle(isHighlighted ? Color.white : Theme.Palette.primaryText)
-                .lineLimit(1).truncationMode(.middle)
-            HStack(spacing: 5) {
-                Text(collection.documentCount.map {
-                    RussianCount.grouped($0, "запись", "записи", "записей")
-                } ?? String(localized: "записей: ?"))
-                if let dimension = collection.effectiveDimension {
-                    Text("· dim \(dimension)")
-                }
-                // Numbers from different metrics are not comparable, so the
-                // metric is always in sight next to them.
-                if let space = collection.space {
-                    Text("· \(space.shortTitle)")
-                } else {
-                    Text(String(localized: "· метрика неизвестна"))
-                        .foregroundStyle(isHighlighted ? Color.white : Theme.Palette.attention)
-                }
-            }
-            .font(Theme.Font.micro)
-            .foregroundStyle(isHighlighted
-                             ? Color.white.opacity(0.8)
-                             : Theme.Palette.captionText)
+    private func takeNewCollectionRequest() {
+        guard newCollectionRequested else { return }
+        newCollectionRequested = false
+        if app.connection.isConnected { isCreatingCollection = true }
+    }
 
-            if !collection.isBound {
-                Text(String(localized: "модель не указана"))
-                    .font(Theme.Font.micro)
-                    .foregroundStyle(isHighlighted ? Color.white : Theme.Palette.attention)
+    /// Подвал списка: «+» — новая коллекция; в меню — то, что относится ко
+    /// всей базе: порядок списка, обновить, сбросить базу.
+    private var listFooter: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack {
+                Button {
+                    isCreatingCollection = true
+                } label: {
+                    Label(String(localized: "Новая коллекция…"), systemImage: "plus")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!app.connection.isConnected)
+                .help(String(localized: "Новая коллекция…"))
+
+                Menu {
+                    Picker(String(localized: "Порядок"), selection: Binding(
+                        get: { app.settings.configuration.collectionListOrder },
+                        set: { app.settings.configuration.collectionListOrder = $0 }
+                    )) {
+                        ForEach(CollectionListOrder.allCases) { order in
+                            Text(order.title).tag(order)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                    Divider()
+                    Button(String(localized: "Обновить список")) {
+                        Task { await model.refresh(app) }
+                    }
+                    .disabled(!app.connection.isConnected)
+                    Divider()
+                    Button(String(localized: "Сбросить базу…"), role: .destructive) {
+                        model.showResetSheet = true
+                    }
+                    .disabled(!app.connection.isConnected)
+                } label: {
+                    Label(String(localized: "Ещё"), systemImage: "ellipsis.circle")
+                        .labelStyle(.iconOnly)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help(String(localized: "Порядок списка, обновить список, сбросить базу"))
+
+                Spacer()
+                if model.isLoadingCollections { ProgressView().controlSize(.small) }
             }
+            .padding(.horizontal)
+            .padding(.vertical)
         }
-        .padding(.vertical, 3)
-        // Здесь имя тоже обрезано посередине, и выделять его мышью нельзя:
-        // строка списка занята выбором коллекции. Остаётся правая кнопка.
+    }
+
+    /// Строка списка: имя и одна строка фактов, обе в одну строку (v3).
+    /// Модель коллекции — в шапке справа; здесь остаётся только её
+    /// отсутствие — это уже состояние, значком у имени.
+    private func collectionRow(_ collection: ChromaCollection) -> some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Text(collection.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !collection.isBound {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel(String(localized: "модель не указана"))
+                }
+            }
+            Text(shortFacts(collection))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .monospacedDigit()
+        }
+        .help(collection.isBound
+              ? "\(collection.name)\n\(rowFacts(collection))"
+              : "\(collection.name)\n\(rowFacts(collection))\n" + String(localized: "модель не указана"))
+        // Имя обрезано посередине, и выделять его мышью нельзя: строка занята
+        // выбором. Остаётся правая кнопка.
         .copyable(collection.name)
     }
 
-    /// Создание коллекции — лист, а не форма в колонке.
-    ///
-    /// В колонке шириной в четверть экрана выпадающий список моделей и три
-    /// параметра индекса не помещались: имена моделей обрезались до
-    /// «text-embedding-qwe…», а метрика — то, что нельзя изменить потом, —
-    /// стояла в самом узком месте окна.
-    private var createCollectionSheet: some View {
-        SheetShell(
-            title: String(localized: "Новая коллекция"),
-            subtitle: String(localized: "Модель и метрику коллекции менять потом нельзя — только пересоздавать её."),
-            help: String(localized: "Коллекция — это набор документов с общими векторами. Модель определяет, чем эти векторы считаются: сравнивать между собой можно только векторы одной модели, поэтому сменить её у готовой коллекции нельзя. Метрика — способ измерять расстояние между векторами; она задаётся при создании индекса и тоже не меняется."),
-            width: 560,
-            height: nil,
-            scrolls: false
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                TextField(String(localized: "Имя (a-z, 0-9, ._-)"), text: $model.newCollectionName)
-                    .textFieldStyle(.roundedBorder)
-                // Says what is wrong while it is being typed, and names the rule
-                // rather than «недопустимое имя».
-                if let problem = model.nameProblem {
-                    Text(problem).font(Theme.Font.caption)
-                        .foregroundStyle(Theme.Palette.attention)
-                }
+    /// «355 · 768 · cosine» — коротко, чтобы не обрезалось в узком списке;
+    /// метрика всегда на виду рядом с числами: расстояния разных метрик
+    /// несравнимы.
+    private func shortFacts(_ collection: ChromaCollection) -> String {
+        var parts = [collection.documentCount.map { $0.formatted() } ?? "?"]
+        if let dimension = collection.effectiveDimension { parts.append(dimension.plainDigits) }
+        parts.append(collection.space?.shortTitle ?? "?")
+        return parts.joined(separator: " · ")
+    }
 
+    /// «9 418 записей · dim 2 560 · cosine» — полностью, в подсказке строки.
+    private func rowFacts(_ collection: ChromaCollection) -> String {
+        var parts = [collection.documentCount.map {
+            RussianCount.grouped($0, "запись", "записи", "записей")
+        } ?? String(localized: "записей: ?")]
+        if let dimension = collection.effectiveDimension { parts.append("dim \(dimension)") }
+        parts.append(collection.space?.shortTitle ?? String(localized: "метрика неизвестна"))
+        return parts.joined(separator: " · ")
+    }
+
+    /// Создание коллекции — лист: модель и метрику потом не сменить.
+    private var createCollectionSheet: some View {
+        SheetForm(
+            cancel: { isCreatingCollection = false },
+            confirmTitle: String(localized: "Создать"),
+            confirmDisabled: !app.connection.isConnected || model.isCreating || model.nameProblem != nil
+                || model.newCollectionName.trimmingCharacters(in: .whitespaces).isEmpty,
+            isWorking: model.isCreating,
+            confirm: {
+                Task {
+                    await model.createCollection(app)
+                    // Имя очищается только после удачного создания — по нему
+                    // и видно, закрывать ли лист.
+                    if model.newCollectionName.isEmpty { isCreatingCollection = false }
+                }
+            }
+        ) {
+            Section {
+                TextField(String(localized: "Имя"), text: $model.newCollectionName, prompt: Text(verbatim: "a-z, 0-9, ._-"))
+            } header: {
+                SectionHeader(
+                    String(localized: "Новая коллекция"),
+                    help: String(localized: "Коллекция — это набор документов с общими векторами. Модель определяет, чем эти векторы считаются: сравнивать можно только векторы одной модели, поэтому сменить её у готовой коллекции нельзя. Метрика — способ измерять расстояние между векторами; она задаётся при создании индекса и тоже не меняется.")
+                )
+            } footer: {
+                // Что не так — пока имя набирают, и названо правило.
+                if let problem = model.nameProblem {
+                    Notice(.warning, problem)
+                }
+            }
+            Section {
                 Picker(String(localized: "Модель"), selection: $model.newCollectionModel) {
                     Text(String(localized: "без модели")).tag("")
                     ForEach(embeddingsModel.embeddingModels) { item in
-                        Text(item.id).lineLimit(1).truncationMode(.middle).tag(item.id)
+                        Text(item.id).tag(item.id)
                     }
                 }
-                if model.newCollectionModel.isEmpty {
-                    Text(String(localized: "Без модели коллекцию можно создать и читать, но добавлять документы и делать запросы — нет: векторы считает приложение, а не сервер."))
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
                 Picker(String(localized: "Метрика"), selection: $model.newCollectionMetric) {
                     ForEach(DistanceMetric.allCases) { metric in
                         Text(metric.title).tag(metric)
                     }
                 }
-                Text(model.newCollectionMetric.explanation)
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    .fixedSize(horizontal: false, vertical: true)
+            } footer: {
+                Text(model.newCollectionModel.isEmpty
+                     ? String(localized: "Без модели коллекцию можно читать, но нельзя пополнять и искать: векторы считает приложение.")
+                     : model.newCollectionMetric.explanation)
             }
-
-            // Collapsed by default: these three change how the index is built,
-            // and leaving a field empty means the server decides.
-            AdvancedSection(place: "collection.index", title: String(localized: "Параметры индекса")) {
-                indexField(String(localized: "ef_construction"), text: $model.draftEFConstruction)
-                indexField(String(localized: "ef_search"), text: $model.draftEFSearch)
-                indexField(String(localized: "max_neighbors"), text: $model.draftMaxNeighbors)
-                Text(String(localized: "Пустое поле — параметр не передаётся, значение выбирает сервер. Больше max_neighbors и ef_construction — точнее поиск, но индекс тяжелее и запись медленнее."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    .fixedSize(horizontal: false, vertical: true)
+            // Свёрнуто: эти три меняют устройство индекса, а пустое поле
+            // значит «решает сервер».
+            AdvancedSection(screen: "collection.index", title: String(localized: "Параметры индекса")) {
+                indexField("ef_construction", text: $model.draftEFConstruction)
+                indexField("ef_search", text: $model.draftEFSearch)
+                indexField("max_neighbors", text: $model.draftMaxNeighbors)
+                Text("Пустое поле — значение выбирает сервер. Больше max_neighbors и ef_construction — точнее поиск, но индекс тяжелее и запись медленнее.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-        } actions: {
-            if model.isCreating { ProgressView().controlSize(.small) }
-            Button(String(localized: "Отмена")) { isCreatingCollection = false }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Создать")) {
-                Task {
-                    await model.createCollection(app)
-                    // Имя очищается только после удачного создания —
-                    // по нему и видно, закрывать ли лист.
-                    if model.newCollectionName.isEmpty { isCreatingCollection = false }
-                }
-            }
-            .buttonStyle(.chromaPrimary)
-            .disabled(!app.connection.isConnected || model.isCreating || model.nameProblem != nil
-                      || model.newCollectionName.trimmingCharacters(in: .whitespaces).isEmpty)
         }
     }
 
     private func indexField(_ title: String, text: Binding<String>) -> some View {
-        HStack {
-            Text(title)
-                .font(Theme.Font.mono)
-                .foregroundStyle(Theme.Palette.captionText)
-                .frame(width: 120, alignment: .leading)
-            TextField(String(localized: "по умолчанию"), text: text)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 90)
-        }
+        TextField(title, text: text, prompt: Text("по умолчанию"))
+            .font(.body.monospaced())
     }
 
     // MARK: - Detail
 
-    /// Re-embedding banners and cards live in the detail column, next to the
-    /// collection they are about. They are deliberately not in the screen's root
-    /// VStack: inserting them there left the window blank after a run (the whole
-    /// NavigationSplitView stopped drawing), and this placement reads better too.
+    /// Ход и итог пересчёта — строками над экраном, рядом с коллекцией, о
+    /// которой они. Не в корневом VStack экрана: вставленные туда, они после
+    /// пересчёта оставляли окно пустым (NavigationSplitView переставал рисовать).
     @ViewBuilder
     private var reembeddingCards: some View {
-        if let error = reembedding.errorMessage {
-            MessageBanner(kind: .error, text: error) { reembedding.errorMessage = nil }
+        let visible = reembedding.errorMessage != nil || reembedding.infoMessage != nil
+            || reembedding.isRunning || reembedding.report != nil
+        if visible {
+            VStack(alignment: .leading) {
+                if let error = reembedding.errorMessage {
+                    HStack {
+                        Notice(.warning, error)
+                        Spacer()
+                        Button(String(localized: "Скрыть")) { reembedding.errorMessage = nil }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                if let message = reembedding.infoMessage {
+                    HStack {
+                        Notice(.info, message)
+                        Spacer()
+                        Button(String(localized: "Скрыть")) { reembedding.infoMessage = nil }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                if reembedding.isRunning {
+                    ReembeddingProgressRow(model: reembedding)
+                }
+                if let report = reembedding.report {
+                    ReembeddingReportRow(report: report)
+                }
+            }
+            .padding()
+            Divider()
         }
-        if let message = reembedding.infoMessage {
-            MessageBanner(kind: .info, text: message) { reembedding.infoMessage = nil }
-        }
-        if reembedding.isRunning {
-            ReembeddingProgressCard(model: reembedding)
-        }
-        if let report = reembedding.report {
-            ReembeddingReportCard(report: report)
-        }
+    }
+
+    /// Имя действующего профиля поиска — для вопроса перед удалением.
+    private var activeProfileName: String {
+        model.profiles.first { $0.id == model.activeProfileID }?.name ?? String(localized: "По умолчанию")
     }
 
     @ViewBuilder
     private var detail: some View {
         if let collection = model.selected {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                    // Пересчёт векторов идёт часами и переживает переход на
-                    // соседнюю вкладку — его видно с любой. Шапка коллекции
-                    // тоже: без неё вкладка «Поиск» не говорит, где ищут
-                    //.
-                    reembeddingCards
-                    collectionHeader(collection)
-
-                    // Полоса вкладок — под именем коллекции, а не под именем
-                    // раздела: она про эту коллекцию.
-                    SegmentedSelector(
-                        options: CollectionTab.allCases.map { ($0, $0.title) },
-                        selection: $tab
-                    )
-
-                    switch tab {
-                    case .documents:
-                        appliedFilterNote
-                        AdvancedSection(place: "collection.filter", title: String(localized: "Фильтр по метаданным")) {
-                            filterCard
-                        }
-                        documentsSection(collection)
-                    case .search:
-                        appliedFilterNote
-                        queryCard(collection)
-                    case .overview:
-                        // Сначала состав — ради него вкладку и открывают;
-                        // проверки под ним отвечают на тот же вопрос «что в
-                        // этой коллекции» с другой стороны: что в ней не так.
-                        // Схема говорит, как должно быть, — это «Правила»
-                        //.
-                        InspectorTabs(
-                            model: inspector, collection: collection, only: .overview,
-                            // Клик по значению фасета уводит в документы с
-                            // готовым фильтром: без этого обзор — картинка,
-                            // по которой нельзя перейти к тому, что она
-                            // показывает (K1 → A9).
-                            applyFacetFilter: { field, value in
-                                model.filter = DocumentFilter(conditions: [
-                                    MetadataCondition(field: field, equals: value)
-                                ])
-                                tab = .documents
-                                Task { await model.applyFilter(app) }
-                            }
-                        )
-                        InspectorTabs(
-                            model: inspector, collection: collection, only: .checks,
-                            // Главная кнопка вкладки — у карточки состава.
-                            emphasisesAction: false,
-                            // Сводка о проверке одна, и стоит она наверху
-                            // вкладки: модель у панелей общая.
-                            showsMessages: false,
-                            applyFacetFilter: { _, _ in }
-                        )
-                    case .topics:
-                        InspectorTabs(
-                            model: inspector, collection: collection,
-                            only: .topics, applyFacetFilter: { _, _ in }
-                        )
-                    case .rules:
-                        schemaCard(collection)
-                    }
-
-                    howItWorks
+            VStack(spacing: 0) {
+                banners
+                collectionHeader(collection)
+                Divider()
+                if tab == .documents {
+                    documentsScreen(collection)
+                } else if tab == .search {
+                    searchScreen(collection)
+                } else if tab == .overview {
+                    insightsScreen(collection)
+                } else {
+                    metadataScreen(collection)
                 }
-                .padding(.top, 4)
-                .padding(.bottom, 8)
-                // Место под накладную полосу прокрутки — постоянное.
-                .scrollGutter()
-                .steadyScrollbar()
+            }
+            // Инспектор документа — у всей детали, а не у таблицы:
+            // приделанный к таблице, он начинался под шапкой коллекции,
+            // и его серая колонка обрывалась на середине высоты.
+            .fittingInspector(isPresented: Binding(
+                get: { showsInspector && tab == .documents },
+                set: { showsInspector = $0 }
+            )) {
+                Group {
+                    if let document = inspectedDocument {
+                        documentInspector(document)
+                    } else {
+                        InspectorPlaceholder(selectedDocumentIDs.count > 1
+                            ? String(localized: "Выбрано несколько документов.")
+                            : String(localized: "Выберите строку в таблице."))
+                    }
+                }
             }
         } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                    reembeddingCards
-                    VStack(spacing: 6) {
-                        Text(String(localized: "Коллекция не выбрана"))
-                            .font(Theme.Font.cardTitle)
-                            .foregroundStyle(Theme.Palette.secondaryText)
-                        Text(String(localized: "Выберите её в списке слева — документы, поиск и правила относятся к одной коллекции."))
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(Theme.Palette.captionText)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 80)
-                    howItWorks
+            VStack(spacing: 0) {
+                banners
+                reembeddingCards
+                ContentUnavailableView {
+                    Label(String(localized: "Выберите коллекцию"), systemImage: "square.stack.3d.up")
+                } description: {
+                    Text("Документы, поиск и правила относятся к одной коллекции.")
                 }
-                .padding(.top, 4)
-                .padding(.bottom, 8)
-                .scrollGutter()
-                .steadyScrollbar()
             }
+        }
+    }
+
+    /// Действия выбранной коллекции — в тулбаре у правого края.
+    ///
+    /// Основные действия macOS ставит к левому краю тулбара, а левый край
+    /// здесь — над списком коллекций: четыре значка выбранной коллекции
+    /// читались как действия списка. Действия всех коллекций — внизу списка.
+    ///
+    /// **Состав тулбара не зависит от выбора**. Элементы стояли под
+    /// `if let collection`, и удаление коллекции снимало их все — выбор на
+    /// миг становился пустым — и тут же вставляло заново для следующей.
+    /// AppKit при этом оставлял в тулбаре прежний экземпляр: имя коллекции
+    /// и её факты появлялись второй раз справа, а кнопки уезжали в меню переполнения «>>».
+    /// Теперь элементы есть всегда; без выбранной коллекции заголовок пуст,
+    /// а действия гаснут — как и на вкладках, где неприменимое гаснет, а не
+    /// исчезает.
+    @ToolbarContentBuilder
+    private var collectionToolbar: some ToolbarContent {
+        let collection = model.selected
+        // Имя и факты коллекции — в полосе тулбара, слева: строка
+        // над содержимым освобождается, и коллекция названа на одном
+        // уровне со своими действиями. Без стеклянной подложки — это
+        // заголовок, а не кнопка.
+        if #available(macOS 26.0, *) {
+            ToolbarItem(placement: .automatic) { collectionTitleSlot(collection) }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .automatic) { collectionTitleSlot(collection) }
+        }
+        // К правому краю, над выбранной коллекцией: основные действия
+        // macOS ставит к левому, а левый край здесь — над списком.
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        }
+        ToolbarItemGroup(placement: .automatic) {
+            // Набор кнопок один на всех вкладках — неприменимое гаснет,
+            // а не исчезает: иначе тулбар перестраивался при каждом
+            // переключении вкладки.
+            Button {
+                showingFilter = true
+            } label: {
+                Label(String(localized: "Фильтр…"),
+                      systemImage: model.appliedFilterDescription == nil
+                        ? "line.3.horizontal.decrease.circle"
+                        : "line.3.horizontal.decrease.circle.fill")
+            }
+            .help(String(localized: "Фильтр по метаданным"))
+            .disabled(collection == nil || (tab != .documents && tab != .search))
+            // Переключатель, а не кнопка: состояние видно по нему
+            // самому.
+            Toggle(isOn: $showsInspector) {
+                Label(String(localized: "Инспектор"), systemImage: "sidebar.right")
+            }
+            .toggleStyle(.button)
+            .keyboardShortcut("i", modifiers: [.command, .option])
+            .help(String(localized: "Показать или скрыть инспектор"))
+            .disabled(collection == nil || tab != .documents)
+            Button {
+                model.beginAddingDocument(app)
+            } label: {
+                // Не «+»: плюс внизу списка — новая коллекция, и два одинаковых
+                // значка с разным смыслом путались.
+                Label(String(localized: "Добавить документ…"), systemImage: "doc.badge.plus")
+            }
+            .disabled(collection?.isBound != true)
+            .help(String(localized: "Добавить документ…"))
+
+            // Значков — не больше трёх, остальное в меню (v3).
+            Menu {
+                // Пункты вкладок — здесь, а не в самой вкладке (v6): набор
+                // меню один на все вкладки, неприменимое гаснет.
+                Toggle(String(localized: "История запросов"), isOn: Binding(
+                    get: { model.showHistory },
+                    set: { shown in
+                        model.showHistory = shown
+                        if shown { model.reloadHistory(app) }
+                    }
+                ))
+                .disabled(tab != .search)
+                Menu(String(localized: "Экспорт отчёта о темах")) {
+                    Button(String(localized: "Markdown…")) { inspector.exportTopics(markdown: true, app: app) }
+                    Button(String(localized: "JSON…")) { inspector.exportTopics(markdown: false, app: app) }
+                }
+                .disabled(tab != .overview || inspector.topicReport == nil)
+                Divider()
+                Button(collection?.isBound == true
+                       ? String(localized: "Модель: \(collection?.boundModel ?? "не указана")…")
+                       : String(localized: "Указать модель…")) {
+                    model.bindModelSelection = collection?.boundModel ?? settings.configuration.defaultEmbeddingModel ?? ""
+                    model.showBindSheet = true
+                }
+                Button(String(localized: "Пересчитать векторы…")) {
+                    if let collection { reembedding.begin(collection: collection, app: app) }
+                }
+                .disabled(collection?.isBound != true || (collection?.documentCount ?? 0) == 0)
+                Button(String(localized: "Импорт CSV или JSON…")) { model.chooseImportFile(app) }
+                    .disabled(collection?.isBound != true)
+                Divider()
+                Button(String(localized: "Экспорт коллекции…")) { model.showExportSheet = true }
+                Button(String(localized: "Импорт пакета .chromaexport…")) { model.showImportPackageSheet = true }
+                Divider()
+                Button(String(localized: "Удалить коллекцию…"), role: .destructive) {
+                    model.deleteConfirmationText = ""
+                    model.deleteTooBig = nil
+                    model.deleteError = nil
+                    model.showDeleteSheet = true
+                }
+            } label: {
+                Label(String(localized: "Действия с коллекцией"), systemImage: "ellipsis.circle")
+            }
+            .help(String(localized: "Модель, пересчёт векторов, импорт, экспорт, удаление коллекции"))
+            .disabled(collection == nil)
+        }
+    }
+
+    /// Место заголовка в тулбаре: имя коллекции или пусто, пока она не
+    /// выбрана, — сам элемент остаётся на месте.
+    @ViewBuilder
+    private func collectionTitleSlot(_ collection: ChromaCollection?) -> some View {
+        if let collection {
+            collectionTitle(collection)
+        } else {
+            Color.clear.frame(width: 1, height: 1)
         }
     }
 
@@ -574,180 +676,140 @@ struct CollectionsView: View {
     ///
     /// Оба факта здесь — о необратимом, и оба взяты из дизайн-макета: модель
     /// и метрика выбираются один раз на всю жизнь коллекции.
-    private var howItWorks: some View {
-        HowItWorks(screen: "collections") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Модель привязана к коллекции навсегда: векторы, посчитанные разными моделями, несравнимы. Чтобы сравнить другую модель или стратегию, коллекцию клонируют — «Модели» → «Пересчёт векторов».")
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Метрику нельзя изменить после создания — только пересоздать коллекцию. Косинусная подходит почти всем эмбеддинг-моделям: они нормированы под неё.")
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Документы читаются страницами по сто: у ChromaDB нет курсора, и порядок выдачи между страницами не гарантирован. Точная работа с конкретными документами — через фильтр.")
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
+    /// Третий уровень текста для экранов-форм коллекции.
+    private var collectionsHowItWorks: some View {
+        HowItWorks(screen: "collections", String(localized: "Модель привязана к коллекции навсегда: векторы, посчитанные разными моделями, несравнимы. Чтобы сравнить другую модель или стратегию, коллекцию клонируют — «Модели» → «Пересчёт векторов». Метрику нельзя изменить после создания — только пересоздать коллекцию; косинусная подходит почти всем эмбеддинг-моделям. Документы читаются страницами по сто: у ChromaDB нет курсора, и порядок выдачи между страницами не гарантирован."))
     }
 
-
-    /// Фильтр живёт на своей вкладке, а действует на этой — значит здесь
-    /// о нём должна быть строка. Иначе человек смотрит на выдачу и не знает,
-    /// почему в ней сорок документов вместо десяти тысяч.
+    /// Фильтр действует и на документы, и на поиск — значит на обеих
+    /// вкладках о нём должна быть строка. Иначе человек смотрит на выдачу
+    /// и не знает, почему в ней сорок документов вместо десяти тысяч.
     @ViewBuilder
     private var appliedFilterNote: some View {
         if let description = model.appliedFilterDescription {
-            HStack(spacing: 12) {
-                Circle()
-                    .fill(Theme.Palette.accent)
-                    .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-                Text("Применён фильтр: \(description)")
-                    .font(Theme.Font.control)
-                    .lineLimit(2)
-                Spacer(minLength: 8)
+            HStack {
+                Label {
+                    Text("Фильтр: \(description)")
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(description)
+                } icon: {
+                    Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(String(localized: "Изменить…")) { showingFilter = true }
                 Button(String(localized: "Сбросить")) {
                     Task { await model.clearFilter(app) }
                 }
-                .buttonStyle(.chromaSecondary)
             }
-            .padding(.horizontal, Theme.Padding.rowHorizontal)
-            .padding(.vertical, Theme.Padding.rowVertical)
-            .background(Theme.Palette.accent.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.row))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.row)
-                    .strokeBorder(Theme.Palette.accent.opacity(0.22), lineWidth: 1)
-            )
+            .padding(.horizontal)
+            .padding(.vertical)
         }
     }
 
-    /// Карточка коллекции — по макету: имя, одна строка фактов о ней и её
-    /// действия справа.
+    /// Шапка выбранной коллекции: имя и одна строка фактов. Действия —
+    /// в тулбаре; служебные поля — на «Обзоре» под «Для опытных».
     ///
-    /// Факты собраны в одну строку вместо трёх россыпью: «5 193 записи ·
-    /// размерность 1024 · косинусная · модель». Всё, что нужно раз в жизни —
-    /// id и служебные поля, — свёрнуто.
+    /// Имя берут руками чаще, чем кажется: выделение мышью **и**
+    /// «Скопировать» в правой кнопке — имя длиной в экран обрезано
+    /// посередине, а скопировать надо целиком.
+    /// Имя и одна строка фактов — в тулбаре.
+    private func collectionTitle(_ collection: ChromaCollection) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(collection.name)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .copyable(collection.name)
+            Text(collectionFactLine(collection))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .copyable(collectionFactLine(collection))
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+        .help(Text(verbatim: "\(collection.name)\n\(collectionFactLine(collection))"))
+    }
+
     private func collectionHeader(_ collection: ChromaCollection) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Padding.cardContentSpacing) {
-            HStack(alignment: .top, spacing: 12) {
-                // Имя коллекции берут руками чаще, чем кажется: его вписывают
-                // в запрос из другого приложения, в команду, в переписку.
-                // Выделение мышью **и** «Скопировать» в правой кнопке — потому
-                // что имя длиной в экран обрезано посередине, и выделить
-                // мышью можно только то, что видно, а скопировать надо целиком.
-                // Модель и размерность рядом — по той же причине.
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(collection.name).font(Theme.Font.objectTitle)
-                        .lineLimit(1).truncationMode(.middle)
-                        .copyable(collection.name)
-                    Text(collectionFactLine(collection))
-                        .font(Theme.Font.caption)
-                        .foregroundStyle(Theme.Palette.captionText)
-                        .lineLimit(1).truncationMode(.middle)
-                        .copyable(collectionFactLine(collection))
-                }
-                .textSelection(.enabled)
-                Spacer(minLength: 8)
-
-                // Одно действие названо словом, остальные — в меню: шесть
-                // подписанных кнопок не помещались рядом со списком и
-                // обрезались до «Пересч…».
-                Button(String(localized: "Модель…")) {
-                    model.bindModelSelection = collection.boundModel ?? settings.configuration.defaultEmbeddingModel ?? ""
-                    model.showBindSheet = true
-                }
-                .buttonStyle(.chromaNormal)
-                .help(collection.isBound
-                      ? String(localized: "Модель коллекции: \(collection.boundModel ?? "не указана")")
-                      : String(localized: "Указать модель, которой считаются векторы этой коллекции"))
-
-                Button(String(localized: "Добавить")) {
-                    model.beginAddingDocument(app)
-                }
-                .buttonStyle(.chromaPrimary)
-                .disabled(!collection.isBound)
-
-                Menu {
-                    Button {
-                        reembedding.begin(collection: collection, app: app)
-                    } label: {
-                        Label(String(localized: "Пересчитать векторы…"), systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .disabled(!collection.isBound || (collection.documentCount ?? 0) == 0)
-
-                    Button {
-                        model.chooseImportFile(app)
-                    } label: {
-                        Label(String(localized: "Импорт CSV или JSON…"), systemImage: "square.and.arrow.down")
-                    }
-                    .disabled(!collection.isBound)
-
-                    Divider()
-
-                    Button {
-                        model.showExportSheet = true
-                    } label: {
-                        Label(String(localized: "Экспорт коллекции…"), systemImage: "shippingbox")
-                    }
-                    .help(String(localized: "Пакет .chromaexport: одна коллекция целиком или по фильтру, с векторами или без"))
-
-                    Button {
-                        model.showImportPackageSheet = true
-                    } label: {
-                        Label(String(localized: "Импорт пакета .chromaexport…"), systemImage: "shippingbox.and.arrow.backward")
-                    }
-                    // Подсказка была от инспектора и обещала «ничего не
-                    // меняет» у действия, которое пишет в базу.
-                    .help(String(localized: "Загрузить пакет .chromaexport в новую коллекцию или в эту. Пишет в базу."))
-
-                    Divider()
-
-                    Button(role: .destructive) {
-                        model.deleteConfirmationText = ""
-                        model.showDeleteSheet = true
-                    } label: {
-                        Label(String(localized: "Удалить коллекцию…"), systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: 30)
-                .help(String(localized: "Пересчёт векторов, импорт, удаление коллекции"))
-            }
-
+        VStack(alignment: .leading) {
             if !collection.isBound {
-                MessageBanner(
-                    kind: .warning,
-                    text: String(localized: "Коллекция создана не этим приложением: неизвестно, какой моделью посчитаны её векторы. Укажите модель — приложение сверит только размерность.")
-                )
+                Notice(.warning, String(localized: "Коллекция создана не этим приложением: неизвестно, какой моделью посчитаны её векторы. Укажите модель — приложение сверит только размерность."))
             }
+            // Вкладки — под именем коллекции, а не в тулбаре над ним:
+            // сначала «какая коллекция», потом «что в ней смотреть».
+            Picker(String(localized: "Вкладка коллекции"), selection: $tab) {
+                ForEach(CollectionTab.allCases) { tab in
+                    Text(tab.title).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+    }
 
-            // Служебные поля коллекции — `_cdbm_*`, хэш параметров нарезки,
-            // `hnsw:space` — читают, когда что-то не сходится, и не читают
-            // никогда в остальное время. Простыня из них стояла первым, что
-            // видно под именем коллекции. Идентификатор — там же:
-            // он нужен ровно в тех же случаях.
-            AdvancedSection(place: "collection.metadata", title: String(localized: "Служебные поля")) {
-                Text("id: \(collection.id)")
-                    .font(Theme.Font.mono)
-                    .foregroundStyle(Theme.Palette.secondaryText)
+    /// Служебные поля коллекции — `_cdbm_*`, хэш нарезки, `hnsw:space` и id:
+    /// их читают, когда что-то не сходится, и не читают в остальное время.
+    private func serviceFields(_ collection: ChromaCollection) -> some View {
+        AdvancedSection(screen: "collection.metadata", title: String(localized: "Служебные поля")) {
+            LabeledContent(String(localized: "id")) {
+                Text(collection.id)
+                    .font(.body.monospaced())
                     .copyable(collection.id)
-                MetadataTable(metadata: collection.metadata)
+                    .copyable(collection.id)
+            }
+            ForEach((collection.metadata ?? [:]).keys.sorted(), id: \.self) { key in
+                let value = collection.metadata?[key]?.displayString ?? ""
+                LabeledContent(key) {
+                    Text(value)
+                        .font(.body.monospaced())
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .copyable(value)
+                        .help(value)
+                }
             }
         }
-        .padding(.horizontal, Theme.Padding.cardHorizontal)
-        .padding(.vertical, Theme.Padding.cardVertical)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.card)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.Radius.card)
-                .strokeBorder(Theme.Palette.border, lineWidth: 1)
-        )
-        .shadow(
-            color: .black.opacity(Theme.Shadow.cardOpacity),
-            radius: Theme.Shadow.cardRadius,
-            y: Theme.Shadow.cardY
-        )
+    }
+
+    /// «Обзор» и «Темы» коллекции — формой: секции инспектора.
+    private func insightsScreen(_ collection: ChromaCollection) -> some View {
+        VStack(spacing: 0) {
+            reembeddingCards
+            Form {
+                InspectorTabs(
+                    model: inspector, collection: collection, only: .overview,
+                    // Значение фасета уводит в документы с готовым
+                    // фильтром (K1 → A9).
+                    applyFacetFilter: { field, value in
+                        model.filter = DocumentFilter(conditions: [
+                            MetadataCondition(field: field, equals: value)
+                        ])
+                        tab = .documents
+                        Task { await model.applyFilter(app) }
+                    }
+                )
+                // Темы — тоже о содержании: о чём коллекция (v3).
+                InspectorTabs(
+                    model: inspector, collection: collection,
+                    only: .topics, applyFacetFilter: { _, _ in }
+                )
+                InspectorTabs(
+                    model: inspector, collection: collection, only: .checks,
+                    showsMessages: false,
+                    applyFacetFilter: { _, _ in }
+                )
+                Section { collectionsHowItWorks }
+            }
+            .formStyle(.grouped)
+            .toggleStyle(.switch)
+        }
     }
 
     /// Одна строка о коллекции: сколько записей, какой размерности, какой
@@ -768,516 +830,88 @@ struct CollectionsView: View {
 
     // MARK: - Filter
 
-    private var filterCard: some View {
-        SectionCard(
-            title: String(localized: "Фильтр по метаданным"),
-            subtitle: String(localized: "Условия собираются в where-запрос ChromaDB — фильтрует сервер, а не приложение.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                savedFilterBar
+    // MARK: - Поиск
 
-                if model.filter.usesRawJSON {
-                    rawFilterEditor
-                } else {
-                    FilterNodeEditor(
-                        node: $model.filter.root,
-                        knownFields: model.filterFieldSuggestions(app),
-                        depth: 0,
-                        onRemove: nil
-                    )
-                    DocumentTextConditionsEditor(
-                        conditions: $model.filter.textConditions,
-                        logic: $model.filter.textLogic
-                    )
-                }
-
-                // A filter the server refused must not disappear from the
-                // screen: the message goes here, next to the conditions.
-                if let problem = model.filterErrorMessage {
-                    Label(problem, systemImage: "exclamationmark.triangle")
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack {
-                    Button(model.filter.usesRawJSON
-                           ? String(localized: "Вернуться к конструктору")
-                           : String(localized: "Редактировать как JSON")) {
-                        model.toggleFilterJSONMode()
-                    }
-                    .buttonStyle(.chromaSecondary)
-
-                    if let json = model.filter.whereJSONString() {
-                        Text(json)
-                            .font(Theme.Font.mono)
-                            .foregroundStyle(Theme.Palette.captionText)
-                            .lineLimit(1).truncationMode(.middle)
-                            .copyable(json)
-                    }
-                    if let json = model.filter.whereDocumentJSONString() {
-                        Text(json)
-                            .font(Theme.Font.mono)
-                            .foregroundStyle(Theme.Palette.captionText)
-                            .lineLimit(1).truncationMode(.middle)
-                            .copyable(json)
-                    }
-                    Spacer()
-                    Button(String(localized: "Сбросить")) {
-                        Task { await model.clearFilter(app) }
-                    }
-                    .buttonStyle(.chromaNormal)
-                    .disabled(model.filter.isEmpty)
-                    Button(String(localized: "Применить")) {
-                        Task { await model.applyFilter(app) }
-                    }
-                    .buttonStyle(.chromaPrimary)
-                }
-            }
-        }
-    }
-
-    /// Saved filters for this collection: pick one, save the current one,
-    /// delete what is no longer needed.
-    private var savedFilterBar: some View {
-        HStack(spacing: 8) {
-            if !model.savedFilters.isEmpty {
-                Menu {
-                    ForEach(model.savedFilters) { saved in
-                        Button(saved.name) { model.applySavedFilter(saved) }
-                    }
-                    Divider()
-                    ForEach(model.savedFilters) { saved in
-                        Button(String(localized: "Удалить «\(saved.name)»"), role: .destructive) {
-                            model.deleteSavedFilter(saved, app: app)
+    /// «Поиск» — форма: запрос и его параметры, история, отчёт, диагностика
+    /// и по секции на каждый результат.
+    private func searchScreen(_ collection: ChromaCollection) -> some View {
+        VStack(spacing: 0) {
+            reembeddingCards
+            appliedFilterNote
+            Form {
+                querySection(collection)
+                if model.showHistory { historySection(collection) }
+                // До первого запроса под формой не пусто, а сказано, что здесь
+                // будет (v6).
+                if model.hits.isEmpty, model.searchReports.isEmpty, model.searchSummary == nil,
+                   model.lastRetrieval == nil, !model.isQuerying {
+                    Section {
+                        ContentUnavailableView {
+                            Label(String(localized: "Введите запрос"), systemImage: "magnifyingglass")
+                        } description: {
+                            Text("Найденные документы появятся здесь — с оценкой близости и местом в исходном файле.")
                         }
+                        .frame(maxWidth: .infinity)
                     }
-                } label: {
-                    Label(String(localized: "Сохранённые (\(model.savedFilters.count))"), systemImage: "bookmark")
                 }
-                .menuStyle(.borderlessButton)
-                .frame(width: 190)
-            }
-
-            TextField(String(localized: "имя фильтра"), text: $model.savedFilterName)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 160)
-            Button(String(localized: "Сохранить фильтр")) {
-                model.saveCurrentFilter(app)
-            }
-            .buttonStyle(.chromaNormal)
-            .disabled(model.filter.isEmpty || model.savedFilterName.trimmingCharacters(in: .whitespaces).isEmpty)
-            Spacer()
-        }
-        .font(Theme.Font.caption)
-    }
-
-    private var rawFilterEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("where").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            TextField(#"{"$and": [{"n": {"$gt": 10}}]}"#, text: $model.filter.rawWhereJSON, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .font(Theme.Font.mono)
-                .lineLimit(1...6)
-            Text("where_document").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            TextField(#"{"$not_contains": "черновик"}"#, text: $model.filter.rawWhereDocumentJSON, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .font(Theme.Font.mono)
-                .lineLimit(1...4)
-            Text(String(localized: "Пока поля заполнены, конструктор не используется. Пустой объект {} сервер отклоняет, поэтому пустые поля просто не отправляются."))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    /// Метрика коллекции, из которой пришёл результат.
-    private func metric(of hit: RetrievalHit, current: ChromaCollection) -> DistanceMetric? {
-        guard let name = hit.collectionName, name != current.name else { return current.space }
-        return model.collections.first { $0.name == name }?.space ?? current.space
-    }
-
-    /// Что ответила каждая коллекция.
-    ///
-    /// Отдельной строкой на коллекцию, а не одной сводкой: коллекция, которая
-    /// не ответила из-за ошибки, выглядит в общей выдаче ровно как коллекция,
-    /// в которой ничего не нашлось, — и человек делает из этого неверный вывод
-    /// о своих данных.
-    private var collectionsReport: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            if let summary = model.searchSummary {
-                Text(summary).font(Theme.Font.caption)
-            }
-            ForEach(model.searchReports, id: \.self) { report in
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(report.failure == nil ? Theme.Palette.running : Theme.Palette.danger)
-                        .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-                    if let failure = report.failure {
-                        Text("\(report.name) — не ответила: \(failure)")
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.danger)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text("\(report.name) — найдено \(report.found.plainDigits), \(Int((report.seconds * 1000).rounded()).plainDigits) мс")
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-                }
-            }
-        }
-    }
-
-    /// Выбор коллекций, которые ищутся вместе с открытой.
-    ///
-    /// Меню, а не список чекбоксов на экране: коллекций бывает два десятка, и
-    /// поиск по одной — по-прежнему самый частый случай. Выбранные названы
-    /// строкой под меню, чтобы «где я сейчас ищу» читалось без открывания.
-    @ViewBuilder
-    private func alsoSearchInRow(_ collection: ChromaCollection) -> some View {
-        let others = model.collections.filter { $0.name != collection.name }
-        if !others.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Menu {
-                        ForEach(others, id: \.id) { other in
-                            Toggle(isOn: Binding(
-                                get: { model.alsoSearchIn.contains(other.name) },
-                                set: { isOn in
-                                    if isOn {
-                                        model.alsoSearchIn.insert(other.name)
-                                    } else {
-                                        model.alsoSearchIn.remove(other.name)
-                                    }
-                                }
-                            )) {
-                                // Коллекция без модели искать не может, и это
-                                // сказано прямо в строке выбора, а не после
-                                // запроса.
-                                Text(other.isBound
-                                     ? other.name
-                                     : String(localized: "\(other.name) — нет модели"))
-                            }
-                            .disabled(!other.isBound)
-                        }
-                    } label: {
-                        Text(model.alsoSearchIn.isEmpty
-                             ? String(localized: "Искать ещё в…")
-                             : String(localized: "Искать ещё в: \(model.alsoSearchIn.count.plainDigits)"))
-                    }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 190)
-
-                    if !model.alsoSearchIn.isEmpty {
-                        Button(String(localized: "Только эта коллекция")) { model.alsoSearchIn = [] }
-                            .buttonStyle(.link).font(Theme.Font.micro)
-                    }
-                    Spacer()
-                }
-
-                if !model.alsoSearchIn.isEmpty {
-                    let names = ([collection.name] + model.alsoSearchIn.sorted())
-                    Text("ищем в: \(names.joined(separator: ", "))")
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        .fixedSize(horizontal: false, vertical: true)
-                    // Поведение при разных моделях — главный вопрос этого
-                    // режима, и ответ на него стоит до запуска, а не после.
-                    Text(multiModelNote(collection))
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-    }
-
-    /// Сколько моделей затронет запрос — столько раз и посчитается вектор.
-    private func multiModelNote(_ collection: ChromaCollection) -> String {
-        let names = Set([collection.name]).union(model.alsoSearchIn)
-        let models = Set(
-            model.collections
-                .filter { names.contains($0.name) }
-                .compactMap { $0.boundModel }
-        )
-        let metrics = Set(
-            model.collections
-                .filter { names.contains($0.name) }
-                .compactMap { $0.space }
-        )
-        var line = String(localized: "Вектор запроса считается по разу на модель: моделей \(models.count.plainDigits).")
-        if metrics.count > 1 {
-            line += String(localized: " Метрики у коллекций разные, поэтому порядок задаётся слиянием рангов, а не расстояниями.")
-        }
-        return line
-    }
-
-    private func queryCard(_ collection: ChromaCollection) -> some View {
-        SectionCard(
-            title: String(localized: "Запрос"),
-            subtitle: String(localized: "Текст превращается в вектор моделью коллекции, затем ищутся ближайшие документы.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                profileBar(collection)
-
-                // Enter выполняет запрос. Поле многострочное —
-                // оно растёт под длинный запрос, — и Return у него уходит
-                // не туда, куда ждёшь: нажатие пропадало впустую, ни выдачи,
-                // ни переноса строки.
-                //
-                // Замерено пробником на этой системе:
-                // • Return у поля с `axis: .vertical` доходит до `onSubmit`
-                //   и строку **не** переносит;
-                // • Shift+Return — тоже `onSubmit`, тоже без переноса;
-                // • перенос строки даёт Option+Return, и только он;
-                // • `onKeyPress` при этом Return видит и может забрать себе.
-                //
-                // Поэтому обработчика два. Какой из них сработает, зависит от
-                // того, успело ли поле забрать нажатие; запрос от этого не
-                // должен зависеть, а два запуска разом отсекает `runQuery`:
-                // он выходит, пока предыдущий не кончился.
-                TextField(String(localized: "Текст запроса"), text: $model.queryText, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(2...5)
-                    .onKeyPress(phases: .down) { press in
-                        guard press.key == .return,
-                              press.modifiers.isDisjoint(with: [.option]) else { return .ignored }
-                        guard !model.isQuerying, collection.isBound else { return .ignored }
-                        Task { await model.runQuery(app) }
-                        return .handled
-                    }
-                    .onSubmit {
-                        guard !model.isQuerying, collection.isBound else { return }
-                        Task { await model.runQuery(app) }
-                    }
-                    .help(String(localized: "Enter — выполнить запрос, Option+Enter — перенос строки."))
-
-                alsoSearchInRow(collection)
-
-                HStack {
-                    Stepper("n_results: \(model.numberOfResults)", value: $model.numberOfResults, in: 1...RetrievalLimits.maximumResults)
-                        .frame(width: 190)
-                    if !model.filter.isEmpty {
-                        Toggle(String(localized: "с фильтром"), isOn: $model.applyFilterToQuery)
-                            .toggleStyle(.chromaCheckbox)
-                            .help(String(localized: "Условия из панели фильтра применяются к запросу вместе с вектором."))
-                    }
-                    // Модель коллекции здесь не повторяется: она стоит
-                    // в строке фактов под именем коллекции, а один и тот же
-                    // факт в двух местах расходится.
-                    Spacer()
-                    Button(String(localized: "История")) {
-                        model.showHistory.toggle()
-                        if model.showHistory { model.reloadHistory(app) }
-                    }
-                    // Открытая история видна по самой кнопке, а не
-                    // только по панели под ней: так же показан «Журнал
-                    // пересчётов» в логах, и разнобоя тут быть не должно.
-                    .buttonStyle(model.showHistory ? .chromaPrimary : .chromaNormal)
-                    if model.isQuerying { ProgressView().controlSize(.small) }
-                    Button(String(localized: "Выполнить")) {
-                        Task { await model.runQuery(app) }
-                    }
-                    .buttonStyle(.chromaPrimary)
-                    .disabled(model.isQuerying || !collection.isBound)
-                }
-
-                if model.showHistory { historyPanel(collection) }
-
-                if !collection.isBound {
-                    Text(String(localized: "Запрос заблокирован: у коллекции не указана модель. Другой моделью выполнять его нельзя — результаты будут бессмысленными."))
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                }
-
-                if !model.searchReports.isEmpty { collectionsReport }
-
-                if !model.hits.isEmpty && model.alsoSearchIn.isEmpty {
-                    // The scale depends entirely on the metric, so the header
-                    // says which one produced these numbers.
-                    Text(collection.space.map { metric in
-                        metric == .cosine
-                            ? String(localized: "Метрика \(metric.shortTitle): рядом с расстоянием показана схожесть.")
-                            : String(localized: "Метрика \(metric.shortTitle): показано сырое значение, в процентах его выразить нельзя.")
-                    } ?? String(localized: "Метрика коллекции неизвестна — значения показаны как есть, без интерпретации."))
-                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                }
-
+                if !model.searchReports.isEmpty || model.searchSummary != nil { collectionsReport }
                 if let diagnostics = model.lastRetrieval {
-                    diagnosticsPanel(diagnostics)
+                    diagnosticsSection(diagnostics)
                 }
-
-                // Тоже лениво: у результата с метаданными и контекстом
-                // соседей строк не меньше, чем у документа в списке.
-                LazyVStack(alignment: .leading, spacing: 10) {
                 // Ключ — коллекция **и** идентификатор: поиск по нескольким
-                // коллекциям нарочно держит одинаковые идентификаторы из
-                // разных коллекций отдельными результатами, а `ForEach`
-                // с повтором ключа показывал одну карточку за обе.
+                // коллекциям держит одинаковые идентификаторы из разных
+                // коллекций отдельными результатами.
                 ForEach(Array(model.hits.enumerated()), id: \.element.listKey) { index, hit in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("#\(index + 1)").font(Theme.Font.caption).bold()
-                            // Из какой коллекции результат — в многоколлекционном
-                            // поиске это первое, что нужно знать о находке
-                            //. При поиске по одной коллекции строка
-                            // не нужна: она и так в шапке экрана.
-                            if !model.alsoSearchIn.isEmpty, let name = hit.collectionName {
-                                Text(name)
-                                    .font(Theme.Font.micro)
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                            .fill(Theme.Palette.subtleFill)
-                                    )
-                            }
-                            Text(hit.id).font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
-                            Spacer()
-                            // Метрика — той коллекции, из которой результат.
-                            // В многоколлекционном поиске у соседа она может
-                            // быть другой, и пересчитывать её расстояние в
-                            // проценты по чужой шкале значило бы показать
-                            // выдуманное число.
-                            Text(hit.queryHit.distanceText(metric: metric(of: hit, current: collection)))
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                            // замкнуть петлю «нашёл → понял → пошёл
-                            // к первоисточнику». Кнопка стоит у каждого
-                            // результата, а не в меню: ходить к исходнику
-                            // нужно на каждом втором.
-                            // Пометить прямо из выдачи: увидел, что фрагмент
-                            // мешает, — понизил, не уходя в список документов
-                            //.
-                            Menu {
-                                marksMenu(
-                                    for: DocumentRecord(
-                                        id: hit.id, document: hit.document, metadata: hit.metadata
-                                    ),
-                                    // Результат из соседней коллекции метится
-                                    // в ней самой, а не в открытой.
-                                    collectionName: hit.collectionName,
-                                    fromHit: true
-                                )
-                            } label: {
-                                Image(systemName: "bookmark").font(Theme.Font.caption)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .frame(width: 28)
-                            .help(String(localized: "Закрепить, понизить или пометить устаревшим"))
-                            Button(String(localized: "Показать в документе")) {
-                                viewer.open(
-                                    chunk: hit.document ?? "",
-                                    metadata: hit.metadata,
-                                    title: hit.metadata.flatMap { metadata in
-                                        DocumentLocator.reference(metadata: metadata).fileName
-                                    } ?? collection.name,
-                                    app: app
-                                )
-                            }
-                            .controlSize(.small)
-                            .disabled((hit.document ?? "").isEmpty)
-                        }
-                        marksLine(of: hit.metadata)
-                        // Редактор тегов открывается **здесь же**, у того
-                        // результата, с которого его позвали: строки этого
-                        // документа в списке слева может не быть вовсе —
-                        // он с другой страницы или вовсе из другой коллекции.
-                        if marksEditorID == hit.id, marksEditorFromHit,
-                           marksEditorCollection == hit.collectionName {
-                            marksEditor(
-                                for: DocumentRecord(
-                                    id: hit.id, document: hit.document, metadata: hit.metadata
-                                ),
-                                collectionName: hit.collectionName
-                            )
-                        }
-                        // A result that swallowed three others is a result the
-                        // user is entitled to know about.
-                        if let note = hit.collapsedNote {
-                            Text(note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        // Which chunk actually matched, when the card is
-                        // showing the section it belongs to.
-                        if let matched = hit.matchedChunkID {
-                            Text(String(localized: "раздел целиком; совпал чанк \(matched)"))
-                                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        // Which source found this one and where it stood before
-                        // the stages rearranged the list. Shown with the
-                        // diagnostics rather than always: on a card that is being
-                        // read for its text it is noise.
-                        if model.showDiagnostics, let origin = hit.originNote {
-                            Text(origin).font(Theme.Font.micro).foregroundStyle(.tertiary)
-                        }
-                        // Neighbours that stood *before* the match are drawn
-                        // before it, so the block reads as continuous text with
-                        // the found fragment in the middle.
-                        ForEach(neighbours(of: hit, before: true)) { attached in
-                            contextText(attached)
-                        }
-                        Text(hit.document ?? "—").font(Theme.Font.body).copyable(hit.document ?? "")
-                        ForEach(neighbours(of: hit, before: false)) { attached in
-                            contextText(attached)
-                        }
-                        // The parent shown beside the match rather than instead
-                        // of it — dimmed, because it is context and not what
-                        // the ranking is based on.
-                        ForEach(hit.context.filter { $0.contextKind == .parent }) { attached in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(String(localized: "контекст: родительский чанк"))
-                                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                                Text(attached.document ?? "—")
-                                    .font(Theme.Font.body).foregroundStyle(Theme.Palette.captionText)
-                                    .copyable(attached.document ?? "")
-                            }
-                            .padding(.leading, 8)
-                        }
-                        MetadataTable(metadata: hit.metadata)
-                    }
-                    .padding(10)
-                    .background(Color(nsColor: .textBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
+                    hitSection(hit, index: index, collection: collection)
                 }
             }
+            .formStyle(.grouped)
+        }
+        .confirmationDialog(
+            String(localized: "Очистить историю запросов?"),
+            isPresented: $confirmingHistoryClear,
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Очистить"), role: .destructive) { model.clearHistory(app) }
+            Button(String(localized: "Отменить"), role: .cancel) {}
+        } message: {
+            Text("Закреплённые и отмеченные для стенда запросы тоже будут удалены.")
         }
     }
 
-    /// Neighbouring chunks on one side of the match, in reading order.
-    private func neighbours(of hit: RetrievalHit, before: Bool) -> [RetrievalHit] {
-        guard let index = hit.chunkIndex else { return [] }
-        return hit.context.filter {
-            guard $0.contextKind == .neighbour, let position = $0.chunkIndex else { return false }
-            return before ? position < index : position > index
-        }
-    }
+    private func querySection(_ collection: ChromaCollection) -> some View {
+        Section {
+            // Enter выполняет запрос. Поле многострочное, и
+            // Return у него уходит не туда, куда ждёшь; замерено:
+            // Return и Shift+Return доходят до `onSubmit` без переноса,
+            // перенос строки даёт только Option+Return, а `onKeyPress`
+            // видит Return раньше поля. Поэтому обработчика два; два запуска
+            // разом отсекает `runQuery`.
+            TextField(String(localized: "Запрос"), text: $model.queryText, prompt: Text("Текст запроса"), axis: .vertical)
+                .labelsHidden()
+                .lineLimit(2...5)
+                .onKeyPress(phases: .down) { press in
+                    guard press.key == .return,
+                          press.modifiers.isDisjoint(with: [.option]) else { return .ignored }
+                    guard !model.isQuerying, collection.isBound else { return .ignored }
+                    Task { await model.runQuery(app) }
+                    return .handled
+                }
+                .onSubmit {
+                    guard !model.isQuerying, collection.isBound else { return }
+                    Task { await model.runQuery(app) }
+                }
+                .help(String(localized: "Enter — выполнить запрос, Option+Enter — перенос строки."))
 
-    /// Attached text, dimmed: it is what surrounds the answer, not the answer.
-    private func contextText(_ hit: RetrievalHit) -> some View {
-        Text(hit.document ?? "—")
-            .font(Theme.Font.body)
-            .foregroundStyle(.tertiary)
-            .copyable(hit.document ?? "")
-    }
+            Toggle(String(localized: "Умный поиск"), isOn: Binding(
+                get: { model.smartSearchEnabled },
+                set: { model.setSmartSearch($0, app: app) }
+            ))
+            .toggleStyle(.switch)
+            .help(String(localized: "Выключенный конвейер — это обычный векторный поиск. Настройки профиля при этом сохраняются."))
 
-    // MARK: - Search profiles
-
-    /// The switch, the profile in force, and everything one does with profiles.
-    ///
-    /// «Умный поиск» is a switch and nothing more: off, the query runs as the
-    /// plain vector search of stage 2, and the profile stays exactly as it was.
-    /// Without it, answering «а что найдёт обычный поиск?» would mean undoing
-    /// six settings and putting them back — which is how tuning gets lost.
-    @ViewBuilder
-    private func profileBar(_ collection: ChromaCollection) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Toggle(String(localized: "Умный поиск"), isOn: Binding(
-                    get: { model.smartSearchEnabled },
-                    set: { model.setSmartSearch($0, app: app) }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                // Иначе в узком окне подпись переносится по одной букве в
-                // строку: у выпадающего списка рядом ширина задана жёстко, и
-                // сжимается единственное, что может, — эта надпись.
-                .fixedSize()
-                .help(String(localized: "Выключенный конвейер — это обычный векторный поиск. Настройки профиля при этом сохраняются."))
-
-                if model.smartSearchEnabled {
+            if model.smartSearchEnabled {
+                LabeledContent(String(localized: "Профиль")) {
                     Picker(String(localized: "Профиль"), selection: Binding(
                         get: { model.activeProfileID },
                         set: { identifier in
@@ -1289,18 +923,14 @@ struct CollectionsView: View {
                             Text(profile.name).tag(Optional(profile.id))
                         }
                         if model.profiles.isEmpty {
-                            // The profile a search uses when nobody has tuned
-                            // anything. It has no id because it is not on disk.
+                            // Профиль, которым ищут, пока никто ничего не
+                            // настраивал. У него нет id: на диске его нет.
                             Text(String(localized: "По умолчанию")).tag(model.activeProfileID)
                         }
                     }
-                    // Список — то, что уступает место: имя профиля читается и
-                    // укороченным, а «Умный поиск» по букве в строку — нет.
-                    .frame(minWidth: 140, idealWidth: 260, maxWidth: 260)
-
+                    .labelsHidden()
+                    .fixedSize()
                     Button(String(localized: "Настроить…")) { model.editActiveProfile(app) }
-                        .fixedSize()
-
                     Menu {
                         Button(String(localized: "Новый профиль…")) { model.newProfile(app) }
                         Button(String(localized: "Дублировать действующий…")) { model.duplicateActiveProfile(app) }
@@ -1308,30 +938,381 @@ struct CollectionsView: View {
                         Button(String(localized: "Экспорт профилей…")) { model.exportProfiles(app) }
                         Button(String(localized: "Импорт профилей…")) { model.importProfiles(app) }
                         Divider()
-                        Button(String(localized: "Удалить действующий профиль"), role: .destructive) {
-                            model.deleteActiveProfile(app)
+                        Button(String(localized: "Удалить действующий профиль…"), role: .destructive) {
+                            confirmingProfileDeletion = true
                         }
                         .disabled(model.profiles.isEmpty)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
                     .menuStyle(.borderlessButton)
-                    .frame(width: 40)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(String(localized: "Профили поиска"))
+                    .accessibilityLabel(String(localized: "Профили поиска"))
+                    .confirmationDialog(
+                        String(localized: "Удалить профиль «\(activeProfileName)»?"),
+                        isPresented: $confirmingProfileDeletion,
+                        titleVisibility: .visible
+                    ) {
+                        Button(String(localized: "Удалить"), role: .destructive) { model.deleteActiveProfile(app) }
+                        Button(String(localized: "Отменить"), role: .cancel) {}
+                    } message: {
+                        Text("Его настройки поиска пропадут. Документы коллекции не затронуты.")
+                    }
                 }
-                Spacer()
             }
 
-            if !model.smartSearchEnabled {
-                Text(String(localized: "Конвейер выключен: запрос идёт как обычный векторный поиск этапа 2. Иерархия, соседи, разнообразие и переранжирование не применяются."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            } else if model.lastRetrieval?.unchangedByProfile == true {
-                // Прямо здесь, а не в свёрнутой панели диагностики:
-                // человек, у которого галочка не меняет выдачу, ищет причину
-                // у переключателя, а не в разделе «как получен результат».
-                Text(String(localized: "Этот профиль не изменил выдачу: свёртка и подъём к разделу доступны только коллекции с двумя уровнями чанков, пометок в выдаче нет, а остальные стадии выключены. Разницу с обычным поиском дадут «Текстовый поиск» (точные слова запроса), «Разнообразие» или «Соседние чанки» — они включаются в «Настроить…»."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                    .fixedSize(horizontal: false, vertical: true)
+            // Поле со стрелками, как все числа в формах (v6 A2).
+            StepperRow(String(localized: "Результатов"), value: $model.numberOfResults, in: 1...RetrievalLimits.maximumResults)
+
+            if !model.filter.isEmpty {
+                Toggle(String(localized: "Применять фильтр"), isOn: $model.applyFilterToQuery)
+                    .toggleStyle(.switch)
+                    .help(String(localized: "Условия из фильтра применяются к запросу вместе с вектором."))
             }
+
+            alsoSearchInRow(collection)
+
+            HStack {
+                // «История запросов» — в меню «⋯» тулбара (v6).
+                Spacer()
+                if model.isQuerying { ProgressView().controlSize(.small) }
+                Button(String(localized: "Выполнить")) {
+                    Task { await model.runQuery(app) }
+                }
+                .disabled(model.isQuerying || !collection.isBound)
+                .help(String(localized: "Выполнить поиск (⌘↩)"))
+            }
+        } header: {
+            SectionHeader(
+                String(localized: "Запрос"),
+                help: String(localized: "Текст превращается в вектор моделью коллекции, затем ищутся ближайшие документы. Конвейер умного поиска добавляет к этому текстовый поиск, иерархию, соседние чанки, разнообразие и переранжирование — по профилю.")
+            )
+        } footer: {
+            if !collection.isBound {
+                Notice(.warning, String(localized: "Запрос заблокирован: у коллекции не указана модель. Другой моделью выполнять его нельзя — результаты будут бессмысленными."))
+            } else if !model.smartSearchEnabled {
+                Text("Конвейер выключен: запрос идёт как обычный векторный поиск.")
+            } else if model.lastRetrieval?.unchangedByProfile == true {
+                // Прямо здесь, а не в свёрнутой диагностике: человек,
+                // у которого галочка не меняет выдачу, ищет причину у неё.
+                Notice(.info, String(localized: "Этот профиль не изменил выдачу: свёртка и подъём к разделу доступны только коллекции с двумя уровнями чанков, пометок в выдаче нет, а остальные стадии выключены. Разницу с обычным поиском дадут «Текстовый поиск», «Разнообразие» или «Соседние чанки» — они включаются в «Настроить…»."))
+            } else if !model.alsoSearchIn.isEmpty {
+                Text(multiModelNote(collection))
+            }
+        }
+    }
+
+    /// Какие коллекции ищутся вместе с открытой. Меню, а не список
+    /// флажков: коллекций бывает два десятка, и поиск по одной — самый
+    /// частый случай.
+    @ViewBuilder
+    private func alsoSearchInRow(_ collection: ChromaCollection) -> some View {
+        let others = model.collections.filter { $0.name != collection.name }
+        if !others.isEmpty {
+            // «Где искать» — одним согласованным выбором (v6): только здесь, во
+            // всех или в выбранных.
+            let searchable = others.filter(\.isBound).map(\.name)
+            // Считаются только существующие коллекции: в выборе могут
+            // остаться имена удалённых.
+            let chosen = model.alsoSearchIn.intersection(others.map(\.name))
+            LabeledContent(String(localized: "Где искать")) {
+                Menu(chosen.isEmpty
+                     ? String(localized: "Только в этой коллекции")
+                     : (!searchable.isEmpty && Set(searchable).isSubset(of: chosen)
+                        ? String(localized: "Во всех коллекциях")
+                        : String(localized: "В выбранных: \((chosen.count + 1).plainDigits)"))) {
+                    Button(String(localized: "Только в этой коллекции")) { model.alsoSearchIn = [] }
+                    Button(String(localized: "Во всех коллекциях")) { model.alsoSearchIn = Set(searchable) }
+                        .disabled(searchable.isEmpty)
+                    Divider()
+                    ForEach(others, id: \.id) { other in
+                        Toggle(isOn: Binding(
+                            get: { model.alsoSearchIn.contains(other.name) },
+                            set: { isOn in
+                                if isOn { model.alsoSearchIn.insert(other.name) } else { model.alsoSearchIn.remove(other.name) }
+                            }
+                        )) {
+                            // Коллекция без модели искать не может — это сказано
+                            // в строке выбора, а не после запроса.
+                            Text(other.isBound ? other.name : String(localized: "\(other.name) — нет модели"))
+                        }
+                        .disabled(!other.isBound)
+                    }
+                }
+                .fixedSize()
+                .help(([collection.name] + model.alsoSearchIn.sorted()).joined(separator: ", "))
+            }
+        }
+    }
+
+    /// Сколько моделей затронет запрос — столько раз и посчитается вектор.
+    private func multiModelNote(_ collection: ChromaCollection) -> String {
+        let names = Set([collection.name]).union(model.alsoSearchIn)
+        let chosen = model.collections.filter { names.contains($0.name) }
+        let models = Set(chosen.compactMap { $0.boundModel })
+        let metrics = Set(chosen.compactMap { $0.space })
+        var line = String(localized: "Ищем в: \(([collection.name] + model.alsoSearchIn.sorted()).joined(separator: ", ")). ")
+        line += String(localized: "Вектор запроса считается по разу на модель: моделей \(models.count.plainDigits).")
+        if metrics.count > 1 {
+            line += String(localized: " Метрики у коллекций разные, поэтому порядок задаётся слиянием рангов, а не расстояниями.")
+        }
+        return line
+    }
+
+    /// Что ответила каждая коллекция: коллекция, не ответившая из-за
+    /// ошибки, в общей выдаче выглядит ровно как пустая.
+    private var collectionsReport: some View {
+        Section {
+            ForEach(model.searchReports, id: \.self) { report in
+                if let failure = report.failure {
+                    LabeledContent {
+                        Text(failure)
+                            .lineLimit(2)
+                            .help(failure)
+                    } label: {
+                        StatusLabel(.error, report.name)
+                    }
+                } else {
+                    LabeledContent {
+                        Text("найдено \(report.found.plainDigits), \(Int((report.seconds * 1000).rounded()).plainDigits) мс")
+                            .monospacedDigit()
+                    } label: {
+                        StatusLabel(.ok, report.name)
+                    }
+                }
+            }
+        } header: {
+            Text(model.searchSummary ?? String(localized: "Коллекции"))
+        }
+    }
+
+    /// Метрика коллекции, из которой пришёл результат.
+    private func metric(of hit: RetrievalHit, current: ChromaCollection) -> DistanceMetric? {
+        guard let name = hit.collectionName, name != current.name else { return current.space }
+        return model.collections.first { $0.name == name }?.space ?? current.space
+    }
+
+    /// «Как получен этот результат»: что каждая стадия получила, что отдала,
+    /// почему и сколько заняла. Свёрнуто: читать результат и объяснять его —
+    /// разные задачи, и вторая реже.
+    private func diagnosticsSection(_ diagnostics: RetrievalDiagnostics) -> some View {
+        Section {
+            DisclosureGroup(isExpanded: $model.showDiagnostics) {
+                if let note = diagnostics.note {
+                    Notice(.info, note)
+                }
+                if let embedding = diagnostics.embeddingLine {
+                    LabeledContent(String(localized: "Вектор запроса"), value: embedding)
+                }
+                ForEach(diagnostics.stages.sorted { $0.stage.order < $1.stage.order }) { report in
+                    stageRow(report, slowest: diagnostics.slowestStage)
+                }
+                LabeledContent {
+                    Button(String(localized: "Скопировать")) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(diagnostics.plainText, forType: .string)
+                    }
+                    .help(String(localized: "Панель хранит только последний запрос — скопированный текст можно приложить к вопросу."))
+                } label: {
+                    Text(String(localized: "Всего: \(Int((diagnostics.totalDuration * 1000).rounded())) мс"))
+                        .monospacedDigit()
+                }
+            } label: {
+                LabeledContent(String(localized: "Как получен этот результат"), value: diagnostics.summary)
+                    .togglesDisclosure($model.showDiagnostics)
+            }
+        }
+    }
+
+    /// Стадия: что получила, что вернула, сколько заняла и почему. Не
+    /// сработавшая показана, а не спрятана: «почему не сработало» — вопрос,
+    /// ради которого панель и есть.
+    private func stageRow(_ report: RetrievalDiagnostics.StageReport, slowest: RetrievalStage?) -> some View {
+        LabeledContent {
+            if report.ran {
+                Text(report.inputCount == report.outputCount
+                     ? String(localized: "\(report.outputCount)")
+                     : String(localized: "\(report.inputCount) → \(report.outputCount)"))
+                    .monospacedDigit()
+                Text(String(localized: "\(Int((report.duration * 1000).rounded())) мс"))
+                    .monospacedDigit()
+                    .foregroundStyle(report.stage == slowest ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+            } else {
+                // «Выключено» и «не выполнено» — разные новости.
+                if report.failed {
+                    StatusLabel(.warning, report.outcome.title)
+                } else {
+                    Text(report.outcome.title).foregroundStyle(.secondary)
+                }
+            }
+        } label: {
+            VStack(alignment: .leading) {
+                Text("\(report.stage.order). \(report.stage.title)")
+                if let note = report.note {
+                    Text(note)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .foregroundStyle(report.ran || report.failed ? .primary : .secondary)
+    }
+
+    /// Один результат — своя секция: откуда он, насколько близок, его текст
+    /// в окружении соседей, пометки и метаданные.
+    private func hitSection(_ hit: RetrievalHit, index: Int, collection: ChromaCollection) -> some View {
+        let record = DocumentRecord(id: hit.id, document: hit.document, metadata: hit.metadata)
+        let metadataKey = hit.listKey
+        return Section {
+            // Соседи до совпадения — до него, после — после: блок читается
+            // сплошным текстом с найденным фрагментом посередине.
+            ForEach(neighbours(of: hit, before: true)) { attached in
+                contextText(attached)
+            }
+            documentText(hit.document)
+            ForEach(neighbours(of: hit, before: false)) { attached in
+                contextText(attached)
+            }
+            // Родитель — рядом с совпадением, а не вместо него: это контекст,
+            // а не то, по чему ранжировали.
+            ForEach(hit.context.filter { $0.contextKind == .parent }) { attached in
+                VStack(alignment: .leading) {
+                    Text("контекст: родительский чанк")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    contextText(attached)
+                }
+            }
+            // Результат, поглотивший три других, — результат, о котором
+            // человек вправе знать.
+            if let note = hit.collapsedNote {
+                Text(note).font(.callout).foregroundStyle(.secondary)
+            }
+            if let matched = hit.matchedChunkID {
+                Text(String(localized: "раздел целиком; совпал чанк \(matched)"))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if model.showDiagnostics, let origin = hit.originNote {
+                Text(origin).font(.callout).foregroundStyle(.tertiary)
+            }
+            marksLine(of: hit.metadata)
+            // Редактор тегов — здесь же, у этого результата: строки документа
+            // в списке может не быть вовсе.
+            if marksEditorID == hit.id, marksEditorFromHit, marksEditorCollection == hit.collectionName {
+                marksEditor(for: record, collectionName: hit.collectionName)
+            }
+            DisclosureGroup(isExpanded: Binding(
+                get: { hitsWithMetadata.contains(metadataKey) },
+                set: { shown in
+                    if shown { hitsWithMetadata.insert(metadataKey) } else { hitsWithMetadata.remove(metadataKey) }
+                }
+            )) {
+                ForEach((hit.metadata ?? [:]).keys.sorted(), id: \.self) { key in
+                    let value = hit.metadata?[key]?.displayString ?? ""
+                    LabeledContent(key) {
+                        Text(value).lineLimit(2).truncationMode(.middle).copyable(value).help(value)
+                    }
+                    .font(.callout)
+                }
+            } label: {
+                Text("Метаданные")
+                    .togglesDisclosure(Binding(
+                        get: { hitsWithMetadata.contains(metadataKey) },
+                        set: { shown in
+                            if shown { hitsWithMetadata.insert(metadataKey) } else { hitsWithMetadata.remove(metadataKey) }
+                        }
+                    ))
+            }
+            HStack {
+                Spacer()
+                // Пометить прямо из выдачи; результат из соседней
+                // коллекции метится в ней самой.
+                Menu(String(localized: "Пометить")) {
+                    marksMenu(for: record, collectionName: hit.collectionName, fromHit: true)
+                }
+                .fixedSize()
+                .help(String(localized: "Закрепить, понизить или пометить устаревшим"))
+                // от найденного — к первоисточнику.
+                Button(String(localized: "Показать в документе…")) {
+                    viewer.open(
+                        chunk: hit.document ?? "",
+                        metadata: hit.metadata,
+                        title: hit.metadata.flatMap { metadata in
+                            DocumentLocator.reference(metadata: metadata).fileName
+                        } ?? collection.name,
+                        app: app
+                    )
+                }
+                .disabled((hit.document ?? "").isEmpty)
+            }
+        } header: {
+            HStack {
+                Text("\(index + 1).")
+                    .monospacedDigit()
+                // Из какой коллекции результат — в многоколлекционном поиске
+                // это первое, что нужно знать о находке.
+                if !model.alsoSearchIn.isEmpty, let name = hit.collectionName {
+                    Text(name).foregroundStyle(.secondary)
+                }
+                Text(hit.id)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                // Метрика — той коллекции, откуда результат.
+                Text(hit.queryHit.distanceText(metric: metric(of: hit, current: collection)))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+        } footer: {
+            if index == 0, model.alsoSearchIn.isEmpty {
+                // Шкала зависит от метрики — какой именно, сказано здесь.
+                Text(collection.space.map { metric in
+                    metric == .cosine
+                        ? String(localized: "Метрика \(metric.shortTitle): рядом с расстоянием показана схожесть.")
+                        : String(localized: "Метрика \(metric.shortTitle): показано сырое значение, в процентах его выразить нельзя.")
+                } ?? String(localized: "Метрика коллекции неизвестна — значения показаны как есть, без интерпретации."))
+            }
+        }
+    }
+
+    /// Соседние чанки с одной стороны от совпадения, в порядке чтения.
+    private func neighbours(of hit: RetrievalHit, before: Bool) -> [RetrievalHit] {
+        guard let index = hit.chunkIndex else { return [] }
+        return hit.context.filter {
+            guard $0.contextKind == .neighbour, let position = $0.chunkIndex else { return false }
+            return before ? position < index : position > index
+        }
+    }
+
+    /// Приложенный текст — приглушённо: это то, что вокруг ответа.
+    private func contextText(_ hit: RetrievalHit) -> some View {
+        documentText(hit.document)
+            .foregroundStyle(.tertiary)
+    }
+
+    /// Текст документа на экране — началом, без управляющих символов,
+    /// двоичное — словами. Скопировать можно весь.
+    @ViewBuilder
+    private func documentText(_ text: String?) -> some View {
+        let preview = DisplayText.preview(text)
+        if preview.looksBinary {
+            Notice(.warning, String(localized: "Похоже на двоичные данные, а не на текст: \(preview.totalCharacters.plainDigits) знаков, из них управляющих в начале — \(preview.controlCharacters.plainDigits). Скорее всего, файл попал в базу без извлечения текста: удалите документ или переиндексируйте источник."))
+                .copyable(text ?? "")
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(preview.text.isEmpty ? "—" : preview.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if preview.isTruncated {
+                    Text("Показаны первые \(preview.text.count.plainDigits) из \(preview.totalCharacters.plainDigits) знаков; целиком — «Скопировать» в контекстном меню.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .copyable(text ?? "")
         }
     }
 
@@ -1357,185 +1338,69 @@ struct CollectionsView: View {
         }
     }
 
-    // MARK: - Diagnostics
-
-    /// «Как получен этот результат»: what each stage was given, what it gave
-    /// back, why, and how long it took.
-    ///
-    /// Collapsed by default — reading a result and explaining a result are
-    /// different tasks, and the second one is rarer. Without the panel, though,
-    /// tuning the pipeline is guesswork and «поиск стал хуже» is unanswerable:
-    /// eight stages can each be the one that dropped the document the user
-    /// expected, and nothing on the card says which.
-    @ViewBuilder
-    private func diagnosticsPanel(_ diagnostics: RetrievalDiagnostics) -> some View {
-        DisclosureGroup(isExpanded: $model.showDiagnostics) {
-            VStack(alignment: .leading, spacing: 6) {
-                // Why the run looked the way it did, when the reason is not any
-                // one stage — «умный поиск выключен» being the case that
-                // otherwise leaves eight stages all blaming the profile.
-                if let note = diagnostics.note {
-                    Text(note).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                }
-                if let embedding = diagnostics.embeddingLine {
-                    HStack(spacing: 8) {
-                        Text(embedding).font(Theme.Font.caption)
-                        Text(String(localized: "считается моделью, не конвейером"))
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    }
-                }
-                ForEach(diagnostics.stages.sorted { $0.stage.order < $1.stage.order }) { report in
-                    stageRow(report, slowest: diagnostics.slowestStage)
-                }
-                Divider()
-                HStack {
-                    Text(String(localized: "Всего: \(Int((diagnostics.totalDuration * 1000).rounded())) мс"))
-                        .font(Theme.Font.caption).bold()
-                    Spacer()
-                    Button(String(localized: "Скопировать")) {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(diagnostics.plainText, forType: .string)
-                    }
-                    .controlSize(.small)
-                    .help(String(localized: "Панель хранит только последний запрос — скопированный текст можно приложить к вопросу."))
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            HStack(spacing: 8) {
-                Text(String(localized: "Как получен этот результат")).font(Theme.Font.caption).bold()
-                Text(diagnostics.summary).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            }
-            .togglesDisclosure($model.showDiagnostics)
-        }
-        .padding(10)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    /// One stage: what it was given, what it returned, how long it took, and why.
-    ///
-    /// A stage that did not run is shown greyed rather than hidden — «почему не
-    /// сработало» is the question the panel exists to answer, and a stage that
-    /// is simply absent from the list answers nothing.
-    private func stageRow(_ report: RetrievalDiagnostics.StageReport, slowest: RetrievalStage?) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(report.stage.order).")
-                .font(Theme.Font.mono)
-                .foregroundStyle(Theme.Palette.captionText)
-                .frame(width: 16, alignment: .trailing)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
-                    Text(report.stage.title).font(Theme.Font.caption)
-                    if report.ran {
-                        Text(report.inputCount == report.outputCount
-                             ? String(localized: "\(report.outputCount)")
-                             : String(localized: "\(report.inputCount) → \(report.outputCount)"))
-                            .font(Theme.Font.mono)
-                            .foregroundStyle(Theme.Palette.captionText)
-                        Text(String(localized: "\(Int((report.duration * 1000).rounded())) мс"))
-                            .font(Theme.Font.micro)
-                            .foregroundStyle(report.stage == slowest ? .orange : .secondary)
-                    } else {
-                        // «Выключено» и «не выполнено» — разные новости, и
-                        // печатать их одним словом значило делать жалобу
-                        // «настройка не сработала» неразрешимой.
-                        Text(report.outcome.title)
-                            .font(Theme.Font.micro)
-                            .foregroundStyle(report.failed ? .orange : .secondary)
-                    }
-                }
-                if let note = report.note {
-                    Text(note)
-                        .font(Theme.Font.micro)
-                        .foregroundStyle(report.failed ? .orange : .secondary)
-                }
-            }
-            Spacer()
-        }
-        .opacity(report.ran || report.failed ? 1 : 0.65)
-    }
-
-    // MARK: - History
-
-    /// Past queries of this collection: repeat one, pin it, or mark it for the
-    /// evaluation stand's query set.
-    ///
-    /// The last of those is the point of the panel. Nobody writes twenty
-    /// representative queries by hand; everybody has already typed them.
-    @ViewBuilder
-    private func historyPanel(_ collection: ChromaCollection) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                TextField(String(localized: "поиск по истории"), text: $model.historySearch)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: model.historySearch) { _, _ in model.reloadHistory(app) }
-                Spacer()
-                Button(String(localized: "Очистить историю"), role: .destructive) {
-                    model.clearHistory(app)
-                }
-                .disabled(model.history.isEmpty)
-            }
-
+    /// Прошлые запросы коллекции: подставить, закрепить, отметить для
+    /// набора стенда оценки. Последнее — смысл панели: двадцать показательных
+    /// запросов руками не пишет никто, а набрал их уже каждый.
+    private func historySection(_ collection: ChromaCollection) -> some View {
+        Section {
+            TextField(String(localized: "Поиск по истории"), text: $model.historySearch, prompt: Text("поиск по истории"))
+                .onChange(of: model.historySearch) { _, _ in model.reloadHistory(app) }
             if model.history.isEmpty {
-                Text(String(localized: "Здесь появятся запросы, которые вы выполняли к этой коллекции."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Text("Здесь появятся запросы, которые вы выполняли к этой коллекции.")
+                    .foregroundStyle(.secondary)
             }
-
-            // История держит до тысячи записей — строить их все, чтобы
-            // показать десяток видимых, не стоит ничего хорошего.
-            LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(model.history) { entry in
-                HStack(alignment: .top, spacing: 8) {
-                    Button {
-                        model.togglePinned(entry, app: app)
-                    } label: {
-                        Image(systemName: entry.isPinned ? "pin.fill" : "pin")
-                    }
-                    .buttonStyle(.borderless)
-                    .help(String(localized: "Закрепить: закреплённые не вытесняются и стоят вверху."))
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(entry.text).font(Theme.Font.body).lineLimit(2)
-                        HStack(spacing: 6) {
-                            Text(entry.line)
-                            Text(entry.ranAt.formatted(date: .abbreviated, time: .shortened))
-                            if entry.filter != nil {
-                                Text(String(localized: "· с фильтром"))
-                            }
-                        }
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-
+                LabeledContent {
                     Button(String(localized: "Подставить")) { model.restore(entry) }
                         .help(String(localized: "Запрос вернётся в поле вместе с фильтром. Выполнить его — отдельная кнопка."))
-                    Button {
-                        model.toggleChosenForEvaluation(entry, app: app)
+                    Menu {
+                        Button(entry.isPinned ? String(localized: "Открепить") : String(localized: "Закрепить")) {
+                            model.togglePinned(entry, app: app)
+                        }
+                        Button(entry.isChosenForEvaluation
+                               ? String(localized: "Убрать из набора стенда")
+                               : String(localized: "Отметить для набора стенда")) {
+                            model.toggleChosenForEvaluation(entry, app: app)
+                        }
+                        Divider()
+                        Button(String(localized: "Удалить из истории"), role: .destructive) {
+                            model.removeFromHistory(entry, app: app)
+                        }
                     } label: {
-                        Label(
-                            entry.isChosenForEvaluation
-                                ? String(localized: "В наборе")
-                                : String(localized: "В набор"),
-                            systemImage: entry.isChosenForEvaluation ? "checkmark.seal.fill" : "checkmark.seal"
-                        )
+                        Image(systemName: "ellipsis.circle")
                     }
-                    .help(String(localized: "Отметить для набора запросов стенда оценки качества."))
-                    Button {
-                        model.removeFromHistory(entry, app: app)
-                    } label: {
-                        Image(systemName: "xmark")
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(String(localized: "Закрепить, отметить для стенда, удалить"))
+                    .accessibilityLabel(String(localized: "Действия с запросом"))
+                } label: {
+                    VStack(alignment: .leading) {
+                        HStack {
+                            if entry.isPinned {
+                                Image(systemName: "pin.fill").foregroundStyle(.secondary)
+                                    .accessibilityLabel(String(localized: "закреплён"))
+                            }
+                            if entry.isChosenForEvaluation {
+                                Image(systemName: "checkmark.seal.fill").foregroundStyle(.secondary)
+                                    .accessibilityLabel(String(localized: "в наборе стенда"))
+                            }
+                            Text(entry.text).lineLimit(2)
+                        }
+                        Text("\(entry.line) · \(entry.ranAt.formatted(date: .abbreviated, time: .shortened))\(entry.filter != nil ? String(localized: " · с фильтром") : "")")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.borderless)
                 }
-                .padding(.vertical, 3)
-                Divider()
             }
+            HStack {
+                Spacer()
+                Button(String(localized: "Очистить историю…"), role: .destructive) { confirmingHistoryClear = true }
+                    .disabled(model.history.isEmpty)
             }
+        } header: {
+            Text("История")
         }
-        .padding(10)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: - Documents
@@ -1546,66 +1411,242 @@ struct CollectionsView: View {
     /// листание — под «?», кнопка «Показать ещё» — в конце списка, где её и
     /// ищут. Раньше это был голый `VStack` без карточки, а объяснение про
     /// порядок страниц висело абзацем под кнопкой.
-    private func documentsSection(_ collection: ChromaCollection) -> some View {
-        SectionCard(
-            title: String(localized: "Документы"),
-            subtitle: model.appliedFilterDescription == nil
+    // MARK: - Документы
+
+    private var selectedDocuments: [DocumentRecord] {
+        model.documents.filter { selectedDocumentIDs.contains($0.id) }
+    }
+
+    private var inspectedDocument: DocumentRecord? {
+        let chosen = selectedDocuments
+        return chosen.count == 1 ? chosen.first : nil
+    }
+
+    /// «Документы» — тип Б: таблица страницы документов, подробности
+    /// выбранного — в инспекторе справа.
+    private func documentsScreen(_ collection: ChromaCollection) -> some View {
+        VStack(spacing: 0) {
+            reembeddingCards
+            appliedFilterNote
+            // Листание limit/offset порядка не обещает; если коллекция
+            // меняется под списком, это сказано.
+            if let notice = model.contentChangedNotice {
+                Notice(.warning, notice)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+            }
+            documentsTable
+                .overlay {
+                    if model.documents.isEmpty && !model.isLoadingDocuments {
+                        if model.appliedFilterDescription == nil {
+                            ContentUnavailableView {
+                                Label(String(localized: "Документов нет"), systemImage: "doc.text")
+                            } description: {
+                                Text("В коллекции пока нет документов.")
+                            }
+                        } else {
+                            ContentUnavailableView {
+                                Label(String(localized: "Ничего не нашлось"), systemImage: "line.3.horizontal.decrease.circle")
+                            } description: {
+                                Text("Под фильтр ничего не подошло.")
+                            } actions: {
+                                Button(String(localized: "Сбросить фильтр")) {
+                                    Task { await model.clearFilter(app) }
+                                }
+                            }
+                        }
+                    }
+                }
+            documentsFooter(collection)
+        }
+        .onChange(of: selectedDocumentIDs) { _, _ in
+            if let document = inspectedDocument {
+                Task { await model.loadVector(for: document, app: app) }
+            }
+        }
+    }
+
+    private var documentsTable: some View {
+        // Строки однострочные (v3): фрагмент — одной строкой, целиком — в
+        // инспекторе и по наведению.
+        Table(model.documents, selection: $selectedDocumentIDs, columnCustomization: $documentColumns) {
+            TableColumn(String(localized: "ID")) { document in
+                Text(document.id)
+                    .font(.body.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(document.id)
+            }
+            .width(min: 70, ideal: 130, max: 180)
+            .customizationID("documents.id")
+            TableColumn(String(localized: "Фрагмент")) { document in
+                Text(document.preview)
+                    .lineLimit(1)
+                    .help(document.preview)
+            }
+            // Главная колонка — но с пределом: без него она забирала всё
+            // свободное место, а ID и источник жались к минимуму.
+            .width(min: 70, ideal: 240, max: 320)
+            .customizationID("documents.фрагмент")
+            TableColumn(String(localized: "Источник")) { document in
+                let source = Self.source(of: document)
+                Text(source.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "—")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(source ?? "")
+            }
+            .width(min: 60, ideal: 140, max: 240)
+            .customizationID("documents.источник")
+            TableColumn(String(localized: "Чанк")) { document in
+                Text(document.metadata?["chunk_index"]?.displayString ?? "—")
+                    .monospacedDigit()
+            }
+            .width(min: 40, ideal: 56, max: 100)
+            .alignment(.numeric)
+            .customizationID("documents.чанк")
+            TableColumn(String(localized: "Токены")) { document in
+                Text(document.metadata?["chunk_estimated_tokens"]?.displayString ?? "—")
+                    .monospacedDigit()
+            }
+            .width(min: 52, ideal: 64, max: 100)
+            .alignment(.numeric)
+            .customizationID("documents.токены")
+            // Значком (v5): слово «закреплён» в узкой колонке обрезалось.
+            // Слово — в подсказке и для VoiceOver.
+            TableColumn(String(localized: "Метка")) { document in
+                if let mark = DocumentMarks(metadata: document.metadata).mark {
+                    Image(systemName: Self.symbol(for: mark))
+                        .foregroundStyle(.secondary)
+                        .help(mark.title)
+                        .accessibilityLabel(mark.title)
+                }
+            }
+            // Постоянной ширины: заголовок целиком, а шире значку незачем.
+            // «Метка», а не «Пометка»: на 900 pt таблице дорог каждый пункт.
+            .width(52)
+            .customizationID("documents.пометка")
+        }
+        .contextMenu(forSelectionType: String.self) { ids in
+            let chosen = model.documents.filter { ids.contains($0.id) }
+            if chosen.count == 1, let document = chosen.first {
+                Button(String(localized: "Изменить текст…")) { model.beginEditing(document, app: app) }
+                Button(String(localized: "Изменить метаданные…")) {
+                    metadataDraft = MetadataDraft(metadata: document.metadata)
+                    metadataEditorID = document.id
+                }
+                Divider()
+                marksMenu(for: document)
+                Divider()
+                Button(String(localized: "Скопировать ID")) { copy(document.id) }
+            }
+            if !chosen.isEmpty {
+                Divider()
+                Button(String(localized: "Удалить…"), role: .destructive) { documentsToDelete = chosen }
+            }
+        } primaryAction: { ids in
+            selectedDocumentIDs = ids
+            showsInspector = true
+        }
+        .onDeleteCommand { documentsToDelete = selectedDocuments }
+        .copyable(selectedDocuments.map(\.id))
+    }
+
+    private func documentsFooter(_ collection: ChromaCollection) -> some View {
+        TableFooter(
+            model.appliedFilterDescription == nil
                 ? String(localized: "Показано \(model.documents.count.formatted()) из \(collection.documentCount.map { $0.formatted() } ?? "?").")
                 : String(localized: "Найдено по фильтру: \(model.documents.count.formatted())."),
             help: String(localized: "ChromaDB не гарантирует порядок выдачи при листании: если коллекция меняется, страницы могут повторяться или пропускаться. Для точной работы с конкретными документами пользуйтесь фильтром.")
         ) {
-            VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                // Paging by limit/offset has no guaranteed order; when the
-                // collection changes under the list, say so.
-                if let notice = model.contentChangedNotice {
-                    MessageBanner(kind: .warning, text: notice)
+            if model.isLoadingDocuments { ProgressView().controlSize(.small) }
+            if model.canLoadMore {
+                Button(String(localized: "Показать ещё \(CollectionsViewModel.pageSize)")) {
+                    Task { await model.loadDocuments(app, reset: false) }
                 }
+                .disabled(model.isLoadingDocuments)
+            }
+            Button {
+                Task { await model.reloadCurrentPage(app) }
+            } label: {
+                Label(String(localized: "Обновить страницу"), systemImage: "arrow.clockwise")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.isLoadingDocuments || model.documents.isEmpty)
+            .help(String(localized: "Обновить страницу"))
+        }
+    }
 
-                if let applied = model.appliedFilterDescription {
-                    Text(applied)
-                        .font(Theme.Font.mono)
-                        .foregroundStyle(Theme.Palette.secondaryText)
-                        .lineLimit(2)
+    /// Значок ручной пометки документа.
+    private static func symbol(for mark: DocumentMark) -> String {
+        switch mark {
+        case .pinned: return "pin.fill"
+        case .demoted: return "arrow.down.circle"
+        case .stale: return "clock.badge.exclamationmark"
+        }
+    }
+
+    private static func source(of document: DocumentRecord) -> String? {
+        document.metadata?["source_file"]?.displayString ?? document.metadata?["file_name"]?.displayString
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Подробности документа: полный текст, пометки, метаданные, вектор.
+    private func documentInspector(_ document: DocumentRecord) -> some View {
+        let marks = DocumentMarks(metadata: document.metadata)
+        return Form {
+            // Действия над документом — в контекстном меню строки, здесь их
+            // не дублируем (v3).
+            Section {
+                InspectorField(String(localized: "Идентификатор"), document.id, monospaced: true)
+                    .copyable(document.id)
+            }
+            // Текст — своей секцией без подписи слева; длинный прокручивает
+            // весь инспектор.
+            Section {
+                documentText(document.document)
+            } header: {
+                Text("Текст")
+            }
+            Section {
+                LabeledContent(String(localized: "Пометка"), value: marks.mark?.title ?? String(localized: "нет"))
+                if !marks.tags.isEmpty {
+                    LabeledContent(String(localized: "Теги"), value: marks.tagsLine)
                 }
-
-                if model.documents.isEmpty && !model.isLoadingDocuments {
-                    Text(model.appliedFilterDescription == nil
-                         ? String(localized: "В коллекции пока нет документов.")
-                         : String(localized: "Под фильтр ничего не подошло."))
-                        .font(Theme.Font.body)
-                        .foregroundStyle(Theme.Palette.captionText)
+                if let note = marks.note, !note.isEmpty {
+                    InspectorField(String(localized: "Заметка"), note)
                 }
-
-                // Lazy, and that is the whole difference between a tab that opens
-                // and a tab you wait for. A plain VStack builds every row at once,
-                // including the ninety-odd below the fold: a page of 100 documents
-                // with two dozen metadata keys each is some five thousand views
-                // assembled on the main thread before the screen appears. Measured
-                // on this machine: 1.65 s to enter the tab, 0.33 s with this line.
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(model.documents) { document in
-                        documentRow(document)
-                    }
+            } header: {
+                Text("Пометки")
+            } footer: {
+                Text("Теги видны агенту и годятся для фильтра по метаданным.")
+            }
+            Section {
+                ForEach((document.metadata ?? [:]).keys.sorted(), id: \.self) { key in
+                    InspectorField(key, document.metadata?[key]?.displayString ?? "")
                 }
-
-                HStack(spacing: 8) {
-                    if model.canLoadMore {
-                        Button(String(localized: "Показать ещё \(CollectionsViewModel.pageSize)")) {
-                            Task { await model.loadDocuments(app, reset: false) }
-                        }
-                        .buttonStyle(.chromaNormal)
-                        .disabled(model.isLoadingDocuments)
-                    }
-                    Button(String(localized: "Обновить страницу")) {
-                        Task { await model.reloadCurrentPage(app) }
-                    }
-                    .buttonStyle(.chromaSecondary)
-                    .disabled(model.isLoadingDocuments || model.documents.isEmpty)
-                    if model.isLoadingDocuments { ProgressView().controlSize(.small) }
-                    Spacer()
+            } header: {
+                Text("Метаданные")
+            }
+            if let vector = model.vectorPreviews[document.id] {
+                Section {
+                    LabeledContent(String(localized: "Размерность"), value: vector.count.formatted())
+                    Text(vector.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", ") + (vector.count > 8 ? ", …" : ""))
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .copyable(vector.map { String($0) }.joined(separator: ", "))
+                } header: {
+                    Text("Вектор")
+                } footer: {
+                    Text("Первые восемь компонент — чтобы отличить модели на глаз.")
                 }
             }
         }
+        .formStyle(.grouped)
     }
 
     // MARK: - Ручные пометки
@@ -1627,16 +1668,21 @@ struct CollectionsView: View {
     ) -> some View {
         let marks = DocumentMarks(metadata: document.metadata)
         ForEach(DocumentMark.allCases) { mark in
-            Button {
-                Task {
-                    await model.setMark(
-                        mark, for: document, app: app, collectionName: collectionName
-                    )
+            // Галочка у стоящей пометки: меню обязано показывать состояние,
+            // а не только предлагать действие. Переключателем, а не «✓ »
+            // в тексте: галочку меню ставит в свою колонку, и текст пункта
+            // не сдвигается относительно соседей.
+            Toggle(isOn: Binding(
+                get: { marks.mark == mark },
+                set: { _ in
+                    Task {
+                        await model.setMark(
+                            mark, for: document, app: app, collectionName: collectionName
+                        )
+                    }
                 }
-            } label: {
-                // Галочка у стоящей пометки: меню обязано показывать
-                // состояние, а не только предлагать действие.
-                Text(marks.mark == mark ? "✓ \(mark.actionTitle)" : mark.actionTitle)
+            )) {
+                Text(mark.actionTitle)
             }
         }
         Button(String(localized: "Теги и заметка…")) {
@@ -1648,29 +1694,126 @@ struct CollectionsView: View {
         }
     }
 
-    /// Теги и заметка — прямо в строке документа, а не отдельным окном:
-    /// это две строки текста, и открывать ради них лист значило бы уводить
-    /// человека от того, что он размечает.
+    /// Теги и заметка — у результата поиска, прямо под ним: строки этого
+    /// документа в таблице может не быть вовсе.
     @ViewBuilder
     private func marksEditor(
         for document: DocumentRecord, collectionName: String? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            TextField(String(localized: "Теги через запятую"), text: $marksTags)
-                .textFieldStyle(.roundedBorder)
-            TextField(String(localized: "Заметка"), text: $marksNote, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
-            HStack(spacing: 8) {
-                Button(String(localized: "Сохранить")) {
+        TextField(String(localized: "Теги"), text: $marksTags, prompt: Text("через запятую"))
+        TextField(String(localized: "Заметка"), text: $marksNote, axis: .vertical)
+            .lineLimit(1...4)
+        HStack {
+            Text("Теги видны агенту и годятся для фильтра по метаданным.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button(String(localized: "Отменить")) {
+                marksEditorID = nil
+                marksEditorCollection = nil
+                marksEditorFromHit = false
+            }
+            Button(String(localized: "Сохранить")) {
+                let tags = marksTags
+                let note = marksNote
+                marksEditorID = nil
+                marksEditorCollection = nil
+                marksEditorFromHit = false
+                // Одной записью: два вызова подряд стёрли бы теги первого.
+                Task {
+                    await model.setTagsAndNote(
+                        tags: tags, note: note, for: document, app: app,
+                        collectionName: collectionName
+                    )
+                }
+            }
+        }
+    }
+
+    /// Что стоит на документе — одной строкой: пометка, теги, заметка.
+    /// Текстом, не цветной плашкой.
+    @ViewBuilder
+    private func marksLine(of metadata: ChromaMetadata?) -> some View {
+        let marks = DocumentMarks(metadata: metadata)
+        if !marks.isEmpty {
+            let parts = [marks.mark?.title, marks.tags.isEmpty ? nil : marks.tagsLine, marks.note]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            Label(parts.joined(separator: " · "), systemImage: "bookmark")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    /// Правка метаданных документа — без пересчёта вектора.
+    @ViewBuilder
+    private var metadataSheet: some View {
+        if let id = metadataEditorID, let document = model.documents.first(where: { $0.id == id }) {
+            SheetForm(
+                cancel: { metadataEditorID = nil },
+                confirmTitle: String(localized: "Сохранить"),
+                confirm: {
+                    Task {
+                        await model.saveMetadataOnly(for: document, draft: metadataDraft, app: app)
+                        metadataEditorID = nil
+                    }
+                }
+            ) {
+                Section {
+                    ForEach($metadataDraft.rows) { $row in
+                        if MetadataDraft.isReserved(row.key) {
+                            LabeledContent(row.key) {
+                                Text(row.value).foregroundStyle(.secondary)
+                                Image(systemName: "lock")
+                                    .foregroundStyle(.secondary)
+                                    .help(String(localized: "Поле ведёт приложение: правка вручную сломала бы привязку модели"))
+                            }
+                        } else {
+                            HStack {
+                                TextField(String(localized: "ключ"), text: $row.key)
+                                    .labelsHidden()
+                                TextField(String(localized: "значение"), text: $row.value)
+                                    .labelsHidden()
+                                Button {
+                                    metadataDraft.remove(row)
+                                } label: {
+                                    Label(String(localized: "Убрать поле"), systemImage: "minus.circle")
+                                        .labelStyle(.iconOnly)
+                                }
+                                .buttonStyle(.borderless)
+                                .help(String(localized: "Убрать поле"))
+                            }
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button(String(localized: "Добавить поле")) { metadataDraft.addRow() }
+                    }
+                } header: {
+                    Text(verbatim: document.id)
+                } footer: {
+                    Text("Вектор не пересчитывается: меняются только метаданные.")
+                }
+            }
+        }
+    }
+
+    /// Теги и заметка документа.
+    @ViewBuilder
+    private var marksSheet: some View {
+        if let id = marksEditorID, let document = model.documents.first(where: { $0.id == id }) {
+            SheetForm(
+                cancel: { marksEditorID = nil; marksEditorCollection = nil },
+                confirmTitle: String(localized: "Сохранить"),
+                confirm: {
                     let tags = marksTags
                     let note = marksNote
+                    let collectionName = marksEditorCollection
                     marksEditorID = nil
                     marksEditorCollection = nil
-                    marksEditorFromHit = false
-                    // Одной записью: два вызова подряд собирали бы пометки
-                    // из метаданных, которые были на экране до правки, и
-                    // второй стёр бы теги, записанные первым.
+                    // Одной записью: два вызова подряд собирали бы пометки из
+                    // метаданных, что были до правки, и второй стёр бы теги.
                     Task {
                         await model.setTagsAndNote(
                             tags: tags, note: note, for: document, app: app,
@@ -1678,387 +1821,262 @@ struct CollectionsView: View {
                         )
                     }
                 }
-                .buttonStyle(.chromaPrimary)
-                Button(String(localized: "Отмена")) {
-                    marksEditorID = nil
-                    marksEditorCollection = nil
-                    marksEditorFromHit = false
+            ) {
+                Section {
+                    TextField(String(localized: "Теги"), text: $marksTags, prompt: Text("через запятую"))
+                    TextField(String(localized: "Заметка"), text: $marksNote, axis: .vertical)
+                        .lineLimit(1...4)
+                } header: {
+                    Text(verbatim: document.id)
+                } footer: {
+                    Text("Теги видны агенту и годятся для фильтра по метаданным.")
                 }
-                .buttonStyle(.chromaNormal)
-                Spacer()
-                Text("теги видны агенту и годятся для фильтра по метаданным")
-                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    /// Что стоит на документе — строкой под его идентификатором.
-    @ViewBuilder
-    private func marksLine(of metadata: ChromaMetadata?) -> some View {
-        let marks = DocumentMarks(metadata: metadata)
-        if !marks.isEmpty {
-            HStack(spacing: 6) {
-                if let mark = marks.mark {
-                    Text(mark.title)
-                        .font(Theme.Font.micro)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(markTint(mark).opacity(0.14))
-                        )
-                        .foregroundStyle(markTint(mark))
-                }
-                if !marks.tags.isEmpty {
-                    Text(marks.tagsLine)
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        .lineLimit(1).truncationMode(.tail)
-                }
-                if let note = marks.note, !note.isEmpty {
-                    Text(note)
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        .lineLimit(1).truncationMode(.tail)
-                }
-                Spacer(minLength: 0)
             }
         }
     }
 
-    /// Цвет — только состояние (правило 7 «как устроен экран»): закреплённое
-    /// работает на выдачу, устаревшее требует решения, понижённое выключено.
-    private func markTint(_ mark: DocumentMark) -> Color {
-        switch mark {
-        case .pinned: return Theme.Palette.running
-        case .demoted: return Theme.Palette.captionText
-        case .stale: return Theme.Palette.attention
-        }
-    }
-
-    private func documentRow(_ document: DocumentRecord) -> some View {
-        let isExpanded = expandedDocumentID == document.id
-        let isEditingMetadata = metadataEditorID == document.id
-
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top) {
-                Text(document.id)
-                    .font(Theme.Font.mono)
-                    .foregroundStyle(Theme.Palette.captionText)
-                    .copyable(document.id)
-                Spacer()
-                Button(isExpanded ? String(localized: "Свернуть") : String(localized: "Раскрыть")) {
-                    expandedDocumentID = isExpanded ? nil : document.id
-                    if !isExpanded {
-                        Task { await model.loadVector(for: document, app: app) }
-                    }
+    /// Фильтр по метаданным — листом: условия собираются в where-запрос
+    /// ChromaDB, фильтрует сервер, а не приложение.
+    private var filterSheet: some View {
+        SheetForm(
+            cancel: { showingFilter = false },
+            confirmTitle: String(localized: "Применить"),
+            confirm: {
+                Task {
+                    await model.applyFilter(app)
+                    if model.filterErrorMessage == nil { showingFilter = false }
                 }
-                .buttonStyle(.link)
-                .font(Theme.Font.caption)
-
-                Menu {
-                    Button(String(localized: "Изменить текст…")) { model.beginEditing(document, app: app) }
-                    Button(String(localized: "Изменить метаданные")) {
-                        metadataDraft = MetadataDraft(metadata: document.metadata)
-                        metadataEditorID = document.id
-                    }
-                    Divider()
-                    marksMenu(for: document)
-                    Divider()
-                    Button(String(localized: "Удалить документ"), role: .destructive) {
-                        Task { await model.deleteDocument(document, app: app) }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle").font(Theme.Font.caption)
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 34)
             }
-
-            marksLine(of: document.metadata)
-
-            Text(isExpanded ? (document.document ?? "") : document.preview)
-                .font(Theme.Font.body)
-                .copyable(document.document ?? "")
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            if isExpanded, let vector = model.vectorPreviews[document.id] {
-                vectorPreview(vector)
-            }
-
-            // Только если редактор позвали отсюда: тот же id мог прийти
-            // из выдачи, и там у него своя строка и своя коллекция.
-            if marksEditorID == document.id, !marksEditorFromHit {
-                marksEditor(for: document)
-            }
-
-            if isEditingMetadata {
-                metadataEditor(for: document)
-            } else if isExpanded {
-                // Метаданные — по «Раскрыть», вместе с полным текстом.
-                // Двадцать строк `chunk_index`, `content_hash`, `file_mtime`
-                // у **каждого** документа превращали список в простыню, в
-                // которой не видно самих документов.
-                MetadataTable(metadata: document.metadata)
-            } else if let source = document.metadata?["source_file"]?.displayString
-                        ?? document.metadata?["file_name"]?.displayString {
-                // Одна строка вместо двадцати: откуда документ — то
-                // единственное из метаданных, что нужно, не раскрывая.
-                Text(source)
-                    .font(Theme.Font.mono)
-                    .foregroundStyle(Theme.Palette.captionText)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.row))
-    }
-
-    /// Raw vectors are unreadable, so only the size and the first components
-    /// are shown — enough to tell two models apart at a glance.
-    private func vectorPreview(_ vector: [Double]) -> some View {
-        let preview = vector.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", ")
-        // Built as a String first: an interpolated ternary makes the compiler
-        // hesitate between Text(String) and Text(LocalizedStringKey).
-        let line: String = "[" + preview + (vector.count > 8 ? ", …" : "") + "]"
-        // String.init is heavily overloaded; spelling the conversion out keeps
-        // type inference (and the .font modifier below) unambiguous.
-        let fullVector: String = vector.map { value in String(value) }.joined(separator: ", ")
-        return VStack(alignment: .leading, spacing: 2) {
-            Text(String(localized: "вектор: размерность \(vector.count.plainDigits), первые \(min(8, vector.count)) компонент"))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-            Text(line)
-                .font(Theme.Font.mono)
-                .foregroundStyle(Theme.Palette.captionText)
-                .copyable(fullVector)
-        }
-    }
-
-    private func metadataEditor(for document: DocumentRecord) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach($metadataDraft.rows) { $row in
-                if MetadataDraft.isReserved(row.key) {
-                    HStack(spacing: 6) {
-                        Text(row.key).font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
-                        Text(row.value).font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
-                        Image(systemName: "lock").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                            .help(String(localized: "Поле ведёт приложение: правка вручную сломала бы привязку модели"))
-                    }
-                } else {
-                    HStack(spacing: 6) {
-                        TextField(String(localized: "ключ"), text: $row.key)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 160)
-                        TextField(String(localized: "значение"), text: $row.value)
-                            .textFieldStyle(.roundedBorder)
-                        Button(role: .destructive) {
-                            metadataDraft.remove(row)
-                        } label: {
-                            Image(systemName: "minus.circle")
+        ) {
+            Section {
+                if !model.savedFilters.isEmpty {
+                    Menu(String(localized: "Сохранённые (\(model.savedFilters.count))")) {
+                        ForEach(model.savedFilters) { saved in
+                            Button(saved.name) { model.applySavedFilter(saved) }
                         }
-                        .buttonStyle(.borderless)
+                        Divider()
+                        ForEach(model.savedFilters) { saved in
+                            Button(String(localized: "Удалить «\(saved.name)»"), role: .destructive) {
+                                model.deleteSavedFilter(saved, app: app)
+                            }
+                        }
+                    }
+                }
+                LabeledContent(String(localized: "Сохранить как")) {
+                    TextField(String(localized: "Сохранить как"), text: $model.savedFilterName, prompt: Text("имя фильтра"))
+                        .labelsHidden()
+                    Button(String(localized: "Сохранить")) { model.saveCurrentFilter(app) }
+                        .fixedSize()
+                        .disabled(model.filter.isEmpty || model.savedFilterName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            } header: {
+                Text("Фильтры коллекции")
+            }
+
+            if !model.filter.usesRawJSON {
+                Section {
+                    FilterNodeEditor(
+                        node: $model.filter.root,
+                        knownFields: model.filterFieldSuggestions(app),
+                        depth: 0,
+                        onRemove: nil
+                    )
+                } header: {
+                    SectionHeader(
+                        String(localized: "Метаданные"),
+                        help: String(localized: "Условия собираются в where-запрос ChromaDB — фильтрует сервер, а не приложение.")
+                    )
+                }
+                Section {
+                    DocumentTextConditionsEditor(
+                        conditions: $model.filter.textConditions,
+                        logic: $model.filter.textLogic
+                    )
+                } header: {
+                    Text("Текст документа")
+                }
+            }
+
+            AdvancedSection(screen: "collection.filter") {
+                Toggle(String(localized: "Редактировать как JSON"), isOn: Binding(
+                    get: { model.filter.usesRawJSON },
+                    set: { if $0 != model.filter.usesRawJSON { model.toggleFilterJSONMode() } }
+                ))
+                if model.filter.usesRawJSON {
+                    TextField(String(localized: "where"), text: $model.filter.rawWhereJSON,
+                              prompt: Text(verbatim: #"{"$and": [{"n": {"$gt": 10}}]}"#), axis: .vertical)
+                        .font(.body.monospaced())
+                        .lineLimit(1...6)
+                    TextField(String(localized: "where_document"), text: $model.filter.rawWhereDocumentJSON,
+                              prompt: Text(verbatim: #"{"$not_contains": "черновик"}"#), axis: .vertical)
+                        .font(.body.monospaced())
+                        .lineLimit(1...4)
+                } else {
+                    // Оба условия, как их получит сервер: и по метаданным, и
+                    // по тексту документа.
+                    if let json = model.filter.whereJSONString() {
+                        Text(json)
+                            .font(.callout.monospaced())
+                            .foregroundStyle(.secondary)
+                            .copyable(json)
+                    }
+                    if let json = model.filter.whereDocumentJSONString() {
+                        Text(json)
+                            .font(.callout.monospaced())
+                            .foregroundStyle(.secondary)
+                            .copyable(json)
                     }
                 }
             }
 
-            HStack {
-                Button {
-                    metadataDraft.addRow()
-                } label: {
-                    Label(String(localized: "Поле"), systemImage: "plus")
-                }
-                Spacer()
-                Button(String(localized: "Отмена")) { metadataEditorID = nil }
-                    .buttonStyle(.chromaNormal)
-                Button(String(localized: "Сохранить")) {
-                    Task {
-                        await model.saveMetadataOnly(for: document, draft: metadataDraft, app: app)
-                        metadataEditorID = nil
+            Section {
+                HStack {
+                    Spacer()
+                    Button(String(localized: "Сбросить фильтр")) {
+                        Task {
+                            await model.clearFilter(app)
+                            showingFilter = false
+                        }
                     }
+                    .disabled(model.filter.isEmpty && model.appliedFilterDescription == nil)
                 }
-                .buttonStyle(.chromaPrimary)
+            } footer: {
+                // Фильтр, который сервер отклонил, не пропадает с экрана:
+                // сообщение — здесь, рядом с условиями.
+                if let problem = model.filterErrorMessage {
+                    Notice(.warning, problem)
+                } else if model.filter.usesRawJSON {
+                    Text("Пока поля JSON заполнены, конструктор не используется. Пустой объект {} сервер отклоняет, поэтому пустые поля не отправляются.")
+                }
             }
-            Text(String(localized: "Вектор не пересчитывается: меняются только метаданные."))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
         }
-        .padding(8)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: - Sheets
 
     private var documentSheet: some View {
-        SheetShell(
-            title: model.isEditingExistingDocument
-                ? String(localized: "Изменить документ")
-                : String(localized: "Добавить документ"),
-            subtitle: String(localized: "Один документ — один вектор."),
-            help: String(localized: "Вектор считается моделью коллекции при сохранении. У изменённого документа он пересчитывается: ChromaDB не обновляет его сама, и поиск указывал бы на старый текст. Длина текста сверяется с контекстом модели — LM Studio отвечает успехом на текст любого размера и молча векторизует только его начало."),
-            width: 640,
-            height: 720
+        SheetForm(
+            width: .wide,
+            cancel: {
+                model.showAddDocumentSheet = false
+                model.editingDocumentID = nil
+            },
+            confirmTitle: model.isEditingExistingDocument ? String(localized: "Сохранить") : String(localized: "Добавить"),
+            confirmDisabled: model.isSavingDocument || model.documentContextVerdict.blocksSending,
+            isWorking: model.isSavingDocument,
+            confirm: { Task { await model.saveDocument(app) } }
         ) {
-            SectionCard(
-                title: String(localized: "Текст"),
-                subtitle: String(localized: "То, что станет вектором и найдётся поиском.")
-            ) {
-                VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                    TextEditor(text: $model.documentText)
-                        .font(Theme.Font.body)
-                        .frame(height: 170)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Theme.Radius.field)
-                                .strokeBorder(Theme.Palette.border, lineWidth: 1)
-                        )
-
-                    // Length against the model's context: LM Studio answers 200 for a
-                    // text of any size and silently embeds only its beginning.
-                    if let message = model.documentContextVerdict.message {
-                        Text(message)
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(model.documentContextVerdict.blocksSending
-                                             ? Theme.Palette.danger : Theme.Palette.attention)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    HStack(spacing: 10) {
-                        TextField(String(localized: "ID (необязательно — иначе UUID)"), text: $model.documentID)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(model.isEditingExistingDocument)
-                        Button(String(localized: "Текст из файла…")) { model.loadDocumentTextFromFile() }
-                            .buttonStyle(.chromaSecondary)
-                    }
+            Section {
+                TextEditor(text: $model.documentText)
+                    .textArea()
+                LabeledContent(String(localized: "ID")) {
+                    TextField(String(localized: "ID"), text: $model.documentID, prompt: Text("необязательно — иначе UUID"))
+                        .labelsHidden()
+                        .disabled(model.isEditingExistingDocument)
+                    Button(String(localized: "Текст из файла…")) { model.loadDocumentTextFromFile() }
+                }
+            } header: {
+                SectionHeader(
+                    model.isEditingExistingDocument ? String(localized: "Изменить документ") : String(localized: "Добавить документ"),
+                    help: String(localized: "Вектор считается моделью коллекции при сохранении. У изменённого документа он пересчитывается: ChromaDB не обновляет его сама. Длина текста сверяется с контекстом модели — LM Studio отвечает успехом на текст любого размера и молча векторизует только его начало.")
+                )
+            } footer: {
+                // Длина — против контекста модели.
+                if let message = model.documentContextVerdict.message {
+                    Notice(.warning, message)
+                } else {
+                    Text("Один документ — один вектор.")
                 }
             }
 
-            SectionCard(
-                title: String(localized: "Метаданные"),
-                subtitle: model.schema(for: model.selected, app: app).map {
-                    String(localized: "По схеме коллекции: полей \($0.fields.count).")
-                } ?? String(localized: "Схемы у коллекции нет — поля произвольные.")
-            ) {
-            VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
+            Section {
                 ForEach($model.documentMetadata.rows) { $row in
                     let field = model.schema(for: model.selected, app: app)?.field(for: row.key.trimmingCharacters(in: .whitespaces))
-                    HStack(spacing: 6) {
+                    HStack {
                         TextField(String(localized: "ключ"), text: $row.key)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 160)
+                            .labelsHidden()
                             .disabled(MetadataDraft.isReserved(row.key) || field != nil)
-                        TextField(field.map { "\($0.type.hint)" } ?? String(localized: "значение"), text: $row.value)
-                            .textFieldStyle(.roundedBorder)
+                        TextField(String(localized: "значение"), text: $row.value, prompt: Text(field.map { "\($0.type.hint)" } ?? String(localized: "значение")))
+                            .labelsHidden()
                             .disabled(MetadataDraft.isReserved(row.key))
                         if let field {
                             Text(field.isRequired ? String(localized: "обяз., \(field.type.title)") : field.type.title)
-                                .font(Theme.Font.micro)
-                                .foregroundStyle(field.isRequired ? Theme.Palette.attention : Theme.Palette.captionText)
-                                .frame(width: 120, alignment: .leading)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
                         }
                         Button {
                             model.documentMetadata.remove(row)
                         } label: {
-                            Image(systemName: "minus.circle")
-                                .foregroundStyle(Theme.Palette.captionText)
+                            Label(String(localized: "Убрать поле"), systemImage: "minus.circle")
+                                .labelStyle(.iconOnly)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.borderless)
                         .help(String(localized: "Убрать поле"))
                         .disabled(MetadataDraft.isReserved(row.key) || field?.isRequired == true)
                     }
                 }
                 HStack {
+                    Spacer()
                     Button(String(localized: "Добавить поле")) { model.documentMetadata.addRow() }
-                        .buttonStyle(.chromaSecondary)
-                    Spacer(minLength: 0)
                 }
-
-                if !model.documentViolations.isEmpty {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(model.documentViolations) { violation in
-                            Text(violation.message)
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
+                ForEach(model.documentViolations) { violation in
+                    Notice(.warning, violation.message)
                 }
-            }
+            } header: {
+                Text("Метаданные")
+            } footer: {
+                Text(model.schema(for: model.selected, app: app).map {
+                    String(localized: "По схеме коллекции: полей \($0.fields.count).")
+                } ?? String(localized: "Схемы у коллекции нет — поля произвольные."))
             }
 
-            // The server would have answered 201 and kept the old document
-            //; the choice belongs to the user.
+            // Сервер ответил бы успехом и оставил прежний документ;
+            // выбор — за человеком.
             if let conflict = model.conflictingDocumentID {
-                SectionCard(
-                    title: String(localized: "Такой документ уже есть"),
-                    subtitle: String(localized: "Документ с идентификатором «\(conflict)» уже лежит в коллекции. Сервер бы ответил успехом и оставил прежний.")
-                ) {
-                    HStack(spacing: 10) {
-                        Button(String(localized: "Перезаписать")) {
-                            Task { await model.overwriteConflictingDocument(app) }
-                        }
-                        .buttonStyle(.chromaNormal)
+                Section {
+                    HStack {
+                        Spacer()
                         Button(String(localized: "Показать существующий")) {
                             Task { await model.revealConflictingDocument(app) }
                         }
-                        .buttonStyle(.chromaNormal)
-                        Spacer(minLength: 0)
+                        Button(String(localized: "Перезаписать")) {
+                            Task { await model.overwriteConflictingDocument(app) }
+                        }
                     }
+                } header: {
+                    Text("Такой документ уже есть")
+                } footer: {
+                    Notice(.warning, String(localized: "Документ с идентификатором «\(conflict)» уже лежит в коллекции. Сервер бы ответил успехом и оставил прежний."))
                 }
             }
-        } actions: {
-            if model.isSavingDocument { ProgressView().controlSize(.small) }
-            Button(String(localized: "Отмена")) {
-                model.showAddDocumentSheet = false
-                model.editingDocumentID = nil
-            }
-            .buttonStyle(.chromaNormal)
-            Button(model.isEditingExistingDocument ? String(localized: "Сохранить") : String(localized: "Добавить")) {
-                Task { await model.saveDocument(app) }
-            }
-            .buttonStyle(.chromaPrimary)
-            .disabled(model.isSavingDocument || model.documentContextVerdict.blocksSending)
         }
     }
 
     private var importSheet: some View {
-        SheetShell(
-            title: String(localized: "Импорт документов"),
-            subtitle: model.importTable.map { table in
-                String(localized: "\(model.importFileName) · \(table.format.title) · строк: \(table.rowCount), колонок: \(table.columns.count)")
-            } ?? String(localized: "Строка таблицы становится документом коллекции."),
-            help: String(localized: "Одна строка файла — один документ: колонка текста становится телом документа, остальные выбранные колонки — его метаданными. Вектор считается моделью коллекции при записи, поэтому импорт идёт со скоростью модели. Строку длиннее контекста модели приложение не записывает и называет её отдельно.")
-        ) {
+        SheetFrame(width: .wide) {
             if let table = model.importTable {
-                SectionCard(
-                    title: String(localized: "Колонки"),
-                    subtitle: String(localized: "Что станет текстом документа, что — его идентификатором и метаданными.")
-                ) {
-                    VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                HStack(spacing: 16) {
-                    HStack {
-                        Text(String(localized: "Текст документа"))
-                        Picker("", selection: $model.importMapping.documentColumn) {
-                            ForEach(table.columns, id: \.self) { Text($0).tag($0) }
-                        }
-                        .labelsHidden()
-                        .frame(width: 180)
+                Section {
+                    Picker(String(localized: "Текст документа"), selection: $model.importMapping.documentColumn) {
+                        ForEach(table.columns, id: \.self) { Text($0).tag($0) }
                     }
-                    HStack {
-                        Text("ID")
-                        Picker("", selection: Binding(
-                            get: { model.importMapping.idColumn ?? "" },
-                            set: { model.importMapping.idColumn = $0.isEmpty ? nil : $0 }
-                        )) {
-                            Text(String(localized: "генерировать")).tag("")
-                            ForEach(table.columns, id: \.self) { Text($0).tag($0) }
-                        }
-                        .labelsHidden()
-                        .frame(width: 180)
+                    Picker(String(localized: "ID"), selection: Binding(
+                        get: { model.importMapping.idColumn ?? "" },
+                        set: { model.importMapping.idColumn = $0.isEmpty ? nil : $0 }
+                    )) {
+                        Text(String(localized: "генерировать")).tag("")
+                        ForEach(table.columns, id: \.self) { Text($0).tag($0) }
                     }
-                    Spacer()
+                } header: {
+                    SectionHeader(
+                        String(localized: "Импорт документов"),
+                        help: String(localized: "Одна строка файла — один документ: колонка текста становится телом документа, остальные выбранные колонки — его метаданными. Вектор считается моделью коллекции при записи, поэтому импорт идёт со скоростью модели. Строку длиннее контекста модели приложение не записывает и называет её отдельно.")
+                    )
+                } footer: {
+                    Text("\(model.importFileName) · \(table.format.title) · строк: \(table.rowCount), колонок: \(table.columns.count)")
                 }
 
-                Text(String(localized: "В метаданные:"))
-                    .font(Theme.Font.control).foregroundStyle(Theme.Palette.secondaryText)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), alignment: .leading)], alignment: .leading) {
+                Section {
                     ForEach(table.columns, id: \.self) { column in
                         Toggle(column, isOn: Binding(
                             get: { model.importMapping.metadataColumns.contains(column) },
@@ -2067,174 +2085,160 @@ struct CollectionsView: View {
                                 else { model.importMapping.metadataColumns.remove(column) }
                             }
                         ))
-                        .font(Theme.Font.control)
+                        .toggleStyle(.checkbox)
                         .disabled(column == model.importMapping.documentColumn)
                     }
+                } header: {
+                    Text("В метаданные")
                 }
 
-                importPreview(table)
+                Section {
+                    ForEach(Array(table.preview(5).enumerated()), id: \.offset) { _, row in
+                        let metadata = model.importMapping.metadataColumns.sorted()
+                            .compactMap { key in (row[key]?.isEmpty == false) ? "\(key)=\(row[key] ?? "")" : nil }
+                            .joined(separator: " · ")
+                        VStack(alignment: .leading) {
+                            Text(row[model.importMapping.documentColumn] ?? "")
+                                .lineLimit(1)
+                            Text([model.importMapping.idColumn.map { "id: \(row[$0] ?? "")" }, metadata.isEmpty ? nil : metadata]
+                                .compactMap { $0 }
+                                .joined(separator: " · "))
+                                .font(.callout.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
+                } header: {
+                    Text("Предпросмотр первых строк")
                 }
             }
 
-            // Chosen before the run, not asked about halfway through.
-            SectionCard(
-                title: String(localized: "Если ID уже есть"),
-                subtitle: model.importDuplicatePolicy.explanation
-            ) {
-                Picker("", selection: $model.importDuplicatePolicy) {
+            // Выбирается до запуска, а не спрашивается на полпути.
+            Section {
+                Picker(String(localized: "Если ID уже есть"), selection: $model.importDuplicatePolicy) {
                     ForEach(DuplicatePolicy.allCases) { policy in
                         Text(policy.title).tag(policy)
                     }
                 }
                 .pickerStyle(.segmented)
-                .labelsHidden()
                 .disabled(model.isImporting)
+                // ход живёт в очереди; читает его отдельный маленький вид.
+                QueueProgressRow(titlePrefix: QueueMirror.TitlePrefix.import)
+            } footer: {
+                Text(model.importDuplicatePolicy.explanation)
             }
 
-            // the queue is the only place progress lives. Читает её
-            // отдельная маленькая вьюха — тело этого экрана не должно
-            // перестраиваться от каждого сообщения о прогрессе.
-            QueueProgressRow(titlePrefix: QueueMirror.TitlePrefix.import)
-            if model.importSkippedInvalid > 0 {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(String(localized: "Пропущено по схеме: \(model.importSkippedInvalid) строк"))
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                    ForEach(model.importViolations.prefix(5)) { violation in
-                        Text("• \(violation.message)").font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                            .lineLimit(1).truncationMode(.middle)
+            if model.importSkippedInvalid > 0 || model.importSummary != nil {
+                Section {
+                    if model.importSkippedInvalid > 0 {
+                        Notice(.warning, String(localized: "Пропущено по схеме: \(model.importSkippedInvalid) строк"))
+                        ForEach(model.importViolations.prefix(5)) { violation in
+                            Text(violation.message)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
+                    if let summary = model.importSummary {
+                        StatusLabel(.ok, String(localized: "Записано \(summary.written), пропущено пустых строк \(summary.skippedEmpty), модель \(summary.model), размерность \(summary.dimension.plainDigits), за \(SecondsText.line(summary.duration))."))
+                        if !summary.skippedDuplicates.isEmpty {
+                            Notice(.warning, String(localized: "Пропущено строк с существующими ID: \(summary.skippedDuplicates.count)"))
+                            Text(summary.skippedDuplicates.prefix(8).joined(separator: ", "))
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        // Названы, а не сосчитаны: пропущенная строка — строка,
+                        // с которой человеку что-то делать.
+                        if !summary.skippedTooLong.isEmpty {
+                            Notice(.warning, String(localized: "Не записано строк длиннее контекста модели: \(summary.skippedTooLong.count)"))
+                            Text(summary.skippedTooLong.prefix(8).joined(separator: ", "))
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Итог")
                 }
             }
-            if let summary = model.importSummary {
-                MessageBanner(
-                    kind: .success,
-                    text: String(localized: "Записано \(summary.written), пропущено пустых строк \(summary.skippedEmpty), модель \(summary.model), размерность \(summary.dimension.plainDigits), за \(SecondsText.line(summary.duration)).")
-                )
-                if !summary.skippedDuplicates.isEmpty {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(String(localized: "Пропущено строк с существующими ID: \(summary.skippedDuplicates.count)"))
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                        Text(summary.skippedDuplicates.prefix(8).joined(separator: ", "))
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                if !summary.skippedTooLong.isEmpty {
-                    // Named, not counted away: a row that was skipped is a row
-                    // the user has to do something about.
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(String(localized: "Не записано строк длиннее контекста модели: \(summary.skippedTooLong.count)"))
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                        Text(summary.skippedTooLong.prefix(8).joined(separator: ", "))
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-
         } actions: {
             if let resumePoint = model.importResumePoint, !model.isImporting {
                 Text(String(localized: "Записано \(resumePoint) — остальное можно дописать"))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .foregroundStyle(.secondary)
             }
+            Spacer()
             if model.isImporting {
                 Button(String(localized: "Отменить")) { model.cancelImport() }
-                    .buttonStyle(.chromaNormal)
+                    .keyboardShortcut(.cancelAction)
             } else {
                 Button(String(localized: "Закрыть")) { model.showImportSheet = false }
-                    .buttonStyle(.chromaNormal)
+                    .keyboardShortcut(.cancelAction)
                 if model.importResumePoint != nil {
                     Button(String(localized: "Продолжить с места сбоя")) { model.runImport(app, resume: true) }
-                        .buttonStyle(.chromaPrimary)
+                        .primaryButtonStyle()
+                        .keyboardShortcut(.defaultAction)
                 } else {
                     Button(String(localized: "Импортировать")) { model.runImport(app) }
-                        .buttonStyle(.chromaPrimary)
+                        .primaryButtonStyle()
+                        .keyboardShortcut(.defaultAction)
                         .disabled(model.importTable == nil || model.importMapping.documentColumn.isEmpty)
                 }
             }
         }
     }
 
-    private func importPreview(_ table: ImportTable) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(String(localized: "Предпросмотр первых строк")).font(Theme.Font.control)
-            ScrollView(.horizontal) {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(table.preview(5).enumerated()), id: \.offset) { _, row in
-                        HStack(spacing: 10) {
-                            Text(row[model.importMapping.documentColumn] ?? "")
-                                .lineLimit(1)
-                                .frame(width: 300, alignment: .leading)
-                            if let idColumn = model.importMapping.idColumn {
-                                Text("id: \(row[idColumn] ?? "")").foregroundStyle(Theme.Palette.captionText).lineLimit(1)
+    // MARK: - Правила
+
+    /// «Правила» — схема метаданных коллекции и проверка документов по ней.
+    private func metadataScreen(_ collection: ChromaCollection) -> some View {
+        VStack(spacing: 0) {
+            reembeddingCards
+            Form {
+                schemaSection
+                // Пока схемы нет, сверять не с чем — секции нет (v6 B4): одна
+                // неактивная кнопка в пустой карточке ничего не говорила.
+                if !model.schemaDraft.fields.isEmpty || model.complianceReport != nil {
+                    complianceSection
+                }
+                serviceFields(collection)
+                AdvancedSection(screen: "collection.schema", title: String(localized: "Схема файлом")) {
+                    HStack {
+                        Button(String(localized: "Экспорт…")) { model.exportSchema(app) }
+                        Button(String(localized: "Импорт…")) { model.importSchema(app) }
+                        Spacer()
+                        if schemaStore.hasSchema(for: model.schemaDraft.collectionName) {
+                            Button(String(localized: "Удалить схему…"), role: .destructive) {
+                                confirmingSchemaDeletion = true
                             }
-                            Text(model.importMapping.metadataColumns.sorted()
-                                .compactMap { key in (row[key]?.isEmpty == false) ? "\(key)=\(row[key] ?? "")" : nil }
-                                .joined(separator: " · "))
-                                .foregroundStyle(Theme.Palette.captionText)
-                                .lineLimit(1)
                         }
-                        .font(Theme.Font.mono)
                     }
+                    Text("Схему можно перенести на другую машину файлом.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(6)
+                Section { collectionsHowItWorks }
             }
-            .frame(height: 110)
-            .background(Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-    }
-
-    /// Вкладка «Правила»: схема и соответствие ей — две разные карточки.
-    ///
-    /// Была одна, и в ней вперемешку лежали редактор полей, проверка
-    /// документов, экспорт схемы файлом, её удаление и кнопки «Отмена /
-    /// Сохранить» — пять несвязанных дел в столбик. Разложено по вопросам:
-    /// «как должно быть», «а как на самом деле» и «редкое».
-    private func schemaCard(_ collection: ChromaCollection) -> some View {
-        VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-            SectionCard(
-                title: String(localized: "Схема метаданных"),
-                subtitle: String(localized: "Какие поля обязательны, какого они типа и что подставляется по умолчанию."),
-                help: String(localized: "У ChromaDB нет собственных схем, поэтому правила хранит приложение. Они применяются и к документам, добавленным вручную, и к тем, что приходят из источников: модель правил одна.")
-            ) {
-                schemaFields
-            }
-
-            complianceCard
-
-            AdvancedSection(place: "collection.schema", title: String(localized: "Схема файлом")) {
-                HStack(spacing: 8) {
-                    Button(String(localized: "Экспорт…")) { model.exportSchema(app) }
-                        .buttonStyle(.chromaNormal)
-                    Button(String(localized: "Импорт…")) { model.importSchema(app) }
-                        .buttonStyle(.chromaNormal)
-                    Spacer()
-                    if schemaStore.hasSchema(for: model.schemaDraft.collectionName) {
-                        Button(String(localized: "Удалить схему")) { model.deleteSchema(app) }
-                            .buttonStyle(.chromaDanger)
-                    }
-                }
-                Text("Схему можно перенести на другую машину файлом. Удаление схемы не трогает документы — исчезают только правила.")
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.captionText)
-            }
+            .formStyle(.grouped)
         }
         .task(id: collection.id) { model.beginEditingSchema(app) }
+        .confirmationDialog(
+            String(localized: "Удалить схему коллекции?"),
+            isPresented: $confirmingSchemaDeletion,
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Удалить"), role: .destructive) { model.deleteSchema(app) }
+            Button(String(localized: "Отменить"), role: .cancel) {}
+        } message: {
+            Text("Документы не трогаются — исчезают только правила.")
+        }
     }
 
-    /// Поля схемы. Пустая схема — это состояние, а не пустое место: она
-    /// значит «метаданные ничем не ограничены», и об этом надо сказать.
-    @ViewBuilder
-    private var schemaFields: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    /// Поля схемы. Пустая схема — состояние, а не пустое место: она значит
+    /// «метаданные ничем не ограничены», и об этом сказано.
+    private var schemaSection: some View {
+        Section {
             if model.schemaDraft.fields.isEmpty {
-                Text("Схемы нет: в метаданных может быть что угодно. Самый быстрый способ начать — собрать черновик по документам, которые уже загружены.")
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.captionText)
-                    .fixedSize(horizontal: false, vertical: true)
+                Text("Схемы нет: в метаданных может быть что угодно. Быстрее всего начать с черновика по уже загруженным документам.")
+                    .foregroundStyle(.secondary)
             } else {
                 ForEach($model.schemaDraft.fields) { $field in
                     schemaFieldRow($field)
@@ -2243,232 +2247,243 @@ struct CollectionsView: View {
                     get: { !model.schemaDraft.allowsExtraFields },
                     set: { model.schemaDraft.allowsExtraFields = !$0 }
                 ))
-                .padding(.top, 4)
+                .toggleStyle(.switch)
             }
-
-            if !model.schemaIssues.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(model.schemaIssues) { issue in
-                        Text("• " + issue.message)
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(Theme.Palette.attention)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+            ForEach(model.schemaIssues) { issue in
+                Notice(.warning, issue.message)
+            }
+            HStack {
+                Button(String(localized: "Добавить поле")) { model.addSchemaField() }
+                Spacer()
+                // Сохранение — единственное, что меняет что-то на диске, и
+                // потому главное, когда схема уже не пуста.
+                if model.schemaDraft.fields.isEmpty {
+                    Button(String(localized: "Вывести из документов")) { model.inferSchema(app) }
+                        .help(String(localized: "Собрать черновик из полей загруженных документов"))
+                } else {
+                    Button(String(localized: "Вывести из документов")) { model.inferSchema(app) }
+                        .help(String(localized: "Собрать черновик из полей загруженных документов"))
+                    Button(String(localized: "Сохранить")) { model.saveSchema(app) }
                 }
             }
-
-            HStack(spacing: 8) {
-                Button(String(localized: "Добавить поле")) { model.addSchemaField() }
-                    .buttonStyle(.chromaNormal)
-                Button(String(localized: "Вывести из документов")) { model.inferSchema(app) }
-                    .buttonStyle(model.schemaDraft.fields.isEmpty ? .chromaPrimary : .chromaNormal)
-                    .help(String(localized: "Собрать черновик из полей загруженных документов"))
-                Spacer()
-                // Сохранение — единственная кнопка, меняющая что-то на диске,
-                // и потому единственная синяя, когда схема уже не пуста.
-                Button(String(localized: "Сохранить")) { model.saveSchema(app) }
-                    .buttonStyle(model.schemaDraft.fields.isEmpty ? .chromaNormal : .chromaPrimary)
-                    .disabled(model.schemaDraft.fields.isEmpty)
-            }
+        } header: {
+            SectionHeader(
+                String(localized: "Схема метаданных"),
+                help: String(localized: "У ChromaDB нет собственных схем, поэтому правила хранит приложение. Они применяются и к документам, добавленным вручную, и к тем, что приходят из источников: модель правил одна.")
+            )
+        } footer: {
+            Text("Какие поля обязательны, какого они типа и что подставляется по умолчанию.")
         }
-        .textFieldStyle(.roundedBorder)
     }
 
     private func schemaFieldRow(_ field: Binding<MetadataField>) -> some View {
-        HStack(spacing: 8) {
-            // Имя поля тянется, остальное фиксировано: сумма жёстких ширин
-            // была шире карточки, и строка уезжала за край.
-            TextField(String(localized: "поле"), text: field.key)
-                .frame(minWidth: 120)
-            Picker("", selection: field.type) {
+        HStack {
+            TextField(String(localized: "Поле"), text: field.key, prompt: Text("поле"))
+                .labelsHidden()
+            Picker(String(localized: "Тип"), selection: field.type) {
                 ForEach(MetadataFieldType.allCases) { type in
                     Text(type.title).tag(type)
                 }
             }
             .labelsHidden()
-            .frame(width: 140)
+            .fixedSize()
             Toggle(String(localized: "обяз."), isOn: field.isRequired)
-                .frame(width: 78)
-            TextField(String(localized: "по умолчанию"), text: field.defaultValue)
-                .frame(width: 140)
+                .toggleStyle(.checkbox)
+                .fixedSize()
+            TextField(String(localized: "По умолчанию"), text: field.defaultValue, prompt: Text("по умолчанию"))
+                .labelsHidden()
             if field.wrappedValue.type == .date {
                 Toggle(String(localized: "+unix"), isOn: field.storesTimestamp)
-                    .frame(width: 76)
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
                     .help(String(localized: "Дополнительно писать <поле>_ts числом: ChromaDB не умеет сравнивать ISO-строки через $gt"))
             }
             Button {
                 model.removeSchemaField(field.wrappedValue)
             } label: {
-                Image(systemName: "minus.circle")
-                    .foregroundStyle(Theme.Palette.captionText)
+                Label(String(localized: "Убрать поле"), systemImage: "minus.circle")
+                    .labelStyle(.iconOnly)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderless)
+            .help(String(localized: "Убрать поле"))
         }
     }
 
-    /// «А как на самом деле»: соответствие документов схеме.
-    ///
-    /// Отдельной карточкой, потому что это другой вопрос и другая цена:
+    /// Соответствие документов схеме — другой вопрос и другая цена:
     /// проверка читает документы пачками и ничего не меняет.
-    private var complianceCard: some View {
-        SectionCard(
-            title: String(localized: "Соответствие документов"),
-            subtitle: String(localized: "Проверка читает документы и сравнивает их со схемой. В базе ничего не меняется.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    Button(String(localized: "Проверить документы")) { model.runComplianceCheck(app) }
-                        .buttonStyle(.chromaNormal)
-                        .disabled(model.isCheckingCompliance || model.schemaDraft.fields.isEmpty)
-                    if model.isCheckingCompliance {
-                        ProgressView().controlSize(.small)
-                        Button(String(localized: "Остановить")) { model.cancelComplianceCheck() }
-                            .buttonStyle(.chromaSecondary)
-                    }
-                    if let progress = model.complianceProgress {
-                        Text("проверено \(progress.checked) из \(progress.total)")
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
+    private var complianceSection: some View {
+        Section {
+            if let report = model.complianceReport {
+                StatusLabel(
+                    report.isClean ? .ok : .warning,
+                    report.isClean
+                        ? String(localized: "Проверено \(report.checked) документов — все соответствуют схеме.")
+                        : String(localized: "Проверено \(report.checked), не соответствуют \(report.offending).\(report.stoppedEarly ? " Показаны первые нарушения." : "")")
+                )
+                ForEach(report.violations.prefix(20)) { violation in
+                    Text("\(violation.documentID ?? "—") · \(violation.message)")
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(violation.message)
                 }
-
-                if model.schemaDraft.fields.isEmpty {
-                    Text("Пока схемы нет, сравнивать не с чем.")
-                        .font(Theme.Font.caption)
-                        .foregroundStyle(Theme.Palette.captionText)
-                }
-
-                if let report = model.complianceReport {
-                    MessageBanner(
-                        kind: report.isClean ? .success : .warning,
-                        text: report.isClean
-                            ? String(localized: "Проверено \(report.checked) документов — все соответствуют схеме.")
-                            : String(localized: "Проверено \(report.checked), не соответствуют \(report.offending).\(report.stoppedEarly ? " Показаны первые нарушения." : "")")
-                    )
-                    ForEach(report.violations.prefix(20)) { violation in
-                        Text("\(violation.documentID ?? "—") · \(violation.message)")
-                            .font(Theme.Font.mono)
-                            .foregroundStyle(Theme.Palette.secondaryText)
-                            .lineLimit(1).truncationMode(.middle)
-                    }
-                    if report.violations.count > 20 {
-                        Text("и ещё \((report.violations.count - 20).plainDigits)")
-                            .font(Theme.Font.caption)
-                            .foregroundStyle(Theme.Palette.captionText)
-                    }
+                if report.violations.count > 20 {
+                    Text("и ещё \((report.violations.count - 20).plainDigits)")
+                        .foregroundStyle(.secondary)
                 }
             }
+            HStack {
+                if let progress = model.complianceProgress {
+                    Text("проверено \(progress.checked) из \(progress.total)")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.isCheckingCompliance {
+                    ProgressView().controlSize(.small)
+                    Button(String(localized: "Остановить")) { model.cancelComplianceCheck() }
+                }
+                Button(String(localized: "Проверить документы")) { model.runComplianceCheck(app) }
+                    .disabled(model.isCheckingCompliance || model.schemaDraft.fields.isEmpty)
+            }
+        } header: {
+            Text("Соответствие документов")
+        } footer: {
+            Text(model.schemaDraft.fields.isEmpty
+                 ? String(localized: "Пока схемы нет, сравнивать не с чем.")
+                 : String(localized: "Проверка читает документы и сравнивает их со схемой. В базе ничего не меняется."))
         }
     }
 
     private var bindSheet: some View {
-        SheetShell(
-            title: String(localized: "Модель коллекции"),
-            subtitle: String(localized: "Чем считать векторы этой коллекции дальше."),
-            help: String(localized: "Приложение не может проверить, какой моделью посчитаны уже существующие векторы, — оно сверяет только размерность. Если она не совпадёт, привязка будет отклонена."),
-            width: 560,
-            height: nil,
-            scrolls: false
+        SheetForm(
+            cancel: { model.showBindSheet = false },
+            confirmTitle: String(localized: "Привязать"),
+            confirmDisabled: model.bindModelSelection.isEmpty || model.isBinding,
+            isWorking: model.isBinding,
+            confirm: { Task { await model.bindModel(app) } }
         ) {
-            Picker(String(localized: "Модель"), selection: $model.bindModelSelection) {
-                Text(String(localized: "— выберите —")).tag("")
-                ForEach(embeddingsModel.embeddingModels) { item in
-                    Text(item.id).tag(item.id)
+            Section {
+                Picker(String(localized: "Модель"), selection: $model.bindModelSelection) {
+                    Text(String(localized: "— выберите —")).tag("")
+                    ForEach(embeddingsModel.embeddingModels) { item in
+                        Text(item.id).tag(item.id)
+                    }
+                }
+            } header: {
+                SectionHeader(
+                    String(localized: "Модель коллекции"),
+                    help: String(localized: "Приложение не может проверить, какой моделью посчитаны уже существующие векторы, — оно сверяет только размерность. Если она не совпадёт, привязка будет отклонена.")
+                )
+            } footer: {
+                if embeddingsModel.embeddingModels.isEmpty {
+                    Notice(.warning, String(localized: "Список моделей пуст. Откройте «Модели» и проверьте соединение с LM Studio."))
+                } else {
+                    Text("Чем считать векторы этой коллекции дальше.")
                 }
             }
-            .font(Theme.Font.control)
-
-            if embeddingsModel.embeddingModels.isEmpty {
-                MessageBanner(
-                    kind: .warning,
-                    text: String(localized: "Список моделей пуст. Откройте «Модели» и проверьте соединение с LM Studio.")
-                )
-            }
-        } actions: {
-            if model.isBinding { ProgressView().controlSize(.small) }
-            Button(String(localized: "Отмена")) { model.showBindSheet = false }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Привязать")) {
-                Task { await model.bindModel(app) }
-            }
-            .buttonStyle(.chromaPrimary)
-            .disabled(model.bindModelSelection.isEmpty || model.isBinding)
         }
     }
 
     private var deleteSheet: some View {
-        SheetShell(
-            title: String(localized: "Удалить коллекцию"),
-            subtitle: model.selected.map {
-                String(localized: "Будут удалены все документы и векторы коллекции «\($0.name)».")
-            } ?? String(localized: "Коллекция не выбрана."),
-            width: 520,
-            height: nil,
-            scrolls: false
+        SheetForm(
+            cancel: { model.showDeleteSheet = false },
+            confirmTitle: String(localized: "Удалить"),
+            confirmDisabled: model.selected.map { model.deleteConfirmationText != $0.name } ?? true
+                || model.isCapturingTrash,
+            isDestructive: true,
+            isWorking: model.isCapturingTrash,
+            confirm: { Task { await model.deleteSelected(app) } }
         ) {
             if let collection = model.selected {
-                // a collection delete is reversible exactly like a single
-                // document's, as long as the trash is on — said here rather
-                // than implied, since «отменить это нельзя» would now be wrong.
-                Text(settings.configuration.trashEnabled
-                     ? String(localized: "Документы сохранятся в «Корзине» и их можно будет восстановить.")
-                     : String(localized: "Корзина выключена в настройках — отменить это будет нельзя."))
-                    .font(Theme.Font.body)
-                    .foregroundStyle(settings.configuration.trashEnabled ? Theme.Palette.primaryText : Theme.Palette.danger)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Text(String(localized: "Введите имя коллекции для подтверждения:"))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                TextField(collection.name, text: $model.deleteConfirmationText)
-                    .textFieldStyle(.roundedBorder)
-
-                if model.isCapturingTrash {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text(String(localized: "Сохраняем документы в корзину…")).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Section {
+                    TextField(String(localized: "Имя коллекции"), text: $model.deleteConfirmationText, prompt: Text(verbatim: collection.name))
+                } header: {
+                    Text(String(localized: "Удалить коллекцию «\(collection.name)»?"))
+                } footer: {
+                    // удаление коллекции обратимо, пока включена корзина,
+                    // и это сказано здесь, а не подразумевается.
+                    if settings.configuration.trashEnabled {
+                        Text("Будут удалены все документы и векторы. Они сохранятся в «Корзине» — их можно будет восстановить. Для подтверждения введите имя коллекции.")
+                    } else {
+                        Notice(.warning, String(localized: "Корзина выключена — отменить удаление будет нельзя. Для подтверждения введите имя коллекции."))
                     }
                 }
+                // Почему не удалилось — здесь же, а не под окном.
+                if let problem = model.deleteTooBig {
+                    deleteTooBigSection(problem, nameConfirmed: model.deleteConfirmationText == collection.name)
+                } else if let error = model.deleteError {
+                    Section { Notice(.warning, error) }
+                }
             }
-        } actions: {
-            Button(String(localized: "Отмена")) { model.showDeleteSheet = false }
-                .buttonStyle(.chromaNormal)
-                .disabled(model.isCapturingTrash)
-            Button(String(localized: "Удалить")) {
-                Task { await model.deleteSelected(app) }
+        }
+        .confirmationDialog(
+            String(localized: "Удалить «\(model.deleteTooBig?.collection ?? "")» без копии?"),
+            isPresented: $confirmingDeleteWithoutTrash,
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Удалить безвозвратно"), role: .destructive) {
+                Task { await model.deleteSelected(app, usingTrash: false) }
             }
-            .buttonStyle(.chromaDanger)
-            .disabled(model.selected.map { model.deleteConfirmationText != $0.name } ?? true
-                      || model.isCapturingTrash)
+            Button(String(localized: "Отменить"), role: .cancel) {}
+        } message: {
+            Text("Документы и векторы уйдут из базы, в корзину ничего не попадёт.")
+        }
+    }
+
+    /// Коллекция не помещается в корзину: причина и два выхода.
+    @ViewBuilder
+    private func deleteTooBigSection(_ problem: CollectionTooBigForTrash, nameConfirmed: Bool) -> some View {
+        Section {
+            Notice(.warning, problem.errorDescription ?? "")
+            if let limit = model.raisedTrashLimit(app) {
+                // Файл корзины на диске длиннее её оценки: векторы в нём
+                // записаны текстом.
+                let disk = ByteCountFormatter.string(fromByteCount: problem.needed * 8 / 5, countStyle: .file)
+                LabeledContent {
+                    Button(String(localized: "Поднять и удалить")) {
+                        Task { await model.raiseTrashLimitAndDelete(app) }
+                    }
+                    .disabled(model.isCapturingTrash || !nameConfirmed)
+                } label: {
+                    Text("Поднять предел корзины до \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .file))")
+                    Text("Копия займёт на диске около \(disk) и будет храниться \(settings.configuration.trashRetentionDays.plainDigits) дн.")
+                }
+            }
+            LabeledContent {
+                Button(String(localized: "Удалить без копии…"), role: .destructive) {
+                    confirmingDeleteWithoutTrash = true
+                }
+                .disabled(model.isCapturingTrash || !nameConfirmed)
+            } label: {
+                Text("Удалить без копии в корзине")
+                Text("Вернуть коллекцию будет нельзя — только собрать заново из источника.")
+            }
         }
     }
 
     private var resetSheet: some View {
-        SheetShell(
-            title: String(localized: "Сброс базы"),
-            subtitle: String(localized: "Будут удалены все коллекции и документы этой базы."),
-            width: 520,
-            height: nil,
-            scrolls: false
-        ) {
-            if let note = model.resetAvailability(app) {
-                MessageBanner(kind: .warning, text: note)
-            }
-
-            Text(String(localized: "Введите СБРОС для подтверждения:"))
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            TextField(String(localized: "СБРОС"), text: $model.resetConfirmationText)
-                .textFieldStyle(.roundedBorder)
-        } actions: {
-            Button(String(localized: "Отмена")) { model.showResetSheet = false }
-                .buttonStyle(.chromaNormal)
-            Button(String(localized: "Сбросить")) {
-                Task { await model.resetDatabase(app) }
-            }
-            .buttonStyle(.chromaDanger)
-            .disabled(!CollectionsViewModel.confirms(
+        SheetForm(
+            cancel: { model.showResetSheet = false },
+            confirmTitle: String(localized: "Сбросить"),
+            confirmDisabled: !CollectionsViewModel.confirms(
                 model.resetConfirmationText, word: String(localized: "СБРОС"), russian: "СБРОС"
-            ))
+            ),
+            isDestructive: true,
+            confirm: { Task { await model.resetDatabase(app) } }
+        ) {
+            Section {
+                TextField(String(localized: "Подтверждение"), text: $model.resetConfirmationText, prompt: Text("СБРОС"))
+            } header: {
+                Text("Сбросить базу?")
+            } footer: {
+                if let note = model.resetAvailability(app) {
+                    Notice(.warning, note)
+                } else {
+                    Notice(.warning, String(localized: "Будут удалены все коллекции и документы этой базы. Для подтверждения введите СБРОС."))
+                }
+            }
         }
     }
 }

@@ -9,6 +9,12 @@ final class SourcesViewModel: ObservableObject {
     // Editing
     @Published var draft: DataSource?
     @Published var draftIsNew = false
+    /// Источник, с которого снята копия в черновике, — чтобы окно
+    /// назвало его и сказало, если копия пишет туда же, куда он.
+    @Published private(set) var draftCopiedFrom: DataSource?
+    /// Источник, каким он был при открытии редактора: по нему
+    /// видно, что в окне поменяли, а что — нет.
+    private var draftBase: DataSource?
     @Published var draftMetadataRows: [MetadataRow] = []
     @Published var draftSeparators = ""
     /// Уровни вложенности папки, которую сейчас настраивают.
@@ -20,6 +26,10 @@ final class SourcesViewModel: ObservableObject {
     /// Папку прочитать не удалось (диск отключён, путь исчез): тогда уровни
     /// не показываются, но и настраивать их вручную никто не мешает.
     @Published var draftLevelsProblem: String?
+    /// Сколько файлов каждого расширения в папке редактируемого источника
+    /// — тем же обходом, что и уровни. `nil` — ещё не сосчитано
+    /// или папку прочитать не удалось.
+    @Published var draftExtensionCounts: [String: Int]?
 
     // Running state
     /// Источники, которые сейчас синхронизируются или ждут своей очереди
@@ -75,6 +85,11 @@ final class SourcesViewModel: ObservableObject {
     /// а здесь — что диск тот самый. Ответ «да» стоит восьми тысяч
     /// документов, и спрашивать о нём тем же способом нельзя.
     @Published var massRemoval: MassRemovalPrompt?
+    /// Прогон упёрся в **другой подключённый** том, а не в отключённый
+    /// диск. Путь тот же — резервный диск сменили на другой с теми
+    /// же файлами, — и сменой пути этого не решить: принять новый диск
+    /// может только человек, ответом на отдельный вопрос.
+    @Published var volumeMismatch: VolumeMismatchPrompt?
     /// Ход массового решения об исчезнувших файлах и строках.
     ///
     /// Файлы разбираются по одному, и каждый — это обращение к базе. На
@@ -99,6 +114,108 @@ final class SourcesViewModel: ObservableObject {
                 return String(localized: "Разбираем листы: \(done.plainDigits) из \(total.plainDigits)")
             }
         }
+    }
+
+    struct VolumeMismatchPrompt: Identifiable, Equatable {
+        var id: UUID { sourceID }
+        let sourceID: UUID
+        let sourceName: String
+        /// Диск, который источник запомнил, и диск, что лежит по его пути
+        /// сейчас, — значениями, а не именами: принять надо ровно
+        /// тот диск, о котором спросили, а имена у двух дисков бывают
+        /// одинаковыми.
+        let remembered: SourceVolume
+        let found: SourceVolume
+        /// Сколько ещё источников запомнили тот же диск и примут новый
+        /// вместе с этим.
+        let alsoMoving: Int
+
+        /// Вопрос — только про другой **подключённый** том: отключённый
+        /// диск принимать нечего, его надо подключить.
+        init?(
+            _ error: Error, source: DataSource, among sources: [DataSource] = [],
+            volumeAt: (URL) -> SourceVolume? = SourceVolume.of
+        ) {
+            guard case SyncError.volumeChanged(_, _?) = error,
+                  let remembered = source.volume, let found = volumeAt(source.url),
+                  !found.isSame(as: remembered) else { return nil }
+            sourceID = source.id
+            sourceName = source.name
+            self.remembered = remembered
+            self.found = found
+            alsoMoving = SourceVolume.sourcesMoving(
+                from: remembered, to: found, among: sources.filter { $0.id != source.id }, volumeAt: volumeAt
+            ).count
+        }
+
+        var message: String {
+            // Два диска с одним именем — обычное дело для замены резервного:
+            // «запомнил „Backup“, подключён „Backup“» не говорило ничего.
+            var text = remembered.title == found.title
+                ? String(localized: "Источник запомнил диск «\(remembered.title)», а по его пути сейчас подключён другой диск с тем же именем.")
+                : String(localized: "Источник запомнил диск «\(remembered.title)», а по его пути сейчас подключён «\(found.title)».")
+            text += " " + String(localized: "Так бывает, когда резервный диск заменили другим с теми же файлами, — и когда подключён не тот диск. Если это тот же источник на новом диске, приложение запомнит новый диск. Если файлов на нём окажется заметно меньше, синхронизация всё равно остановится и из базы ничего не удалит.")
+            if alsoMoving > 0 {
+                text += " " + String(localized: "Тот же прежний диск запомнили ещё источников: \(alsoMoving.plainDigits) — новый диск они примут вместе с этим.")
+            }
+            return text
+        }
+    }
+
+    /// Что делать с прогоном, упёршимся в диск.
+    enum VolumeQuestion: Equatable {
+        /// Не про другой подключённый диск — обычная ошибка.
+        case notAboutDisk
+        /// По пути источника уже тот диск, что запомнен: новый диск приняли,
+        /// пока прогон шёл со старой копией источника, или вернули прежний.
+        case alreadySettled
+        /// Спросить.
+        case ask(VolumeMismatchPrompt)
+        /// Про те же диски уже спрошено — ответ на тот вопрос примет и этот
+        /// источник.
+        case covered
+        /// Спрошено про другой диск: этот — строкой ошибки, а не поверх.
+        case asError
+    }
+
+    /// Решение о вопросе — отдельно от экрана, чтобы его можно было проверить.
+    ///
+    /// Источник берётся из настроек, а не копией, с которой начинался
+    /// прогон: «Синхронизировать все» ставит источники в очередь
+    /// разом, и прогон, дождавшийся своей очереди после ответа «это тот же
+    /// источник», упирался в прежний диск из своей копии и спрашивал о нём
+    /// второй раз. Показанный вопрос не подменяется: второй прогон
+    /// подменял бы вопрос, который человек читает.
+    static func volumeQuestion(
+        _ error: Error, source: DataSource, sources: [DataSource], shown: VolumeMismatchPrompt?,
+        volumeAt: (URL) -> SourceVolume? = SourceVolume.of
+    ) -> VolumeQuestion {
+        guard case SyncError.volumeChanged(_, _?) = error else { return .notAboutDisk }
+        let fresh = sources.first { $0.id == source.id } ?? source
+        if let kept = fresh.volume, let now = volumeAt(fresh.url), kept.isSame(as: now) { return .alreadySettled }
+        guard let prompt = VolumeMismatchPrompt(error, source: fresh, among: sources, volumeAt: volumeAt) else {
+            return .notAboutDisk
+        }
+        guard let shown else { return .ask(prompt) }
+        let sameDisks = shown.remembered.isSame(as: prompt.remembered) && shown.found.isSame(as: prompt.found)
+        return sameDisks ? .covered : .asError
+    }
+
+    /// `true` — ошибка разобрана здесь, и строкой её больше показывать не надо.
+    private func noteVolumeMismatch(_ error: Error, source: DataSource, app: AppEnvironment) -> Bool {
+        switch Self.volumeQuestion(error, source: source, sources: app.settings.configuration.dataSources, shown: volumeMismatch) {
+        case .notAboutDisk:
+            return false
+        case .alreadySettled:
+            infoMessage = String(localized: "Диск источника «\(source.name)» теперь тот, что запомнен, — запустите синхронизацию ещё раз.")
+        case .ask(let prompt):
+            volumeMismatch = prompt
+        case .covered:
+            break
+        case .asError:
+            errorMessage = app.describe(error)
+        }
+        return true
     }
 
     struct MassRemovalPrompt: Identifiable {
@@ -142,6 +259,10 @@ final class SourcesViewModel: ObservableObject {
     /// сами таблицы — такие же файлы в папке, и в счёт файлов они входят
     ///.
     @Published var tableFiles: [UUID: Int] = [:]
+    /// Коллекции, куда источник записал таблицы. Файловый манифест знает
+    /// только коллекции документов, и в «Куда» не попадала коллекция, куда
+    /// писали одни книги (ревью).
+    @Published var tableCollections: [UUID: [String]] = [:]
     /// files an older version of the extractor produced. Learned from the
     /// last plan or run of a source and shown until something is done about it —
     /// the app never puts them in a queue by itself.
@@ -154,8 +275,12 @@ final class SourcesViewModel: ObservableObject {
     @Published var outdatedMetadata: [UUID: Int] = [:]
     /// the diagnostics screen. Files the last run could not read, and
     /// files it read with something to say about them.
-    @Published var problems: [UUID: [FileProblem]] = [:]
-    @Published var warnedFiles: [UUID: [ManifestEntry]] = [:]
+    @Published var problems: [UUID: [FileProblem]] = [:] { didSet { findingsRevision &+= 1 } }
+    @Published var warnedFiles: [UUID: [ManifestEntry]] = [:] { didSet { findingsRevision &+= 1 } }
+    /// Номер версии находок: «Диагностика» перестраивает строки
+    /// таблицы по нему, а не при каждой перерисовке. Сравнить номер — дёшево,
+    /// сравнить тысячи находок — нет.
+    private(set) var findingsRevision = 0
     /// set when the pending run would send a lot of rows to the model.
     /// The sample-run offer is shown only while this is set.
     @Published var tableEstimates: [UUID: TableRunEstimate] = [:]
@@ -343,7 +468,9 @@ final class SourcesViewModel: ObservableObject {
         var chunking = source.chunking
         // Разделители живут в поле ввода до сохранения черновика: без разбора
         // умолчанием стали бы вчерашние.
-        chunking.separators = Self.parseSeparators(draftSeparators, fallback: chunking.separators)
+        if draftSeparators != Self.formatSeparators(chunking.separators) {
+            chunking.separators = Self.parseSeparators(draftSeparators, fallback: chunking.separators)
+        }
         app.settings.configuration.setChunkingDefault(chunking)
         app.log.record(
             .info, "Источники",
@@ -380,8 +507,13 @@ final class SourcesViewModel: ObservableObject {
     /// У заведённого источника числа его собственные: человек их однажды
     /// подобрал, и подменять их при переключении туда-обратно значит терять
     /// работу молча. Там для этого есть кнопка «Взять умолчание».
+    ///
+    /// У копии — тоже: её нарезка взята у оригинала нарочно. Умолчание
+    /// заменяло бы её целиком, вместе с контекстом в вектор и обогащением, и
+    /// копия, где хотели сменить одну стратегию, отличалась бы от оригинала
+    /// ещё и тем, о чём её не просили.
     func chunkingStrategyChanged(to strategy: ChunkStrategy, app: AppEnvironment) {
-        guard draftIsNew, var source = draft, source.chunking.strategy == strategy else { return }
+        guard draftIsNew, draftCopiedFrom == nil, var source = draft, source.chunking.strategy == strategy else { return }
         source.chunking = app.settings.configuration.chunkingDefault(for: strategy)
         applyToDraft(source)
     }
@@ -389,15 +521,60 @@ final class SourcesViewModel: ObservableObject {
     /// Кладёт источник в черновик вместе с полями, которые живут отдельно.
     private func applyToDraft(_ source: DataSource) {
         draft = source
-        draftSeparators = source.chunking.separators
-            .map { $0.replacingOccurrences(of: "\n", with: "\\n") }
-            .joined(separator: " | ")
+        draftSeparators = Self.formatSeparators(source.chunking.separators)
+    }
+
+    /// «Скопировать источник»: то же окно, что у нового источника,
+    /// с настройками этого — меняешь папку или пару полей, и новый готов.
+    func beginCopying(_ source: DataSource, app: AppEnvironment) {
+        // Из настроек, а не из строки списка: строка могла отстать от
+        // прогона или импорта, случившегося, пока меню было открыто.
+        let current = app.settings.configuration.dataSources.first { $0.id == source.id } ?? source
+        beginEditing(current.copied(), isNew: true)
+        draftCopiedFrom = current
+    }
+
+    /// Другая папка для нового источника — прежде всего для копии: у неё
+    /// папка взята у оригинала, а копируют чаще всего ради другой папки.
+    func chooseDraftFolder() {
+        guard let source = draft, draftIsNew, !source.isWeb,
+              let url = ConnectionViewModel.chooseDirectory(
+                  title: String(localized: "Выберите папку с документами"),
+                  message: "Файлы из этой папки будут разбиты на чанки и проиндексированы в коллекцию."
+              ) else { return }
+        setDraftFolder(url.path)
+    }
+
+    /// Новая папка черновика.
+    ///
+    /// Исключённые файлы и профили, назначенные файлам, — пути внутри прежней
+    /// папки. В другой папке они назвали бы чужие файлы с теми же путями, и
+    /// такой файл молча не индексировался бы: у копии одной папки договора
+    /// в другой лежит свой «Документ/Приложение.docx».
+    func setDraftFolder(_ path: String) {
+        guard var source = draft else { return }
+        if (path as NSString).standardizingPath != (source.path as NSString).standardizingPath {
+            source.excludedPaths = []
+            source.tableProfileAssignments = [:]
+        }
+        source.path = path
+        draft = source
+    }
+
+    /// Копия пишет те же файлы в те же коллекции, что оригинал: тогда каждый
+    /// файл лёг бы в базу дважды.
+    var draftDuplicatesOriginal: Bool {
+        guard let draft, let original = draftCopiedFrom else { return false }
+        return draft.writesSameDocuments(as: original)
     }
 
     func beginEditing(_ source: DataSource, isNew: Bool = false) {
+        draftCopiedFrom = nil
         draft = source
+        draftBase = source
         draftIsNew = isNew
         draftFolderLevels = nil
+        draftExtensionCounts = nil
         draftLevelsProblem = nil
         draftLevelsScanning = false
         alignDraftLevels()
@@ -405,9 +582,7 @@ final class SourcesViewModel: ObservableObject {
             MetadataRow(key: $0, value: source.customMetadata[$0] ?? "")
         }
         if draftMetadataRows.isEmpty { draftMetadataRows = [MetadataRow()] }
-        draftSeparators = source.chunking.separators
-            .map { $0.replacingOccurrences(of: "\n", with: "\\n") }
-            .joined(separator: " | ")
+        draftSeparators = Self.formatSeparators(source.chunking.separators)
     }
 
     /// Считает уровни папки для редактора.
@@ -421,21 +596,23 @@ final class SourcesViewModel: ObservableObject {
             return
         }
         draftFolderLevels = nil
+        draftExtensionCounts = nil
         draftLevelsProblem = nil
         draftLevelsScanning = true
         let syncService = app.syncService
         Task { [weak self] in
             do {
-                let levels = try await syncService.folderLevels(source: source)
+                let overview = try await syncService.folderOverview(source: source)
                 await MainActor.run {
-                    guard let self, self.draft?.id == source.id else { return }
-                    self.draftFolderLevels = levels
+                    guard let self, self.draft?.id == source.id, self.draft?.path == source.path else { return }
+                    self.draftFolderLevels = overview.levels
+                    self.draftExtensionCounts = overview.extensionCounts
                     self.draftLevelsScanning = false
                     self.alignDraftLevels()
                 }
             } catch {
                 await MainActor.run {
-                    guard let self, self.draft?.id == source.id else { return }
+                    guard let self, self.draft?.id == source.id, self.draft?.path == source.path else { return }
                     self.draftLevelsProblem = app.describe(error)
                     self.draftLevelsScanning = false
                 }
@@ -530,19 +707,39 @@ final class SourcesViewModel: ObservableObject {
                 .filter { !$0.0.isEmpty },
             uniquingKeysWith: { _, last in last }
         )
-        source.chunking.separators = Self.parseSeparators(draftSeparators, fallback: source.chunking.separators)
+        // Поле не трогали — разделители остаются как есть, без разбора.
+        if draftSeparators != Self.formatSeparators(source.chunking.separators) {
+            source.chunking.separators = Self.parseSeparators(draftSeparators, fallback: source.chunking.separators)
+        }
+        // Поверх того, что сейчас в настройках, — только поменянное в окне
+        //; отметки прогона — из настроек, у папки, которая
+        // переехала, том запоминается заново.
+        if let current = app.settings.configuration.dataSources.first(where: { $0.id == source.id }) {
+            if let draftBase, draftBase.id == source.id {
+                source = DataSource.savingEdits(source, madeOn: draftBase, onto: current)
+            } else {
+                source.takeRunStamps(from: current)
+            }
+        }
 
         app.settings.upsert(source: source)
+        let origin = draftCopiedFrom.map { " (копия «\($0.name)»)" } ?? ""
         app.log.record(
             .info,
             "Источники",
-            "\(draftIsNew ? "Добавлен" : "Изменён") источник «\(source.name)»: \(source.mapping.title), \(source.chunking.summaryText)"
+            "\(draftIsNew ? "Добавлен" : "Изменён") источник «\(source.name)»\(origin): \(source.mapping.title), \(source.chunking.summaryText)"
         )
         draft = nil
+        draftBase = nil
+        draftCopiedFrom = nil
         refreshManifests(app)
     }
 
-    func cancelDraft() { draft = nil }
+    func cancelDraft() {
+        draft = nil
+        draftBase = nil
+        draftCopiedFrom = nil
+    }
 
     // MARK: - Diagnostics actions
 
@@ -554,10 +751,7 @@ final class SourcesViewModel: ObservableObject {
     }
 
     func enableOCR(for source: DataSource, app: AppEnvironment) {
-        guard !source.ocrEnabled else { return }
-        var updated = source
-        updated.ocrEnabled = true
-        app.settings.upsert(source: updated)
+        guard app.settings.updateSource(id: source.id, { $0.ocrEnabled = true }) else { return }
         app.log.record(.info, "Источники", "Источник «\(source.name)»: включено распознавание (OCR) из диагностики")
         // Not started here: recognising a folder of scans is minutes to hours of
         // work, and rule 4 of Приложение 5 says the user starts it.
@@ -565,15 +759,31 @@ final class SourcesViewModel: ObservableObject {
         refreshManifests(app)
     }
 
+    /// Листы без подходящего профиля — текстом: решение из
+    /// «Диагностики» для разряда «Листы без профиля». Прогон, как и с OCR,
+    /// запускает человек; флаг входит в подпись профилей, и следующий прогон
+    /// перечитает табличные файлы источника сам.
+    func writeUnmatchedSheetsAsText(for source: DataSource, app: AppEnvironment) {
+        guard app.settings.updateSource(id: source.id, { $0.unmatchedSheetsAsText = true }) else { return }
+        app.log.record(.info, "Источники", "Источник «\(source.name)»: листы без подходящего профиля записываются текстом — включено из диагностики")
+        infoMessage = String(localized: "Листы без подходящего профиля источника «\(source.name)» будут записаны текстом. Запустите синхронизацию, когда будете готовы.")
+        refreshManifests(app)
+    }
+
     /// Stop trying to read this file. Not a deletion: if it is already in the
     /// collection it turns up as «требует решения» on the next run, and the user
     /// decides what happens to its chunks (rule 1 of Приложение 5).
     func exclude(_ relativePath: String, in source: DataSource, app: AppEnvironment) {
-        guard !source.excludedPaths.contains(relativePath) else { return }
-        var updated = source
-        updated.excludedPaths.append(relativePath)
-        app.settings.upsert(source: updated)
-        app.log.record(.warning, "Источники", "Источник «\(source.name)»: файл \(relativePath) исключён из индексации (документы в базе не тронуты)")
+        guard app.settings.configuration.dataSources.contains(where: { $0.id == source.id }) else { return }
+        let changed = app.settings.updateSource(id: source.id) { current in
+            if !current.excludedPaths.contains(relativePath) { current.excludedPaths.append(relativePath) }
+        }
+        if changed {
+            app.log.record(.warning, "Источники", "Источник «\(source.name)»: файл \(relativePath) исключён из индексации (документы в базе не тронуты)")
+        }
+        // Уже исключённый (в редакторе источника) — тоже забывается: находка
+        // о нём осталась от прошлого прогона, и кнопка иначе не делала бы
+        // ничего видимого.
         // И из манифеста тоже: список на экране пережил бы перезапуск, а
         // исключённый файл в нём — это находка, о которой уже всё решено.
         forget([relativePath], in: source.id, app: app)
@@ -583,9 +793,7 @@ final class SourcesViewModel: ObservableObject {
     /// Undoing an exclusion: the file goes back into the source and the next run
     /// reads it like any other.
     func include(_ relativePath: String, in source: DataSource, app: AppEnvironment) {
-        var updated = source
-        updated.excludedPaths.removeAll { $0 == relativePath }
-        app.settings.upsert(source: updated)
+        guard app.settings.updateSource(id: source.id, { $0.excludedPaths.removeAll { $0 == relativePath } }) else { return }
         app.log.record(.info, "Источники", "Источник «\(source.name)»: файл \(relativePath) снова индексируется")
     }
 
@@ -602,13 +810,20 @@ final class SourcesViewModel: ObservableObject {
     /// источника вместо общего.
     @discardableResult
     func exclude(_ paths: [String], in source: DataSource, app: AppEnvironment) -> Int {
-        let fresh = paths.filter { !source.excludedPaths.contains($0) }
+        var fresh: [String] = []
+        var excluded: [String] = []
+        app.settings.updateSource(id: source.id) { current in
+            let already = Set(current.excludedPaths)
+            var seen = Set<String>()
+            excluded = paths.filter { seen.insert($0).inserted }
+            fresh = excluded.filter { !already.contains($0) }
+            current.excludedPaths.append(contentsOf: fresh)
+        }
+        // Уже исключённые забываются вместе с новыми: их находки остались
+        // от прошлого прогона.
+        if !excluded.isEmpty { forget(excluded, in: source.id, app: app) }
         guard !fresh.isEmpty else { return 0 }
-        var updated = source
-        updated.excludedPaths.append(contentsOf: fresh)
-        app.settings.upsert(source: updated)
         app.log.record(.warning, "Источники", "Источник «\(source.name)»: исключено из индексации файлов — \(fresh.count.plainDigits) (документы в базе не тронуты)")
-        forget(fresh, in: source.id, app: app)
         return fresh.count
     }
 
@@ -689,21 +904,70 @@ final class SourcesViewModel: ObservableObject {
 
     func removeSource(_ source: DataSource, app: AppEnvironment) {
         app.settings.removeSource(id: source.id)
-        Task { await app.syncService.removeManifest(for: source.id) }
+        // Все файлы состояния, а не только манифест файлов: прежние
+        // версии и манифест таблиц оставались на диске навсегда. Каждое
+        // хранилище стирает свои сам, в своей очереди — там же, где пишет.
+        let id = source.id
+        Task {
+            await app.syncService.removeManifest(for: id)
+            app.tableManifests.remove(sourceID: id)
+        }
         manifestInfo[source.id] = nil
         manifestsRead.remove(source.id)
         tableFiles[source.id] = nil
+        tableRows[source.id] = nil
+        tableCollections[source.id] = nil
         pendingRemovals[source.id] = nil
         app.log.record(.warning, "Источники", "Источник «\(source.name)» удалён из списка (документы в базе не тронуты)")
     }
 
     /// Separators are typed as one line, with `\n` spelled out: a text field
     /// cannot hold a real newline, and an invisible one is unreadable anyway.
+    ///
+    /// Разделители строкой для поля: перевод строки — `\n`, через « | »,
+    /// а разделитель с пробелом по краю — в кавычках: «. » и « »
+    /// без кавычек на экране неотличимы от «.» и пустоты, и любая правка
+    /// строки молча теряла пробел. В кавычки берётся и разделитель,
+    /// начинающийся с кавычки, — иначе разбор принял бы её за свою.
+    ///
+    /// Черту внутри разделителя записать нельзя: она и есть граница между
+    /// разделителями. Разделитель с ней разделится на два, если поле
+    /// поправить.
+    static func formatSeparators(_ separators: [String]) -> String {
+        separators
+            .map { separator -> String in
+                let shown = separator.replacingOccurrences(of: "\n", with: "\\n")
+                let spacedEdge = shown.first.map(isEdgeSpace) == true || shown.last.map(isEdgeSpace) == true
+                return spacedEdge || shown.hasPrefix("\"") ? "\"" + shown + "\"" : shown
+            }
+            .joined(separator: " | ")
+    }
+
+    /// Пробел по краю куска — от набора, и разбор его срезает. Правило одно
+    /// на оба направления: поле брало в кавычки только пробел
+    /// и табуляцию, а разбор срезал и неразрывный пробел, и «. » с ним,
+    /// вставленное из русского текста, теряло пробел при первой правке.
+    private static func isEdgeSpace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy(CharacterSet.whitespaces.contains)
+    }
+
+    /// Разделители из поля — обратное `formatSeparators` без потерь.
+    ///
+    /// Прежде каждый кусок обрезался по пробелам целиком, а среди
+    /// разделителей по умолчанию есть «. » и « »: первый становился «.»,
+    /// второй пропадал вовсе. Сохранение источника, даже ничего не менявшее
+    /// в нарезке, переписывало разделители — у источников, заведённых через
+    /// редактор, они стали `["\n\n", "\n", "."]`, и текст резался по точке
+    /// в «3.5» и «файл.docx». Теперь пробелы по краям куска — от
+    /// набора и срезаются, а нужный пробел пишется в кавычках: `". "`, `" "`.
     static func parseSeparators(_ text: String, fallback: [String]) -> [String] {
-        let parts = text.components(separatedBy: "|")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .map { $0.replacingOccurrences(of: "\\n", with: "\n") }
+        let parts = text.components(separatedBy: "|").compactMap { piece -> String? in
+            let trimmed = piece.trimmingCharacters(in: .whitespaces)
+            let quoted = trimmed.count >= 2 && trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"")
+            let body = quoted ? String(trimmed.dropFirst().dropLast()) : trimmed
+            let separator = body.replacingOccurrences(of: "\\n", with: "\n")
+            return separator.isEmpty ? nil : separator
+        }
         return parts.isEmpty ? fallback : parts
     }
 
@@ -718,6 +982,7 @@ final class SourcesViewModel: ObservableObject {
             var warned: [UUID: [ManifestEntry]] = [:]
             var tableRowCounts: [UUID: Int] = [:]
             var tableFileCounts: [UUID: Int] = [:]
+            var tableCollectionNames: [UUID: [String]] = [:]
             var tableRemovals: [UUID: [PendingRowRemoval]] = [:]
             var awaitingWrite: [UUID: [SheetAwaitingWrite]] = [:]
             var git: [UUID: GitSyncService.Status] = [:]
@@ -758,6 +1023,7 @@ final class SourcesViewModel: ObservableObject {
                 if rows > 0 {
                     tableRowCounts[source.id] = rows
                     tableFileCounts[source.id] = tables.count
+                    tableCollectionNames[source.id] = Array(Set(tables.values.map(\.collectionName))).sorted()
                 }
                 // Исчезнувшие строки таблиц — из того же прочитанного, без
                 // второго похода на диск.
@@ -811,6 +1077,7 @@ final class SourcesViewModel: ObservableObject {
                     self.warnedFiles[source.id] = warned[source.id]
                     self.tableRows[source.id] = tableRowCounts[source.id]
                     self.tableFiles[source.id] = tableFileCounts[source.id]
+                    self.tableCollections[source.id] = tableCollectionNames[source.id]
                     self.pendingRowRemovals[source.id] = tableRemovals[source.id]
                     self.sheetsAwaitingWrite[source.id] = awaitingWrite[source.id]
                     self.gitStatus[source.id] = git[source.id]
@@ -884,7 +1151,12 @@ final class SourcesViewModel: ObservableObject {
                     self?.infoMessage = "План синхронизации «\(source.name)»: \(plan.summaryLine)."
                 }
             } catch {
-                await MainActor.run { self?.errorMessage = app.describe(error) }
+                await MainActor.run {
+                    guard let self else { return }
+                    if !self.noteVolumeMismatch(error, source: source, app: app) {
+                        self.errorMessage = app.describe(error)
+                    }
+                }
             }
             await MainActor.run { _ = self?.busySourceIDs.remove(source.id) }
             self?.refreshManifests(app)
@@ -1057,6 +1329,38 @@ final class SourcesViewModel: ObservableObject {
         }
     }
 
+    /// Человек ответил: это тот же источник на новом диске.
+    ///
+    /// Запоминается тот диск, о котором спросили, — и только если по пути
+    /// источника лежит всё ещё он: диск, сменившийся, пока вопрос
+    /// был открыт, — это диск, о котором человека не спрашивали. Вместе
+    /// с источником новый диск принимают те, что запомнили тот же прежний.
+    /// Прогон не запускается сам: его запускает человек, а порог массовой
+    /// пропажи по-прежнему остановит его, если на новом диске
+    /// окажется заметно меньше файлов.
+    func acceptNewVolume(_ prompt: VolumeMismatchPrompt, app: AppEnvironment) {
+        let sources = app.settings.configuration.dataSources
+        guard let source = sources.first(where: { $0.id == prompt.sourceID }) else { return }
+        guard let now = SourceVolume.of(source.url) else {
+            errorMessage = String(localized: "Диск по пути источника «\(source.name)» больше не подключён — ничего не запомнено. Подключите его и запустите синхронизацию ещё раз.")
+            return
+        }
+        guard now.isSame(as: prompt.found) else {
+            errorMessage = String(localized: "Диск по пути источника «\(source.name)» сменился, пока был открыт вопрос, — ничего не запомнено. Запустите синхронизацию ещё раз.")
+            return
+        }
+        let moving = Set(SourceVolume.sourcesMoving(from: prompt.remembered, to: now, among: sources))
+            .union([source.id])
+        for id in moving {
+            app.settings.updateSource(id: id) { $0.volume = now }
+        }
+        let names = sources.filter { moving.contains($0.id) }.map { "«\($0.name)»" }.joined(separator: ", ")
+        app.log.record(.warning, "Источники", "Человек принял новый диск «\(now.title)» вместо «\(prompt.remembered.title)» для источников: \(names)")
+        infoMessage = moving.count > 1
+            ? String(localized: "Новый диск «\(now.title)» запомнен для источников: \(names). Запустите синхронизацию.")
+            : String(localized: "Источник «\(source.name)» теперь на диске «\(now.title)». Запустите синхронизацию.")
+    }
+
     func cancelPendingSync(_ sourceID: UUID) {
         pendingConfirmations.remove(sourceID)
         tableEstimates[sourceID] = nil
@@ -1206,6 +1510,10 @@ final class SourcesViewModel: ObservableObject {
                     confirmedMassRemoval: confirmedMassRemoval,
                     yield: { await context.yieldToHigherPriority() }
                 ) { update in
+                    // Новая коллекция видна сразу, а не после прогона.
+                    if update.collectionsReady {
+                        Task { @MainActor in app.collectionsMayHaveChanged() }
+                    }
                     Task { await context.report(progress: update.fraction, detail: Self.progressLine(update)) }
                 }
                 // Валидаторы запоминаются только после удачной записи: иначе
@@ -1237,20 +1545,19 @@ final class SourcesViewModel: ObservableObject {
             // документов. Экран коллекций держит свой список — без этой
             // отметки он показывал бы прежние числа, пока его не переоткроют
             //. Если прогон ничего не записал, беспокоить незачем.
-            if !summary.wroteNothing { app.collectionsMayHaveChanged() }
+            if !summary.wroteNothing { app.collectionsMayHaveChanged(recount: summary.collections) }
             staleExtraction[source.id] = summary.staleExtraction.isEmpty ? nil : summary.staleExtraction
             // Источник перечитывается из настроек, а не берётся копией
             // с начала прогона: за минуты синхронизации его могли убрать
             // из списка, исключить файл, включить OCR — и сохранение копии
             // вернуло бы убранный источник и откатило правки. Меняются
             // только отметки прогона; убранный источник не воскрешается.
-            if var updated = app.settings.configuration.dataSources.first(where: { $0.id == source.id }) {
+            app.settings.updateSource(id: source.id) { updated in
                 updated.lastSyncedAt = Date()
                 // Том запоминается по удачному прогону: именно он
                 // и есть «тот самый диск», с которым потом сверяются.
                 // У источника, заведённого прежней сборкой, он появится здесь же.
                 if let volume = SourceVolume.of(source.url) { updated.volume = volume }
-                app.settings.upsert(source: updated)
             }
             if reason.isAutomatic {
                 // An automatic run must never be invisible: it lands in the log
@@ -1283,6 +1590,8 @@ final class SourcesViewModel: ObservableObject {
         } catch {
             if reason.isAutomatic {
                 app.log.record(.error, "Источники", "Синхронизация «\(source.name)» (\(reason.title)) не удалась: \(app.describe(error))")
+            } else if noteVolumeMismatch(error, source: source, app: app) {
+                // У этой ошибки есть ответ, и спрашивается он вопросом.
             } else {
                 errorMessage = app.describe(error)
             }
@@ -1701,6 +2010,15 @@ final class SourcesViewModel: ObservableObject {
                     deleted += try await app.syncService.resolve(
                         removal: removal, decision: decision, source: source, chroma: app.client
                     )
+                } catch SyncError.alreadyRunning(let name) {
+                    // Источник занят прогоном — остальные пункты упрутся
+                    // в то же самое. Одно сообщение вместо десятков отказов;
+                    // неразобранное остаётся в списке.
+                    failed = removals.count - index
+                    await MainActor.run {
+                        self?.errorMessage = app.describe(SyncError.alreadyRunning(name))
+                    }
+                    break
                 } catch {
                     failed += 1
                     app.report(error, category: "Источники")
@@ -1750,6 +2068,15 @@ final class SourcesViewModel: ObservableObject {
                     deleted += try await app.syncService.resolve(
                         rowRemoval: removal, decision: decision, source: source, chroma: app.client
                     )
+                } catch SyncError.alreadyRunning(let name) {
+                    // Источник занят прогоном — остальные пункты упрутся
+                    // в то же самое. Одно сообщение вместо десятков отказов;
+                    // неразобранное остаётся в списке.
+                    failed = removals.count - index
+                    await MainActor.run {
+                        self?.errorMessage = app.describe(SyncError.alreadyRunning(name))
+                    }
+                    break
                 } catch {
                     failed += 1
                     app.report(error, category: "Таблицы")
@@ -1791,11 +2118,11 @@ final class SourcesViewModel: ObservableObject {
         let name = CollectionNaming.sanitize(source.collectionName)
         let schema = MetadataSchema.drafted(collectionName: name, from: source)
         guard !schema.isEmpty else {
-            infoMessage = "У источника нет своих полей метаданных — черновик схемы был бы пустым."
+            infoMessage = String(localized: "У источника нет своих полей метаданных — ни ручных, ни из названий папок, — черновик схемы был бы пустым.")
             return
         }
         app.schemaStore.save(schema)
-        infoMessage = "Черновик схемы коллекции «\(name)» создан из полей источника: \(schema.fields.map(\.trimmedKey).joined(separator: ", ")). Отредактировать можно во вкладке «Коллекции»."
+        infoMessage = String(localized: "Черновик схемы коллекции «\(name)» создан из полей источника: \(schema.fields.map(\.trimmedKey).joined(separator: ", ")). Отредактировать можно во вкладке «Коллекции».")
     }
 }
 

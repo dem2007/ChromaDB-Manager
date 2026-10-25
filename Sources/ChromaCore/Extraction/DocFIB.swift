@@ -42,6 +42,10 @@ struct DocFIB {
         case plcfBtePapx = 13
         case clx = 33
         case grpXstAtnOwners = 36
+        /// Определения списков (`fcPlfLst`): за ними сразу идут уровни.
+        case plfLst = 73
+        /// Экземпляры списков (`fcPlfLfo`): на них ссылаются абзацы.
+        case plfLfo = 74
     }
 
     /// `nil` — это не заголовок Word 97, и своей читалке здесь делать нечего.

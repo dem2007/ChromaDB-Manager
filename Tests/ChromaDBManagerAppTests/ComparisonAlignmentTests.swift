@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import AppKit
 
 /// Сравнение вариантов стоит строками, а не стопкой независимых колонок.
@@ -51,9 +52,12 @@ final class ComparisonAlignmentTests: XCTestCase {
             view.contains("ScrollView([.horizontal, .vertical])"),
             "панель выдачи обязана листаться по обеим осям"
         )
+        // Панель разметки — отдельная часть вкладки «Прогоны» и занимает всё
+        // место под своей шапкой: высота у неё своя, от окна, а не от
+        // содержимого, — иначе ленивый стек снова строит всё разом.
         XCTAssertTrue(
-            view.contains("containerRelativeFrame(.vertical)"),
-            "у панели обязана быть своя высота — от видимой части страницы"
+            view.contains(".frame(maxWidth: .infinity, maxHeight: .infinity)"),
+            "у панели обязана быть своя высота — всё место под шапкой"
         )
         XCTAssertTrue(view.contains("LazyVStack"), "список запросов обязан быть ленивым")
     }
@@ -83,11 +87,11 @@ final class ComparisonAlignmentTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(clearance, 15, "полоса шире отведённого места")
     }
 
-    /// Высота строки не пляшет: место под три строки текста отведено всегда.
+    /// Высота строки не пляшет: место под пять строк текста отведено всегда.
     func testTheRowKeepsItsHeight() throws {
         let view = try source()
         XCTAssertTrue(
-            view.contains("lineLimit(3, reservesSpace: true)"),
+            view.contains("lineLimit(5, reservesSpace: true)"),
             "плавающая высота строки — это и есть «скачет при прокрутке»"
         )
     }
@@ -100,41 +104,37 @@ final class ComparisonAlignmentTests: XCTestCase {
     /// последним, поэтому за край уезжал именно он: половина видна, нажать
     /// нельзя. Глазами это ловится только если прокрутить сравнение до правого
     /// края колонки, поэтому — тест.
+    /// Строка разметки — три оценки и значок «показать в источнике» —
+    /// помещается в колонку целиком.
+    ///
+    /// Меряется настоящая разметка, а не сумма выдуманных чисел: строка
+    /// собирается теми же системными кнопками и тем же размером, что
+    /// на экране, и её ширина сравнивается с шириной колонки. Если значок не
+    /// помещается, он уезжает за край колонки — видна половина, нажать не на что.
+    @MainActor
     func testTheMarkingRowFitsTheColumnTogetherWithTheSourceButton() throws {
         let view = try source()
         let column = try XCTUnwrap(
             Self.number(after: "private static let columnWidth: CGFloat = ", in: view),
             "не нашлась ширина колонки"
         )
-
-        // Метрики берутся из стиля кнопки, а не выдумываются здесь: если стиль
-        // изменится, тест обязан считать по-новому, а не проходить по старому.
-        let components = try self.components()
-        let padding = try XCTUnwrap(
-            Self.number(after: "kind == .normal ? ", in: components),
-            "не нашёлся горизонтальный отступ капсулы"
-        )
-        let fontSize = try XCTUnwrap(
-            Self.number(after: "let size: CGFloat = kind == .secondary ? 12.5 : ", in: components),
-            "не нашёлся кегль надписи на капсуле"
-        )
-
-        // Выбранная кнопка набрана `.medium`, и место под неё держится всегда
-        // (`reservesEmphasisWidth`) — считать надо по ней, а не по `.regular`.
-        let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
-        let titles = ["релевантен", "частично", "нерелевантен"]
-        let capsules = titles.reduce(0.0) { total, title in
-            total + (title as NSString).size(withAttributes: [.font: font]).width + 2 * padding
+        let row = HStack(spacing: 4) {
+            ForEach(["релевантен", "частично", "нерелевантен"], id: \.self) { title in
+                if title == "нерелевантен" {
+                    Button(title) {}.controlSize(.small).fixedSize()
+                        .buttonStyle(.borderedProminent).tint(.red)
+                } else {
+                    Button(title) {}.controlSize(.small).fixedSize().buttonStyle(.bordered)
+                }
+            }
+            Spacer(minLength: 4)
+            Button { } label: { Image(systemName: "doc.text.magnifyingglass") }
+                .buttonStyle(.borderless).controlSize(.small)
         }
-
-        // Промежутки: `HStack(spacing: 4)` ставит их между всеми соседями,
-        // включая распорку перед значком, — их три, а не два.
-        let spacing = 4.0
-        let icon = NSImage(systemSymbolName: "doc.text.magnifyingglass", accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: fontSize, weight: .regular))?
-            .size.width ?? 18
-
-        let needed = capsules + 2 * spacing + spacing + spacing + icon
+        .fixedSize()
+        let host = NSHostingView(rootView: row)
+        host.layoutSubtreeIfNeeded()
+        let needed = host.fittingSize.width
         XCTAssertGreaterThanOrEqual(
             column, needed,
             "строка разметки шире колонки — значок «показать в источнике» уедет за край: "
@@ -142,20 +142,6 @@ final class ComparisonAlignmentTests: XCTestCase {
         )
     }
 
-    private func components() throws -> String {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/ChromaDBManagerApp/Views/Components.swift")
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw XCTSkip("исходники экрана не найдены рядом с тестами")
-        }
-        return try String(contentsOf: url, encoding: .utf8)
-    }
-
-    /// Число сразу за образцом — так тест читает величину из исходника, а не
-    /// повторяет её у себя, где она устареет молча.
     private static func number(after marker: String, in text: String) -> CGFloat? {
         guard let range = text.range(of: marker) else { return nil }
         let tail = text[range.upperBound...].prefix(12)

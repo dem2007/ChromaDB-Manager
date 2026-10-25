@@ -55,6 +55,22 @@ final class DocxPartsTests: XCTestCase {
         XCTAssertFalse(extracted.warnings.contains(.commentsSkipped), "\(extracted.warnings)")
     }
 
+    /// Замечание — под своим абзацем, а не в конце документа.
+    func testACommentStandsUnderItsParagraph() async throws {
+        let url = try write(
+            body: DocxFixture.paragraph("Срок поставки — тридцать дней.")
+                + "<w:p><w:r><w:t>Цена фиксирована.</w:t></w:r><w:r><w:commentReference w:id=\"1\"/></w:r></w:p>"
+                + DocxFixture.paragraph("Гарантия — два года."),
+            comments: [(id: "1", author: "Петров", text: "Уточнить валюту")]
+        )
+        let text = try await extract(url).plainText
+        guard let comment = text.range(of: "Комментарий (Петров): Уточнить валюту"),
+              let price = text.range(of: "Цена фиксирована."),
+              let warranty = text.range(of: "Гарантия — два года.") else { return XCTFail(text) }
+        XCTAssertLessThan(price.upperBound, comment.lowerBound)
+        XCTAssertLessThan(comment.upperBound, warranty.lowerBound, text)
+    }
+
     /// Осиротевшее замечание, на которое в документе нет ссылки, документу
     /// не приписывается.
     func testAnUnreferencedCommentIsLeftAlone() async throws {
@@ -161,6 +177,135 @@ final class DocxPartsTests: XCTestCase {
         XCTAssertTrue(text.contains("2.2. и в полном объёме"), text)
         // Вложенный уровень начинается заново под следующим пунктом верхнего.
         XCTAssertTrue(text.contains("3. Стороны договорились"), text)
+    }
+
+    // MARK: - Нумерация по спецификации
+
+    /// Стили заголовков с нумерацией «1», «1.1» — как в ТЗ: у абзацев своей
+    /// разметки номера нет, номер даёт стиль, а уровень — связь уровня
+    /// списка со стилем.
+    static let headingNumberingStyles = """
+    <w:style w:type="paragraph" w:styleId="H1"><w:name w:val="heading 1"/>\
+    <w:pPr><w:numPr><w:numId w:val="5"/></w:numPr><w:outlineLvl w:val="0"/></w:pPr></w:style>\
+    <w:style w:type="paragraph" w:styleId="H2"><w:name w:val="heading 2"/><w:basedOn w:val="H1"/>\
+    <w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="5"/></w:numPr><w:outlineLvl w:val="1"/></w:pPr></w:style>\
+    <w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/><w:basedOn w:val="H1"/>\
+    <w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style>
+    """
+
+    static let headingNumbering = """
+    <w:abstractNum w:abstractNumId="9">\
+    <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="H1"/><w:lvlText w:val="%1"/></w:lvl>\
+    <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="H2"/><w:lvlText w:val="%1.%2"/></w:lvl>\
+    <w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2.%3"/></w:lvl>\
+    </w:abstractNum>\
+    <w:num w:numId="5"><w:abstractNumId w:val="9"/></w:num>\
+    <w:num w:numId="6"><w:abstractNumId w:val="9"/></w:num>\
+    <w:num w:numId="7"><w:abstractNumId w:val="9"/>\
+    <w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride>\
+    <w:lvlOverride w:ilvl="1"><w:startOverride w:val="1"/></w:lvlOverride>\
+    <w:lvlOverride w:ilvl="2"><w:startOverride w:val="1"/></w:lvlOverride></w:num>
+    """
+
+    func testAStyleNumbersItsParagraphs() async throws {
+        let url = try write(
+            body: DocxFixture.paragraph("Общие положения", style: "H1")
+                + DocxFixture.paragraph("Предмет закупки", style: "H2")
+                + DocxFixture.paragraph("Место оказания услуг", style: "H2")
+                + DocxFixture.paragraph("Без номера, хоть стиль и от заголовка", style: "Plain")
+                + DocxFixture.paragraph("Требования", style: "H1"),
+            styles: Self.headingNumberingStyles, numbering: Self.headingNumbering
+        )
+        let text = try await extract(url).plainText
+        XCTAssertTrue(text.contains("1 Общие положения"), text)
+        XCTAssertTrue(text.contains("1.1 Предмет закупки"), text)
+        XCTAssertTrue(text.contains("1.2 Место оказания услуг"), text)
+        XCTAssertTrue(text.contains("\nБез номера"), text)
+        XCTAssertTrue(text.contains("2 Требования"), text)
+    }
+
+    /// Экземпляры одного определения считают вместе; экземпляр с
+    /// `startOverride` — отдельный список, общий счёт он не сбивает.
+    func testInstancesShareTheCountAndARestartedOneCountsApart() async throws {
+        let url = try write(
+            body: DocxFixture.paragraph("Раздел", numbering: 5, indent: 0)
+                + DocxFixture.paragraph("первый", numbering: 5, indent: 1)
+                + DocxFixture.paragraph("перезапущенный", numbering: 7, indent: 2)
+                + DocxFixture.paragraph("второй", numbering: 6, indent: 1),
+            styles: Self.headingNumberingStyles, numbering: Self.headingNumbering
+        )
+        let text = try await extract(url).plainText
+        XCTAssertTrue(text.contains("1.1 первый"), text)
+        XCTAssertTrue(text.contains("1.1.1 перезапущенный"), text)
+        XCTAssertTrue(text.contains("1.2 второй"), "общий счёт продолжается: \(text)")
+    }
+
+    /// Скрытый и пустой нумерованный абзацы Word считает; уровень, впервые
+    /// показанный в номере вложенного пункта, с этой минуты начат.
+    func testHiddenAndEmptyParagraphsCountAndShownLevelsStart() async throws {
+        let url = try write(body:
+            DocxFixture.paragraph("скрытый", numbering: 1, hidden: true)
+            + "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr></w:p>"
+            + DocxFixture.paragraph("подпункт без пункта", numbering: 1, indent: 1)
+            + DocxFixture.paragraph("пункт", numbering: 1)
+        )
+        let text = try await extract(url).plainText
+        XCTAssertTrue(text.contains("2.1. подпункт без пункта"), text)
+        XCTAssertTrue(text.contains("3. пункт"), text)
+        XCTAssertFalse(text.contains("скрытый"), text)
+    }
+
+    /// Оглавление не индексируется: заголовки и так стоят на своих местах.
+    func testTableOfContentsIsLeftOut() async throws {
+        let styles = DocxFixture.defaultStyles + """
+        <w:style w:type="paragraph" w:styleId="TOC1"><w:name w:val="toc 1"/></w:style>\
+        <w:style w:type="paragraph" w:styleId="TOCHead"><w:name w:val="TOC Heading"/></w:style>
+        """
+        let url = try write(
+            body: DocxFixture.paragraph("Содержание", style: "TOCHead")
+                + DocxFixture.paragraph("1 Общие положения\t3", style: "TOC1")
+                + DocxFixture.paragraph("2 Требования\t5", style: "TOC1")
+                + DocxFixture.paragraph("Общие положения", style: "Heading1")
+                + DocxFixture.paragraph("Текст раздела достаточно длинный, чтобы быть абзацем."),
+            styles: styles
+        )
+        let document = try await extract(url)
+        XCTAssertFalse(document.plainText.contains("Содержание"), document.plainText)
+        XCTAssertFalse(document.plainText.contains("Требования"), document.plainText)
+        XCTAssertTrue(document.plainText.contains("Общие положения"), document.plainText)
+        XCTAssertTrue(document.warnings.contains { $0.text.contains("оглавление не индексируется: 3") }, "\(document.warnings)")
+    }
+
+    func testNumberFormatsReadAsWordShowsThem() {
+        typealias Counter = DocxPartsReader.NumberingCounter
+        XCTAssertEqual(Counter.format(3, as: "none"), "")
+        XCTAssertEqual(Counter.format(3, as: "decimalZero"), "03")
+        XCTAssertEqual(Counter.format(3, as: "russianLower"), "в")
+        XCTAssertEqual(Counter.format(10, as: "russianUpper"), "К")
+    }
+
+    /// Неразрывный дефис и знак символьного шрифта — в тексте, а не пропадают.
+    func testNonBreakingHyphenAndSymbolsReachTheText() async throws {
+        let url = try write(body: """
+        <w:p><w:r><w:t>Федеральный закон № 99</w:t></w:r><w:r><w:noBreakHyphen/><w:t>ФЗ</w:t></w:r>\
+        <w:r><w:t xml:space="preserve"> ПП ВПД </w:t></w:r><w:r><w:sym w:font="Wingdings" w:char="F0E0"/></w:r>\
+        <w:r><w:t xml:space="preserve"> ИПС</w:t></w:r></w:p>\
+        <w:p><w:del w:id="1" w:author="a"><w:r><w:delText>старый</w:delText><w:noBreakHyphen/></w:r></w:del>\
+        <w:r><w:t>новый текст абзаца</w:t></w:r></w:p>
+        """)
+        let text = try await extract(url).plainText
+        XCTAssertTrue(text.contains("№ 99-ФЗ"), text)
+        XCTAssertTrue(text.contains("ПП ВПД → ИПС"), text)
+        XCTAssertTrue(text.contains("\nновый текст абзаца") || text.hasPrefix("новый"), text)
+        XCTAssertFalse(text.contains("-новый"), text)
+    }
+
+    /// `w:sym` в обычном шрифте — сам знак Юникода, а не код шрифта Symbol.
+    func testASymbolInAnOrdinaryFontIsItsUnicodeCharacter() {
+        typealias Body = DocxPartsReader
+        XCTAssertEqual(Body.inlineCharacter("w:sym", attributes: ["w:font": "Times New Roman", "w:char": "2116"]), "№")
+        XCTAssertEqual(Body.inlineCharacter("w:sym", attributes: ["w:font": "Symbol", "w:char": "F0B7"]), "•")
+        XCTAssertEqual(Body.inlineCharacter("w:sym", attributes: ["w:font": "Wingdings", "w:char": "F0E0"]), "→")
     }
 
     func testABulletListGetsADashRatherThanANumber() async throws {

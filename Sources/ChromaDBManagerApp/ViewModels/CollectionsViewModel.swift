@@ -81,9 +81,11 @@ final class CollectionsViewModel: ObservableObject {
     /// this app works with are trained for cosine.
     @Published var newCollectionMetric: DistanceMetric = .cosine
     /// Index parameters, as typed. Empty means «не передавать», not «взять
-    /// наше представление о серверном значении».
+    /// наше представление о серверном значении». `ef_search` заполнен
+    /// значением, с которым коллекции создаёт и синхронизация:
+    /// видно, что уйдёт на сервер, и стереть его можно.
     @Published var draftEFConstruction = ""
-    @Published var draftEFSearch = ""
+    @Published var draftEFSearch = String(HNSWParameters.recommendedEFSearch)
     @Published var draftMaxNeighbors = ""
 
     /// Numbers the user actually typed. Anything unparseable is left out
@@ -112,6 +114,11 @@ final class CollectionsViewModel: ObservableObject {
     /// before the collection itself is dropped — can take a while on a large
     /// collection, and rule 2 says it must not look like nothing is happening.
     @Published var isCapturingTrash = false
+    /// Почему удаление не состоялось — для самого окна удаления.
+    /// Прежде причина уходила в плашку на экране под окном, и нажатие
+    /// «Удалить» выглядело так, будто не делает ничего.
+    @Published var deleteTooBig: CollectionTooBigForTrash?
+    @Published var deleteError: String?
 
     // Add / edit a document
     @Published var documentText = ""
@@ -353,7 +360,31 @@ final class CollectionsViewModel: ObservableObject {
         defer { isLoadingCollections = false }
 
         do {
-            collections = try await client.listCollections(withCounts: true)
+            // Без счёта у сервера: `count` поднимает в его память
+            // индекс коллекции, и список из всех коллекций занимал гигабайты
+            // ещё до первого поиска. Число — последнее известное; заново
+            // спрашиваются открытая коллекция и те, в которые только что
+            // писали.
+            var listed = try await client.listCollections(withCounts: false)
+            let recount = app.takePendingRecount()
+            let previous = Set(collections.map(\.id))
+            for index in listed.indices {
+                let collection = listed[index]
+                if collection.id == selectedID || recount.contains(collection.name),
+                   let fresh = try? await client.count(collectionID: collection.id) {
+                    listed[index].documentCount = fresh
+                    app.collectionCounts.record(fresh, for: collection.id)
+                } else {
+                    listed[index].documentCount = app.collectionCounts.count(for: collection.id)
+                }
+            }
+            // Забываются только пропавшие с **этого** подключения: список
+            // прежнего сервера после переключения — не повод стереть его числа.
+            if listedConnectionID != nil, listedConnectionID == app.connectionID {
+                app.collectionCounts.forget(previous.subtracting(listed.map(\.id)))
+            }
+            listedConnectionID = app.connectionID
+            collections = listed
             if let selectedID, !collections.contains(where: { $0.id == selectedID }) {
                 self.selectedID = nil
                 documents = []
@@ -410,6 +441,8 @@ final class CollectionsViewModel: ObservableObject {
     /// удалял одноимённый документ из B. Кладётся только ответ на последний
     /// запрос и только пока выбрана та же коллекция.
     private var documentsRequest = 0
+    /// Подключение, с которого прочитан нынешний список коллекций.
+    private var listedConnectionID: UUID?
 
     private func isCurrent(_ request: Int, _ collection: ChromaCollection) -> Bool {
         request == documentsRequest && selected?.id == collection.id
@@ -440,7 +473,7 @@ final class CollectionsViewModel: ObservableObject {
                 documents += page
             }
             canLoadMore = page.count == Self.pageSize
-            await noteCollectionSize(client, collection: collection, reset: reset)
+            await noteCollectionSize(client, collection: collection, reset: reset, app: app)
         } catch {
             guard isCurrent(request, collection) else { return }
             if reset { documents = [] }
@@ -453,8 +486,15 @@ final class CollectionsViewModel: ObservableObject {
     ///
     /// Unfiltered only: with a filter the total says nothing about how many
     /// rows match it.
-    private func noteCollectionSize(_ client: ChromaClient, collection: ChromaCollection, reset: Bool) async {
+    private func noteCollectionSize(_ client: ChromaClient, collection: ChromaCollection, reset: Bool, app: AppEnvironment) async {
         guard filter.isEmpty, let current = try? await client.count(collectionID: collection.id) else { return }
+        // Открытая коллекция посчитана заново — число в списке и в памяти
+        // приложения то же.
+        if let index = collections.firstIndex(where: { $0.id == collection.id }),
+           collections[index].documentCount != current {
+            collections[index].documentCount = current
+        }
+        app.collectionCounts.record(current, for: collection.id)
         if reset || countWhenPageLoaded == nil {
             countWhenPageLoaded = current
             return
@@ -667,23 +707,48 @@ final class CollectionsViewModel: ObservableObject {
 
     // MARK: - Delete collection
 
-    func deleteSelected(_ app: AppEnvironment) async {
+    /// - Parameter usingTrash: `false` — удалить без копии в корзине, когда
+    ///   человек выбрал это сам в окне удаления; `nil` — как в настройках.
+    func deleteSelected(_ app: AppEnvironment, usingTrash: Bool? = nil) async {
         guard let client = app.client, let collection = selected else { return }
+        deleteTooBig = nil
+        deleteError = nil
         guard deleteConfirmationText == collection.name else {
             errorMessage = String(localized: "Имя введено неверно — удаление отменено.")
             return
         }
-        let usesTrash = app.settings.configuration.trashEnabled
+        // Второе нажатие, пока идёт первое, — не второе удаление.
+        // Флаг держится до конца операции: прежде он снимался сразу после
+        // захвата в корзину, и пока сервер удалял большую коллекцию, кнопка
+        // снова горела, ничего не показывая. Второе нажатие запускало захват
+        // уже удалённой коллекции и кончалось ошибкой «не найдена».
+        guard !isCapturingTrash else { return }
+        isCapturingTrash = true
+        defer {
+            isCapturingTrash = false
+            // Захват большой коллекции листает её целиком.
+            MemoryRelief.soon()
+        }
+        let usesTrash = usingTrash ?? app.settings.configuration.trashEnabled
         do {
             if usesTrash {
-                isCapturingTrash = true
-                defer { isCapturingTrash = false }
                 // If the capture fails partway, the collection must stay:
                 // deleting it anyway would defeat the one thing J3 exists for
                 // (rule 1, Приложение 5 — a manual delete has to stay reversible).
                 try await captureCollectionToTrash(collection, client: client, app: app)
             }
-            try await client.deleteCollection(name: collection.name)
+            do {
+                try await client.deleteCollection(name: collection.name)
+            } catch ChromaError.collectionNotFound {
+                // Её уже нет — то, чего и добивались.
+            } catch {
+                // Ответа не дождались — это ещё не значит, что не удалилось
+                //: спросить у сервера, а не объявлять сбой вслепую.
+                // Один список, а не два запроса: сбой первого из двух
+                // читался как «коллекции нет».
+                guard let listed = try? await client.listCollections(),
+                      !listed.contains(where: { $0.name == collection.name }) else { throw error }
+            }
             statusMessage = usesTrash
                 ? String(localized: "Коллекция «\(collection.name)» удалена — документы сохранены в корзине.")
                 : String(localized: "Коллекция «\(collection.name)» удалена.")
@@ -692,10 +757,31 @@ final class CollectionsViewModel: ObservableObject {
             selectedID = nil
             documents = []
             await refresh(app)
+        } catch let tooBig as CollectionTooBigForTrash {
+            deleteTooBig = tooBig
+            app.log.record(.warning, "Коллекции", tooBig.errorDescription ?? "")
         } catch {
-            errorMessage = app.describe(error)
+            deleteError = app.describe(error)
             app.report(error, category: "Коллекции")
         }
+    }
+
+    /// Предел, до которого `raiseTrashLimitAndDelete` поднимет корзину:
+    /// коллекция и то, что в корзине уже лежит, — с шагом в четверть
+    /// гигабайта.
+    func raisedTrashLimit(_ app: AppEnvironment) -> Int64? {
+        guard let problem = deleteTooBig else { return nil }
+        let quarter: Int64 = 268_435_456
+        let wanted = problem.needed + Int64(app.trash.totalBytes)
+        return max(app.settings.configuration.trashLimitBytes, (wanted + quarter - 1) / quarter * quarter)
+    }
+
+    func raiseTrashLimitAndDelete(_ app: AppEnvironment) async {
+        guard let problem = deleteTooBig, let limit = raisedTrashLimit(app) else { return }
+        app.settings.configuration.trashLimitBytes = limit
+        app.trash.updateRetention(days: app.settings.configuration.trashRetentionDays, limitBytes: limit)
+        app.log.record(.info, "Корзина", "Предел корзины поднят до \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)) для удаления коллекции «\(problem.collection)»")
+        await deleteSelected(app)
     }
 
     /// Pages through the whole collection, vectors included, before it is
@@ -726,6 +812,23 @@ final class CollectionsViewModel: ObservableObject {
                     collectionDimension: dimension,
                     reason: .collection
                 )
+            }
+            // Коллекция обязана поместиться в корзину целиком. Иначе
+            // вытеснение по объёму съедает её же первые страницы, пока
+            // захватываются последние, удаление проходит — и часть коллекции
+            // пропадает безвозвратно под обещание «сохранятся в корзине».
+            // Оценка — по первой странице, той же мерой, что у вытеснения.
+            if offset == 0 {
+                let total = (try? await client.count(collectionID: collection.id)) ?? page.count
+                let average = Double(TrashService.estimatedBytes(of: batch)) / Double(max(1, batch.count))
+                // С запасом в пятую часть: первая страница — не вся коллекция,
+                // и недооценка здесь стоит части удалённого.
+                let needed = Int64(average * Double(total) * 1.2)
+                if needed > app.trash.capacityBytes {
+                    throw CollectionTooBigForTrash(
+                        collection: collection.name, needed: needed, capacity: app.trash.capacityBytes
+                    )
+                }
             }
             // Бросит, если страница не легла на диск: тогда коллекция не
             // удаляется вовсе. Часть страниц при этом уже в корзине —
@@ -1676,7 +1779,7 @@ final class CollectionsViewModel: ObservableObject {
             return
         }
         profiles = app.searchProfiles.profiles(for: collection.name)
-        activeProfileID = app.searchProfiles.defaultProfile(for: collection.name).id
+        activeProfileID = app.searchProfiles.defaultProfile(for: collection.name, model: collection.boundModel).id
         smartSearchEnabled = app.searchProfiles.isPipelineEnabled(for: collection.name)
     }
 
@@ -1688,7 +1791,7 @@ final class CollectionsViewModel: ObservableObject {
         app.searchProfiles.setPipelineEnabled(enabled, for: collection.name)
         smartSearchEnabled = enabled
         statusMessage = enabled
-            ? String(localized: "Умный поиск включён: запросы идут через конвейер профиля «\(app.searchProfiles.defaultProfile(for: collection.name).name)».")
+            ? String(localized: "Умный поиск включён: запросы идут через конвейер профиля «\(app.searchProfiles.defaultProfile(for: collection.name, model: collection.boundModel).name)».")
             : String(localized: "Умный поиск выключен: запросы выполняются как обычный векторный поиск. Настройки профиля сохранены.")
     }
 
@@ -1719,7 +1822,7 @@ final class CollectionsViewModel: ObservableObject {
 
     func duplicateActiveProfile(_ app: AppEnvironment) {
         guard let collection = selected else { return }
-        var copy = app.searchProfiles.defaultProfile(for: collection.name)
+        var copy = app.searchProfiles.defaultProfile(for: collection.name, model: collection.boundModel)
         copy.id = UUID()
         copy.name = String(localized: "\(copy.name) — копия")
         copy.isDefault = false
@@ -1729,7 +1832,7 @@ final class CollectionsViewModel: ObservableObject {
 
     func editActiveProfile(_ app: AppEnvironment) {
         guard let collection = selected else { return }
-        profileDraft = app.searchProfiles.defaultProfile(for: collection.name)
+        profileDraft = app.searchProfiles.defaultProfile(for: collection.name, model: collection.boundModel)
         showProfileEditor = true
     }
 
@@ -1748,7 +1851,7 @@ final class CollectionsViewModel: ObservableObject {
     /// whatever remains.
     func deleteActiveProfile(_ app: AppEnvironment) {
         guard let collection = selected else { return }
-        let profile = app.searchProfiles.defaultProfile(for: collection.name)
+        let profile = app.searchProfiles.defaultProfile(for: collection.name, model: collection.boundModel)
         guard profiles.contains(where: { $0.id == profile.id }) else { return }
         app.searchProfiles.remove(id: profile.id)
         reloadProfiles(app)
@@ -1891,5 +1994,19 @@ final class CollectionsViewModel: ObservableObject {
             }
             return nil
         }
+    }
+}
+
+/// Коллекция не помещается в корзину целиком: удалять её с корзиной
+/// значит потерять часть безвозвратно.
+struct CollectionTooBigForTrash: LocalizedError {
+    let collection: String
+    let needed: Int64
+    let capacity: Int64
+
+    var errorDescription: String? {
+        let size = ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)
+        let limit = ByteCountFormatter.string(fromByteCount: capacity, countStyle: .file)
+        return String(localized: "Коллекция «\(collection)» не поместится в корзину: ей нужно около \(size), а предел корзины — \(limit). Корзина вытеснила бы её же первые записи, и удаление стало бы необратимым наполовину. Ничего не удалено. Увеличьте предел в «Настройках» → «Хранение» или, если копия не нужна, выключите там корзину на время удаления.")
     }
 }

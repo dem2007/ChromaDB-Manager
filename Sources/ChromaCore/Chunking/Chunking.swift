@@ -169,36 +169,31 @@ public enum LLMGranularity: String, Codable, CaseIterable, Identifiable, Sendabl
     }
 
     /// Default prompt per mode. Editable in the UI — this is only the starting point.
+    ///
+    /// Модель получает текст пронумерованными предложениями и отвечает
+    /// **номерами** границ: куски вырезаются из исходника, и
+    /// переписать, сократить или выдумать текст модели нечем. Шаблон со
+    /// старой подстановкой `{{TEXT}}`, просящий фрагменты текстом, тоже
+    /// работает — его фрагменты сверяются с исходником.
     public var defaultPrompt: String {
+        let task: String
         switch self {
         case .atomic:
-            return """
-            Раздели текст на атомарные утверждения: каждый фрагмент — одна законченная мысль, понятная без соседних.
-            Не сокращай, не пересказывай и не добавляй ничего от себя: объединение всех фрагментов должно давать исходный текст.
-            Ответь только JSON-массивом строк, без пояснений: ["фрагмент", "фрагмент"].
-
-            Текст:
-            {{TEXT}}
-            """
+            task = "Раздели текст на атомарные утверждения: каждый фрагмент — одна законченная мысль, понятная без соседних."
         case .topical:
-            return """
-            Раздели текст на тематические разделы: смена темы — граница фрагмента.
-            Не сокращай, не пересказывай и не добавляй ничего от себя: объединение всех фрагментов должно давать исходный текст.
-            Ответь только JSON-массивом строк, без пояснений: ["фрагмент", "фрагмент"].
-
-            Текст:
-            {{TEXT}}
-            """
+            task = "Раздели текст на тематические разделы: смена темы — граница фрагмента."
         case .logical:
-            return """
-            Раздели текст на логические блоки: вступление, аргументы, выводы, примеры, определения.
-            Не сокращай, не пересказывай и не добавляй ничего от себя: объединение всех фрагментов должно давать исходный текст.
-            Ответь только JSON-массивом строк, без пояснений: ["фрагмент", "фрагмент"].
-
-            Текст:
-            {{TEXT}}
-            """
+            task = "Раздели текст на логические блоки: вступление, аргументы, выводы, примеры, определения."
         }
+        return """
+        Ниже текст, разбитый на пронумерованные предложения.
+        \(task)
+        Назови номера предложений, с которых начинается каждый фрагмент, кроме первого. Сам текст не переписывай.
+        Ответь только JSON без пояснений: {"starts": [номер, номер]}. Если весь текст — один фрагмент, ответь {"starts": []}.
+
+        Текст:
+        {{NUMBERED_TEXT}}
+        """
     }
 }
 
@@ -316,6 +311,14 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         [enrichmentModel, chatModel]
             .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }
+    }
+
+    /// Модель предложений Semantic, если она задана. Пустая строка
+    /// равна «не задана» тем же правилом, что у обогащения: иначе очищенное
+    /// поле не откатывалось к модели источника, и каждый файл падал с «нет
+    /// эмбеддинг-модели».
+    public var resolvedSentenceModel: String? {
+        sentenceEmbeddingModel.map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
     }
 
     // Document-based
@@ -534,13 +537,21 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
     public var signature: String {
         let unit = sizeUnit == .tokens ? "t" : "c"
         var parts = [strategy.rawValue]
+        // Размер в токенах переводится в знаки этим числом: его смена
+        // сдвигает границы всех кусков, и подпись обязана это видеть.
+        if sizeUnit == .tokens { parts.append("cpt\(TokenEstimator.charactersPerToken)") }
         // контекстный префикс меняет то, что уходит в модель, при любой
         // стратегии — значит это часть рецепта коллекции, а не настройка
         // показа.
         if contextPrefix { parts.append("ctx") }
         // Обогащение стоит вызова модели на чанк — оно обязано быть видно
         // в строке настроек источника, а не только в форме.
-        if contextEnrichment { parts.append("ctx+llm") }
+        // Модель, пишущая контекст, — часть рецепта: её строка
+        // уходит в вектор, и смена модели без новой подписи смешала бы
+        // в коллекции векторы двух моделей.
+        if contextEnrichment {
+            parts.append(resolvedEnrichmentModel.map { "ctx+llm:\($0)" } ?? "ctx+llm")
+        }
 
         switch strategy {
         case .fixed:
@@ -572,7 +583,7 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
                 "th:\(thresholdMode.rawValue)\(thresholdSignature)",
                 "buf\(sentenceBuffer)",
                 "min\(minChunkSize)\(unit)", "max\(maxChunkSize)\(unit)",
-                "sm:\(sentenceEmbeddingModel ?? "source")",
+                "sm:\(resolvedSentenceModel ?? "source")",
             ]
         case .adaptive:
             parts += [
@@ -653,11 +664,33 @@ public struct ChunkingConfiguration: Codable, Hashable, Sendable {
         case .hierarchical:
             return "\(strategy.title) · родитель \(parentChunkSize) / ребёнок \(childChunkSize) \(unit)"
         case .semantic:
-            return "\(strategy.title) · \(thresholdMode.title) \(Int(thresholdValue.rounded())) · \(minChunkSize)–\(maxChunkSize) \(unit)"
+            // Порог — как в подписи: абсолютное расстояние до целого
+            // округлялось в 0 или 1, и смена порога на карточке не была видна.
+            let threshold = thresholdMode == .absolute ? String(format: "%.2f", thresholdValue) : thresholdSignature
+            return "\(strategy.title) · \(thresholdMode.title) \(threshold) · \(minChunkSize)–\(maxChunkSize) \(unit)"
         case .adaptive:
             return "\(strategy.title) · база \(baseChunkSize) \(unit) · \(minChunkSize)–\(maxChunkSize) · чувствительность \(String(format: "%.1f", sensitivity))"
         case .llmBased:
             return "\(strategy.title) · \(chatModel ?? "модель не выбрана") · \(granularity.title)"
+        }
+    }
+
+    /// Размер куска в знаках, в который обязан уложиться кусок таблицы
+    /// вместе с дописанной шапкой, или `nil`, если кусок делить
+    /// нельзя.
+    ///
+    /// - Структурная стратегия с запасным путём «оставить как есть» — раздел
+    ///   длиннее предела человек велел оставить целым.
+    /// - Родитель иерархической нарезки — контекст своих детей: разделённый,
+    ///   он оставлял детей второй половины с чужим `parent_chunk_id` и без
+    ///   места в документе. Предел модели за ним всё равно следит
+    ///   (`OversizeChunks`).
+    public func characterLimit(of chunk: TextChunk) -> Int? {
+        switch strategy {
+        case .fixed, .recursive: return chunkSizeInCharacters
+        case .documentBased: return oversizedFallback == .keep ? nil : maxSectionSizeInCharacters
+        case .hierarchical: return chunk.level > 0 ? nil : childSizeInCharacters
+        case .adaptive, .semantic, .llmBased: return maxSizeInCharacters
         }
     }
 
@@ -733,6 +766,14 @@ public struct TextChunk: Hashable {
     /// Set when the chunk did not come from the chosen strategy — currently only
     /// "the chat model answered with nonsense, this is the Recursive fallback".
     public var note: String?
+    /// Сколько знаков в начале куска — дописанная шапка таблицы: её
+    /// в этом месте файла нет. По этой мере `get_file` убирает шапку на швах,
+    /// где читатель её только что видел. Ноль — ничего не дописано.
+    ///
+    /// Не в инициализаторе: кусок с другим текстом обязан начинаться с нуля,
+    /// и каждое пересоздание куска так и делает — мера переживает только
+    /// перенумерацию (`renumbered`).
+    public var repeatedHeaderLength = 0
 
     public init(index: Int, text: String, level: Int = 0, parentIndex: Int? = nil, note: String? = nil) {
         self.index = index
@@ -743,6 +784,13 @@ public struct TextChunk: Hashable {
     }
 
     public var estimatedTokens: Int { TokenEstimator.estimatedTokens(text) }
+
+    /// Тот же кусок под другим номером — с мерой дописанной шапки.
+    public func renumbered(_ index: Int, parentIndex: Int?) -> TextChunk {
+        var copy = TextChunk(index: index, text: text, level: level, parentIndex: parentIndex, note: note)
+        copy.repeatedHeaderLength = repeatedHeaderLength
+        return copy
+    }
 }
 
 public protocol Chunking {
@@ -752,29 +800,26 @@ public protocol Chunking {
 /// LM Studio does not expose the model's tokenizer over the OpenAI-compatible
 /// API, so token counts in the UI are an estimate and labelled as such.
 public enum TokenEstimator {
-    /// ~4 characters per token is the common rule of thumb for English;
-    /// for Russian text it is closer to 3, so we use 3.5 as a middle ground.
+    /// Знаков русского текста на токен — у токенизатора Qwen3.
     ///
-    /// **Это число завышено, и менять его нельзя молча**. Замер
-    /// токенизатором Qwen3 на корпусе русской Википедии: 2.68 знака на токен
-    /// (разброс 2.54–2.77 по шести файлам). То есть «512 токенов» в форме
-    /// превращаются в 1792 знака ≈ 669 настоящих токенов — на 31 % больше
-    /// заказанного.
+    /// Было 3.5, и «512 токенов» в форме превращались в 1792 знака ≈ 669
+    /// настоящих токенов — на 31 % больше заказанного. Замер токенизатором
+    /// Qwen3 на корпусе пользователя (82 документа): 2.78 знака на токен по
+    /// всему тексту, 2.29 — медиана по файлам (таблицы и цифры дробятся
+    /// мельче), 2.02–2.95 между десятым и девяностым процентилем; на русской
+    /// Википедии — 2.68. Взято 2.6: «512 токенов» — 1331 знак, около 510
+    /// настоящих токенов на прозе и до 660 на таблицах.
     ///
-    /// Почему константа всё-таки осталась: она переводит **настройку**
-    /// в знаки, и её правка сдвинула бы границы чанков у всех источников,
-    /// не меняя подписи стратегии, — коллекция набралась бы смесью старой
-    /// и новой нарезки по мере правки файлов. Честный выход для того, кому
-    /// нужна точность, — единица «знаки»: их приложение знает наверняка,
-    /// а токены не знает никогда (у эндпойнта эмбеддингов LM Studio
-    /// `usage.prompt_tokens` равен нулю — проверено).
+    /// Константа переводит **настройку** в знаки, поэтому её правка сдвигает
+    /// границы кусков у всех источников в токенах. Чтобы коллекция не
+    /// набралась смесью старой и новой нарезки, она входит в подпись нарезки
+    /// (`ChunkingConfiguration.signature`): такие источники перенарезаются
+    /// целиком. Точно знает размер только единица «знаки» — у эндпойнта
+    /// эмбеддингов LM Studio `usage.prompt_tokens` равен нулю.
     ///
     /// Там, где ошибка опасна, а не косметична, берётся
     /// `pessimisticCharactersPerToken`.
-    ///
-    /// Годится, чтобы **показать** человеку порядок величины. Не годится,
-    /// чтобы на этом основании решать, влезет ли промпт: см. ниже.
-    public static let charactersPerToken = 3.5
+    public static let charactersPerToken = 2.6
 
     /// Для бюджета промпта — когда ошибка в одну сторону безобидна, а в
     /// другую означает отказ модели.
@@ -837,15 +882,41 @@ public struct FixedSizeChunker: Chunking {
 
 /// Splits on the first separator that yields pieces small enough, then packs
 /// neighbouring pieces back together up to `size`, adding a tail overlap.
+///
+/// **Три правила, которых раньше не было.**
+///
+/// * Части хранят свои разделители, и куски склеиваются из них дословно.
+///   Раньше пустые части после разреза выбрасывались вместе с разделителем:
+///   блок, кончавшийся `\n\n`, терял его, и последняя строка таблицы
+///   приклеивалась к шапке следующей — `| 357,28 || N п/п |`. На корпусе
+///   при 512 токенах — 269 таких склеек в 18 файлах.
+/// * Перекрытие — целыми частями, а если последняя часть длиннее перекрытия,
+///   то с начала предложения, в крайнем случае с начала слова. Раньше это
+///   были последние N знаков, и треть кусков начиналась с середины слова или
+///   строки таблицы, а раздел куска по его началу оказывался предыдущим.
+/// * Строка таблицы не режется внутри и в перекрытие не идёт: шапку
+/// каждому куску таблицы дописывает конвейер, а обрывок строки
+///   — это значения без своей позиции. Строку длиннее куска делит по
+/// ячейкам `TableChunks`.
 public struct RecursiveChunker: Chunking {
     public let size: Int
     public let overlap: Int
     public let separators: [String]
+    /// Строка таблицы и шапка с разделителем не режутся, даже если длиннее
+    /// куска. Выключается там, где размер — жёсткий предел, а не ориентир:
+    /// у окон LLM-нарезки, посчитанных по контексту модели и таймауту.
+    public let keepsTableRowsWhole: Bool
 
-    public init(size: Int, overlap: Int, separators: [String]) {
+    public init(size: Int, overlap: Int, separators: [String], keepsTableRowsWhole: Bool = true) {
         self.size = max(1, size)
         self.overlap = max(0, min(overlap, max(0, size - 1)))
         self.separators = separators.isEmpty ? ["\n\n", "\n", ". ", " "] : separators
+        self.keepsTableRowsWhole = keepsTableRowsWhole
+    }
+
+    /// Часть, которую нельзя резать дальше, хоть она и длиннее куска.
+    private func isIndivisible(_ text: String) -> Bool {
+        keepsTableRowsWhole && (Self.isTableRow(text) || Self.isTableHeader(text))
     }
 
     public func chunks(from text: String) -> [TextChunk] {
@@ -858,26 +929,58 @@ public struct RecursiveChunker: Chunking {
     }
 
     private func split(_ text: String, separatorIndex: Int) -> [String] {
-        if text.count <= size { return [text] }
+        if text.count <= size || isIndivisible(text) { return [text] }
         guard separatorIndex < separators.count else {
             // No separators left: hard-cut what is still too long.
-            return FixedSizeChunker(size: size, overlap: 0).chunks(from: text).map(\.text)
+            return Self.cut(text, every: size)
         }
 
-        let separator = separators[separatorIndex]
-        let parts = text.components(separatedBy: separator).filter { !$0.isEmpty }
+        // Разделитель `| --- |` — с шапкой над ним: шапка, оставшаяся
+        // в конце одного куска, и разделитель в начале другого не дают
+        // таблицы ни там, ни там.
+        var parts: [String] = []
+        for part in Self.pieces(of: text, separator: separators[separatorIndex]) {
+            if let last = parts.last, Self.isTableRow(last),
+               TableText.isSeparator(part.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                parts[parts.count - 1] = last + part
+            } else {
+                parts.append(part)
+            }
+        }
         if parts.count <= 1 {
             return split(text, separatorIndex: separatorIndex + 1)
         }
 
         var result: [String] = []
-        for (offset, part) in parts.enumerated() {
-            // Keep the separator so sentences don't lose their punctuation.
-            let restored = offset < parts.count - 1 ? part + separator : part
-            if restored.count <= size {
-                result.append(restored)
+        for part in parts {
+            if part.count <= size || isIndivisible(part) {
+                result.append(part)
             } else {
-                result += split(restored, separatorIndex: separatorIndex + 1)
+                result += split(part, separatorIndex: separatorIndex + 1)
+            }
+        }
+        return result
+    }
+
+    /// Части текста **с разделителем на конце** каждой: склеенные подряд,
+    /// они дают исходный текст знак в знак. Часть из одних пробелов
+    /// и разделителей — хвост предыдущей, а не своя.
+    static func pieces(of text: String, separator: String) -> [String] {
+        guard !separator.isEmpty else { return [text] }
+        var raw: [String] = []
+        var rest = text[...]
+        while let found = rest.range(of: separator) {
+            raw.append(String(rest[..<found.upperBound]))
+            rest = rest[found.upperBound...]
+        }
+        if !rest.isEmpty { raw.append(String(rest)) }
+
+        var result: [String] = []
+        for piece in raw {
+            if !result.isEmpty, piece.allSatisfy({ $0.isWhitespace || $0.isNewline }) || piece == separator {
+                result[result.count - 1] += piece
+            } else {
+                result.append(piece)
             }
         }
         return result
@@ -886,26 +989,140 @@ public struct RecursiveChunker: Chunking {
     private func merge(_ pieces: [String]) -> [String] {
         var result: [String] = []
         var current = ""
+        /// Длина `current` в знаках: `count` у строки — проход по ней,
+        /// и на каждой части он делал склейку квадратичной.
+        var currentCount = 0
+        var parts: [String] = []
+        /// Первая часть куска — перекрытие, повтор конца предыдущего.
+        var startsWithOverlap = false
+
+        func emit() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { result.append(trimmed) }
+        }
 
         for piece in pieces {
+            let pieceCount = piece.count
             if current.isEmpty {
                 current = piece
-            } else if current.count + piece.count <= size {
+                currentCount = pieceCount
+                parts = [piece]
+                startsWithOverlap = false
+            } else if currentCount + pieceCount <= size {
                 current += piece
+                currentCount += pieceCount
+                parts.append(piece)
             } else {
-                result.append(current.trimmingCharacters(in: .whitespacesAndNewlines))
-                current = overlapTail(of: current) + piece
+                // Шапка таблицы в конце куска — без единой строки под ней —
+                // уходит в следующий, к своим строкам.
+                // С ней — подпись прямо над ней («Таблица 16 – …»): одна
+                // в конце куска она оставалась обрывком без таблицы.
+                // Шапка, с которой кусок начался, тоже переносится: одна она
+                // выходила отдельным куском без единой строки.
+                var carried = ""
+                if let last = parts.last, Self.isTableHeader(last) {
+                    parts.removeLast()
+                    carried = last
+                    if let caption = parts.last, Self.isCaption(caption, limit: size) {
+                        parts.removeLast()
+                        carried = caption + carried
+                    }
+                    current = parts.joined()
+                }
+                // Кусок из одного перекрытия — дубль конца предыдущего:
+                // он не пишется.
+                let onlyOverlap = !carried.isEmpty && startsWithOverlap && parts.count == 1
+                if !onlyOverlap { emit() }
+                if !carried.isEmpty {
+                    current = carried + piece
+                    currentCount = current.count
+                    parts = [carried, piece]
+                    startsWithOverlap = false
+                    continue
+                }
+                // Перекрытие, с которым кусок вылез бы за размер, не берётся:
+                // размер — граница, перекрытие — пожелание.
+                let tail = overlapTail(of: parts)
+                let tailCount = tail.count
+                let fits = !tail.isEmpty && tailCount + pieceCount <= size
+                current = fits ? tail + piece : piece
+                currentCount = fits ? tailCount + pieceCount : pieceCount
+                parts = fits ? [tail, piece] : [piece]
+                startsWithOverlap = fits
             }
         }
-        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            result.append(current.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return result.filter { !$0.isEmpty }
+        emit()
+        return result
     }
 
-    private func overlapTail(of text: String) -> String {
-        guard overlap > 0, text.count > overlap else { return "" }
-        return String(text.suffix(overlap))
+    /// Конец куска, с которого начнётся следующий: целые части, а если
+    /// последняя часть длиннее перекрытия — её конец с начала предложения
+    /// или слова. Всегда дословный конец куска.
+    private func overlapTail(of parts: [String]) -> String {
+        guard overlap > 0, let last = parts.last else { return "" }
+        var tail = ""
+        for part in parts.reversed() {
+            guard tail.count + part.count <= overlap else { break }
+            tail = part + tail
+        }
+        // Внутри таблицы перекрытия нет: обрывок строки — значения без
+        // позиции, а шапку куску и так дописывают. Проверяется часть,
+        // из которой взят хвост: конец длинной строки таблицы с `|`
+        // не начинается и строкой таблицы сам не выглядит.
+        let source = tail.isEmpty ? last : tail
+        if source.split(separator: "\n").contains(where: { Self.isTableRow(String($0)) }) { return "" }
+        if tail.isEmpty { tail = Self.alignedSuffix(of: last, maximum: overlap) }
+        return tail
+    }
+
+    /// Самый длинный конец `text` не длиннее `maximum`, начинающийся
+    /// с предложения, а если такого нет — со слова.
+    static func alignedSuffix(of text: String, maximum: Int) -> String {
+        let length = text.count
+        guard maximum > 0, length > 0 else { return "" }
+        if length <= maximum { return text }
+        let earliest = text.index(text.endIndex, offsetBy: -maximum)
+        if let sentence = SentenceSplitter.ranges(in: text).first(where: { $0.lowerBound >= earliest }) {
+            return String(text[sentence.lowerBound...])
+        }
+        var index = earliest
+        while index < text.endIndex {
+            if index > text.startIndex, text[text.index(before: index)].isWhitespace, !text[index].isWhitespace {
+                return String(text[index...])
+            }
+            index = text.index(after: index)
+        }
+        return ""
+    }
+
+    /// Одна строка таблицы Markdown — `| … |`, без переводов строки внутри.
+    static func isTableRow(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.count > 2 && trimmed.hasPrefix("|") && trimmed.hasSuffix("|") && !trimmed.contains("\n")
+    }
+
+    /// Подпись таблицы: короткая строка прозы — не больше четверти куска.
+    static func isCaption(_ text: String, limit: Int) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed.count <= limit / 4 && !trimmed.contains("\n") && !trimmed.hasPrefix("|")
+    }
+
+    /// Шапка таблицы — строка и разделитель `| --- |` под ней.
+    static func isTableHeader(_ text: String) -> Bool {
+        let lines = text.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
+        return lines.count == 2 && isTableRow(lines[0]) && TableText.isSeparator(lines[1])
+    }
+
+    /// Нарезка по знакам — когда разделителей больше нет.
+    static func cut(_ text: String, every size: Int) -> [String] {
+        var result: [String] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let end = text.index(start, offsetBy: size, limitedBy: text.endIndex) ?? text.endIndex
+            result.append(String(text[start..<end]))
+            start = end
+        }
+        return result
     }
 }
 

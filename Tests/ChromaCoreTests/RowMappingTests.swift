@@ -411,22 +411,27 @@ final class RowIdentityTests: XCTestCase {
     /// Two sources with identical sheets must not write onto each other.
     func testIDsAreScopedToTheSourceAndTheSheet() {
         let byOtherSource = RowMapper.identifier(
-            sourceID: UUID(), sheetName: "Каталог", key: "A-1", rowContent: "x"
+            sourceID: UUID(), sourceFile: "a.xlsx", sheetName: "Каталог", key: "A-1", rowContent: "x"
         )
         let bySameSourceOtherSheet = RowMapper.identifier(
-            sourceID: sourceID, sheetName: "Другой", key: "A-1", rowContent: "x"
+            sourceID: sourceID, sourceFile: "a.xlsx", sheetName: "Другой", key: "A-1", rowContent: "x"
         )
         let mine = RowMapper.identifier(
-            sourceID: sourceID, sheetName: "Каталог", key: "A-1", rowContent: "x"
+            sourceID: sourceID, sourceFile: "a.xlsx", sheetName: "Каталог", key: "A-1", rowContent: "x"
         )
         XCTAssertNotEqual(mine, byOtherSource)
         XCTAssertNotEqual(mine, bySameSourceOtherSheet)
+        // Тот же лист и ключ в другом файле источника — другой документ.
+        let byOtherFile = RowMapper.identifier(
+            sourceID: sourceID, sourceFile: "b.xlsx", sheetName: "Каталог", key: "A-1", rowContent: "x"
+        )
+        XCTAssertNotEqual(mine, byOtherFile)
     }
 
     /// A key and a content hash must not collide even when the strings match.
     func testAKeyIDAndAContentIDAreDifferentThings() {
-        let keyed = RowMapper.identifier(sourceID: sourceID, sheetName: "s", key: "A-1", rowContent: "A-1")
-        let unkeyed = RowMapper.identifier(sourceID: sourceID, sheetName: "s", key: nil, rowContent: "A-1")
+        let keyed = RowMapper.identifier(sourceID: sourceID, sourceFile: "a.xlsx", sheetName: "s", key: "A-1", rowContent: "A-1")
+        let unkeyed = RowMapper.identifier(sourceID: sourceID, sourceFile: "a.xlsx", sheetName: "s", key: nil, rowContent: "A-1")
         XCTAssertNotEqual(keyed, unkeyed)
     }
 }

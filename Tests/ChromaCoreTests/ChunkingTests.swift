@@ -82,7 +82,7 @@ final class ChunkingTests: XCTestCase {
 
     func testTokenEstimatorRoundTrip() {
         XCTAssertEqual(TokenEstimator.estimatedTokens(""), 0)
-        XCTAssertEqual(TokenEstimator.characters(forTokens: 10), 35)
-        XCTAssertEqual(TokenEstimator.estimatedTokens(String(repeating: "a", count: 35)), 10)
+        XCTAssertEqual(TokenEstimator.characters(forTokens: 10), 26)
+        XCTAssertEqual(TokenEstimator.estimatedTokens(String(repeating: "a", count: 26)), 10)
     }
 }

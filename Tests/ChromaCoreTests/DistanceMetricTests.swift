@@ -20,10 +20,15 @@ final class CollectionConfigurationTests: XCTestCase {
 
     /// an empty field means «server decides», not «send our idea of the
     /// default». The server rejects unknown keys outright, so the set of keys
-    /// matters as much as the values.
+    /// matters as much as the values. Исключение — `ef_search` по умолчанию
+    ///: его приложение задаёт само.
     func testUntouchedIndexParametersAreNotSentAtAll() {
-        let body = hnsw(CollectionConfiguration())
+        let body = hnsw(CollectionConfiguration(hnsw: HNSWParameters()))
         XCTAssertEqual(Array(body.keys), ["space"])
+
+        let defaults = hnsw(CollectionConfiguration())
+        XCTAssertEqual(Set(defaults.keys), ["space", "ef_search"])
+        XCTAssertEqual(defaults["ef_search"] as? Int, 500)
 
         let tuned = hnsw(CollectionConfiguration(
             metric: .l2,

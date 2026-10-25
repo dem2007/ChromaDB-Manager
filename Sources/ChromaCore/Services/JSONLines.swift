@@ -35,4 +35,27 @@ enum JSONLines {
         data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
             .compactMap { String(data: Data($0), encoding: .utf8) }
     }
+
+    /// Строки по одной, без копии файла в памяти.
+    ///
+    /// `read` держит сразу и весь файл, и все его строки: на корзине
+    /// в полтора гигабайта это три гигабайта на время запуска. Здесь файл
+    /// отображается в память, и строка живёт, пока её разбирают.
+    static func forEachLine(at url: URL, _ body: (Data) throws -> Void) rethrows {
+        guard let data = try? Data(contentsOf: url, options: .alwaysMapped), !data.isEmpty else { return }
+        // По сырому буферу и `memchr`: побайтный обход `Data` как коллекции
+        // на полутора гигабайтах занимал больше пятнадцати секунд.
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var start = 0
+            while start < raw.count {
+                let found = memchr(base + start, 0x0A, raw.count - start)
+                let end = found.map { base.distance(to: UnsafeRawPointer($0)) } ?? raw.count
+                if end > start {
+                    try autoreleasepool { try body(Data(bytes: base + start, count: end - start)) }
+                }
+                start = end + 1
+            }
+        }
+    }
 }

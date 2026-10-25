@@ -397,6 +397,11 @@ final class MCPAnswerSurfaceTests: XCTestCase {
         // Заглушка отдаёт 2048 документов: без бюджета ответ разрастётся
         // настолько, что промах будет виден без всяких допусков.
         for (name, arguments) in [
+            // Поиск — с шапкой и пометками, которые раньше прибавлялись
+            // после рендера, мимо бюджета.
+            ("search", JSONValue.object([
+                "collection": .string("notes"), "query": .string("latin"), "n_results": .int(100),
+            ])),
             ("get_documents", JSONValue.object(["collection": .string("notes"), "limit": .int(100)])),
             ("collect_mentions", .object([
                 "collection": .string("notes"), "contains": .string("latin"), "limit": .int(100),

@@ -20,21 +20,19 @@ final class ChosenStateIsVisibleTests: XCTestCase {
         return try String(contentsOf: url, encoding: .utf8)
     }
 
-    /// Кнопки оценки красятся стилем, а не `.tint`.
-    func testTheGradeButtonsPaintThemselvesThroughTheStyle() throws {
+    /// Выбранная оценка залита цветом, остальные — обычные кнопки.
+    ///
+    /// Живой случай: оценку ставили, а кнопка не менялась ничем, и человек
+    /// жал её второй раз, снимая только что поставленную. Системный
+    /// переключатель-кнопка с `.tint` красил надписи всех трёх, а заливку
+    /// выбранной делал едва заметной — та же беда. Поэтому выбранная —
+    /// `.borderedProminent` с цветом своей оценки, остальные — `.bordered`.
+    func testTheChosenGradeIsFilledWithItsColour() throws {
         let view = try source("Sources/ChromaDBManagerApp/Views/EvaluationView.swift")
-        XCTAssertTrue(
-            view.contains(".buttonStyle(.chromaChoice(grade == candidate ? Self.tint(candidate) : nil))"),
-            "оценка обязана попадать в стиль кнопки"
-        )
-        XCTAssertFalse(
-            view.contains(".tint(grade == candidate"),
-            "`.tint` до капсульного стиля не доходит — красить им нельзя"
-        )
-        XCTAssertFalse(
-            view.contains(".tint(chosen ?"),
-            "выбранный k красится тем же способом, что и оценка"
-        )
+        XCTAssertTrue(view.contains("gradeButton(candidate, chosen: grade == candidate)"), "кнопка знает, выбрана ли её оценка")
+        XCTAssertTrue(view.contains(".buttonStyle(.borderedProminent)"), "выбранная оценка — залитая кнопка")
+        XCTAssertTrue(view.contains(".tint(Self.tint(candidate))"), "залита цветом своей оценки")
+        XCTAssertFalse(view.contains("chromaChoice"), "капсульный стиль на экране оценки больше не нужен")
     }
 
     /// Каждый переключатель показывает, включён ли он.
@@ -44,9 +42,9 @@ final class ChosenStateIsVisibleTests: XCTestCase {
     /// ровно та ошибка, за которой сюда и пришли. Показывать можно чем
     /// угодно: другим стилем, другой надписью, — лишь бы разница была.
     func testEveryToggleButtonShowsWhetherItIsOn() throws {
-        /// «?» у заголовка карточки: состояние видно по самому всплывающему
-        /// окну, которое кнопка и открывает.
-        let allowed = ["Components.swift"]
+        /// Исключений больше нет: капсульный стиль и «?» карточек ушли вместе
+        /// с `Components.swift`, а переключатели стали `Toggle(.button)`.
+        let allowed: [String] = []
         let views = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -73,17 +71,5 @@ final class ChosenStateIsVisibleTests: XCTestCase {
             }
         }
         XCTAssertEqual(mute, [], "переключатель обязан выглядеть по-разному включённым и выключенным")
-    }
-
-    /// Сам стиль умеет выбранное состояние: заливка, белая надпись, обводка.
-    func testTheStyleKnowsHowToLookChosen() throws {
-        let components = try source("Sources/ChromaDBManagerApp/Views/Components.swift")
-        XCTAssertTrue(components.contains("var chosen: Color?"), "у стиля обязано быть выбранное состояние")
-        XCTAssertTrue(components.contains("if chosen != nil { return .white }"), "надпись выбранной кнопки — белая")
-        XCTAssertTrue(components.contains("Capsule().fill(chosen)"), "выбранная кнопка заливается своим цветом")
-        XCTAssertTrue(
-            components.contains("static func chromaChoice(_ chosen: Color?) -> CapsuleButtonStyle"),
-            "стиль выбора вызывается одним именем во всём приложении"
-        )
     }
 }

@@ -189,8 +189,14 @@ final class SecurityViewModel: ObservableObject {
     /// Пример для того, кто будет подключаться. Показывается с настоящим
     /// портом и настоящей схемой — набирать его руками по памяти неоткуда.
     func connectionExample(app: AppEnvironment) -> String {
-        let port = app.settings.configuration.proxyPort.plainDigits
-        guard app.settings.configuration.proxyUsesTLS else {
+        Self.connectionExample(configuration: app.settings.configuration)
+    }
+
+    /// Пример подключения — только из порта и режима шифрования, поэтому его
+    /// показывает и форма ключа клиента, не заводя своей модели.
+    static func connectionExample(configuration: AppConfiguration) -> String {
+        let port = configuration.proxyPort.plainDigits
+        guard configuration.proxyUsesTLS else {
             return "curl http://127.0.0.1:\(port)/api/v2/heartbeat -H \"X-Chroma-Token: КЛЮЧ\""
         }
         return "curl --cacert chromadb-manager.pem https://127.0.0.1:\(port)/api/v2/heartbeat -H \"X-Chroma-Token: КЛЮЧ\""

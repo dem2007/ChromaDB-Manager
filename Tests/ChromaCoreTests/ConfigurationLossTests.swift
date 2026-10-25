@@ -227,4 +227,42 @@ final class ConfigurationLossTests: XCTestCase {
         }
         XCTAssertEqual(loaded.dataSources.count, 3, "копия не должна подменять настоящий файл")
     }
+
+    // MARK: - Настройки более новой сборки
+
+    /// Файл, записанный этой же сборкой, читается без потерь — и без тревоги.
+    func testOwnSettingsRaiseNoAlarm() throws {
+        var config = configuration(sources: 3)
+        config.dataSources[0].tableProfiles = [TableProfile(name: "p", mapping: TableMapping(sheetName: "s", columns: ["a"]))]
+        try SettingsStore.encoded(config).write(to: configURL)
+        let store = SettingsStore(fileURL: configURL)
+        XCTAssertNil(store.loss)
+    }
+
+    /// Незнакомое значение в одном профиле таблиц уносило при записи все
+    /// профили источника, а незнакомое поле — само себя. Теперь это сказано
+    /// при чтении, и файл лежит снимком до первой записи.
+    func testSettingsOfANewerBuildAreNamedAndKept() throws {
+        var config = configuration(sources: 1)
+        config.dataSources[0].tableProfiles = [TableProfile(name: "p", mapping: TableMapping(sheetName: "s", columns: ["a"]))]
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: SettingsStore.encoded(config)) as? [String: Any])
+        var sources = try XCTUnwrap(json["dataSources"] as? [[String: Any]])
+        var profiles = try XCTUnwrap(sources[0]["tableProfiles"] as? [[String: Any]])
+        var variants = try XCTUnwrap(profiles[0]["variants"] as? [[String: Any]])
+        variants[0]["sheets"] = ["future": ["x": 1]]
+        profiles[0]["variants"] = variants
+        sources[0]["tableProfiles"] = profiles
+        sources[0]["futureField"] = "value"
+        json["dataSources"] = sources
+        let raw = try JSONSerialization.data(withJSONObject: json)
+        try raw.write(to: configURL)
+
+        let store = SettingsStore(fileURL: configURL)
+        let notice = try XCTUnwrap(store.loss)
+        XCTAssertTrue(notice.unrepresented.contains("dataSources[источник 0].tableProfiles"), "\(notice.unrepresented)")
+        XCTAssertTrue(notice.unrepresented.contains("dataSources[источник 0].futureField"), "\(notice.unrepresented)")
+        let snapshot = try XCTUnwrap(notice.snapshot)
+        XCTAssertEqual(try Data(contentsOf: snapshot), raw)
+        XCTAssertTrue(notice.message.contains(snapshot.lastPathComponent))
+    }
 }

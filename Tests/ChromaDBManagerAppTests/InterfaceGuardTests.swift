@@ -34,20 +34,22 @@ final class CopyableNamesTests: XCTestCase {
         return Array(lines[start..<end])
     }
 
-    /// Заголовок коллекции: имя берётся и мышью, и правой кнопкой.
+    /// Заголовок коллекции: имя берётся правой кнопкой, целиком.
     ///
-    /// Обоими способами, и это не избыточность: имя длиной в экран обрезано
-    /// посередине, и выделение мышью берёт только видимое.
+    /// Выделение мышью снято снова: `.textSelection` роняет
+    /// приложение, а «Скопировать» берёт имя целиком, даже обрезанное
+    /// посередине.
     func testTheCollectionNameCanBeCopiedFromTheHeader() throws {
-        let header = body(of: "collectionHeader", in: try collectionsView()).joined(separator: "\n")
+        // С имя и факты — в тулбаре, функцией `collectionTitle`.
+        let header = body(of: "collectionTitle", in: try collectionsView()).joined(separator: "\n")
         XCTAssertFalse(header.isEmpty, "функция заголовка коллекции не найдена")
         XCTAssertTrue(
             header.contains(".copyable(collection.name)"),
             "у имени коллекции должно быть «Скопировать» в правой кнопке"
         )
         XCTAssertTrue(
-            header.contains(".textSelection(.enabled)"),
-            "имя и строку фактов должно быть можно выделить мышью"
+            header.contains(".copyable(collectionFactLine(collection))"),
+            "строку фактов тоже должно быть можно скопировать"
         )
     }
 
@@ -91,10 +93,12 @@ final class ColumnLettersTests: XCTestCase {
         )
     }
 
-    /// карточка «Сейчас» не меняет размеров от своего содержимого.
+    /// секция «Сейчас» не меняет размеров от своего содержимого.
     ///
     /// Проверять глазами тут нечего: дефект виден только в движении — при
     /// запуске, когда подключается адрес, тикает аптайм и отвечает сервер.
+    /// После перехода на `Form` высоту строки задаёт система, и держится она
+    /// тем, что каждое значение — в одну строку.
     func testTheStatusCardKeepsItsSizeWhatever() throws {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -103,20 +107,22 @@ final class ColumnLettersTests: XCTestCase {
             throw XCTSkip("исходники экрана не найдены рядом с тестами")
         }
         let source = try String(contentsOf: url, encoding: .utf8)
+        guard let start = source.range(of: "private var nowSection"),
+              let end = source.range(of: "private func monospaced", range: start.upperBound..<source.endIndex)
+        else { return XCTFail("секция «Сейчас» не найдена — экран переписан, сторожа надо переписать вместе с ним") }
+        let section = source[start.lowerBound..<end.lowerBound]
 
-        XCTAssertTrue(
-            source.contains(".frame(height: Theme.Size.statusRow)"),
-            "высота строки состояния задаётся числом, а не текстом в ней"
-        )
-        XCTAssertTrue(
-            source.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
-            "значение занимает всю оставшуюся ширину и не тянет строку за собой"
-        )
-        // Строка, которой может не быть, — это карточка, которая подрастает
+        // Каждое значение — одной строкой: адрес и путь, растущие в две,
+        // двигали бы всё, что ниже.
+        let values = section.components(separatedBy: "LabeledContent(").count - 1
+        let singleLine = section.components(separatedBy: ".lineLimit(1)").count - 1
+        XCTAssertGreaterThanOrEqual(singleLine, 3, "значения секции «Сейчас» обязаны быть в одну строку")
+        XCTAssertGreaterThanOrEqual(values, 6, "строк в секции «Сейчас» меньше шести — какая-то пропала")
+        // Строка, которой может не быть, — это секция, которая подрастает
         // на ходу. Телеметрия появлялась через секунду после запуска.
         XCTAssertFalse(
-            source.contains("if let telemetry"),
-            "строка телеметрии обязана стоять всегда — иначе карточка растёт на ходу"
+            section.contains("if let telemetry") || section.contains("if processManager.telemetryStatus"),
+            "строка телеметрии обязана стоять всегда — иначе секция растёт на ходу"
         )
     }
 
@@ -252,7 +258,7 @@ final class CertificateOnScreenTests: XCTestCase {
             "обрезанный отпечаток сверить нельзя — он для того и нужен, чтобы совпасть целиком"
         )
         XCTAssertTrue(source.contains("model.copy(certificate.fingerprint)"), "отпечаток должен копироваться кнопкой")
-        XCTAssertTrue(source.contains(".textSelection(.enabled)"), "и выделяться мышью")
+        XCTAssertTrue(source.contains(".copyable(certificate.fingerprint)"), "и правой кнопкой")
     }
 
     func testExportAndReissueAreBothOnTheScreen() throws {

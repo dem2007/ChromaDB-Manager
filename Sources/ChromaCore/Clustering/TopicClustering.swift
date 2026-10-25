@@ -123,7 +123,9 @@ public struct TopicClustering: Sendable {
         }
 
         // 2. Векторы — из базы, партиями.
-        var vectors: [[Double]] = []
+        // Векторы сразу кладутся в плоский набор: массив массивов
+        // рядом с ним удваивал память выборки.
+        var builder: VectorSet.Builder?
         var vectorIDs: [String] = []
         var dimension = collection.effectiveDimension ?? 0
         var withoutVector = 0
@@ -143,7 +145,8 @@ public struct TopicClustering: Sendable {
                     withoutVector += 1
                     continue
                 }
-                vectors.append(vector)
+                if builder == nil { builder = VectorSet.Builder(dimension: dimension, expected: sampleIDs.count) }
+                builder?.append(vector)
                 vectorIDs.append(id)
             }
             progress?(Progress(
@@ -154,21 +157,21 @@ public struct TopicClustering: Sendable {
         if withoutVector > 0 {
             notes.append(String(localized: "Без вектора или с вектором другой длины: \(withoutVector.plainDigits) документов — в кластеризацию они не вошли."))
         }
-        guard vectors.count >= 2, dimension > 0 else {
-            throw ClusteringError.tooFewVectors(vectors.count)
+        guard vectorIDs.count >= 2, dimension > 0, let builder else {
+            throw ClusteringError.tooFewVectors(vectorIDs.count)
         }
 
         // 3. Разбиение.
         try Task.checkCancellation()
         progress?(Progress(done: 0, total: 1, stage: String(localized: "Кластеризация")))
-        let points = VectorSet(vectors: vectors, dimension: dimension)
+        let points = builder.build()
         // Нулевой вектор набор отбрасывает — и вместе с ним ломается
         // соответствие «точка ↔ документ». Поэтому идентификаторы и тексты
         // раскладываются по тому же списку `keptIndexes`, а не по своему
         // правилу: иначе тема получила бы примеры от чужих строк.
         let ids = points.keptIndexes.map { vectorIDs[$0] }
-        if points.count < vectors.count {
-            notes.append(String(localized: "Нулевых векторов: \((vectors.count - points.count).plainDigits) — у них нет направления, и в кластеризацию они не вошли."))
+        if points.count < vectorIDs.count {
+            notes.append(String(localized: "Нулевых векторов: \((vectorIDs.count - points.count).plainDigits) — у них нет направления, и в кластеризацию они не вошли."))
         }
         guard points.count >= 2 else { throw ClusteringError.tooFewVectors(points.count) }
 
@@ -383,6 +386,7 @@ public struct TopicClustering: Sendable {
     /// молчаливый провал разбора здесь недопустим — тема просто останется
     /// без названия, о чём отчёт и скажет.
     static func parse(_ answer: String) -> (title: String, summary: String?)? {
+        let answer = removingThinking(answer)
         guard let start = answer.firstIndex(of: "{"), let end = answer.lastIndex(of: "}"), start < end else {
             return nil
         }
@@ -392,8 +396,43 @@ public struct TopicClustering: Sendable {
         else { return nil }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let summary = (object["summary"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (trimmed, (summary?.isEmpty ?? true) ? nil : summary)
+        let summary = (object["summary"] as? String).flatMap(plausibleSummary)
+        return (trimmed, summary)
+    }
+
+    /// Рассуждение «думающей» модели — не ответ: блоки `<think>…</think>`
+    /// вырезаются, а незакрытый (обрезанный ответ) — всё до `</think>`.
+    static func removingThinking(_ text: String) -> String {
+        var text = text
+        while let open = text.range(of: "<think>"),
+              let close = text.range(of: "</think>", range: open.upperBound..<text.endIndex) {
+            text.removeSubrange(open.lowerBound..<close.upperBound)
+        }
+        if let close = text.range(of: "</think>") {
+            text = String(text[close.upperBound...])
+        }
+        return text
+    }
+
+    /// Описание темы — одна фраза о документах. Рассуждение модели о самой
+    /// задаче, положенное в поле `summary` (так отвечала GLM 4.7 Flash:
+    /// «The user wants a short title…»), описанием не считается — строки
+    /// описания тогда просто нет. Проверяется и при разборе ответа, и при
+    /// показе уже сохранённых отчётов.
+    public static func plausibleSummary(_ summary: String) -> String? {
+        let text = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let lower = text.lowercased()
+        let reasoningOpeners = [
+            "the user wants", "the user asks", "the user is asking", "the user has", "the user provided",
+            "we need to", "we have", "let me", "let's", "okay,", "ok,", "i need to", "i will", "i should",
+            "first,", "the task", "пользователь просит", "пользователь хочет", "нужно придумать", "задача:",
+        ]
+        if reasoningOpeners.contains(where: { lower.hasPrefix($0) }) { return nil }
+        if lower.contains("<think") || lower.contains("</think") { return nil }
+        // Одна фраза не бывает длиннее абзаца.
+        if text.count > 400 { return nil }
+        return text
     }
 }
 

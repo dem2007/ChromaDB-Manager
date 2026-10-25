@@ -85,6 +85,12 @@ public enum EvaluationReport {
                 scores: metrics.map { $0.ndcg[k] }
             ))
         }
+        for k in ks {
+            columns.append(column(
+                key: "chars@\(k)", title: charactersTitle(k), direction: .lowerIsBetter,
+                scores: metrics.map { $0.charactersPerUseful[k] }, scale: .characters
+            ))
+        }
         // Заголовок без слова «медиана»: сама ячейка уже пишет «медиана 5 мс ·
         // p95 11 мс», и строка читалась как «поиск, медиана: медиана 5 мс».
         // В сравнении прогонов заголовок другой — там в ячейке одно число.
@@ -100,15 +106,21 @@ public enum EvaluationReport {
         return Table(variantNames: names, columns: columns, highlightsBest: metrics.count > 1)
     }
 
+    /// Заголовок строки цены попадания — один на таблицу и сравнение.
+    static func charactersTitle(_ k: Int) -> String {
+        String(localized: "знаков на полезный@\(k)")
+    }
+
     private static func column(
-        key: String, title: String, direction: Direction, scores: [MetricScore?]
+        key: String, title: String, direction: Direction, scores: [MetricScore?],
+        scale: Scale = .ratio
     ) -> Column {
         let values = scores.map { $0?.value }
         let best = bestIndices(values, direction: direction, comparable: scores.count > 1)
         let cells = scores.enumerated().map { index, score in
             Cell(
                 value: score?.value,
-                text: score?.text ?? "—",
+                text: scale.text(score?.value),
                 isBest: best.contains(index)
             )
         }
@@ -242,7 +254,7 @@ public extension EvaluationReport {
             «\(shortest.name)» — \(RussianCount.grouped(shortest.length, "символ", "символа", "символов")). \
             Эталон — фрагмент текста, и длинный кусок содержит его чаще просто \
             потому, что он длинный: hit rate и nDCG у таких вариантов сравнимы \
-            лишь с оговоркой.
+            лишь с оговоркой. Цену попадания показывает строка «знаков на полезный».
             """)
     }
 
@@ -341,6 +353,8 @@ public extension EvaluationReport {
         case ratio
         /// Секунды — показываются миллисекундами, целыми.
         case seconds
+        /// Знаки — целыми, с разрядами: «1 544».
+        case characters
 
         public func text(_ value: Double?) -> String {
             guard let value else { return "—" }
@@ -348,6 +362,7 @@ public extension EvaluationReport {
             case .ratio: return String(format: "%.2f", value)
             // Разряды разделяются так же, как в таблице выше: «5 473 мс».
             case .seconds: return String(localized: "\(Int((value * 1000).rounded())) мс")
+            case .characters: return Int(value.rounded()).formatted()
             }
         }
 
@@ -367,6 +382,10 @@ public extension EvaluationReport {
                 // дефис, как в строках долей выше («-0.01»).
                 let sign = milliseconds > 0 ? "+" : "-"
                 return sign + String(localized: "\(abs(milliseconds)) мс")
+            case .characters:
+                let characters = Int(change.rounded())
+                guard characters != 0 else { return nil }
+                return (characters > 0 ? "+" : "-") + abs(characters).formatted()
             }
         }
     }
@@ -477,6 +496,13 @@ public extension EvaluationReport {
             result.append(MetricDelta(
                 key: "ndcg@\(k)", title: "nDCG@\(k)", direction: .higherIsBetter,
                 before: old.ndcg[k]?.value, after: new.ndcg[k]?.value
+            ))
+        }
+        for k in ks {
+            result.append(MetricDelta(
+                key: "chars@\(k)", title: charactersTitle(k), direction: .lowerIsBetter,
+                before: old.charactersPerUseful[k]?.value, after: new.charactersPerUseful[k]?.value,
+                scale: .characters
             ))
         }
         // Единица в заголовке: остальные строки сравнения — доли от нуля до

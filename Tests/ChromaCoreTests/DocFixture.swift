@@ -34,6 +34,27 @@ struct DocFixture {
     var hiddenParagraphs: Set<Int> = []
     /// Абзацы, набранные полужирным «наоборот, чем в стиле».
     var boldParagraphs: Set<Int> = []
+    /// Определения списков — `PlfLst` с уровнями.
+    var lists: [DocList] = []
+    /// Экземпляры списков — `PlfLfo`; абзац ссылается на них с 1.
+    var listInstances: [DocListInstance] = []
+    /// Список и уровень, заданные в абзаце: `sprmPIlfo` и `sprmPIlvl`.
+    var paragraphLists: [Int: (instance: Int, level: Int)] = [:]
+    /// Абзацы, закрытые разрывом раздела (0x0C) вместо знака абзаца.
+    var sectionBreaks: Set<Int> = []
+
+    struct DocList {
+        var id: UInt32
+        /// Вид номера (`nfc`), строка номера — `%1.%2.`, как в `.docx`, —
+        /// и начальный номер.
+        var levels: [(format: UInt8, text: String, start: Int32)]
+    }
+
+    struct DocListInstance {
+        var listID: UInt32
+        /// Уровень → номер, с которого список начинается заново.
+        var restarts: [Int: Int32] = [:]
+    }
 
     struct DocStyle {
         var name: String
@@ -58,7 +79,10 @@ struct DocFixture {
         }
 
         // 1. Основной текст.
-        for paragraph in paragraphs { counts[0] += append(paragraph) }
+        for (index, paragraph) in paragraphs.enumerated() {
+            counts[0] += append(paragraph)
+            if sectionBreaks.contains(index) { characters[characters.count - 1] = 0x0C }
+        }
 
         // 2. Сноски.
         var footnoteBounds: [Int] = [0]
@@ -194,7 +218,13 @@ struct DocFixture {
         if !styles.isEmpty {
             place(1, stylesheet())
         }
-        if !styles.isEmpty || !paragraphStyles.isEmpty {
+        if !lists.isEmpty {
+            let (definitions, instances) = listTables()
+            locations[73] = (fc: table.count, lcb: 2 + lists.count * 28)
+            table.append(definitions)
+            place(74, instances)
+        }
+        if !styles.isEmpty || !paragraphStyles.isEmpty || !paragraphLists.isEmpty || !sectionBreaks.isEmpty {
             let properties = paragraphProperties(documentSize: document.count, bounds: bounds)
             document.append(properties.pages)
             place(13, properties.plcfBtePapx)
@@ -283,6 +313,63 @@ struct DocFixture {
         return result
     }
 
+    /// Таблицы списков: `PlfLst` с уровнями сразу за ним и `PlfLfo`
+    /// с данными экземпляров (MS-DOC 2.9.147, 2.9.150).
+    private func listTables() -> (definitions: Data, instances: Data) {
+        var definitions = Data()
+        definitions.append(u16(UInt16(lists.count)))
+        for list in lists {
+            definitions.append(u32(list.id))
+            definitions.append(u32(0))
+            for _ in 0..<9 { definitions.append(u16(0x0FFF)) }
+            definitions.append(UInt8(list.levels.count == 1 ? 1 : 0))
+            definitions.append(0)
+        }
+        for list in lists {
+            for index in 0..<(list.levels.count == 1 ? 1 : 9) {
+                let level = index < list.levels.count ? list.levels[index] : (format: UInt8(0), text: "", start: Int32(1))
+                definitions.append(u32(UInt32(bitPattern: level.start)))
+                definitions.append(level.format)
+                definitions.append(0)
+                definitions.append(Data(count: 9))     // rgbxchNums
+                definitions.append(0)                  // ixchFollow
+                definitions.append(Data(count: 8))     // dxaIndentSav, unused2
+                definitions.append(Data(count: 4))     // cbGrpprlChpx, cbGrpprlPapx, …
+                // «%N» — знак с кодом N−1 на месте номера уровня.
+                var units: [UInt16] = []
+                var characters = Array(level.text.utf16)[...]
+                while let unit = characters.popFirst() {
+                    if unit == 0x25, let digit = characters.first, (0x31...0x39).contains(digit) {
+                        units.append(digit - 0x31)
+                        characters.removeFirst()
+                    } else {
+                        units.append(unit)
+                    }
+                }
+                definitions.append(u16(UInt16(units.count)))
+                for unit in units { definitions.append(u16(unit)) }
+            }
+        }
+
+        var instances = Data()
+        instances.append(u32(UInt32(listInstances.count)))
+        for instance in listInstances {
+            instances.append(u32(instance.listID))
+            instances.append(Data(count: 8))
+            instances.append(UInt8(instance.restarts.count))
+            instances.append(Data(count: 3))
+        }
+        for instance in listInstances {
+            instances.append(u32(0xFFFF_FFFF))         // cp
+            for (level, start) in instance.restarts.sorted(by: { $0.key < $1.key }) {
+                instances.append(u32(UInt32(bitPattern: start)))
+                instances.append(UInt8(level) | 0x10)  // fStartAt
+                instances.append(Data(count: 3))
+            }
+        }
+        return (definitions, instances)
+    }
+
     /// Границы абзацев основного текста: где абзац начинается в потоке
     /// и каким стилем набран.
     private func paragraphBounds(
@@ -300,7 +387,7 @@ struct DocFixture {
         var list: [(fc: Int, istd: Int, number: Int)] = []
         var start = 0
         var number = 0
-        for (index, character) in characters.enumerated() where character == 0x0D {
+        for (index, character) in characters.enumerated() where character == 0x0D || character == 0x0C {
             guard index < mainCount else { break }
             list.append((fc: fileOffset(of: start), istd: paragraphStyles[number] ?? 0, number: number))
             start = index + 1
@@ -351,7 +438,15 @@ struct DocFixture {
         for bound in bounds.list {
             var record = Data([2])
             record.append(u16(UInt16(bound.istd)))
-            record.append(Data(count: 4 - record.count))
+            if let list = paragraphLists[bound.number] {
+                record.append(u16(0x460B))
+                record.append(u16(UInt16(list.instance)))
+                record.append(u16(0x260A))
+                record.append(UInt8(list.level))
+                record[0] = UInt8((record.count - 1 + 1) / 2)
+            }
+            if record.count % 2 == 1 { record.append(0) }
+            record.append(Data(count: max(0, 4 - record.count)))
             records.append(record)
         }
         let page = propertyPage(

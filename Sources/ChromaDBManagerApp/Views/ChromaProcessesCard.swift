@@ -1,80 +1,98 @@
 import SwiftUI
 import ChromaCore
 
-/// Процессы chroma, оставшиеся от прошлых запусков.
+/// Процессы chroma, оставшиеся от прошлых запусков —
+/// секциями формы «Обзора».
 ///
 /// **Живёт на «Обзоре», а не в установке.** Такой процесс держит порт и базу,
 /// и увидеть его надо в первую секунду после запуска приложения — на экране,
-/// который человек и так открывает. На вкладке «Установка» карточка попадалась
-/// на глаза тому, кто и без неё пришёл разбираться с движком, а остальным —
-/// никогда: до неё надо было додуматься.
+/// который человек и так открывает.
 ///
-/// Своим файлом, а не куском экрана: карточка отвечает на один вопрос —
-/// «чужие процессы нашего сервера», — и её должно быть можно поставить куда
-/// угодно, не таща за собой пол-экрана окружения.
+/// Своим файлом, а не куском экрана: секции отвечают на один вопрос —
+/// «чужие процессы нашего сервера», — и их можно поставить в любую форму.
 struct ChromaProcessesCard: View {
     @EnvironmentObject private var app: AppEnvironment
     @EnvironmentObject private var processManager: ChromaProcessManager
     /// Чужие процессы chroma усыновляет и останавливает та же модель, что и
-    /// раньше: переехали карточки, а не логика.
+    /// раньше: переехали секции, а не логика.
     @ObservedObject var serverModel: ServerViewModel
+    @State private var stopping: RunningServerRecord?
 
     var body: some View {
-        // Пусто — карточки нет вовсе: постоянный «процессов не найдено»
-        // на первом экране это строка, которую перестают читать.
-        if !processManager.orphans.isEmpty { orphansCard }
-        if !processManager.unverified.isEmpty { unverifiedCard }
+        // Пусто — секции нет вовсе: постоянный «процессов не найдено»
+        // на первом экране — строка, которую перестают читать.
+        if !processManager.orphans.isEmpty { orphansSection }
+        if !processManager.unverified.isEmpty { unverifiedSection }
     }
 
-    private var orphansCard: some View {
-        SectionCard(
-            title: String(localized: "Найден процесс от прошлой сессии"),
-            subtitle: String(localized: "Приложение сохраняет PID запущенных им серверов и проверяет их при старте.")
-        ) {
+    private var orphansSection: some View {
+        Section {
             ForEach(processManager.orphans) { record in
-                HStack {
+                LabeledContent {
+                    Button(String(localized: "Остановить…"), role: .destructive) { stopping = record }
+                        // У кнопки своей строки, а не у секции: диалог на
+                        // секции формы не открывается.
+                        .confirmationDialog(
+                            String(localized: "Остановить процесс \(record.pid)?"),
+                            isPresented: Binding(
+                                get: { stopping?.id == record.id },
+                                set: { if !$0 { stopping = nil } }
+                            )
+                        ) {
+                            Button(String(localized: "Остановить"), role: .destructive) {
+                                Task { await serverModel.stopOrphan(record, app: app) }
+                            }
+                            Button(String(localized: "Отменить"), role: .cancel) {}
+                        } message: {
+                            Text("Процесс сервера на порту \(record.port.plainDigits) будет остановлен. Данные базы не трогаются.")
+                        }
+                } label: {
                     process(record)
-                    Spacer()
-                    Button(String(localized: "Остановить")) {
-                        Task { await serverModel.stopOrphan(record, app: app) }
-                    }
-                    .buttonStyle(.chromaNormal)
                 }
-                .padding(.vertical, 2)
             }
-            Text(String(localized: "Если этот процесс обслуживает вашу локальную базу, приложение просто подключится к нему при следующем подключении."))
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+        } header: {
+            SectionHeader(
+                String(localized: "Найден процесс от прошлой сессии"),
+                help: String(localized: "Приложение сохраняет PID запущенных им серверов и проверяет их при старте.")
+            )
+        } footer: {
+            Text("Если он обслуживает вашу локальную базу, приложение подключится к нему при следующем подключении.")
         }
     }
 
-    /// Processes that are alive and look like ours but could not be confirmed.
+    /// Живые и похожие на наш сервер, но не подтверждённые процессы.
     ///
-    /// Shown rather than quietly dropped: forgetting them is exactly how four
-    /// servers once ended up running for days, holding the database, with the
-    /// app unaware they existed. The app will not signal what it cannot
-    /// identify — but it will say that something is there.
-    private var unverifiedCard: some View {
-        SectionCard(
-            title: String(localized: "Процесс, который не удалось опознать"),
-            subtitle: String(localized: "Он жив и похож на наш сервер, но одну из проверок подтвердить не вышло. Приложение не отправляет сигналы тому, в чём не уверено, — и не забывает про такие процессы.")
-        ) {
+    /// Показываются, а не отбрасываются молча: так однажды четыре сервера
+    /// работали сутками, держа базу, а приложение о них не знало.
+    /// Сигнал тому, что не опознано, приложение не шлёт — но говорит, что оно есть.
+    private var unverifiedSection: some View {
+        Section {
             ForEach(processManager.unverified) { record in
                 process(record)
-                    .padding(.vertical, 2)
             }
-            Text(String(localized: "Причина — в логе, раздел «Сервер». Часто это временно: проверьте ещё раз кнопкой обновления. Если процесс лишний, его можно снять вручную по PID."))
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+        } header: {
+            SectionHeader(
+                String(localized: "Процесс, который не удалось опознать"),
+                help: String(localized: "Он жив и похож на наш сервер, но одну из проверок подтвердить не вышло. Приложение не отправляет сигналы тому, в чём не уверено, — и не забывает про такие процессы.")
+            )
+        } footer: {
+            Text("Причина — в логе, раздел «Сервер». Если процесс лишний, его можно снять вручную по PID.")
         }
     }
 
     /// Чем процесс назван человеку: PID и адрес, путь к базе, время запуска.
     private func process(_ record: RunningServerRecord) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("PID \(record.pid) · \(record.host):\(record.port)").font(Theme.Font.body)
-            Text(record.path).font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                .lineLimit(1).truncationMode(.middle)
+        VStack(alignment: .leading) {
+            Text("PID \(record.pid) · \(record.host):\(record.port)")
+            Text(record.path)
+                .font(.callout.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(record.path)
             Text(String(localized: "запущен \(record.startedAt.formatted(date: .abbreviated, time: .shortened))"))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 }

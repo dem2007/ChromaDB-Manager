@@ -238,16 +238,25 @@ public enum SheetModeDetector {
     static func isHeaderRow(_ row: SheetRow, columns: [Int]) -> Bool {
         guard columns.count > 1 else { return false }
         var named = 0
+        var labels: Set<String> = []
         for column in columns {
             switch row.value(at: column) {
             case .number, .measured, .date, .boolean:
                 return false
             case .text(let value):
-                if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { named += 1 }
+                let label = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !label.isEmpty {
+                    named += 1
+                    labels.insert(label)
+                }
             case .empty:
                 continue
             }
         }
+        // Одна подпись во всех колонках — это название листа, объединённое
+        // над таблицей и разложенное по колонкам, а не шапка: у шапки
+        // подписи разные (`SheetRow.isUniform`).
+        guard labels.count > 1 else { return false }
         return Double(named) / Double(columns.count) >= 0.75
     }
 
@@ -259,6 +268,9 @@ public enum SheetModeDetector {
         guard width > 0, !rows.isEmpty else { return false }
         var agreeing = 0
         var judged = 0
+        // Строка-раздел, разложенная по колонкам, — не данные: её
+        // текст в колонке цен не делает колонку разнородной.
+        let rows = rows.filter { !$0.isUniform }
         for column in 0..<width {
             var kinds: Set<String> = []
             for row in rows {

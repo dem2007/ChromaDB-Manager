@@ -90,6 +90,24 @@ public enum ListLeadIns {
         leadIns.first { $0.range.contains(offset) }?.text
     }
 
+    /// Вводная фраза для куска `start..<end`: список, на котором кусок
+    /// начался, или список, занявший больше половины куска.
+    ///
+    /// По одному первому знаку кусок, начатый перекрытием — хвостом абзаца
+    /// перед списком, — вводной фразы не получал, хотя весь остальной он
+    /// из пунктов. Фраза, которая стоит в самом куске (`text`), не
+    /// повторяется: подлежащее у пунктов и так есть.
+    public static func leadIn(from start: Int, to end: Int, text: String, in leadIns: [LeadIn]) -> String? {
+        if let own = leadIn(at: start, in: leadIns) { return own }
+        let length = end - start
+        guard length > 0 else { return nil }
+        let dominant = leadIns
+            .filter { $0.range.lowerBound > start && $0.range.lowerBound < end }
+            .first { (min(end, $0.range.upperBound) - $0.range.lowerBound) * 2 > length }
+        guard let dominant, !text.contains(dominant.text) else { return nil }
+        return dominant.text
+    }
+
     /// Блок, кончающийся двоеточием и годный в роли вводной фразы.
     static func isLeadIn(_ block: String) -> Bool {
         guard block.hasSuffix(":") else { return false }

@@ -348,22 +348,24 @@ final class MCPToolTests: XCTestCase {
         XCTAssertTrue(result["content"]?[0]?["text"]?.stringValue?.contains("старый агент") ?? false)
     }
 
-    /// Неизвестный инструмент — ошибка протокола: модель её не исправит,
-    /// и спецификация требует именно её.
+    /// Неизвестный инструмент — ошибка протокола с кодом −32602, как
+    /// в спецификации (`2026-07-28`, «Tools»). Не −32601: по HTTP «метод не
+    /// найден» отвечается 404, и клиент решил бы, что нет `tools/call` вовсе.
     func testAnUnknownToolIsAProtocolError() async {
         let service = await service(clients: [client()])
         switch await call(service, "drop_everything", key: key) {
         case .success: XCTFail("неизвестный инструмент обязан быть ошибкой протокола")
-        case .failure(let error): XCTAssertEqual(error.code, JSONRPCError.methodNotFound)
+        case .failure(let error): XCTAssertEqual(error.code, JSONRPCError.invalidParams)
         }
     }
 
-    func testAMissingRequiredArgumentIsAProtocolErrorToo() async {
+    /// Неверные аргументы — ошибка выполнения (`isError`), а не протокола:
+    /// по ней модель исправит вызов сама.
+    func testAMissingRequiredArgumentIsAToolExecutionError() async {
         let service = await service(clients: [client()])
-        switch await call(service, "describe_collection", .object([:]), key: key) {
-        case .success: XCTFail("без обязательного параметра вызов невозможен")
-        case .failure(let error): XCTAssertEqual(error.code, JSONRPCError.invalidParams)
-        }
+        let result = await call(service, "describe_collection", .object([:]), key: key)
+        guard let refusal = result.inputRefusal else { return XCTFail("без обязательного параметра вызов невозможен") }
+        XCTAssertTrue(refusal.message.contains("collection"), refusal.message)
     }
 
     /// Сбой базы — тоже ошибка выполнения: она объяснима, и агент передаст
@@ -473,8 +475,7 @@ final class MCPToolTests: XCTestCase {
             service, "search",
             .object(["collection": .string("заметки"), "query": .string("   ")]), key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("пустой запрос принят") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("пустой запрос принят") }
         XCTAssertTrue(error.message.contains("query"))
     }
 
@@ -535,8 +536,7 @@ final class MCPToolTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("строка принята как фильтр") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("строка принята как фильтр") }
         XCTAssertNil(backend.received.search)
     }
 
@@ -831,8 +831,7 @@ final class MCPToolTests: XCTestCase {
         let result = await call(
             service, "collect_mentions", .object(["collection": .string("заметки")]), key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("вызов без слова принят") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("вызов без слова принят") }
         XCTAssertNil(backend.received.documents)
     }
 
@@ -924,7 +923,7 @@ final class MCPToolTests: XCTestCase {
             .object(["collection": .string("заметки"), "contains": .int(5)]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("число принято как слово") }
+        guard let error = result.inputRefusal else { return XCTFail("число принято как слово") }
         XCTAssertTrue(error.message.contains("must be a string"), error.message)
         XCTAssertNil(backend.received.documents)
     }
@@ -1072,10 +1071,9 @@ final class MCPToolTests: XCTestCase {
                 ]),
                 key: key
             )
-            guard case .failure(let error) = result else {
+            guard let error = result.inputRefusal else {
                 return XCTFail("принято как список полей: \(wrong)")
             }
-            XCTAssertEqual(error.code, JSONRPCError.invalidParams)
         }
         XCTAssertNil(backend.received.search)
     }
@@ -1150,8 +1148,7 @@ final class MCPToolTests: XCTestCase {
             service, "get_documents",
             .object(["collection": .string("заметки"), "ids": .array([.int(7)])]), key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("числовой id принят") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("числовой id принят") }
     }
 
     /// Коллекция вне whitelist недоступна и поиску, не только каталогу.
@@ -1183,10 +1180,9 @@ final class MCPToolTests: XCTestCase {
             service, "search",
             .object(["collection": .string(""), "query": .string("аренда")]), key: key
         )
-        guard case .failure(let error) = result else {
+        guard let error = result.inputRefusal else {
             return XCTFail("пустое имя коллекции принято как имя")
         }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
         XCTAssertNil(backend.received.search, "до бэкенда такой вызов доходить не должен")
     }
 
@@ -1199,10 +1195,9 @@ final class MCPToolTests: XCTestCase {
             service, "get_documents",
             .object(["collection": .string(""), "ids": .array([.string("d1")])]), key: key
         )
-        guard case .failure(let error) = result else {
+        guard let error = result.inputRefusal else {
             return XCTFail("пустое имя коллекции принято как имя")
         }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
         XCTAssertNil(backend.received.documents, "до бэкенда такой вызов доходить не должен")
     }
 
@@ -1315,8 +1310,7 @@ final class MCPToolTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("вложенные метаданные приняты") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("вложенные метаданные приняты") }
         XCTAssertTrue(error.message.contains("автор"), error.message)
     }
 
@@ -1333,8 +1327,7 @@ final class MCPToolTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("повтор принят") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("повтор принят") }
     }
 
     func testAnEmptyDocumentTextIsRefusedByNumber() async {
@@ -1350,7 +1343,7 @@ final class MCPToolTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("пустой текст принят") }
+        guard let error = result.inputRefusal else { return XCTFail("пустой текст принят") }
         XCTAssertTrue(error.message.contains("2"), error.message)
     }
 
@@ -1416,8 +1409,7 @@ final class MCPToolTests: XCTestCase {
             ]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("фильтр принят") }
-        XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+        guard let error = result.inputRefusal else { return XCTFail("фильтр принят") }
         XCTAssertNil(backend.received.delete)
     }
 
@@ -1428,8 +1420,7 @@ final class MCPToolTests: XCTestCase {
             .object(["collection": .string("заметки"), "ids": .array([])]),
         ] {
             let result = await call(service, "delete_documents", arguments, key: key)
-            guard case .failure(let error) = result else { return XCTFail("пустой список принят") }
-            XCTAssertEqual(error.code, JSONRPCError.invalidParams)
+            guard let error = result.inputRefusal else { return XCTFail("пустой список принят") }
         }
     }
 
@@ -1474,7 +1465,27 @@ final class MCPToolTests: XCTestCase {
     /// с новыми и получает «дневной предел исчерпан», не записав ни одного
     /// документа.
     func testAFailedWriteGivesTheDailyQuotaBack() async throws {
+        try await assertQuota(afterAddFailingWith: MCPToolFailure("Identifiers are already taken. Nothing was written."), spent: 0)
+        // Частичная запись: легло два документа из шести — за них предел
+        // и остаётся. Записи бэкенда — те же документы агента, один к одному.
+        try await assertQuota(
+            afterAddFailingWith: ChromaError.partialWrite(ChromaError.PartialWrite(
+                written: 2, total: 6, failedBatch: 2, batchCount: 3, reason: "сбой"
+            )),
+            spent: 2
+        )
+        // Отмена посреди записи: что успело лечь, неизвестно — часть уже
+        // ушла по сети. Норма не возвращается: вернуть её значило бы дать
+        // ключу писать сверх дневного предела отменами и повторами.
+        try await assertQuota(afterAddFailingWith: CancellationError(), spent: 6)
+    }
+
+    private func assertQuota(
+        afterAddFailingWith failure: any Error & Sendable, spent expected: Int,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
         struct FailingBackend: MCPToolBackend {
+            let failure: any Error & Sendable
             func collections(allowed: [String]) async throws -> [MCPCollectionSummary] {
                 [MCPCollectionSummary(name: "заметки", documentCount: 0, model: "e5", metric: "cosine", dimension: 8)]
             }
@@ -1491,7 +1502,7 @@ final class MCPToolTests: XCTestCase {
                 MCPDocumentsAnswer(documents: [], hasMore: false)
             }
             func add(_ request: MCPAddRequest) async throws -> MCPAddAnswer {
-                throw MCPToolFailure("Identifiers are already taken. Nothing was written.")
+                throw failure
             }
             func delete(_ request: MCPDeleteRequest) async throws -> MCPDeleteAnswer {
                 MCPDeleteAnswer(deleted: [], missing: [], keptInTrash: false)
@@ -1501,7 +1512,7 @@ final class MCPToolTests: XCTestCase {
         let access = AccessController()
         let client = writer(maxPerDay: 10)
         await access.setClients([client])
-        let service = MCPToolService(backend: FailingBackend(), access: access)
+        let service = MCPToolService(backend: FailingBackend(failure: failure), access: access)
 
         _ = try await service.call(
             name: "add_documents",
@@ -1513,7 +1524,7 @@ final class MCPToolTests: XCTestCase {
         ).get()
 
         let spent = await access.usageToday(for: client.id)
-        XCTAssertEqual(spent, 0, "предел списан за запись, которой не было")
+        XCTAssertEqual(spent, expected, "предел списан не за то, что записано", file: file, line: line)
     }
 
     // MARK: - Журнал доступа
@@ -1732,7 +1743,10 @@ final class MCPToolTests: XCTestCase {
 
     private func request(_ method: String, id: Int = 1, params: [String: JSONValue] = [:]) throws -> Data {
         var object = params
-        object["_meta"] = .object([MCPProtocol.metaProtocolVersion: .string(MCPProtocol.version)])
+        object["_meta"] = .object([
+            MCPProtocol.metaProtocolVersion: .string(MCPProtocol.version),
+            MCPProtocol.metaClientCapabilities: .object([:]),
+        ])
         return try JSONEncoder().encode(JSONValue.object([
             "jsonrpc": .string("2.0"),
             "id": .int(id),
@@ -2059,7 +2073,7 @@ final class MCPFixtureTests: XCTestCase {
 
     func testDiscoverFixture() async throws {
         let answer = try await respond("""
-        {"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"проверка","version":"1"}}}}
+        {"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"проверка","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}
         """)
         XCTAssertEqual(answer["jsonrpc"], .string("2.0"))
         XCTAssertEqual(answer["id"], .int(1))
@@ -2072,8 +2086,9 @@ final class MCPFixtureTests: XCTestCase {
     }
 
     func testWrongVersionFixture() async throws {
+        // Версия, которой сервер не знает, — пример из самой спецификации.
         let answer = try await respond("""
-        {"jsonrpc":"2.0","id":"строковый-id","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}
+        {"jsonrpc":"2.0","id":"строковый-id","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}
         """)
         // Идентификатор возвращается той же породы, какой пришёл.
         XCTAssertEqual(answer["id"], .string("строковый-id"))
@@ -2110,7 +2125,8 @@ final class MCPFixtureTests: XCTestCase {
 
     func testUnparseableFixture() async throws {
         let answer = try await respond("{это не json")
-        XCTAssertEqual(answer["id"], .null)
+        // Без `id`, а не с `null`: схема MCP не допускает `null` в нём.
+        XCTAssertNil(answer["id"])
         XCTAssertEqual(answer["error"]?["code"], .int(-32700))
     }
 }

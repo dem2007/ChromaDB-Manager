@@ -118,14 +118,17 @@ public enum TableRowLoader {
                     headerPassed = true
                     if sheetRow.number == headerRow {
                         header = values
-                        return sheetRow.number < upperBound
+                        return row == nil || sheetRow.number < upperBound
                     }
                     // Строки заголовков в файле не оказалось (пустая или
                     // файл поменялся) — дальше данные, без подписей.
                 } else {
                     headerPassed = true
                     header = values
-                    return sheetRow.number < upperBound
+                    // Без строки окно — первые строки под шапкой, где бы она
+                    // ни стояла: граница — номер строки, и шапка
+                    // ниже двадцать четвёртой обрывала чтение на себе.
+                    return row == nil || sheetRow.number < upperBound
                 }
             }
             if let row {

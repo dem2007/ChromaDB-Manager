@@ -14,6 +14,8 @@ import SwiftUI
 struct CommaListField: View {
     let title: String
     let items: [String]
+    /// Что значит пустое поле — подсказкой в нём самом.
+    let prompt: String?
     /// Как привести один элемент к виду, в котором он хранится; пустой —
     /// выбрасывается.
     let clean: (String) -> String
@@ -22,12 +24,13 @@ struct CommaListField: View {
     @State private var text = ""
 
     init(
-        _ title: String, items: [String],
+        _ title: String, items: [String], prompt: String? = nil,
         clean: @escaping (String) -> String = { $0.trimmingCharacters(in: .whitespaces) },
         commit: @escaping ([String]) -> Void
     ) {
         self.title = title
         self.items = items
+        self.prompt = prompt
         self.clean = clean
         self.commit = commit
     }
@@ -40,7 +43,7 @@ struct CommaListField: View {
     }
 
     var body: some View {
-        TextField(title, text: $text)
+        TextField(title, text: $text, prompt: prompt.map { Text($0) })
             .onAppear { text = items.joined(separator: ", ") }
             .onChange(of: text) { _, typed in
                 let parsed = parse(typed)

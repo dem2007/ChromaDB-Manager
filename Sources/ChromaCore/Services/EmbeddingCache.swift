@@ -18,7 +18,11 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 public actor EmbeddingCache {
     public struct Statistics: Sendable, Equatable {
         public let entries: Int
+        /// Сами векторы.
         public let bytes: Int64
+        /// Сколько кэш занимает в файле: векторы, ключи, индекс и страницы,
+        /// в которые они разложены. Предел — про это число.
+        public var fileBytes: Int64 = 0
         /// Since the app started — the honest way to tell whether the cache is
         /// doing anything (8.8).
         public let hits: Int
@@ -30,7 +34,7 @@ public actor EmbeddingCache {
         }
 
         public var sizeText: String {
-            ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            ByteCountFormatter.string(fromByteCount: max(bytes, fileBytes), countStyle: .file)
         }
     }
 
@@ -98,6 +102,7 @@ public actor EmbeddingCache {
         """
         if execute(schema) {
             isAvailable = true
+            enableIncrementalVacuum()
             return
         }
 
@@ -118,11 +123,33 @@ public actor EmbeddingCache {
         handle = retry
         if execute(schema) {
             isAvailable = true
+            enableIncrementalVacuum()
         } else {
             sqlite3_close(retry)
             handle = nil
             log(.warning, "Кэш", "Кэш эмбеддингов выключен: базу не удалось создать")
         }
+    }
+
+    /// Освобождённое вытеснением место возвращается диску.
+    ///
+    /// Без этого SQLite держит удалённые страницы у себя: файл кэша с пределом
+    /// в гигабайт весил 1,48 ГБ, из них 340 МБ — пустые страницы, которые
+    /// когда-то занимали вытесненные векторы. Режим включается один раз:
+    /// у нового файла — до первой таблицы, у старого — перестройкой файла.
+    private func enableIncrementalVacuum() {
+        guard scalar("PRAGMA auto_vacuum") != 2 else { return }
+        let before = fileSize()
+        execute("PRAGMA auto_vacuum = INCREMENTAL")
+        guard execute("VACUUM") else {
+            log(.warning, "Кэш", "Кэш эмбеддингов не удалось перестроить — освобождённое место вернётся диску только после «Очистить кэш»")
+            return
+        }
+        execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if before > 1_048_576 {
+            log(.info, "Кэш", "Файл кэша эмбеддингов перестроен: \(ByteCountFormatter.string(fromByteCount: before, countStyle: .file)) → \(ByteCountFormatter.string(fromByteCount: fileSize(), countStyle: .file))")
+        }
+        evictIfNeeded(force: true)
     }
 
     public func setLimit(bytes: Int64) {
@@ -257,7 +284,9 @@ public actor EmbeddingCache {
         // плашка «Обзора» показывала 0 КБ при 489,9 МБ на диске. Открытие
         // идемпотентно, поэтому спросить — значит и открыть.
         if !isAvailable { open() }
-        return Statistics(entries: count(), bytes: storedBytes(), hits: hits, misses: misses)
+        var statistics = Statistics(entries: count(), bytes: storedBytes(), hits: hits, misses: misses)
+        statistics.fileBytes = occupiedBytes()
+        return statistics
     }
 
     /// For the run report: «из N эмбеддингов взято из кэша M» (8.8).
@@ -270,6 +299,12 @@ public actor EmbeddingCache {
 
     /// Oldest by **last use**, not by age: a text embedded once a year ago and
     /// read yesterday is more valuable than one written yesterday and never read.
+    ///
+    /// Предел — про место в файле, а не про сумму векторов: вектор
+    /// в 4–10 КБ ложится в SQLite цепочкой страниц, и вместе с ключами
+    /// и индексом файл занимал на 17 % больше, чем сами векторы. Сколько
+    /// освободит одна запись, оценивается по этой доле, и обход повторяется,
+    /// пока файл не уложится.
     private func evictIfNeeded(force: Bool) {
         guard isAvailable else { return }
         // A sweep costs a SUM over the table; doing it on every insert would be
@@ -277,22 +312,42 @@ public actor EmbeddingCache {
         guard force || bytesSinceSweep > limitBytes / 100 else { return }
         bytesSinceSweep = 0
 
-        let total = storedBytes()
-        guard total > limitBytes else { return }
+        let started = occupiedBytes()
+        guard started > limitBytes else { return }
         // Down to nine tenths of the limit, so the next insert does not start
         // another sweep.
         let target = Int64(Double(limitBytes) * 0.9)
 
-        var freed: Int64 = 0
-        var victims: [String] = []
-        for candidate in oldestEntries() {
-            guard total - freed > target else { break }
-            victims.append(candidate.key)
-            freed += candidate.bytes
+        var removed = 0
+        // Ключи по давности — один раз на обход: следующий круг продолжает
+        // с того места, где остановился прежний.
+        let candidates = oldestEntries()
+        var next = 0
+        for _ in 0..<4 {
+            let occupied = occupiedBytes()
+            guard occupied > target else { break }
+            let payload = storedBytes()
+            guard payload > 0 else { break }
+            let overhead = max(1, Double(occupied) / Double(payload))
+            let excess = Double(occupied - target)
+
+            var freed = 0.0
+            var victims: [String] = []
+            while next < candidates.count, freed < excess {
+                victims.append(candidates[next].key)
+                freed += Double(candidates[next].bytes) * overhead
+                next += 1
+            }
+            guard !victims.isEmpty else { break }
+            execute("BEGIN")
+            for key in victims { remove(key: key) }
+            execute("COMMIT")
+            removed += victims.count
+            execute("PRAGMA incremental_vacuum")
         }
-        guard !victims.isEmpty else { return }
-        for key in victims { remove(key: key) }
-        log(.info, "Кэш", "Кэш эмбеддингов ужат до \(ByteCountFormatter.string(fromByteCount: storedBytes(), countStyle: .file)): вытеснено записей \(victims.count.plainDigits)")
+        guard removed > 0 else { return }
+        execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        log(.info, "Кэш", "Кэш эмбеддингов ужат до \(ByteCountFormatter.string(fromByteCount: occupiedBytes(), countStyle: .file)): вытеснено записей \(removed.plainDigits)")
     }
 
     /// Oldest by **last use**, not by age: a text embedded a year ago and read
@@ -335,6 +390,17 @@ public actor EmbeddingCache {
 
     private func count() -> Int {
         Int(scalar("SELECT COUNT(*) FROM vectors"))
+    }
+
+    /// Занятые страницы файла — без свободных.
+    private func occupiedBytes() -> Int64 {
+        let pages = scalar("PRAGMA page_count") - scalar("PRAGMA freelist_count")
+        return max(0, pages) * scalar("PRAGMA page_size")
+    }
+
+    private func fileSize() -> Int64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        return (attributes?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     private func storedBytes() -> Int64 {

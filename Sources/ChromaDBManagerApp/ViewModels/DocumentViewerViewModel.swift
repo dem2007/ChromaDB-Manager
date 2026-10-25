@@ -198,15 +198,20 @@ final class DocumentViewerViewModel: ObservableObject {
     }
 
     private func openRichText(at url: URL, chunk: String) {
-        do {
+        // Вне главного потока, как и простой текст: документ на сотни
+        // мегабайт картинок разбирается секундами, и окно не должно
+        // замирать на это время.
+        offMain({ () -> (NSAttributedString, TextFragmentPlacement?) in
             let attributed = try TextDocumentLoader.richText(at: url)
-            state = .richText(
-                text: attributed,
-                placement: TextFragmentPlacement.locate(chunk: chunk, in: attributed.string),
-                url: url
-            )
-        } catch {
-            failedToShow(url: url, reason: error.localizedDescription)
+            return (attributed, TextFragmentPlacement.locate(chunk: chunk, in: attributed.string))
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let (attributed, placement)):
+                self.state = .richText(text: attributed, placement: placement, url: url)
+            case .failure(let error):
+                self.failedToShow(url: url, reason: error.localizedDescription)
+            }
         }
     }
 

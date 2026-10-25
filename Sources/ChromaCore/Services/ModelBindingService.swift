@@ -155,7 +155,7 @@ public actor ModelBindingService {
 
         // Измеренное в прошлые запуски — проба стоит семи вызовов, и платить
         // за неё каждый раз незачем.
-        if let remembered = await limits?.limit(for: model), remembered.loadedContext == loaded {
+        if let remembered = await limits?.limit(for: model), remembered.isFresh(loadedContext: loaded) {
             inputLimitProbed.insert(model)
             inputLimitCache[model] = remembered.characters
             return remembered.characters

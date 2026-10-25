@@ -65,6 +65,27 @@ public struct Topic: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
+extension Topic {
+    /// Описание проверяется и при чтении сохранённого отчёта: рассуждение
+    /// модели, попавшее в поле до проверки при разборе ответа («The user
+    /// wants…»), не выходит ни на экран, ни в экспорт Markdown и JSON.
+    /// Остальные поля читаются так же, как в синтезированной реализации.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(Int.self, forKey: .id),
+            title: try container.decode(String.self, forKey: .title),
+            summary: try container.decodeIfPresent(String.self, forKey: .summary)
+                .flatMap(TopicClustering.plausibleSummary),
+            isNamed: try container.decode(Bool.self, forKey: .isNamed),
+            documentCount: try container.decode(Int.self, forKey: .documentCount),
+            share: try container.decode(Double.self, forKey: .share),
+            averageDistance: try container.decode(Double.self, forKey: .averageDistance),
+            examples: try container.decode([TopicExample].self, forKey: .examples)
+        )
+    }
+}
+
 /// Документы, не отнесённые ни к одной теме.
 ///
 /// Отдельной категорией, а не молча приписанные к ближайшей: часто именно они

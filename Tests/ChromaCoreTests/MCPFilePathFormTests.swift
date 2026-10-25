@@ -319,8 +319,7 @@ final class MCPFileFingerprintTests: XCTestCase {
             arguments: .object(["collection": .string("заметки")]),
             key: key
         )
-        guard case .failure(let error) = result else { return XCTFail("вызов без файла обязан быть отвергнут") }
-        XCTAssertEqual(error.code, -32602)
+        guard let error = result.inputRefusal else { return XCTFail("вызов без файла обязан быть отвергнут") }
         XCTAssertTrue(error.message.contains("file_id"), error.message)
         XCTAssertTrue(error.message.contains("source_file"), error.message)
     }

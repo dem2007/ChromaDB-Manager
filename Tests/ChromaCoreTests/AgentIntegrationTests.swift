@@ -1121,6 +1121,58 @@ final class AgentIntegrationTests: XCTestCase {
         )
     }
 
+    /// Файл, убранный из скилла, убирается и у агента — иначе тот читает
+    /// правила, которых больше нет. Убранное остаётся в снимке.
+    func testAFileRemovedFromTheSkillLeavesTheAgentToo() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = try skillSource(in: home)
+        let target = home.appendingPathComponent("skills/expertise/it-doc-expertise")
+        let backups = home.appendingPathComponent("skills-backups")
+        _ = try AgentIntegration.copySkill(from: source, to: target, named: "it-doc-expertise", backupsIn: backups)
+        try FileManager.default.removeItem(at: source.appendingPathComponent("scripts/run.py"))
+
+        let outcome = try AgentIntegration.copySkill(from: source, to: target, named: "it-doc-expertise", backupsIn: backups)
+        XCTAssertFalse(outcome.changedNothing)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("scripts/run.py").path))
+        let backup = try XCTUnwrap(outcome.backup)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: backup).appendingPathComponent("scripts/run.py").path))
+    }
+
+    /// Ссылка внутри скилла доезжает до агента содержимым, а не ссылкой
+    /// в чужой репозиторий.
+    func testASymlinkInTheSkillArrivesAsContent() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = try skillSource(in: home)
+        let outside = home.appendingPathComponent("общий-справочник.md")
+        try "общее правило\n".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: source.appendingPathComponent("references/shared.md"), withDestinationURL: outside
+        )
+        let target = home.appendingPathComponent("skills/expertise/it-doc-expertise")
+        _ = try AgentIntegration.copySkill(
+            from: source, to: target, named: "it-doc-expertise", backupsIn: home.appendingPathComponent("skills-backups")
+        )
+        let copied = target.appendingPathComponent("references/shared.md")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: copied.path), "доехала ссылка")
+        XCTAssertEqual(try String(contentsOf: copied, encoding: .utf8), "общее правило\n")
+        let again = try AgentIntegration.copySkill(
+            from: source, to: target, named: "it-doc-expertise", backupsIn: home.appendingPathComponent("skills-backups")
+        )
+        XCTAssertTrue(again.changedNothing, "ссылка на тот же текст — не изменение")
+    }
+
+    /// Новый файл настройки рождается закрытым, а не открытым на миг.
+    func testANewConfigurationIsBornPrivate() throws {
+        let home = try temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = home.appendingPathComponent("mcp.json")
+        _ = try AgentIntegration.writeConfiguration(.bionic, to: url, key: "k", helperPath: "/h")
+        let mode = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(mode.intValue & 0o077, 0)
+    }
+
     /// Папка без `SKILL.md` — не скилл, и об этом говорится словами.
     func testAFolderWithoutASkillFileIsRefused() throws {
         let home = try temporaryHome()

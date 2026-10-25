@@ -80,6 +80,7 @@ public enum MetadataFieldType: String, Codable, CaseIterable, Identifiable, Send
         case .double: return .number
         case .bool: return .boolean
         case .null: return .string
+        case .list: return .string
         }
     }
 
@@ -218,7 +219,11 @@ public struct MetadataSchema: Codable, Hashable, Identifiable, Sendable {
         // Table sources. Here for the same reason as the rest — and for
         // one more: a spreadsheet column named «row_number» would otherwise
         // overwrite the field row-level synchronisation depends on.
-        "sheet_name", "row_number", "row_key", "table_mode",
+        "sheet_name", "sheet_index", "row_number", "row_key", "table_mode",
+        // Повторённая шапка таблицы в начале куска.
+        "repeated_header_chars",
+        // Лист записан формой, строками текста.
+        "table_layout",
         // Покрытие книги: сколько её листов вообще размечено.
         "sheets_indexed", "sheets_total",
     ]

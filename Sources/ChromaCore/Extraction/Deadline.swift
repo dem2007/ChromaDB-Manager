@@ -74,19 +74,25 @@ enum Deadline {
         private var timer: Task<Void, Never>?
         private var cancelWaiter: (() -> Void)?
         private var cancelledEarly = false
+        /// Гонка решена раньше, чем задачи легли сюда: работа успела кончиться
+        /// до `set`. Тогда снимать их некому — и таймер проспал бы весь срок.
+        private var decided = false
 
         func set(worker: Task<Void, Never>, timer: Task<Void, Never>, once: @escaping () -> Void) {
-            let early: Bool = lock.withLock {
+            let (early, done): (Bool, Bool) = lock.withLock {
                 self.worker = worker
                 self.timer = timer
                 self.cancelWaiter = once
-                return cancelledEarly
+                return (cancelledEarly, decided)
             }
-            if early { cancelFromOutside() }
+            if early { cancelFromOutside() } else if done { cancelAll() }
         }
 
         func cancelAll() {
-            let (worker, timer) = lock.withLock { (self.worker, self.timer) }
+            let (worker, timer) = lock.withLock { () -> (Task<Void, Never>?, Task<Void, Never>?) in
+                decided = true
+                return (self.worker, self.timer)
+            }
             worker?.cancel()
             timer?.cancel()
         }

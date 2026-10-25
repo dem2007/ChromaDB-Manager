@@ -65,6 +65,8 @@ public enum DistanceMetric: String, Codable, CaseIterable, Identifiable, Sendabl
 ///
 /// Every field is optional and **an empty field is not sent at all**: the app
 /// has no business inventing its own idea of the server's defaults.
+/// The one exception is `ef_search`, measured and set to `recommended` when a
+/// collection is created without explicit parameters.
 /// The names are the ones the server actually accepts — it rejects anything
 /// else with 422 and lists the valid set, which is how these were found:
 /// `space`, `ef_construction`, `ef_search`, `max_neighbors`, `num_threads`,
@@ -89,6 +91,20 @@ public struct HNSWParameters: Codable, Hashable, Sendable {
         efConstruction == nil && efSearch == nil && maxNeighbors == nil
     }
 
+    /// Ширина поиска, с которой приложение создаёт коллекции.
+    ///
+    /// Единственное исключение из «серверу виднее», и оно замерено. С
+    /// серверными 100 индекс HNSW возвращал не настоящие ближайшие куски: у
+    /// коллекций «Базы 2» в 1–4,5 тысячи кусков в top-10 приходилось в среднем
+    /// 96 % точных, на худших запросах — 5–6 из 10. Пропуски приходились на
+    /// короткие запросы-термины и делали сравнение двух прогонов одного
+    /// профиля расходящимся на 0,04 nDCG. На коллекциях такого размера
+    /// 500 почти не стоит времени: даже полный перебор здесь — миллисекунды.
+    public static let recommendedEFSearch = 500
+
+    /// Параметры, с которыми коллекция создаётся, если их не задали.
+    public static var recommended: HNSWParameters { HNSWParameters(efSearch: recommendedEFSearch) }
+
     /// The `hnsw` object of the create request, with absent fields absent.
     public func requestFields() -> [String: Any] {
         var fields: [String: Any] = [:]
@@ -104,7 +120,7 @@ public struct CollectionConfiguration: Hashable, Sendable {
     public var metric: DistanceMetric
     public var hnsw: HNSWParameters
 
-    public init(metric: DistanceMetric = .cosine, hnsw: HNSWParameters = HNSWParameters()) {
+    public init(metric: DistanceMetric = .cosine, hnsw: HNSWParameters = .recommended) {
         self.metric = metric
         self.hnsw = hnsw
     }

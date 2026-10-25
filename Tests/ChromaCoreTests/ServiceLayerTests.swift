@@ -270,6 +270,19 @@ final class SourceIdentityTests: XCTestCase {
         let root = URL(fileURLWithPath: "/tmp/docs")
         XCTAssertEqual(SourceSyncService.relative(URL(fileURLWithPath: "/tmp/docs/sub/a.md"), to: root), "sub/a.md")
         XCTAssertEqual(SourceSyncService.relative(URL(fileURLWithPath: "/other/a.md"), to: root), "a.md")
+        // Регистр корня не тот, что на диске, — путь всё равно внутри него:
+        // иначе файлы из разных подпапок сливались в одно имя.
+        let typed = URL(fileURLWithPath: "/Users/someone/Docs")
+        XCTAssertEqual(
+            SourceSyncService.relative(URL(fileURLWithPath: "/Users/someone/docs/a/README.md"), to: typed),
+            "a/README.md"
+        )
+        XCTAssertEqual(
+            SourceSyncService.relative(URL(fileURLWithPath: "/Users/someone/docs/b/README.md"), to: typed),
+            "b/README.md"
+        )
+        // Соседняя папка с тем же началом имени — не подпапка.
+        XCTAssertEqual(SourceSyncService.relative(URL(fileURLWithPath: "/tmp/docs2/a.md"), to: root), "a.md")
     }
 
     func testScanFiltersByExtensionAndRecursion() async throws {

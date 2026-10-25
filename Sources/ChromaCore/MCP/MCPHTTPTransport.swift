@@ -93,7 +93,7 @@ public struct MCPHTTPTransport: Sendable {
         if let origin = header("origin"), await !isAllowed(origin: origin) {
             return Self.error(
                 status: 403,
-                JSONRPCError(code: JSONRPCError.invalidRequest, message: "Origin не разрешён: \(origin)")
+                JSONRPCError(code: JSONRPCError.invalidRequest, message: "Origin is not allowed: \(origin)")
             )
         }
 
@@ -107,17 +107,17 @@ public struct MCPHTTPTransport: Sendable {
                 headers: [("Allow", "POST"), ("Content-Type", "application/json; charset=utf-8")],
                 body: Self.encode(JSONRPCOutgoing.unidentifiedFailure(JSONRPCError(
                     code: JSONRPCError.invalidRequest,
-                    message: "Конечная точка MCP принимает только POST"
+                    message: "The MCP endpoint accepts POST only"
                 )))
             )
         }
 
         // 3. Тело.
         guard let incoming = try? JSONDecoder().decode(JSONRPCIncoming.self, from: body) else {
-            return Self.error(
-                status: 400,
-                JSONRPCError(code: JSONRPCError.parseError, message: "Тело не разобрано как JSON-RPC")
-            )
+            // Не JSON — ошибка разбора; JSON, но не одиночный запрос
+            // (пакет, ответ) — неверный запрос: тело POST по спецификации —
+            // ровно один запрос или одно уведомление.
+            return Self.error(status: 400, MCPServer.unreadable(body))
         }
 
         // 4. Заголовки против тела. Порядок важен: сначала совпадение версии
@@ -146,12 +146,23 @@ public struct MCPHTTPTransport: Sendable {
             return Response(status: 202)
         }
 
-        guard let outgoing = await server.respond(to: incoming, key: key) else {
+        // Отказы проверки запроса — версия, обязательные поля `_meta` —
+        // отвечаются статусом 400: так требует транспорт (`2026-07-28`,
+        // «Protocol Version Header», «_meta»). Пропущенные дальше, они
+        // уходили бы с 200, как удачный ответ.
+        if let rejection = MCPServer.preflight(incoming) {
+            return Self.error(status: 400, rejection, id: incoming.id)
+        }
+
+        // Заголовок версии — то, чем старый клиент называет свою ревизию
+        // после рукопожатия: тела у него версии нет.
+        let negotiated = header(Self.protocolVersionHeader)
+        guard let outgoing = await server.respond(to: incoming, key: key, negotiatedVersion: negotiated) else {
             // Запрос с идентификатором обязан получить ответ; молчание здесь
             // означало бы, что клиент ждёт вечно.
             return Self.error(
                 status: 500,
-                JSONRPCError(code: JSONRPCError.internalError, message: "Сервер не сформировал ответ"),
+                JSONRPCError(code: JSONRPCError.internalError, message: "The server produced no response"),
                 id: incoming.id
             )
         }
@@ -206,7 +217,7 @@ public struct MCPHTTPTransport: Sendable {
         if let version, let inBody, inBody != version {
             return JSONRPCError(
                 code: headerMismatch,
-                message: "MCP-Protocol-Version «\(version)» не совпадает с версией в теле «\(inBody)»"
+                message: "Header mismatch: MCP-Protocol-Version «\(version)» does not match the body value «\(inBody)»"
             )
         }
         // Версия в теле — примета нынешней ревизии: прежние её туда
@@ -215,22 +226,31 @@ public struct MCPHTTPTransport: Sendable {
         if version == nil, let inBody {
             return JSONRPCError(
                 code: headerMismatch,
-                message: "Нет заголовка MCP-Protocol-Version, а в теле указана версия «\(inBody)»"
+                message: "Header mismatch: the MCP-Protocol-Version header is missing, and the body names «\(inBody)»"
             )
         }
         // Зеркальные заголовки ввела ревизия 2026-07-28; с прежних их
         // не **требуют**, но присланные сверяют.
         let mirrorsHeaders = version == MCPProtocol.version
+        // Заголовок новой ревизии обязывает и тело: версия в `_meta` у такого
+        // запроса обязательна. Без неё он прошёл бы как запрос старой эпохи,
+        // не подходя ни под одну.
+        if mirrorsHeaders, inBody == nil, incoming.id != nil,
+           incoming.method != MCPProtocol.initializeMethod {
+            return .invalidParams(
+                "Missing required _meta field «\(MCPProtocol.metaProtocolVersion)»: the MCP-Protocol-Version header names \(MCPProtocol.version)"
+            )
+        }
 
         if let method = header(methodHeader) {
             guard method == incoming.method else {
                 return JSONRPCError(
                     code: headerMismatch,
-                    message: "Mcp-Method «\(method)» не совпадает с методом в теле «\(incoming.method)»"
+                    message: "Header mismatch: Mcp-Method «\(method)» does not match the body method «\(incoming.method)»"
                 )
             }
         } else if mirrorsHeaders {
-            return JSONRPCError(code: headerMismatch, message: "Нет обязательного заголовка Mcp-Method")
+            return JSONRPCError(code: headerMismatch, message: "Header mismatch: the required Mcp-Method header is missing")
         }
 
         // `Mcp-Name` обязателен там, где у запроса есть имя: вызов
@@ -238,16 +258,16 @@ public struct MCPHTTPTransport: Sendable {
         if let expected = namedValue(in: incoming) {
             if let raw = header(nameHeader) {
                 guard let decoded = decodeHeaderValue(raw) else {
-                    return JSONRPCError(code: headerMismatch, message: "Mcp-Name закодирован неверно")
+                    return JSONRPCError(code: headerMismatch, message: "Header mismatch: the Mcp-Name header is not valid Base64")
                 }
                 guard decoded == expected else {
                     return JSONRPCError(
                         code: headerMismatch,
-                        message: "Mcp-Name «\(decoded)» не совпадает со значением в теле «\(expected)»"
+                        message: "Header mismatch: Mcp-Name «\(decoded)» does not match the body value «\(expected)»"
                     )
                 }
             } else if mirrorsHeaders {
-                return JSONRPCError(code: headerMismatch, message: "Нет обязательного заголовка Mcp-Name")
+                return JSONRPCError(code: headerMismatch, message: "Header mismatch: the required Mcp-Name header is missing")
             }
         }
         return nil

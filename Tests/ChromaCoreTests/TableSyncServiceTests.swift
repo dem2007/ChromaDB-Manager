@@ -99,11 +99,11 @@ final class TableSyncServiceTests: XCTestCase {
         )
     }
 
-    private func context(profiles: [TableProfile], rowLimit: Int? = nil) -> TableSyncService.Context {
+    private func context(profiles: [TableProfile], rowLimit: Int? = nil, documentMetadata: ChromaMetadata = [:]) -> TableSyncService.Context {
         TableSyncService.Context(
             sourceID: sourceID, relativePath: "прайс.xlsx", collectionID: "col",
             collectionName: "catalogue", embeddingModel: "m", dimension: 4,
-            profiles: profiles, rowLimit: rowLimit
+            profiles: profiles, rowLimit: rowLimit, documentMetadata: documentMetadata
         )
     }
 
@@ -135,13 +135,41 @@ final class TableSyncServiceTests: XCTestCase {
         profiles: [TableProfile],
         database: FakeDatabase,
         embeddings: FakeEmbeddings,
-        rowLimit: Int? = nil
+        rowLimit: Int? = nil,
+        documentMetadata: ChromaMetadata = [:]
     ) async throws -> TableSyncReport {
         let sheets = try await TableSyncService.read(url: url).sheets
         return try await TableSyncService().sync(
-            sheets: sheets, manifest: &manifest, context: context(profiles: profiles, rowLimit: rowLimit),
+            sheets: sheets, manifest: &manifest, context: context(profiles: profiles, rowLimit: rowLimit, documentMetadata: documentMetadata),
             chroma: database, embeddings: embeddings
         )
+    }
+
+    // MARK: - Поля файла
+
+    /// Строка таблицы несёт поля файла: имя, уровни пути, свои поля
+    /// источника. Колонка строки с тем же именем важнее. Правка общих полей
+    /// доходит до записанных строк без новых векторов.
+    func testARowCarriesTheFieldsOfItsFile() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        let shared: ChromaMetadata = ["file_name": .string("прайс.xlsx"), "OGV": .string("Ведомство А"), "цена": .int(0)]
+
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings, documentMetadata: shared)
+        let bolt = try XCTUnwrap(database.documents.values.first { $0.document.contains("Болт") })
+        XCTAssertEqual(bolt.metadata["file_name"], .string("прайс.xlsx"))
+        XCTAssertEqual(bolt.metadata["OGV"], .string("Ведомство А"))
+        XCTAssertEqual(bolt.metadata["цена"], .int(12), "колонка строки важнее общего поля")
+
+        let embedded = embeddings.counter.texts
+        var renamed = shared
+        renamed["OGV"] = .string("Ведомство Б")
+        let report = try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings, documentMetadata: renamed)
+        XCTAssertEqual(embeddings.counter.texts, embedded, "векторы не пересчитываются")
+        XCTAssertEqual(report.rowsMetadataOnly, 2)
+        XCTAssertTrue(database.documents.values.allSatisfy { $0.metadata["OGV"] == .string("Ведомство Б") })
     }
 
     // MARK: - The first run
@@ -559,6 +587,76 @@ final class TableSyncServiceTests: XCTestCase {
         XCTAssertEqual(database.documents.count, 2)
     }
 
+    /// Выборка — не весь лист: лист, ждущий записи, ждёт и дальше,
+    /// исчезнувшие строки ждут решения, подписи файла не ставятся — и
+    /// следующий полный прогон откроет файл и допишет остальное.
+    func testASampleRunDoesNotMarkTheSheetAsWritten() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8), ("A-3", "Шайба", 3)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings())
+        let written = manifest.profilesSignature
+        XCTAssertFalse(written.isEmpty)
+
+        // Пропажа строки замечена полным прогоном…
+        let shorter = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings())
+        XCTAssertEqual(manifest.pendingRemovals["Каталог"]?.rows.count, 1)
+
+        // …а лист переиндексируют и пробуют на выборке.
+        _ = manifest.forgetSheet("Каталог")
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings(), rowLimit: 1)
+        XCTAssertEqual(manifest.sheetsAwaitingWrite, ["Каталог"], "выборка не записала лист целиком")
+        XCTAssertEqual(manifest.profilesSignature, "", "подпись после выборки скрыла бы файл от полного прогона")
+
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings())
+        XCTAssertEqual(manifest.sheetsAwaitingWrite, [])
+        XCTAssertEqual(manifest.profilesSignature, written)
+        XCTAssertEqual(manifest.sheets["Каталог"]?.rowCount, 2)
+    }
+
+    /// Выборка не снимает список исчезнувших строк: в её плане их нет вовсе.
+    func testASampleRunKeepsPendingRemovals() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings())
+        let shorter = try workbook([("A-1", "Болт", 12)])
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings())
+        XCTAssertEqual(manifest.pendingRemovals["Каталог"]?.rows.count, 1)
+
+        try await run(shorter, manifest: &manifest, profiles: [profile()], database: database, embeddings: FakeEmbeddings(), rowLimit: 1)
+        XCTAssertEqual(manifest.pendingRemovals["Каталог"]?.rows.count, 1, "выборка сняла решение о строках")
+    }
+
+    /// Лист-документ с куском длиннее контекста модели дорезается, как кусок
+    /// файла: в модель не уходит ничего длиннее контекста, а лист
+    /// попадает в базу целиком, а не пропускается.
+    func testADocumentSheetLongerThanTheContextIsCutToFit() async throws {
+        let items = (1...400).map { ("A-\($0)", "Позиция номер \($0) с длинным описанием", Double($0)) }
+        let url = try workbook(items)
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let database = FakeDatabase()
+        let sheets = try await TableSyncService.read(url: url).sheets
+        var context = context(profiles: [profile(mode: .document)])
+        context.contextLength = 512
+        let report = try await TableSyncService().sync(
+            sheets: sheets, manifest: &manifest, context: context, chroma: database, embeddings: FakeEmbeddings()
+        )
+        XCTAssertEqual(report.sheetsIndexed, ["Каталог"])
+        XCTAssertTrue(report.problems.isEmpty, "\(report.problems.map(\.reason))")
+        XCTAssertGreaterThan(database.documents.count, 1)
+        for document in database.documents.values {
+            XCTAssertFalse(
+                ContextBudget.check(document.document, contextLength: 512).blocksSending,
+                "кусок длиннее контекста ушёл в модель"
+            )
+        }
+        let text = database.documents.values.map(\.document).joined(separator: "\n")
+        XCTAssertTrue(text.contains("A-400"), "хвост листа не попал в базу")
+        XCTAssertTrue(report.warnings.contains { $0.contains("дорезано") }, "\(report.warnings)")
+    }
+
     // MARK: - Formats
 
     /// Every format supports arrives at the same pipeline.
@@ -610,6 +708,174 @@ final class TableSyncServiceTests: XCTestCase {
                 error.localizedDescription.contains("выключен"),
                 error.localizedDescription
             )
+        }
+    }
+
+    // MARK: - Разбор ревью: идентификаторы строк
+
+    private func sync(
+        _ url: URL, file: String, manifest: inout TableFileManifest, profiles: [TableProfile],
+        database: FakeDatabase, embeddings: FakeEmbeddings, rowLimit: Int? = nil
+    ) async throws -> TableSyncReport {
+        let sheets = try await TableSyncService.read(url: url).sheets
+        var context = context(profiles: profiles, rowLimit: rowLimit)
+        context.relativePath = file
+        return try await TableSyncService().sync(
+            sheets: sheets, manifest: &manifest, context: context, chroma: database, embeddings: embeddings
+        )
+    }
+
+    /// Два файла источника, читаемые одним профилем, с одними и теми же
+    /// ключами — разные документы, и у каждого свой лист в метаданных.
+    func testRowsOfTwoFilesWithTheSameKeyStaySeparate() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)], sheet: "Январь")
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        var january = TableFileManifest(relativePath: "январь.xlsx", collectionName: "catalogue")
+        var february = TableFileManifest(relativePath: "февраль.xlsx", collectionName: "catalogue")
+        try await sync(url, file: "январь.xlsx", manifest: &january, profiles: [profile()], database: database, embeddings: embeddings)
+        try await sync(url, file: "февраль.xlsx", manifest: &february, profiles: [profile()], database: database, embeddings: embeddings)
+
+        XCTAssertEqual(database.documents.count, 4, "строки второго файла затёрли первый")
+        XCTAssertTrue(Set(january.sheets.values.flatMap(\.documentIDs)).isDisjoint(with: february.sheets.values.flatMap(\.documentIDs)))
+        XCTAssertTrue(database.documents.values.allSatisfy { $0.metadata["sheet_name"] == .string("Январь") },
+                      "лист в метаданных — настоящий лист книги, а не тот, где размечали профиль")
+    }
+
+    /// Строки, записанные по прежней схеме идентификаторов, переезжают под
+    /// новые со своими векторами — модель не зовётся, прежние id снимаются.
+    /// Под прежним id, который делили файлы, лежит чужой текст — такая
+    /// строка считается заново.
+    func testRowsUnderTheOldIdentifiersMoveWithTheirVectors() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+        XCTAssertEqual(embeddings.counter.texts, 2)
+
+        // Как было до исправления: те же строки под прежними id. У второй
+        // под её id лежит текст другого файла.
+        var sheet = try XCTUnwrap(manifest.sheets["Каталог"])
+        for (identity, record) in sheet.rows {
+            let old = "old-" + record.documentID
+            var moved = try XCTUnwrap(database.documents.removeValue(forKey: record.documentID))
+            if record.rowKey == "A-2" {
+                moved = EmbeddedRecord(id: old, document: "Артикул: A-2\nНазвание: Шайба", embedding: [9, 9, 9, 9], metadata: moved.metadata)
+            } else {
+                moved = EmbeddedRecord(id: old, document: moved.document, embedding: moved.embedding, metadata: moved.metadata)
+            }
+            database.documents[old] = moved
+            sheet.rows[identity]?.documentID = old
+        }
+        manifest.sheets["Каталог"] = sheet
+
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+
+        XCTAssertEqual(embeddings.counter.texts, 3, "заново считается только строка с чужим текстом под прежним id")
+        XCTAssertEqual(database.documents.count, 2)
+        XCTAssertTrue(database.documents.keys.allSatisfy { !$0.hasPrefix("old-") }, "прежние id должны быть сняты")
+        XCTAssertEqual(Set(database.documents.keys), Set(manifest.sheets["Каталог"]?.documentIDs ?? []))
+    }
+
+    /// Лист, разметку которого перевели в «документ», не стирает свои строки
+    /// молча: это переиндексация, и её предлагают отдельно.
+    func testADocumentSheetWithAChangedMappingIsLeftAlone() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        try await run(url, manifest: &manifest, profiles: [profile()], database: database, embeddings: embeddings)
+
+        let report = try await run(url, manifest: &manifest, profiles: [profile(mode: .document)], database: database, embeddings: embeddings)
+        XCTAssertEqual(report.sheetsNeedingReindex, ["Каталог"])
+        XCTAssertEqual(database.deleted, [])
+        XCTAssertEqual(database.documents.count, 2)
+    }
+
+    /// Пробный прогон на выборке строк лист-документ целиком не пишет.
+    func testATrialRunDoesNotWriteADocumentSheetWhole() async throws {
+        let url = try workbook([("A-1", "Болт", 12), ("A-2", "Гайка", 8)])
+        let database = FakeDatabase()
+        let embeddings = FakeEmbeddings()
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        let report = try await run(
+            url, manifest: &manifest, profiles: [profile(mode: .document)],
+            database: database, embeddings: embeddings, rowLimit: 1
+        )
+        XCTAssertEqual(database.upsertCalls, 0)
+        XCTAssertEqual(embeddings.counter.texts, 0)
+        XCTAssertFalse(report.warnings.isEmpty)
+    }
+
+    /// Шапка листа-документа, дописанная после нарезки, — в размер куска
+    ///: кусок, вылезший за него, делится по строкам, и шапка — в
+    /// каждой части.
+    func testTheRepeatedSheetHeaderFitsTheChunkSize() async throws {
+        let items = (1...40).map { ("A-\($0)", "Позиция каталога номер \($0) с длинным названием", Double($0)) }
+        let url = try workbook(items)
+        let database = FakeDatabase()
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        var chunking = ChunkingConfiguration()
+        chunking.strategy = .fixed
+        chunking.sizeUnit = .characters
+        chunking.chunkSize = 400
+        chunking.overlapPercent = 0
+        let pipeline = ChunkingPipeline(configuration: chunking)
+        var context = context(profiles: [profile(mode: .document)])
+        context.chunker = { text in try await pipeline.chunks(from: text, fileExtension: "md") }
+        context.chunkLimit = { [chunking] chunk in chunking.characterLimit(of: chunk) }
+        // Ход — по партиям: счётчик не стоит, пока пишется файл.
+        let reported = WrittenCounter()
+        context.onBatchWritten = { count in _ = reported.add(count) }
+        let sheets = try await TableSyncService.read(url: url).sheets
+        try await TableSyncService().sync(
+            sheets: sheets, manifest: &manifest, context: context, chroma: database, embeddings: FakeEmbeddings()
+        )
+        let texts = database.documents.values.map(\.document)
+        XCTAssertGreaterThan(texts.count, 3)
+        XCTAssertEqual(reported.add(0), texts.count, "о каждой записанной партии сказано")
+        for text in texts {
+            XCTAssertLessThanOrEqual(Double(text.count), 400 * 1.1, "кусок вылез за размер вместе с шапкой: \(text.count)")
+            XCTAssertTrue(text.contains("| Артикул | Название | Цена |"), "шапка в каждом куске")
+        }
+    }
+
+    /// Кусок без строк таблицы — длинное примечание над ней — получает шапку
+    /// листа после нарезки и всё равно укладывается в размер: без
+    /// подгонки он вылезал на длину шапки.
+    func testANotesChunkWithTheSheetHeaderFitsTheChunkSize() async throws {
+        var builder = XLSXFixtureBuilder()
+        let note = String(repeating: "Примечание к прайсу, которое занимает много места. ", count: 7)
+        var rows: [[XLSXFixtureBuilder.Cell]] = [[.inline(note)], [.shared("Артикул"), .shared("Название"), .shared("Цена")]]
+        for index in 1...6 { rows.append([.shared("A-\(index)"), .shared("Позиция \(index)"), .number(Double(index))]) }
+        builder.sheets = [.init(name: "Каталог", rows: rows)]
+        let url = root.appendingPathComponent("прайс.xlsx")
+        try builder.build().write(to: url)
+
+        let profile = TableProfile(name: "Каталог", mapping: TableMapping(
+            sheetName: "Каталог", mode: .document, headerRow: 2, columns: columns,
+            roles: ["Артикул": .metadata, "Название": .text, "Цена": .metadata], keyColumn: "Артикул"
+        ))
+        var chunking = ChunkingConfiguration()
+        chunking.strategy = .fixed
+        chunking.sizeUnit = .characters
+        chunking.chunkSize = 300
+        chunking.overlapPercent = 0
+        let pipeline = ChunkingPipeline(configuration: chunking)
+        var context = context(profiles: [profile])
+        context.chunker = { text in try await pipeline.chunks(from: text, fileExtension: "md") }
+        context.chunkLimit = { [chunking] chunk in chunking.characterLimit(of: chunk) }
+        let database = FakeDatabase()
+        var manifest = TableFileManifest(relativePath: "прайс.xlsx", collectionName: "catalogue")
+        try await TableSyncService().sync(
+            sheets: try await TableSyncService.read(url: url).sheets, manifest: &manifest, context: context,
+            chroma: database, embeddings: FakeEmbeddings()
+        )
+        let texts = database.documents.values.map(\.document)
+        XCTAssertFalse(texts.isEmpty)
+        for text in texts {
+            XCTAssertLessThanOrEqual(Double(text.count), 300 * 1.1, "кусок вылез за размер вместе с шапкой: \(text.count)\n\(text)")
         }
     }
 }
@@ -760,18 +1026,37 @@ final class DocumentSheetTests: XCTestCase {
         }
     }
 
-    private func run(_ url: URL, manifest: inout TableFileManifest, database: Database, chunkLines: Int = 4) async throws -> TableSyncReport {
+    private func run(
+        _ url: URL, manifest: inout TableFileManifest, database: Database, chunkLines: Int = 4,
+        profiles: [TableProfile]? = nil, unmatchedSheetsAsText: Bool = false,
+        documentMetadata: ChromaMetadata = [:]
+    ) async throws -> TableSyncReport {
         let sheets = try await TableSyncService.read(url: url).sheets
         return try await TableSyncService().sync(
             sheets: sheets, manifest: &manifest,
             context: TableSyncService.Context(
                 sourceID: UUID(uuidString: "00000000-0000-0000-0000-0000000000DD")!,
                 relativePath: "отчёт.xlsx", collectionID: "col", collectionName: "reports",
-                embeddingModel: "m", dimension: 4, profiles: [profile()],
-                chunker: chunker(chunkLines)
+                embeddingModel: "m", dimension: 4, profiles: profiles ?? [profile()],
+                chunker: chunker(chunkLines), unmatchedSheetsAsText: unmatchedSheetsAsText,
+                documentMetadata: documentMetadata
             ),
             chroma: database, embeddings: Embeddings()
         )
+    }
+
+    /// Кусок листа-документа несёт поля файла: без них лист не
+    /// попадал под фильтр по уровням пути, а в выдаче у него не было имени.
+    func testASheetChunkCarriesTheFieldsOfItsFile() async throws {
+        let url = try report(rows: 12)
+        var manifest = TableFileManifest(relativePath: "отчёт.xlsx", collectionName: "reports")
+        let database = Database()
+        _ = try await run(url, manifest: &manifest, database: database,
+                          documentMetadata: ["file_name": .string("отчёт.xlsx"), "YEAR": .string("2026")])
+        XCTAssertGreaterThan(database.documents.count, 1)
+        XCTAssertTrue(database.documents.values.allSatisfy {
+            $0.metadata["file_name"] == .string("отчёт.xlsx") && $0.metadata["YEAR"] == .string("2026")
+        })
     }
 
     /// The rule calls compulsory: without the header, the second chunk is
@@ -788,6 +1073,53 @@ final class DocumentSheetTests: XCTestCase {
         let header = "| Показатель | Значение | Комментарий |"
         XCTAssertTrue(database.documents.values.allSatisfy { $0.document.hasPrefix(header) })
         XCTAssertTrue(database.documents.values.allSatisfy { $0.metadata["table_mode"] == .string("document") })
+    }
+
+    /// лист, под который не подошёл ни один профиль, пишется текстом
+    /// с заголовком в каждом чанке и считается в покрытии книги; без флага —
+    /// по-прежнему ждёт профиля и не пишет ничего.
+    func testAnUnmatchedSheetIsWrittenAsText() async throws {
+        let url = try report(rows: 12)
+        var manifest = TableFileManifest(relativePath: "отчёт.xlsx", collectionName: "reports")
+        let database = Database()
+        let result = try await run(url, manifest: &manifest, database: database, profiles: [], unmatchedSheetsAsText: true)
+
+        XCTAssertEqual(result.sheetsIndexed, ["Отчёт"])
+        XCTAssertTrue(result.problems.isEmpty, "\(result.problems)")
+        XCTAssertTrue(result.warnings.contains { $0.contains("записан текстом") }, "\(result.warnings)")
+        XCTAssertGreaterThan(database.documents.count, 1)
+        let header = "| Показатель | Значение | Комментарий |"
+        XCTAssertTrue(database.documents.values.allSatisfy { $0.document.hasPrefix(header) })
+        XCTAssertTrue(database.documents.values.allSatisfy { $0.metadata["table_mode"] == .string("document") })
+    }
+
+    /// кусок с дописанной шапкой знает её длину, и шапка в начале
+    /// его текста — ровно столько знаков; место листа в книге — у каждого.
+    func testARepeatedHeaderIsMeasuredInTheMetadata() async throws {
+        let url = try report(rows: 12)
+        var manifest = TableFileManifest(relativePath: "отчёт.xlsx", collectionName: "reports")
+        let database = Database()
+        try await run(url, manifest: &manifest, database: database)
+
+        let header = "| Показатель | Значение | Комментарий |"
+        let measured = database.documents.values.filter { $0.metadata[TableChunkHeaders.lengthKey] != nil }
+        XCTAssertFalse(measured.isEmpty)
+        for record in measured {
+            guard case .int(let length)? = record.metadata[TableChunkHeaders.lengthKey] else { return XCTFail() }
+            let prefix = String(record.document.prefix(length))
+            XCTAssertTrue(prefix.hasPrefix(header) && prefix.hasSuffix("\n"), prefix)
+        }
+        XCTAssertTrue(database.documents.values.allSatisfy { $0.metadata["sheet_index"] == .int(0) })
+    }
+
+    func testWithoutTheFallbackAnUnmatchedSheetWaitsForAProfile() async throws {
+        let url = try report(rows: 3)
+        var manifest = TableFileManifest(relativePath: "отчёт.xlsx", collectionName: "reports")
+        let database = Database()
+        let result = try await run(url, manifest: &manifest, database: database, profiles: [])
+
+        XCTAssertEqual(result.problems.map(\.sheetName), ["Отчёт"])
+        XCTAssertTrue(database.documents.isEmpty)
     }
 
     func testRowsAreNotDocumentsInThisMode() async throws {

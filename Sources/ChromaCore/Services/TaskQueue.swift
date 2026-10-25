@@ -341,6 +341,10 @@ public actor TaskQueue {
             cancellers[id]?()
             log(.info, "Задачи", "Задача «\(running[id]?.title ?? "")» отменяется — сервер останавливается")
         }
+        // Отошедшая в сторону — тоже работающая: клиент исчезающего сервера
+        // у неё на руках, и ждать его возвращения ей не с чем.
+        let aside = waiters.filter { $0.isReturning && $0.ticket.connectionID == connectionID }.map(\.id)
+        for id in aside { cancel(id: id) }
         var kept = 0
         for index in waiters.indices where waiters[index].ticket.connectionID == connectionID {
             let id = waiters[index].id
@@ -463,7 +467,12 @@ public actor TaskQueue {
         guard !isPaused || priority == .interactive else { return false }
         // Задача, гасящая сервер, начинается только на пустой очереди —
         // и, пока идёт, не пускает никого.
-        if group.needsEmptyQueue { return running.isEmpty }
+        //
+        // Пустой — значит и без тех, кто отошёл в сторону: уступившая задача
+        // вынута из `running`, но стоит посреди собственной работы с клиентом
+        // на руках. Пускать бэкап в этот промежуток значило гасить сервер
+        // под ней — а уступает она каждый раз, когда агенту нужна модель.
+        if group.needsEmptyQueue { return running.isEmpty && !waiters.contains(where: \.isReturning) }
         if running.values.contains(where: { $0.group.needsEmptyQueue }) { return false }
         guard group.isSerial else { return true }
         return !isRunning(group: group)
@@ -487,6 +496,9 @@ public actor TaskQueue {
         store.save(resumable + pendingRequests())
         promote()
         publish()
+        // Задача кончилась — её временная память свободна; отдать её
+        // системе.
+        MemoryRelief.soon()
     }
 
     /// Admits as many waiters as the free groups allow, in queue order.
@@ -527,16 +539,20 @@ public actor TaskQueue {
             connectionID: info.connectionID, submittedAt: info.submittedAt,
             startedAt: nil, state: .queued, progress: info.progress, detail: info.detail
         )
-        promote()
-        publish()
 
         // Cancellation while standing aside is not swallowed: the caller's task
         // is cancelled too, and it will notice at its own next checkpoint.
+        //
+        // В очередь — **до** того, как место отдадут: пока отошедшая задача
+        // не стоит среди ожидающих, очередь выглядит пустой, и бэкап, которому
+        // нужна пустая очередь, начинался прямо посреди её работы.
         try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             enqueue(Waiter(
                 id: id, ticket: ticket, submittedAt: info.submittedAt,
                 continuation: continuation, isReturning: true
             ))
+            promote()
+            publish()
         }
     }
 

@@ -58,13 +58,9 @@ public enum OversizeChunks {
                 result.append(chunk)
                 continue
             }
-            let pieces = pieces(of: chunk.text, budget: budget)
             split += 1
-            for piece in pieces {
-                result.append(TextChunk(
-                    index: result.count, text: piece,
-                    level: chunk.level, parentIndex: chunk.parentIndex, note: chunk.note
-                ))
+            for piece in pieces(of: chunk, budget: budget) {
+                result.append(piece.renumbered(result.count, parentIndex: piece.parentIndex))
             }
         }
 
@@ -73,11 +69,7 @@ public enum OversizeChunks {
         // чанка, и дырка в нумерации выглядела бы как след прерванной
         // синхронизации.
         let fixed = result.enumerated().map { position, chunk -> TextChunk in
-            TextChunk(
-                index: position, text: chunk.text, level: chunk.level,
-                parentIndex: chunk.parentIndex.flatMap { renumbered[$0] },
-                note: chunk.note
-            )
+            chunk.renumbered(position, parentIndex: chunk.parentIndex.flatMap { renumbered[$0] })
         }
         return (fixed, split)
     }
@@ -105,30 +97,78 @@ public enum OversizeChunks {
     }
 
     /// Куски текста, каждый в пределах бюджета.
-    static func pieces(of text: String, budget: Budget) -> [String] {
+    ///
+    /// Таблица делится по строкам, и каждая часть получает шапку:
+    /// раньше кусок таблицы дорезался по «предложениям» и склеивался
+    /// пробелом — строки сливались в одну, «2.4 ГГц» становилось «2. 4 ГГц»,
+    /// а вторая и дальше части оставались без шапки.
+    ///
+    /// Части таблицы несут длину дописанной шапки: по ней `get_file`
+    /// снимает шапку на стыке. Часть, которую пришлось дорезать ещё и по
+    /// предложениям, её теряет — шапка там только у первого обрывка.
+    static func pieces(of chunk: TextChunk, budget: Budget) -> [TextChunk] {
+        func plain(_ text: String) -> TextChunk {
+            TextChunk(index: chunk.index, text: text, level: chunk.level, parentIndex: chunk.parentIndex, note: chunk.note)
+        }
+        if TableChunks.containsTable(chunk.text) {
+            let parts = TableChunks.headedPieces(
+                of: chunk, limit: characters(in: budget), headers: TableChunkHeaders.headers(in: chunk.text)
+            )
+            if parts.count > 1 {
+                return parts.flatMap { part -> [TextChunk] in
+                    guard doesNotFit(part.text, budget: budget) else { return [part] }
+                    return sentencePieces(of: part.text, budget: budget).enumerated().map { position, text in
+                        var piece = plain(text)
+                        if position == 0, text.hasPrefix(part.text.prefix(part.repeatedHeaderLength)) {
+                            piece.repeatedHeaderLength = part.repeatedHeaderLength
+                        }
+                        return piece
+                    }
+                }
+            }
+        }
+        return sentencePieces(of: chunk.text, budget: budget).map(plain)
+    }
+
+    /// Бюджет в знаках: замеренный предел или токены по пессимистичной
+    /// оценке — меньшее из двух.
+    static func characters(in budget: Budget) -> Int {
+        let byTokens = budget.tokens.map { max(1, Int(Double($0) * TokenEstimator.pessimisticCharactersPerToken)) }
+        return [byTokens, budget.characters].compactMap { $0 }.min() ?? Int.max
+    }
+
+    /// Проза — по предложениям, **вырезкой** из текста: переводы строк
+    /// между предложениями остаются, как стояли.
+    static func sentencePieces(of text: String, budget: Budget) -> [String] {
         var result: [String] = []
-        var current = ""
+        var span: Range<String.Index>?
 
         func flush() {
-            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { result.append(trimmed) }
-            current = ""
+            if let span {
+                let piece = text[span].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !piece.isEmpty { result.append(piece) }
+            }
+            span = nil
         }
 
-        for sentence in SentenceSplitter.sentences(in: text) {
+        for range in SentenceSplitter.ranges(in: text) {
             // Предложение само не влезает — режем его мельче, а накопленное
             // отдаём как есть.
-            guard !doesNotFit(sentence, budget: budget) else {
+            guard !doesNotFit(String(text[range]), budget: budget) else {
                 flush()
-                result.append(contentsOf: split(sentence, budget: budget))
+                result.append(contentsOf: split(String(text[range]), budget: budget))
                 continue
             }
-            let candidate = current.isEmpty ? sentence : current + " " + sentence
-            if doesNotFit(candidate, budget: budget) {
+            guard let current = span else {
+                span = range
+                continue
+            }
+            let candidate = current.lowerBound..<range.upperBound
+            if doesNotFit(String(text[candidate]), budget: budget) {
                 flush()
-                current = sentence
+                span = range
             } else {
-                current = candidate
+                span = candidate
             }
         }
         flush()

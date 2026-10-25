@@ -43,81 +43,72 @@ struct DropSheet: View {
     }
 
     var body: some View {
-        SheetShell(
-            title: String(localized: "Перетащенное"),
-            subtitle: String(localized: "Перетащено: \(items.summary). Приложение ничего не делает с этим само."),
-            help: String(localized: "Папка становится источником: приложение следит за ней и переиндексирует изменившиеся файлы. Отдельные файлы добавляются разово — следить за ними приложение не будет, и, если они изменятся на диске, в базе останется прежний текст."),
-            width: 560,
-            height: nil,
-            scrolls: false
-        ) {
-            if !items.folders.isEmpty {
-                SectionCard(
-                    title: String(localized: "Папки"),
-                    subtitle: String(localized: "Станут источниками — с отслеживанием изменений.")
-                ) {
-                    VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                        ForEach(items.folders, id: \.self) { url in
-                            Text(url.path).font(Theme.Font.mono).foregroundStyle(Theme.Palette.captionText)
-                                .lineLimit(1).truncationMode(.middle)
-                        }
-                        HStack {
-                            Button(String(localized: "Зарегистрировать источником")) { registerSources(items.folders) }
-                                .buttonStyle(.chromaNormal)
-                            Spacer(minLength: 0)
-                        }
+        SheetFrame {
+            Section {
+                LabeledContent(String(localized: "Перетащено"), value: items.summary)
+            } header: {
+                SectionHeader(
+                    String(localized: "Перетащенное"),
+                    help: String(localized: "Папка становится источником: приложение следит за ней и переиндексирует изменившиеся файлы. Отдельные файлы добавляются разово — следить за ними приложение не будет, и, если они изменятся на диске, в базе останется прежний текст.")
+                )
+            } footer: {
+                VStack(alignment: .leading) {
+                    Text("Приложение ничего не делает с этим само — выберите, что сделать.")
+                    if !items.unsupported.isEmpty {
+                        Notice(.warning, String(localized: "Приложение не читает: \(items.unsupported.map(\.lastPathComponent).joined(separator: ", "))"))
                     }
+                }
+            }
+
+            if !items.folders.isEmpty {
+                Section {
+                    ForEach(items.folders, id: \.self) { url in
+                        Label(url.path, systemImage: "folder")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(url.path)
+                    }
+                    Button(String(localized: "Зарегистрировать источником")) { registerSources(items.folders) }
+                } header: {
+                    Text("Папки")
+                } footer: {
+                    Text("Станут источниками — с отслеживанием изменений.")
                 }
             }
 
             if !items.files.isEmpty {
-                SectionCard(
-                    title: String(localized: "Файлы"),
-                    subtitle: String(localized: "Разовое добавление: следить за этими файлами приложение не будет.")
-                ) {
-                    VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                        ForEach(items.files.prefix(8), id: \.self) { url in
-                            Text(url.lastPathComponent).font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                                .lineLimit(1).truncationMode(.middle)
-                        }
-                        if items.files.count > 8 {
-                            Text("…и ещё \(RussianCount.grouped(items.files.count - 8, "файл", "файла", "файлов"))")
-                                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                        }
-                        HStack(spacing: 10) {
-                            Text("В коллекцию").font(Theme.Font.control)
-                            Picker("", selection: $collection) {
-                                Text("выберите").tag("")
-                                ForEach(collections, id: \.self) { Text($0).tag($0) }
-                            }
-                            .labelsHidden()
-                            Spacer(minLength: 0)
-                        }
-                        // Пустой список — это тупик, и объяснить его надо
-                        // здесь: иначе кнопка просто не нажимается, и почему —
-                        // непонятно.
-                        if let problem = collectionsProblem {
-                            Text(problem).font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        HStack {
-                            Button(String(localized: "Добавить документами")) { addDocuments(items.files, collection) }
-                                .buttonStyle(.chromaNormal)
-                                .disabled(collection.isEmpty)
-                            Spacer(minLength: 0)
-                        }
+                Section {
+                    ForEach(items.files.prefix(8), id: \.self) { url in
+                        Label(url.lastPathComponent, systemImage: "doc")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    if items.files.count > 8 {
+                        Text("…и ещё \(RussianCount.grouped(items.files.count - 8, "файл", "файла", "файлов"))")
+                            .foregroundStyle(.secondary)
+                    }
+                    Picker(String(localized: "В коллекцию"), selection: $collection) {
+                        Text("выберите").tag("")
+                        ForEach(collections, id: \.self) { Text($0).tag($0) }
+                    }
+                    Button(String(localized: "Добавить документами")) { addDocuments(items.files, collection) }
+                        .disabled(collection.isEmpty)
+                } header: {
+                    Text("Файлы")
+                } footer: {
+                    // Пустой список — это тупик, и объяснить его надо
+                    // здесь: иначе кнопка просто не нажимается, и почему —
+                    // непонятно.
+                    if let problem = collectionsProblem {
+                        Notice(.warning, problem)
+                    } else {
+                        Text("Разовое добавление: следить за этими файлами приложение не будет.")
                     }
                 }
             }
-
-            if !items.unsupported.isEmpty {
-                Text("Приложение не читает: \(items.unsupported.map(\.lastPathComponent).joined(separator: ", "))")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         } actions: {
-            Button(String(localized: "Отмена"), action: cancel)
-                .buttonStyle(.chromaNormal)
+            Spacer()
+            Button(String(localized: "Отменить"), action: cancel)
                 .keyboardShortcut(.cancelAction)
         }
         .task { await loadCollections() }

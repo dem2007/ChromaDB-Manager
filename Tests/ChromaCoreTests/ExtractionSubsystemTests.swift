@@ -178,6 +178,43 @@ final class ExtractorRegistryTests: XCTestCase {
         XCTAssertEqual(PlainTextExtractor.read(at: url), "Привет")
     }
 
+    /// KOI8-R и CP866 тоже «читаются» как Windows-1251 — набором
+    /// чужих букв. Кодировка узнаётся по тому, какое прочтение похоже на
+    /// русский текст.
+    func testKOI8RAndCP866AreRecognisedByTheirLetters() throws {
+        let text = "Договор поставки 12. Стороны согласовали сроки, цену и порядок приёмки товара."
+        for guess in [TextEncodingGuess.koi8R, .cp866, .windows1251] {
+            let data = try XCTUnwrap(text.data(using: guess.encoding))
+            XCTAssertEqual(DelimitedTableReader.detectEncoding(data), guess, guess.title)
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(guess.rawValue)-\(UUID().uuidString).txt")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try data.write(to: url)
+            XCTAssertEqual(PlainTextExtractor.read(at: url), text, guess.title)
+        }
+        // Короткое слово — тоже.
+        for guess in [TextEncodingGuess.koi8R, .cp866, .windows1251] {
+            let data = try XCTUnwrap("Привет".data(using: guess.encoding))
+            XCTAssertEqual(DelimitedTableReader.detectEncoding(data), guess, guess.title)
+        }
+    }
+
+    /// Без русских букв — Windows-1251, как было: английский текст в cp1252
+    /// с «умными» кавычками не становится кириллицей CP866.
+    func testWesternTextWithoutCyrillicStaysWindows1251() {
+        var data = Data("He said ".utf8)
+        data.append(contentsOf: [0x93])
+        data.append(contentsOf: Array("quoted".utf8))
+        data.append(contentsOf: [0x94, 0x20, 0x96, 0x20])
+        data.append(contentsOf: Array("done.".utf8))
+        XCTAssertEqual(DelimitedTableReader.detectEncoding(data), .windows1251)
+    }
+
+    func testHTMLWithoutCharsetInKOI8RIsReadAsRussian() throws {
+        let html = "<html><body><p>Порядок приёмки товара и сроки оплаты.</p></body></html>"
+        let data = try XCTUnwrap(html.data(using: TextEncodingGuess.koi8R.encoding))
+        XCTAssertEqual(HTMLParser.decode(data, contentType: nil), html)
+    }
+
     /// Срок ограничивает **ожидание**: работа, не слышащая отмены, не держит
     /// вызывающего дольше срока.
     func testTheDeadlineDoesNotWaitForStuckWork() async {

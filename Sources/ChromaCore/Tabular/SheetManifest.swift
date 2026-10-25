@@ -129,6 +129,16 @@ extension TableMapping {
         if !renamed.isEmpty {
             parts.append("titles:" + renamed.map { "\($0)=\(title(of: $0))" }.joined(separator: ","))
         }
+        // «№» и «%» в подписи стали словами ключа: ключ метаданных
+        // таких колонок уже не тот, что записан в коллекции. Подпись листа
+        // меняется — и предлагается переиндексация, а не тихая запись строк
+        // под новыми ключами рядом со старыми. Только у таких листов: у
+        // остальных ключи прежние, и по той же причине, что выше,
+        // подпись у них не трогается.
+        let spelled = columns.filter { title(of: $0).contains("№") || title(of: $0).contains("%") }
+        if !spelled.isEmpty {
+            parts.append("keys:" + spelled.map { ColumnKeyNormaliser.normalise(title(of: $0)) }.joined(separator: ","))
+        }
         return parts.joined(separator: ";")
     }
 }
@@ -239,6 +249,7 @@ public enum TableSyncPlanner {
         case .double(let value): return "d:\(value)"
         case .bool(let value): return "b:\(value)"
         case .null: return "n"
+        case .list(let values): return "l:[" + values.map(describe).joined(separator: ",") + "]"
         }
     }
 
@@ -262,10 +273,24 @@ public enum TableSyncPlanner {
         manifest: SheetManifest,
         sourceID: UUID,
         sourceFile: String,
-        coverage: SheetCoverage? = nil
+        coverage: SheetCoverage? = nil,
+        /// Место листа в книге — по нему `get_file` отдаёт листы
+        /// в порядке книги.
+        sheetIndex: Int? = nil,
+        merges: [XLSXReader.MergedRange] = [],
+        /// Поля файла, общие для всех его строк. Входят в хеш
+        /// метаданных: когда книгу перечитывают после правки уровней пути или
+        /// своих полей источника (`TableFileManifest.metadataSignature`),
+        /// новые значения доходят до записанных строк без пересчёта векторов.
+        shared: ChromaMetadata = [:]
     ) -> SheetSyncPlan {
         var plan = SheetSyncPlan()
         let signature = mapping.signature
+        // Шапка в несколько строк даёт колонкам видимые названия. Это
+        // свойство файла, а не рецепта: подпись сопоставления — по профилю,
+        // иначе окно профиля, сравнивая её с записанной, вечно просило бы
+        // переиндексации. Изменившийся текст строк и так их перезапишет.
+        let recipe = mapping.labelled(rows: rows, merges: merges, layout: layout)
         // A changed mapping rewrites every row by a different recipe. says
         // that is a re-index offered as its own operation with a backup — so the
         // plan says so and does not quietly turn every row into «changed».
@@ -280,7 +305,6 @@ public enum TableSyncPlanner {
         // непустая строка, выше неё ничего и не было; со строкой, указанной
         // руками, шапка отчёта — название, дата, подпись — иначе стала бы
         // документами наравне со строками таблицы.
-        let firstDataRow = headerRow.map { $0 + 1 } ?? Int.min
         var seen: Set<String> = []
         /// Номер строки, которая первой заняла этот идентификатор документа.
         var claimedBy: [String: Int] = [:]
@@ -289,12 +313,25 @@ public enum TableSyncPlanner {
         // Строки файла собираются до разбора: без ключевой колонки строка
         // узнаётся по содержимому, а для этого надо видеть их все.
         var freshRows: [(document: TableRowDocument, record: TableRowRecord)] = []
-        for row in rows where row.number >= firstDataRow {
-            guard !row.isEmpty else { continue }
+        let dataRows = RowMapper.dataRows(rows, below: headerRow, layout: layout, merges: merges)
+        // Путь записи — значения предков в её главной колонке.
+        let paths = RecordPaths.overrides(rows: dataRows, mapping: recipe, layout: layout)
+        for row in dataRows {
+            // Строка-раздел, разложенная по колонкам, — не запись:
+            // раньше у неё был текст только в первой колонке, и она шла
+            // в пустые. Так и остаётся — иначе «Крепёж» стал бы и артикулом,
+            // и названием, и ценой. Раздел — это **объединение**, накрывшее
+            // всю строку: запись, у которой просто совпали значения
+            // («Болт | Болт»), остаётся записью.
+            if row.isUniform, Self.isSpreadByOneMerge(row, merges: merges) {
+                plan.empty.append(row.number)
+                continue
+            }
             guard let document = RowMapper.document(
-                for: row, mapping: mapping, layout: layout,
-                sourceID: sourceID, sourceFile: sourceFile, coverage: coverage
-            ) else {
+                for: row, mapping: recipe, layout: layout,
+                sourceID: sourceID, sourceFile: sourceFile, coverage: coverage, sheetIndex: sheetIndex,
+                overrides: paths[row.number] ?? [:]
+            )?.with(shared: shared) else {
                 plan.empty.append(row.number)
                 continue
             }
@@ -387,7 +424,10 @@ public enum TableSyncPlanner {
             }
             if previous.textHash != fresh.textHash {
                 plan.reembedded.append((document, previous.documentID))
-            } else if previous.metadataHash != fresh.metadataHash {
+            } else if previous.metadataHash != fresh.metadataHash || previous.documentID != document.id {
+                // Тот же текст под другим идентификатором — переезд, а не
+                // правка: так записанное до того, как файл вошёл в
+                // идентификатор, переходит под новый со своим вектором.
                 plan.metadataOnly.append((document, previous.documentID))
             } else {
                 plan.unchanged += 1
@@ -408,6 +448,16 @@ public enum TableSyncPlanner {
             .filter { claimedBy[$0.documentID] == nil }
             .sorted { $0.rowNumber < $1.rowNumber }
         return plan
+    }
+
+    /// Все занятые клетки строки накрыты одним объединением.
+    static func isSpreadByOneMerge(_ row: SheetRow, merges: [XLSXReader.MergedRange]) -> Bool {
+        let columns = row.cells.filter { !$0.value.isEmpty }.map(\.key)
+        guard let first = columns.min(), let last = columns.max() else { return false }
+        return merges.contains {
+            $0.firstRow <= row.number && row.number <= $0.lastRow
+                && $0.firstColumn <= first && last <= $0.lastColumn
+        }
     }
 
     /// The manifest after a run that wrote everything the plan proposed.

@@ -37,7 +37,9 @@ public enum XLSError: LocalizedError, Equatable {
 public struct XLSReader {
     public struct Limits: Sendable {
         public var maxRows: Int
-        public init(maxRows: Int = 1_000_000) { self.maxRows = maxRows }
+        public init(maxRows: Int = 1_000_000) {
+            self.maxRows = maxRows
+        }
     }
 
     public let sheets: [SheetInfo]
@@ -104,6 +106,7 @@ public struct XLSReader {
         static let filePass: UInt16 = 0x002F
         static let format: UInt16 = 0x041E
         static let rk: UInt16 = 0x027E
+        static let mergedCells: UInt16 = 0x00E5
     }
 
     static func record(in stream: Data, at offset: Int) -> Record? {
@@ -146,7 +149,7 @@ public struct XLSReader {
                         styles.dateStyles.insert(index)
                         continue
                     }
-                    if let mask, let unit = XLSXReader.maskUnit(mask) { styles.units[index] = unit }
+                    if let unit = XLSXReader.numberFormat(mask: mask, formatID: formatID) { styles.units[index] = unit }
                 }
                 result.styles = styles
                 return result
@@ -185,8 +188,35 @@ public struct XLSReader {
 
     // MARK: - Лист
 
+    /// Число диапазонов, затем по восемь байт: первая и последняя строка,
+    /// первая и последняя колонка — с нуля.
+    static func mergedRanges(_ payload: Data) -> [XLSXReader.MergedRange] {
+        let count = Int(CFBContainerReader.u16(payload, 0))
+        var result: [XLSXReader.MergedRange] = []
+        for index in 0..<count {
+            let base = 2 + index * 8
+            guard base + 8 <= payload.count else { break }
+            result.append(XLSXReader.MergedRange(
+                firstRow: Int(CFBContainerReader.u16(payload, base)) + 1,
+                lastRow: Int(CFBContainerReader.u16(payload, base + 2)) + 1,
+                firstColumn: Int(CFBContainerReader.u16(payload, base + 4)),
+                lastColumn: Int(CFBContainerReader.u16(payload, base + 6))
+            ))
+        }
+        return result
+    }
+
     public func rows(of sheet: SheetInfo, limits: Limits = Limits()) throws -> (rows: [SheetRow], warnings: [XLSXWarning]) {
-        guard let start = offsets[sheet.name] else { return ([], []) }
+        let read = try rowsAndMerges(of: sheet, limits: limits)
+        return (read.rows, read.warnings)
+    }
+
+    /// Строки листа и его объединения — за один проход по записям:
+    /// объединения читаются тем же обходом, что и ячейки.
+    public func rowsAndMerges(
+        of sheet: SheetInfo, limits: Limits = Limits()
+    ) throws -> (rows: [SheetRow], warnings: [XLSXWarning], merges: [XLSXReader.MergedRange]) {
+        guard let start = offsets[sheet.name] else { return ([], [], []) }
         var cells: [Int: [Int: CellValue]] = [:]
         var warnings: [XLSXWarning] = []
         var formulasWithoutValue = 0
@@ -194,7 +224,15 @@ public struct XLSReader {
         var truncated = false
         /// Ячейка, чьё значение придёт следующей записью `STRING`.
         var pendingFormula: (row: Int, column: Int)?
+        /// Объединения листа. Раньше запись не читалась вовсе, и
+        /// значение объединённой ячейки стояло только в верхней строке.
+        var merges: [XLSXReader.MergedRange] = []
         var offset = start
+        /// Глубина вложенных подпотоков. Диаграмма на листе — свой
+        /// подпоток BOF…EOF внутри листа, до записи объединений: первый же
+        /// EOF кончал лист, и объединения не читались. Смещение листа
+        /// указывает на его собственный BOF; если нет — лист уже открыт.
+        var depth = Self.record(in: stream, at: start)?.type == Kind.bof ? 0 : 1
 
         func put(_ row: Int, _ column: Int, _ value: CellValue) {
             guard !truncated else { return }
@@ -224,14 +262,32 @@ public struct XLSReader {
         while let record = Self.record(in: stream, at: offset) {
             offset = record.next
             let payload = record.payload
+            if record.type == Kind.bof {
+                depth += 1
+                continue
+            }
+            if record.type == Kind.eof, depth > 1 {
+                depth -= 1
+                continue
+            }
+            // Записи диаграммы — не ячейки листа.
+            guard depth <= 1 else { continue }
             switch record.type {
             case Kind.eof:
                 if formulasWithoutValue > 0 { warnings.append(.formulaWithoutValue(cells: formulasWithoutValue)) }
                 if phantomDays > 0 { warnings.append(.phantomLeapDay(cells: phantomDays)) }
-                let result = cells.keys.sorted().map { number in
-                    SheetRow(number: number + 1, cells: cells[number] ?? [:])
-                }
-                return (result, warnings)
+                // Значение объединения — в каждой его клетке, вниз и вбок,
+                // тем же правилом, что у `.xlsx`. Только в пустые
+                // клетки и только в строки, которые в файле есть:
+                // колонка, объединённая целиком, иначе давала десятки тысяч
+                // строк из одного значения.
+                let result = MergeFill.filling(
+                    cells.keys.sorted().map { SheetRow(number: $0 + 1, cells: cells[$0] ?? [:]) },
+                    merges: merges
+                )
+                return (result, warnings, merges)
+            case Kind.mergedCells:
+                merges += Self.mergedRanges(payload)
             case Kind.labelSST:
                 let index = Int(CFBContainerReader.u32(payload, 6))
                 let text = index < sharedStrings.count ? sharedStrings[index] : ""

@@ -120,7 +120,10 @@ final class EmbeddingsViewModel: ObservableObject {
             // В таблице порядок другой, чем в выпадающих списках: здесь это
             // перечень установленного, а не выбор под задачу.
             models = ModelPickerOrder.tableSorted(loaded)
-            connectionMessage = "Подключено к \(app.settings.configuration.lmStudioBaseURL). Моделей: \(models.count), из них эмбеддинговых: \(embeddingModels.count)."
+            // Не баннером над всеми вкладками «Моделей» (v6 A4): что
+            // подключено и сколько моделей — строка «Состояние» на вкладке
+            // «Подключение»; баннер — только для ошибки и итога действия.
+            app.log.record(.info, "LM Studio", "Подключено к \(app.settings.configuration.lmStudioBaseURL). Моделей: \(models.count), из них эмбеддинговых: \(embeddingModels.count).")
 
             if app.settings.configuration.defaultEmbeddingModel == nil,
                let first = embeddingModels.first {
@@ -449,7 +452,7 @@ final class EmbeddingsViewModel: ObservableObject {
                 await app.benchmarks.store(result)
                 await self.refreshBenchmarks(app)
                 self.connectionMessage = String(
-                    localized: "Модель «\(model)»: \(String(format: "%.1f", result.textsPerSecond)) текстов/с при батче \(result.optimalBatchSize ?? 0), первый вызов \(String(format: "%.2f", result.firstCallSeconds)) с."
+                    localized: "Модель «\(model)»: \((result.textsPerSecond).decimal(1)) текстов/с при батче \(result.optimalBatchSize ?? 0), первый вызов \((result.firstCallSeconds).decimal(2)) с."
                 )
                 // a measurement of a large model runs for minutes, and the
                 // user is invited by the warning itself to go and do something

@@ -316,7 +316,9 @@ final class ReextractionPlanTests: XCTestCase {
         var original = plan(stale: ["a.pdf"])
         original = SyncPlan(
             sourceID: original.sourceID, sourceName: original.sourceName, items: original.items,
-            newlyMissing: original.newlyMissing, pendingRemovals: original.pendingRemovals,
+            newlyMissing: original.newlyMissing,
+            returnedFromOrphaned: ["back.pdf"],
+            pendingRemovals: original.pendingRemovals,
             staleExtraction: original.staleExtraction,
             tableRowsToEmbed: 42,
             newFolderLevels: [NewFolderLevel(number: 3, folderCount: 7, examples: ["2025", "2026"])]
@@ -326,6 +328,9 @@ final class ReextractionPlanTests: XCTestCase {
 
         XCTAssertEqual(forced.newFolderLevels.map(\.number), [3])
         XCTAssertEqual(forced.tableRowsToEmbed, 42)
+        // Вернувшийся после «Оставить в базе» файл теряет пометку и при
+        // переизвлечении — иначе его следующее исчезновение прошло бы молча.
+        XCTAssertEqual(forced.returnedFromOrphaned, ["back.pdf"])
     }
 
     /// Переизвлечение сохраняет **все** поля самого элемента, а не только

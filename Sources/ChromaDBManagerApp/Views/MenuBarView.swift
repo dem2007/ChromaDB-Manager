@@ -26,57 +26,84 @@ struct MenuBarView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            status
-            Divider()
+        VStack(alignment: .leading) {
+            // Сначала — состояние: сервер и задачи, затем MCP (v6); что
+            // делается и пауза — под ними.
+            serverLine
             mcpStatus
+            Divider()
+            status
             Divider()
             quickSearch
             Divider()
             footer
         }
-        .padding(12)
-        // Высота задана жёстко, а не по содержимому: всплывающее окно
-        // `MenuBarExtra` защёлкивает размер при первом показе и под
-        // появившиеся результаты не растёт — они оказывались за краем
-        // и выглядели как «поиск ничего не нашёл». Проверено в окне.
-        .frame(width: 400, height: 430, alignment: .top)
+        .menuBarPanel()
     }
 
     // MARK: - Состояние
 
+    /// Сервер — состоянием подключения; справа — сколько задач.
+    private var serverLine: some View {
+        HStack {
+            StatusLabel(serverState.0, serverState.1)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+            Spacer()
+            Text(queueMirror.tasks.isEmpty
+                 ? String(localized: "задач нет")
+                 : String(localized: "задач: \(queueMirror.tasks.count.plainDigits)"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var serverState: (StatusLabel.State, String) {
+        switch app.connection {
+        case .connected(_, _, let isLocal, _):
+            return (.ok, isLocal ? String(localized: "Сервер работает") : String(localized: "Подключено к серверу"))
+        case .connecting:
+            return (.warning, String(localized: "Подключение…"))
+        case .failed:
+            return (.error, String(localized: "Нет подключения к базе"))
+        // Не «сервер остановлен»: у внешнего сервера или при живом процессе
+        // без подключения это неправда — разорвано подключение.
+        case .disconnected:
+            return (.off, String(localized: "Не подключено"))
+        }
+    }
+
     private var status: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Image(systemName: summary.symbol)
-                Text(summary.headline).font(Theme.Font.caption.weight(.semibold))
+        VStack(alignment: .leading) {
+            // Что идёт сейчас — только когда идёт: «Задач нет» — уже в первой
+            // строке счётчиком.
+            if summary.isBusy || summary.paused {
+                Label(summary.headline, systemImage: summary.symbol)
+                    .font(.callout)
                     .lineLimit(1).truncationMode(.middle)
             }
             if let queue = summary.queueLine {
-                Text(queue).font(Theme.Font.caption).foregroundStyle(.secondary)
+                Text(queue).font(.caption).foregroundStyle(.secondary)
             }
             if let paused = summary.pausedLine {
-                Text(paused).font(Theme.Font.caption).foregroundStyle(.orange)
+                Notice(.warning, paused).font(.caption)
             }
             if let sync = summary.lastSync {
-                Text(sync).font(Theme.Font.caption).foregroundStyle(.secondary)
+                Text(sync).font(.caption).foregroundStyle(.secondary)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             // Глобальная пауза (8.4) — прямо здесь: ради неё в строку меню
             // и заглядывают, когда LM Studio занята чем-то другим.
             //
             // Через координатор, а не записью флага: пауза — это ещё и пауза
-            // очереди, и таймеры со слежением. Один флаг оставлял очередь
-            // стоять после «продолжить» — агент и ручные синхронизации ждали
-            // вечно, — а расписание не перестраивалось.
+            // очереди, и таймеры со слежением.
             Toggle(isOn: Binding(
                 get: { settings.configuration.automaticSyncPaused },
                 set: { app.autoSync.setPaused($0, app: app) }
             )) {
-                Text("Пауза автоматической синхронизации").font(Theme.Font.caption)
+                Text("Пауза автоматической синхронизации").font(.caption)
             }
             .toggleStyle(.switch).controlSize(.mini)
-            .padding(.top, 2)
         }
     }
 
@@ -85,35 +112,34 @@ struct MenuBarView: View {
     /// Работает ли мост для агентов — прямо здесь, в строке меню.
     ///
     /// Ради этого вопроса окно и оставляют закрытым: «приложение можно
-    /// закрыть, но агент должен ходить». Ответ на него был виден только на
-    /// экране «Клиенты», то есть в том самом окне, которого нет.
+    /// закрыть, но агент должен ходить».
     private var mcpStatus: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(mcp.isListening ? Theme.Palette.running : Theme.Palette.stopped)
-                .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-            Text(mcp.isListening
-                 ? String(localized: "MCP слушает")
-                 : String(localized: "MCP не запущен"))
-                .font(Theme.Font.caption)
+        HStack {
+            StatusLabel(
+                mcp.isListening ? .ok : (mcp.lastError == nil ? .off : .error),
+                mcp.isListening
+                    ? String(localized: "MCP слушает")
+                    : String(localized: "MCP не запущен")
+            )
+            .font(.caption)
             if mcp.isListening {
                 // Сколько мостов открыто сейчас и сколько вызовов было за
                 // сеанс: «слушает» и «им пользуются» — разные факты.
                 Text(mcp.connections.isEmpty
                      ? String(localized: "подключений нет")
                      : String(localized: "подключений: \(mcp.connections.count.plainDigits)"))
-                    .font(Theme.Font.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondary)
                 if mcp.callCount > 0 {
-                    // Разделитель — отдельным видом, а не частью строки:
-                    // склеенный интерполяцией, он уезжал в каталог текстов
-                    // ключом «· %@», переводить который нечего.
-                    Text(verbatim: "·").font(Theme.Font.caption).foregroundStyle(.secondary)
+                    // Разделитель — отдельным видом: склеенный интерполяцией,
+                    // он уезжал в каталог текстов ключом «· %@».
+                    Text(verbatim: "·").font(.caption).foregroundStyle(.secondary)
                     Text("вызовов: \(mcp.callCount.plainDigits)")
-                        .font(Theme.Font.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             } else if let error = mcp.lastError {
-                Text(error).font(Theme.Font.caption).foregroundStyle(.orange)
+                Text(error).font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.tail)
+                    .help(error)
             }
             Spacer()
         }
@@ -124,14 +150,14 @@ struct MenuBarView: View {
     private var quickSearch: some View {
         // Тот же вид, что в панели по горячей клавише: две реализации
         // быстрого поиска разошлись бы через месяц.
-        QuickSearchView(search: search, openDocument: openViewerWindow)
+        QuickSearchView(search: search, openDocument: openViewerWindow, fillsHeight: false)
     }
 
     // MARK: - Низ
 
     private var footer: some View {
         HStack {
-            Button("Открыть окно") {
+            Button(String(localized: "Открыть окно")) {
                 openMainWindow(search.hits.isEmpty ? nil : .search(
                     collection: settings.configuration.menuBar.quickSearchCollection,
                     text: search.text
@@ -139,7 +165,7 @@ struct MenuBarView: View {
             }
             .controlSize(.small)
             Spacer()
-            Button("Выйти") { NSApplication.shared.terminate(nil) }
+            Button(String(localized: "Выйти")) { NSApplication.shared.terminate(nil) }
                 .controlSize(.small)
         }
     }

@@ -11,7 +11,7 @@ import ChromaCore
 /// действительностью — и список дёргается ровно так, как жаловался заказчик.
 ///
 /// **Здесь собран двойник строки, а не она сама.** Настоящая требует модель
-/// и окружение приложения; двойник повторяет её состав — подпись, три строки
+/// и окружение приложения; двойник повторяет её состав — подпись, пять строк
 /// текста, ряд оценок, мнение модели — теми же шрифтами и тем же стилем
 /// кнопок. Он ловит то, что ломается молча: изменившийся кегль, добавленную
 /// строку, другой стиль капсулы. Если строку переделают, не тронув двойника,
@@ -25,16 +25,21 @@ final class ResultRowHeightTests: XCTestCase {
         var body: some View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("1. 7 090 знаков · родительский")
-                    .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText).lineLimit(1)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Text("…к настройке обмена со шлюзом ведомства Исполнитель обязан наладить защищённое соединение рабочих серверов и…")
-                    .font(Theme.Font.caption)
-                    .lineLimit(3, reservesSpace: true)
+                    .font(.subheadline)
+                    .lineLimit(5, reservesSpace: true)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 4) {
                     ForEach(["релевантен", "частично", "нерелевантен"], id: \.self) { title in
-                        Button(title) {}.buttonStyle(.chromaChoice(nil)).controlSize(.small).fixedSize()
+                        if title == "частично" {
+                            Button(title) {}.controlSize(.small).fixedSize()
+                                .buttonStyle(.borderedProminent).tint(.orange)
+                        } else {
+                            Button(title) {}.controlSize(.small).fixedSize().buttonStyle(.bordered)
+                        }
                     }
-                    Text("не размечено").font(Theme.Font.micro).lineLimit(1).layoutPriority(-1)
+                    Text("не размечено").font(.caption).lineLimit(1).layoutPriority(-1)
                     Spacer(minLength: 4)
                     Button { } label: { Image(systemName: "doc.text.magnifyingglass") }
                         .buttonStyle(.borderless).controlSize(.small)
@@ -42,13 +47,13 @@ final class ResultRowHeightTests: XCTestCase {
                 if judged {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
-                            Text("модель: релевантен").font(Theme.Font.micro).italic()
+                            Text("модель: релевантен").font(.caption).italic()
                             Button("принять") {}.buttonStyle(.borderless).controlSize(.small)
                         }
                         // Причина занимает три строки — столько ей отведено
                         // в настоящей строке.
                         Text(String(repeating: "причина оценки ", count: 12))
-                            .font(Theme.Font.micro).italic()
+                            .font(.caption).italic()
                             .lineLimit(3).fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -62,12 +67,12 @@ final class ResultRowHeightTests: XCTestCase {
         let note: Bool
         var body: some View {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Иерархия: отвечать родителем").font(Theme.Font.caption).bold()
+                Text("Иерархия: отвечать родителем").font(.subheadline).bold()
                 Text("вектор переиспользован · поиск 1 033 мс · 10 результатов")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                    .font(.subheadline).foregroundStyle(.secondary)
                 if note {
                     Text("Прогон записан до того, как метаданные стали сохраняться: перехода к исходнику по нему нет. Прогоните набор заново.")
-                        .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
+                        .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -101,7 +106,7 @@ final class ResultRowHeightTests: XCTestCase {
     /// под неё держится по прогону, а не по колонке.
     func testTheNoteIsMeasuredForTheWholeRun() {
         let mixed = EvaluationRunSamples.run(queries: 3, hits: 3, metadata: true, firstWithoutMetadata: true)
-        XCTAssertEqual(EvaluationView.headerHeight(for: mixed), 66, "хватить места обязано и той колонке, где оговорка есть")
+        XCTAssertEqual(EvaluationView.headerHeight(for: mixed), 62, "хватить места обязано и той колонке, где оговорка есть")
     }
 
     /// Ширина сетки — то, чем ограничены подпись запроса и разделитель.
@@ -115,10 +120,18 @@ final class ResultRowHeightTests: XCTestCase {
     /// Подпись запроса — две строки, и число под неё отведённое верно.
     func testTheQueryTitleKeepsTwoLines() {
         let twin = Text("Порядок обновления справочников")
-            .font(Theme.Font.body).bold()
+            .font(.body).bold()
             .lineLimit(2, reservesSpace: true)
             .fixedSize(horizontal: false, vertical: true)
         XCTAssertEqual(height(twin), EvaluationView.queryTitleHeight)
+    }
+
+    /// Строка тегов и фильтра — одна строка, и место под неё верно.
+    func testTheQueryHintKeepsOneLine() {
+        let twin = Text(String(repeating: "теги: факт, таблица · фильтр: source_file = ТЗ.docx ", count: 4))
+            .font(.subheadline).foregroundStyle(.secondary)
+            .lineLimit(1)
+        XCTAssertEqual(height(twin), EvaluationView.queryHintHeight)
     }
 
     /// Высота блока запроса складывается из закреплённых частей — и складка
@@ -131,13 +144,15 @@ final class ResultRowHeightTests: XCTestCase {
         let run = EvaluationRunSamples.run(queries: 1, hits: 10, metadata: true, variants: 3)
         let expected = EvaluationView.queryTitleHeight
             + EvaluationView.blockSpacing
+            + EvaluationView.queryHintHeight
+            + EvaluationView.blockSpacing
             + EvaluationView.headerHeight(for: run)
             + 10 * (EvaluationView.blockSpacing + EvaluationView.rowHeight(judged: false))
             + EvaluationView.blockSpacing
             + EvaluationView.dividerHeight
         // Ровно столько же насчитывает и сам экран — через свой собственный
         // проход по рядам.
-        let byHand: CGFloat = 32 + 6 + 34 + 1070 + 6 + 1
+        let byHand: CGFloat = 32 + 6 + 14 + 6 + 32 + 1200 + 6 + 1
         XCTAssertEqual(expected, byHand)
     }
 

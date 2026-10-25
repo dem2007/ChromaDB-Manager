@@ -174,9 +174,13 @@ public actor EvaluationRunner {
             .filter { $0.role == .match }
             .enumerated()
             .map { position, hit in
-                EvaluationHit(
+                // Контекст результатом не становится, но его объём хранится:
+                // агент читает и его.
+                let context = hit.context.reduce(0) { $0 + ($1.document?.count ?? 0) }
+                return EvaluationHit(
                     id: hit.id, text: hit.document, distance: hit.distance,
-                    position: position + 1, metadata: hit.metadata
+                    position: position + 1, metadata: hit.metadata,
+                    contextCharacters: context > 0 ? context : nil
                 )
             }
     }

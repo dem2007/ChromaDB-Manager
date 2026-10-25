@@ -582,6 +582,7 @@ public struct DocumentFilter: Hashable, Codable, Sendable {
         case .double(let number): return number
         case .bool(let flag): return flag
         case .null: return NSNull()
+        case .list(let values): return values.map(unwrap)
         }
     }
 
@@ -613,5 +614,51 @@ public struct SavedFilter: Identifiable, Hashable, Codable, Sendable {
         self.collectionName = collectionName
         self.filter = filter
         self.savedAt = savedAt
+    }
+}
+
+public extension DocumentFilter {
+    /// Фильтр одной строкой: «source_file = ТЗ.docx И year ≥ 2025; текст
+    /// содержит «КС3»». Для подписи запроса на стенде оценки:
+    /// размечающему надо видеть, в чём искал поиск. `nil` — фильтр ничего
+    /// не ограничивает.
+    var summary: String? {
+        var parts: [String] = []
+        let rawWhere = rawWhereJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rawWhere.isEmpty {
+            parts.append(Self.compacted(rawWhere))
+        } else if let tree = root.summary(nested: false) {
+            parts.append(tree)
+        }
+        let rawDocument = rawWhereDocumentJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rawDocument.isEmpty {
+            parts.append(String(localized: "текст: \(Self.compacted(rawDocument))"))
+        } else {
+            let texts = textConditions.filter(\.isComplete).map { String(localized: "текст \($0.op.title) «\($0.text)»") }
+            if !texts.isEmpty { parts.append(texts.joined(separator: " \(textLogic.shortTitle) ")) }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    }
+
+    /// JSON, набранный руками, — в одну строку.
+    private static func compacted(_ json: String) -> String {
+        json.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: " ")
+    }
+}
+
+extension FilterNode {
+    /// Дерево условий одной строкой; вложенная группа из нескольких
+    /// условий — в скобках.
+    func summary(nested: Bool) -> String? {
+        if let condition {
+            guard condition.isComplete else { return nil }
+            return "\(condition.field) \(condition.op.title) \(condition.value)"
+        }
+        let parts = children.compactMap { $0.summary(nested: true) }
+        guard !parts.isEmpty else { return nil }
+        let joined = parts.joined(separator: " \((logic ?? .and).shortTitle) ")
+        return nested && parts.count > 1 ? "(\(joined))" : joined
     }
 }

@@ -11,141 +11,51 @@ import ChromaCore
 ///
 /// Экран **только показывает**: ни одной операции он сам не начинает, кроме
 /// тех, что и так есть на соседних вкладках. Каждая строка ведёт туда, где
-/// это можно изменить.
+/// это можно изменить. Язык интерфейса отсюда уехал в «Настройки».
 struct OverviewView: View {
     @EnvironmentObject private var app: AppEnvironment
-    /// Язык интерфейса живёт в `UserDefaults` системы, а не в конфигурации
-    /// приложения: оттуда его читает загрузчик ресурсов.
-    private let languages = InterfaceLanguageStore()
-    @State private var needsRestart = false
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var processManager: ChromaProcessManager
     @ObservedObject var server: ServerViewModel
     @ObservedObject var collectionsModel: CollectionsViewModel
     @ObservedObject var environment: EnvironmentViewModel
     @ObservedObject var sources: SourcesViewModel
-    /// Размер кэша векторов на плашке. Считает его та же модель, что и на
+    /// Размер кэша векторов в сводке. Считает его та же модель, что и на
     /// экране «Модели», — число одно на приложение, а не два своих.
     @ObservedObject var embeddings: EmbeddingsViewModel
     /// Куда уйти, если человек решит закрыть находку. Экран не чинит сам —
     /// он показывает и провожает туда, где чинят.
     var go: (SidebarSection, Int?) -> Void = { _, _ in }
+    @State private var confirmingServerStop = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                tiles
-                nowCard
-                // Процесс от прошлой сессии — рядом с фактами о сервере,
-                // и до списка решений: он держит порт и базу, и это
-                // не «стоит закрыть», а «вот прямо сейчас лишний сервер».
-                // Карточки нет, когда таких процессов нет.
-                ChromaProcessesCard(serverModel: server)
-                decisionsCard
-                languageCard
-            }
-            .padding(.top, 8)
-            .pageContentPadding()
-            .frame(maxWidth: .infinity, alignment: .leading)
+        Form {
+            summarySection
+            nowSection
+            // Процесс от прошлой сессии — рядом с фактами о сервере и до
+            // списка решений: он держит порт и базу. Секций нет,
+            // когда таких процессов нет.
+            ChromaProcessesCard(serverModel: server)
+            decisionsSection
         }
+        .formStyle(.grouped)
         .task { await embeddings.refreshCacheStatistics(app) }
     }
 
-    // MARK: - Язык интерфейса
+    // MARK: - Сводка
 
-    /// Выбор языка и честное «со следующего запуска».
-    ///
-    /// Язык бандла выбирается загрузчиком ресурсов **до** первой строки
-    /// приложения, поэтому мгновенно переключить его нельзя: половина экрана
-    /// осталась бы на прежнем языке, потому что тексты уже прочитаны. Экран
-    /// говорит это прямо и предлагает перезапустить — а не делает вид, что
-    /// поменял, и не перезапускает сам.
-    private var languageCard: some View {
-        SectionCard(
-            title: String(localized: "Язык интерфейса"),
-            subtitle: String(localized: "По умолчанию — как в системе. Выбор применится при следующем запуске: язык читается до того, как приложение покажет первое окно."),
-            help: String(localized: "Английский перевод неполный: строки без перевода остаются русскими. Это видно сразу и ничего не ломает — приложение ищет текст по русской строке из кода.")
-        ) {
-            VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                HStack(spacing: 10) {
-                    Picker("", selection: Binding(
-                        get: { languages.current },
-                        set: { chosen in
-                            needsRestart = languages.apply(chosen)
-                            app.log.record(.info, "Интерфейс", "Язык интерфейса: \(chosen.title)")
-                        }
-                    )) {
-                        ForEach(InterfaceLanguage.allCases) { language in
-                            Text(language.title).tag(language)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 220)
-
-                    if let running = InterfaceLanguageStore.running() {
-                        Text("сейчас: \(running)")
-                            .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                    }
-                    Spacer()
-                }
-
-                if needsRestart {
-                    HStack(spacing: 10) {
-                        Label(
-                            String(localized: "Язык поменяется при следующем запуске."),
-                            systemImage: "arrow.clockwise"
-                        )
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.attention)
-                        Button(String(localized: "Перезапустить")) { restart() }
-                            .buttonStyle(.chromaSecondary)
-                        Spacer()
-                    }
-                }
-            }
+    /// Сколько всего — четыре числа. Список коллекций живёт на своём экране
+    /// целиком, здесь от него нужен только счёт (правило 2).
+    private var summarySection: some View {
+        Section {
+            LabeledContent(String(localized: "Коллекций"), value: collectionsModel.collections.count.formatted())
+            LabeledContent(String(localized: "Документов"), value: documentsValue)
+            LabeledContent(String(localized: "Источников"), value: settings.configuration.dataSources.count.formatted())
+            LabeledContent(String(localized: "Кэш векторов"), value: embeddings.cacheStatistics?.sizeText ?? "—")
+        } header: {
+            Text("Сводка")
         }
-    }
-
-    /// Перезапуск: этот процесс выходит, новый запускается после него.
-    ///
-    /// Не наоборот: выход при идущей индексации спрашивают и его можно
-    /// отменить, а запущенную заранее вторую копию отменить уже нельзя — две
-    /// копии делили бы настройки, сервер и прокси. Запуск назначается
-    /// в `applicationWillTerminate`, когда выход уже состоялся.
-    private func restart() {
-        AppDelegate.relaunchOnExit = true
-        NSApplication.shared.terminate(nil)
-    }
-
-    // MARK: - Плашки
-
-    /// Сколько всего — четырьмя числами, как в макете.
-    ///
-    /// Раньше внизу экрана лежала карточка «Что в базе» с шестью именами
-    /// коллекций и хвостом «и ещё девять»: список коллекций уже есть на своём
-    /// экране целиком, а здесь от него нужен был только счёт (правило 2).
-    private var tiles: some View {
-        HStack(spacing: 16) {
-            StatTile(
-                title: String(localized: "Коллекций"),
-                value: collectionsModel.collections.count.formatted(),
-                go: { go(.collections, nil) }
-            )
-            StatTile(
-                title: String(localized: "Документов"),
-                value: documentsValue,
-                go: { go(.collections, nil) }
-            )
-            StatTile(
-                title: String(localized: "Источников"),
-                value: settings.configuration.dataSources.count.formatted(),
-                go: { go(.sources, nil) }
-            )
-            StatTile(
-                title: String(localized: "Кэш векторов"),
-                value: embeddings.cacheStatistics?.sizeText ?? "—",
-                go: { go(.models, nil) }
-            )
-        }
+        .monospacedDigit()
     }
 
     /// Пока число документов коллекции не пришло, оно `nil`, а не ноль:
@@ -153,74 +63,130 @@ struct OverviewView: View {
     private var documentsValue: String {
         let known = collectionsModel.collections.compactMap(\.documentCount)
         guard !known.isEmpty else { return "—" }
-        return known.reduce(0, +).formatted()
+        // Числа известны не у всех коллекций: сумма — нижняя граница,
+        // и это видно, а не подаётся как итог.
+        let total = known.reduce(0, +).formatted()
+        return known.count < collectionsModel.collections.count ? "≥ \(total)" : total
     }
 
     // MARK: - Сейчас
 
-    private var nowCard: some View {
-        SectionCard(
-            title: String(localized: "Сейчас"),
-            subtitle: String(localized: "Куда пишет приложение и что из этого работает."),
-            help: String(localized: "Приложение само запускает процесс chroma и подключается к нему. Прокси — отдельный слой: только через него к базе ходят внешние клиенты. Сам ChromaDB всегда остаётся на 127.0.0.1.")
-        ) {
-            VStack(alignment: .leading, spacing: 14) {
-                statusRow(
-                    title: String(localized: "Сервер ChromaDB"),
-                    state: processManager.isRunning ? .ok : .unknown,
-                    value: serverValue
-                )
-                statusRow(
-                    title: String(localized: "Прокси"),
-                    state: app.proxy.state.isRunning ? .ok : .unknown,
-                    value: proxyValue
-                )
-                statusRow(
-                    title: String(localized: "Адрес"),
-                    state: app.connection.isConnected ? .ok : .missing,
-                    value: addressValue,
-                    isMonospaced: true
-                )
-                statusRow(
-                    title: String(localized: "Папка базы"),
-                    state: .ok,
-                    value: databaseValue,
-                    isMonospaced: true
-                )
-                statusRow(
-                    title: String(localized: "Режим"),
-                    state: .ok,
-                    value: settings.configuration.mode.title
-                )
-                // Телеметрия показывается словами самого сервера, а не нашим
-                // утверждением о нём: мы передаём то, что он сказал о себе
-                // при запуске.
-                //
-                // Строка стоит всегда, даже когда сказать нечего.
-                // Она появлялась вместе с ответом сервера — то есть через
-                // секунду после запуска, — и карточка в этот момент
-                // подрастала, уводя вниз всё, что под ней. «Сервер ещё не
-                // отвечал» — такой же ответ, как остальные, и место он
-                // занимает то же.
-                statusRow(
-                    title: String(localized: "Телеметрия"),
-                    state: processManager.telemetryStatus == nil ? .unknown : .ok,
-                    value: processManager.telemetryStatus
-                        ?? String(localized: "сервер ещё не отвечал")
-                )
+    /// Управление процессом — строкой под ним (v6 B1: вкладки «Сервер» больше
+    /// нет). Ошибка и итог действия — здесь же, а вопрос об остановке — на
+    /// самой кнопке: на секции формы он не открывается.
+    @ViewBuilder
+    private var serverControls: some View {
+        if let error = server.errorMessage {
+            LabeledContent {
+                Button(String(localized: "Скрыть")) { server.errorMessage = nil }
+                    .buttonStyle(.borderless)
+            } label: {
+                Notice(.warning, error)
             }
+        }
+        if let status = server.statusMessage {
+            LabeledContent {
+                Button(String(localized: "Скрыть")) { server.statusMessage = nil }
+                    .buttonStyle(.borderless)
+            } label: {
+                Notice(.info, status)
+            }
+        }
+        HStack {
+            Spacer()
+            if server.isBusy { ProgressView().controlSize(.small) }
+            if processManager.isRunning {
+                Button(String(localized: "Перезапустить")) {
+                    Task { await server.restart(app, collectionsModel: collectionsModel) }
+                }
+                Button(String(localized: "Остановить…"), role: .destructive) { confirmingServerStop = true }
+                    .confirmationDialog(
+                        String(localized: "Остановить сервер ChromaDB?"),
+                        isPresented: $confirmingServerStop
+                    ) {
+                        Button(String(localized: "Остановить"), role: .destructive) {
+                            Task { await server.stop(app) }
+                        }
+                        Button(String(localized: "Отменить"), role: .cancel) {}
+                    } message: {
+                        Text("Пока сервер стоит, недоступны коллекции, поиск и агенты. Данные не трогаются: база — это папка на диске.")
+                    }
+            } else {
+                Button(String(localized: "Запустить")) {
+                    Task { await server.start(app, collectionsModel: collectionsModel) }
+                }
+            }
+        }
+        .disabled(server.isBusy)
+    }
+
+    /// Строки стоят всегда и в одну строку каждая: значения меняются
+    /// сами — аптайм тикает, адрес появляется по подключении, сервер
+    /// отвечает про телеметрию когда ответит, — и секция не должна от этого
+    /// расти и уводить вниз всё, что под ней.
+    private var nowSection: some View {
+        Section {
+            LabeledContent(String(localized: "Сервер ChromaDB")) {
+                StatusLabel(processManager.isRunning ? .ok : .off, serverValue)
+                    .lineLimit(1)
+            }
+            serverControls
+            LabeledContent(String(localized: "Прокси")) {
+                StatusLabel(app.proxy.state.isRunning ? .ok : .off, proxyValue)
+                    .lineLimit(1)
+            }
+            LabeledContent(String(localized: "Адрес")) {
+                monospaced(addressValue)
+            }
+            LabeledContent(String(localized: "Папка базы")) {
+                monospaced(app.localDatabaseURL.path)
+            }
+            .contextMenu {
+                Button(String(localized: "Показать в Finder")) {
+                    NSWorkspace.shared.activateFileViewerSelecting([app.localDatabaseURL])
+                }
+            }
+            LabeledContent(String(localized: "Режим"), value: settings.configuration.mode.title)
+            if let backup = lastBackup {
+                LabeledContent(String(localized: "Резервная копия")) {
+                    Button("\(backup.createdAt.formatted(date: .abbreviated, time: .shortened)) · \(backup.sizeText)") {
+                        go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии")))
+                    }
+                    .buttonStyle(.link)
+                    .help(String(localized: "Открыть «Резервные копии»"))
+                }
+            }
+            // Пределы записи — ответ сервера, а не настройка: здесь, а не в
+            // «Для опытных» рядом с редактируемыми полями (v4 A5).
+            writeLimitRows
+            // Своими словами, а сообщение сервера — в подсказке: сырая
+            // английская строка движка — не текст интерфейса.
+            LabeledContent(String(localized: "Телеметрия")) {
+                Text(telemetryValue)
+                    .lineLimit(1)
+                    .help(processManager.telemetryStatus ?? "")
+            }
+        } header: {
+            SectionHeader(
+                String(localized: "Сейчас"),
+                help: String(localized: "Приложение само запускает процесс chroma и подключается к нему. Прокси — отдельный слой: только через него к базе ходят внешние клиенты. Сам ChromaDB всегда остаётся на 127.0.0.1.")
+            )
         }
     }
 
-    /// «Работает · PID 12152 · 4 ч 12 мин» — три факта о процессе одной
-    /// строкой: он есть, вот его номер, вот сколько он держится. Раньше это
-    /// были три отдельные строки на другом экране.
+    private func monospaced(_ value: String) -> some View {
+        Text(value)
+            .font(.body.monospaced())
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .copyable(value)
+            .help(value)
+    }
+
+    /// «Работает (PID 12152) · 4:12:03» — процесс, его номер и сколько он
+    /// держится. PID уже в `state.title`, второй раз не добавляется.
     private var serverValue: String {
         guard processManager.isRunning else { return String(localized: "Остановлен") }
-        // PID отдельной частью не добавляется: `state.title` уже говорит
-        // «Работает (PID 13760)», и приписка давала «Работает (PID 13760) ·
-        // PID 13760» — видно только на экране, в коде обе строки выглядят
-        // разумно.
         var parts = [processManager.state.title]
         if let uptime = processManager.uptime { parts.append(RootView.uptimeText(uptime)) }
         return parts.joined(separator: " · ")
@@ -238,43 +204,37 @@ struct OverviewView: View {
         return String(localized: "нет подключения")
     }
 
-    /// Путь берётся у окружения, а не из настроек напрямую: не выбранный
-    /// человеком путь означает не «пути нет», а «база лежит там, где приложение
-    /// её завело по умолчанию». Показывать в этом случае «путь не выбран» —
-    /// значит утверждать, что база нигде.
-    private var databaseValue: String {
-        app.localDatabaseURL.path
+    /// Что сервер разрешает в одном запросе на запись. Показывается, потому
+    /// что запасное значение — догадка: окажись оно выше настоящего предела,
+    /// сбой случится много позже, посреди импорта.
+    @ViewBuilder
+    private var writeLimitRows: some View {
+        if let limits = app.writeLimits {
+            LabeledContent(String(localized: "Записей в одном запросе")) {
+                if limits.isReportedByServer {
+                    Text(limits.maxRecords.formatted())
+                        .monospacedDigit()
+                        .help(String(localized: "По данным сервера"))
+                } else {
+                    StatusLabel(.warning, String(localized: "\(limits.maxRecords.plainDigits), безопасное значение"))
+                        .help(String(localized: "Сервер не сообщил предел — используется значение, которое заведомо проходит."))
+                }
+            }
+            LabeledContent(
+                String(localized: "Размер одного запроса"),
+                value: Int64(limits.maxBodyBytes).formatted(.byteCount(style: .binary))
+            )
+        }
     }
 
-    /// Строка «поле — значение» с раз и навсегда заданными размерами.
-    ///
-    /// Ни высота, ни ширины колонок не зависят от текста, и это здесь главное:
-    /// значения в карточке меняются сами по себе — аптайм тикает раз в
-    /// секунду, адрес появляется по подключении, сервер отвечает про
-    /// телеметрию когда ответит. Пока размеры считались от содержимого,
-    /// каждое такое обновление двигало карточку и всё, что под ней.
-    ///
-    /// Значение занимает всю оставшуюся ширину независимо от своей длины —
-    /// потому и не тянет строку за собой; лишнее подрезается посередине.
-    private func statusRow(
-        title: String, state: CheckState, value: String, isMonospaced: Bool = false
-    ) -> some View {
-        HStack(spacing: 10) {
-            StatusDot(state: state)
-            Text(title)
-                .font(Theme.Font.control)
-                .foregroundStyle(Theme.Palette.secondaryText)
-                .lineLimit(1)
-                .frame(width: 150, alignment: .leading)
-            Text(value)
-                .font(isMonospaced ? Theme.Font.mono : Theme.Font.control)
-                .foregroundStyle(isMonospaced ? Theme.Palette.secondaryText : Theme.Palette.primaryText)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .copyable(value)
+    /// Что сервер сказал о телеметрии — своими словами.
+    private var telemetryValue: String {
+        guard let status = processManager.telemetryStatus else {
+            return String(localized: "сервер ещё не отвечал")
         }
-        .frame(height: Theme.Size.statusRow)
+        return status.localizedCaseInsensitiveContains("no telemetry")
+            ? String(localized: "не собирается")
+            : String(localized: "см. сообщение сервера")
     }
 
     // MARK: - Требует решения
@@ -291,6 +251,13 @@ struct OverviewView: View {
         let isUrgent: Bool
         let action: String?
         let go: (() -> Void)?
+    }
+
+    /// Копия старше недели — уже повод сделать новую.
+    private static let backupIsStaleAfter: TimeInterval = 7 * 24 * 60 * 60
+
+    private var lastBackup: BackupRecord? {
+        environment.backups.first(where: { !$0.isIncomplete })
     }
 
     private var decisions: [Decision] {
@@ -373,14 +340,18 @@ struct OverviewView: View {
                 go: { go(.clients, nil) }
             ))
         }
-        if let backup = environment.backups.first(where: { !$0.isIncomplete }) {
-            found.append(Decision(
-                id: "backup",
-                text: String(localized: "Последняя резервная копия — \(backup.createdAt.formatted(date: .abbreviated, time: .shortened)), \(backup.sizeText)"),
-                isUrgent: false,
-                action: String(localized: "Резервные копии"),
-                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии"))) }
-            ))
+        // Свежая копия ничего не требует — она строкой в «Сейчас» (v6);
+        // здесь — только устаревшая или отсутствующая.
+        if let backup = lastBackup {
+            if Date().timeIntervalSince(backup.createdAt) > Self.backupIsStaleAfter {
+                found.append(Decision(
+                    id: "backup",
+                    text: String(localized: "Последняя резервная копия — \(backup.createdAt.formatted(.relative(presentation: .named))), \(backup.sizeText)"),
+                    isUrgent: false,
+                    action: String(localized: "Резервные копии"),
+                    go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии"))) }
+                ))
+            }
         } else {
             found.append(Decision(
                 id: "no-backup",
@@ -393,58 +364,29 @@ struct OverviewView: View {
         return found
     }
 
-    private var decisionsCard: some View {
+    private var decisionsSection: some View {
         let items = decisions
-        return SectionCard(
-            title: String(localized: "Требует решения"),
-            // Без числительного: «одна вещь», «две вещи», «пять вещей» —
-            // три разные формы, и подстановка числа в такую фразу ломает
-            // согласование ровно там, где его никто не проверяет.
-            subtitle: items.isEmpty
-                ? String(localized: "Ничего не ждёт вашего решения.")
-                : String(localized: "Ниже — то, что стоит закрыть. Остальное в порядке.")
-        ) {
+        return Section {
             if items.isEmpty {
-                Text("Приложение подключено, файлы прочитаны, доступ настроен.")
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.captionText)
+                Text("Всё в порядке")
             } else {
-                VStack(alignment: .leading, spacing: Theme.Padding.rowSpacing) {
-                    ForEach(items) { item in
-                        decisionRow(item)
+                ForEach(items) { item in
+                    LabeledContent {
+                        if let action = item.action, let go = item.go {
+                            Button(action, action: go)
+                                .buttonStyle(.link)
+                        }
+                    } label: {
+                        StatusLabel(item.isUrgent ? .warning : .off, item.text)
                     }
                 }
             }
-        }
-    }
-
-    private func decisionRow(_ item: Decision) -> some View {
-        HStack(spacing: 12) {
-            Circle()
-                .fill(item.isUrgent ? Theme.Palette.attention : Theme.Palette.stopped)
-                .frame(width: Theme.Size.statusDot, height: Theme.Size.statusDot)
-            Text(item.text)
-                .font(Theme.Font.control)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if let action = item.action, let go = item.go {
-                Button(action, action: go)
-                    .buttonStyle(.chromaSecondary)
+        } header: {
+            Text("Требует решения")
+        } footer: {
+            if items.isEmpty {
+                Text("Приложение подключено, файлы прочитаны, доступ настроен.")
             }
         }
-        .padding(.horizontal, Theme.Padding.rowHorizontal)
-        .padding(.vertical, Theme.Padding.rowVertical)
-        .background(
-            item.isUrgent
-                ? Theme.Palette.attention.opacity(0.09)
-                : Theme.Palette.subtleFill
-        )
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.row))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.Radius.row).strokeBorder(
-                item.isUrgent ? Theme.Palette.attention.opacity(0.24) : Theme.Palette.border,
-                lineWidth: 1
-            )
-        )
     }
-
 }

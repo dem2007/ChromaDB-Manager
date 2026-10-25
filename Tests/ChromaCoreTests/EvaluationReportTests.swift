@@ -140,6 +140,44 @@ final class EvaluationReportTests: XCTestCase {
         XCTAssertTrue(caveat?.contains("LLM") == true)
     }
 
+    /// Цена попадания: оба варианта нашли нужное, но крупный отдал
+    /// в шесть раз больше текста. По hit rate они равны, по знакам на
+    /// полезный лучше короткий — меньше значит лучше.
+    func testTheCheaperHitIsTheBestCharactersPerUseful() {
+        let long = variant("Крупная")
+        let short = variant("Мелкая")
+        let q = query("запрос", relevant: "нужный текст")
+        let run = EvaluationRun(
+            name: "прогон", querySetID: UUID(), querySetName: "набор",
+            queries: [q], variants: [long, short],
+            results: [
+                EvaluationResult(queryID: q.id, variantID: long.id,
+                                 hits: hits(["нужный текст" + String(repeating: "а", count: 5988)])),
+                EvaluationResult(queryID: q.id, variantID: short.id,
+                                 hits: hits(["нужный текст" + String(repeating: "б", count: 988)])),
+            ],
+            isComplete: true
+        )
+        let table = EvaluationReport.table(EvaluationMetrics.compute(run: run, ks: [5]), ks: [5])
+        let column = table.columns.first { $0.key == "chars@5" }
+        XCTAssertEqual(column?.direction, .lowerIsBetter)
+        XCTAssertEqual(column?.cells.map(\.value), [6000, 1000])
+        XCTAssertEqual(column?.cells.map(\.isBest), [false, true])
+        XCTAssertEqual(table.columns.first { $0.key == "hit@5" }?.cells.map(\.isBest), [false, false])
+    }
+
+    /// В сравнении прогонов — та же строка, целыми знаками, и меньше значит
+    /// лучше.
+    func testFewerCharactersPerUsefulIsAnImprovement() {
+        let delta = EvaluationReport.MetricDelta(
+            key: "chars@5", title: "знаков", direction: .lowerIsBetter,
+            before: 8506, after: 1544, scale: .characters
+        )
+        XCTAssertEqual(delta.improved, true)
+        XCTAssertTrue(delta.changeText?.hasPrefix("-") == true)
+        XCTAssertFalse(delta.afterText.contains("."))
+    }
+
     /// Варианты сопоставимой длины оговорки не получают: предупреждение,
     /// висящее всегда, читать перестают.
     func testComparableLengthsGetNoCaveat() {

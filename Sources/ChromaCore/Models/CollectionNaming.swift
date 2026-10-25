@@ -65,8 +65,13 @@ public enum CollectionNaming {
     ///
     /// Обрезка до 60 символов — **до** снятия краевых знаков: обрезанное
     /// после имя могло кончиться на «_» или «-», которые сервер отвергает.
-    public static func sanitize(_ raw: String) -> String {
-        let latin = transliterated(raw)
+    ///
+    /// - Parameter transliterating: `false` — прежнее правило, не-латиница
+    ///   в «_». Нужно источникам, заведённым до транслитерации: их подпапки
+    ///   уже лежат в коллекциях под прежними именами, и новое правило молча
+    ///   увело бы каждый файл в другую коллекцию с пересчётом векторов.
+    public static func sanitize(_ raw: String, transliterating: Bool = true) -> String {
+        let latin = transliterating ? transliterated(raw) : raw
         var name = String(latin.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
         while name.contains("..") { name = name.replacingOccurrences(of: "..", with: ".") }
         name = String(name.prefix(60))

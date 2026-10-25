@@ -9,7 +9,8 @@ import UniformTypeIdentifiers
 /// chapters instead of along a character count.
 public struct EPUBExtractor: DocumentTextExtractor {
     public let id = "epub"
-    public let version = 1
+    /// 2 — знаки нормализуются.
+    public let version = 2
 
     public init() {}
 

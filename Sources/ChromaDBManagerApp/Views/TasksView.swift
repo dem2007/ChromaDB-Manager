@@ -6,6 +6,11 @@ import ChromaCore
 ///
 /// Before this screen the app could be busy for an hour with nothing to point
 /// at; the panel exists so «чем занято приложение» has an answer.
+///
+/// Тип Б: таблица задач — выполняемые первыми; «Пауза / Продолжить» и
+/// «Отменить задачу» — тулбар и контекстное меню; пусто —
+/// `ContentUnavailableView`. Оставшееся с прошлого запуска — строками над
+/// таблицей: это решение, которого ждут от человека.
 struct TasksView: View {
     @EnvironmentObject private var app: AppEnvironment
     /// Очередь — отдельным объектом: этот экран про неё и есть,
@@ -15,141 +20,57 @@ struct TasksView: View {
     @ObservedObject var sources: SourcesViewModel
 
     @State private var isPaused = false
+    @State private var selection: QueuedTaskInfo.ID?
+    /// Порядок, ширины и видимость колонок — помнит окно (v3).
+    @SceneStorage("table.tasks.v3") private var columns: TableColumnCustomization<QueuedTaskInfo>
+
+    /// Выполняемые — первыми: ради них экран и открывают.
+    private var tasks: [QueuedTaskInfo] {
+        queueMirror.tasks.filter { $0.state == .running } + queueMirror.tasks.filter { $0.state == .queued }
+    }
+
+    private var queuedCount: Int { queueMirror.tasks.filter { $0.state == .queued }.count }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                if !queueMirror.resumableRequests.isEmpty { resumableCard }
-                runningCard
-                if !queued.isEmpty { queuedCard }
-                explanation
+        VStack(spacing: 0) {
+            topRows
+            if tasks.isEmpty {
+                ContentUnavailableView {
+                    Label(String(localized: "Нет задач"), systemImage: "checklist")
+                } description: {
+                    Text(isPaused
+                         ? String(localized: "Очередь на паузе: ничего не запускается, пока её не продолжить.")
+                         : String(localized: "Сейчас ничего не выполняется и ничего не ждёт."))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                table
             }
-            .padding(.top, 4)
-            .pageContentPadding()
+            footer
         }
+        .toolbar { toolbarContent }
         .task { isPaused = await app.queue.paused }
     }
 
-    private var running: [QueuedTaskInfo] { queueMirror.tasks.filter { $0.state == .running } }
-    private var queued: [QueuedTaskInfo] { queueMirror.tasks.filter { $0.state == .queued } }
+    // MARK: - Над таблицей
 
-    /// Пауза очереди — рядом с тем, что она останавливает.
-    ///
-    /// Стояла кнопкой в шапке экрана, где читалась как действие раздела;
-    /// на деле это переключатель состояния очереди, и место ему в её карточке.
-    private var pauseButton: some View {
-        Button(isPaused
-               ? String(localized: "Продолжить")
-               : String(localized: "Пауза")) {
-            let next = !isPaused
-            isPaused = next
-            // The same pause the «Источники» screen shows: one state, two
-            // places to reach it. Через координатор — он ставит на
-            // паузу очередь и перестраивает таймеры и слежение.
-            app.autoSync.setPaused(next, app: app)
-        }
-        .buttonStyle(isPaused ? .chromaPrimary : .chromaNormal)
-    }
-
-    // MARK: - Running
-
-    private var runningCard: some View {
-        SectionCard(
-            title: String(localized: "Выполняется"),
-            subtitle: String(localized: "Задачи, которым нужна одна и та же локальная модель, идут по очереди — одновременно она обслуживает одну.")
-        ) {
-            VStack(alignment: .leading, spacing: Theme.Padding.cardContentSpacing) {
-                if running.isEmpty {
-                    Text(isPaused
-                         ? String(localized: "Очередь на паузе: ничего не запускается, пока её не продолжить.")
-                         : String(localized: "Сейчас ничего не выполняется."))
-                        .font(Theme.Font.body)
-                        .foregroundStyle(isPaused ? Theme.Palette.attention : Theme.Palette.captionText)
-                } else {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(running) { task in
-                            taskRow(task, isRunning: true)
-                            if task.id != running.last?.id { Divider() }
-                        }
+    /// Пауза и то, что осталось с прошлого запуска, — строками над таблицей.
+    @ViewBuilder
+    private var topRows: some View {
+        if isPaused || !queueMirror.resumableRequests.isEmpty {
+            VStack(alignment: .leading) {
+                if isPaused {
+                    HStack {
+                        Notice(.warning, String(localized: "Очередь на паузе: новые задачи не запускаются, уже начатая доигрывает до конца."))
+                        Spacer()
+                        Button(String(localized: "Продолжить")) { setPaused(false) }
                     }
                 }
-                HStack {
-                    pauseButton
-                    Spacer()
-                    if !queued.isEmpty {
-                        Text("в очереди \(RussianCount.grouped(queued.count, "задача", "задачи", "задач"))")
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    }
-                }
-            }
-        }
-    }
-
-    private var queuedCard: some View {
-        SectionCard(
-            title: String(localized: "В очереди"),
-            subtitle: String(localized: "Порядок: действие пользователя, запрос агента, ручная операция, автоматическая, фоновая проверка. Внутри одного приоритета — в порядке поступления.")
-        ) {
-            if queued.isEmpty {
-                Text(String(localized: "Очередь пуста."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(queued) { task in
-                        taskRow(task, isRunning: false)
-                        if task.id != queued.last?.id { Divider() }
-                    }
-                }
-            }
-        }
-    }
-
-    private func taskRow(_ task: QueuedTaskInfo, isRunning: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(task.title).font(Theme.Font.body)
-                Spacer()
-                Button(String(localized: "Отменить")) { app.cancelTask(task.id) }
-                    .buttonStyle(.chromaSecondary)
-            }
-
-            if isRunning, let progress = task.progress {
-                ProgressView(value: progress)
-                    .frame(maxWidth: 420)
-            }
-
-            Text(subtitle(for: task, isRunning: isRunning))
-                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                .lineLimit(2)
-        }
-    }
-
-    private func subtitle(for task: QueuedTaskInfo, isRunning: Bool) -> String {
-        var parts = [task.priority.title, task.group.title]
-        if isRunning, let started = task.startedAt {
-            parts.append(String(localized: "начата в \(Self.time.string(from: started))"))
-        } else {
-            parts.append(String(localized: "ждёт \(Int(task.waitedSeconds).plainDigits) с"))
-        }
-        if let detail = task.detail { parts.append(detail) }
-        return parts.joined(separator: " · ")
-    }
-
-    // MARK: - Left over from last time
-
-    private var resumableCard: some View {
-        SectionCard(
-            title: String(localized: "Осталось с прошлого запуска"),
-            subtitle: String(localized: "Приложение не запускает их само: индексация меняет базу, а молча база не меняется.")
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
+                // Приложение не запускает их само: индексация меняет базу,
+                // а молча база не меняется.
                 ForEach(queueMirror.resumableRequests, id: \.self) { request in
                     HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(request.title).font(Theme.Font.body)
-                            Text(Self.kindTitle(request.kind))
-                                .font(Theme.Font.micro).foregroundStyle(Theme.Palette.captionText)
-                        }
+                        Notice(.info, String(localized: "Осталось с прошлого запуска: \(request.title) — \(Self.kindTitle(request.kind))"))
                         Spacer()
                         if request.kind == .sync,
                            let id = UUID(uuidString: request.subject),
@@ -160,11 +81,121 @@ struct TasksView: View {
                             }
                         }
                         Button(String(localized: "Забыть")) { app.forgetResumable(request) }
-                            .buttonStyle(.link)
+                            .buttonStyle(.borderless)
                     }
                 }
             }
+            .padding()
+            Divider()
         }
+    }
+
+    // MARK: - Таблица
+
+    private var table: some View {
+        // Строки однострочные (v3): подробности — своей колонкой.
+        Table(tasks, selection: $selection, columnCustomization: $columns) {
+            TableColumn(String(localized: "Задача")) { task in
+                Text(task.title).lineLimit(1).help(task.title)
+            }
+            .customizationID("tasks.задача")
+            TableColumn(String(localized: "Подробности")) { task in
+                Text(task.detail ?? "")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(task.detail ?? "")
+            }
+            .customizationID("tasks.подробности")
+            TableColumn(String(localized: "Ход")) { task in
+                if task.state == .running {
+                    if let progress = task.progress {
+                        ProgressView(value: progress)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                } else {
+                    Text("ждёт \(Int(task.waitedSeconds).plainDigits) с")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .width(min: 100, ideal: 160, max: 220)
+            .customizationID("tasks.ход")
+            TableColumn(String(localized: "Состояние")) { task in
+                if task.state == .running {
+                    StatusLabel(.ok, task.startedAt.map {
+                        String(localized: "выполняется с \(Self.time.string(from: $0))")
+                    } ?? String(localized: "выполняется"))
+                } else {
+                    StatusLabel(.off, String(localized: "в очереди"))
+                }
+            }
+            .width(min: 120, ideal: 170, max: 240)
+            .customizationID("tasks.состояние")
+            TableColumn(String(localized: "Приоритет")) { task in
+                Text(task.priority.title).foregroundStyle(.secondary)
+            }
+            .width(min: 90, ideal: 140, max: 200)
+            .customizationID("tasks.приоритет")
+            TableColumn(String(localized: "Группа")) { task in
+                Text(task.group.title).foregroundStyle(.secondary)
+            }
+            .width(min: 90, ideal: 140, max: 200)
+            .customizationID("tasks.группа")
+        }
+        .contextMenu(forSelectionType: QueuedTaskInfo.ID.self) { ids in
+            Button(String(localized: "Отменить задачу"), role: .destructive) {
+                for id in ids { app.cancelTask(id) }
+            }
+            .disabled(ids.isEmpty)
+        }
+        .onDeleteCommand {
+            if let selection { app.cancelTask(selection) }
+        }
+    }
+
+    private var footer: some View {
+        TableFooter(
+            footerLine,
+            help: String(localized: "Порядок очереди: действие пользователя, запрос агента, ручная операция, автоматическая, фоновая проверка. Внутри одного приоритета — в порядке поступления. Задачи, которым нужна одна и та же локальная модель, идут по очереди. Долгая задача не прерывается на полпути: она уступает очередь между батчами эмбеддинга — поэтому поиск во время индексации папки ждёт не всю папку, а текущий батч. Пауза останавливает запуск новых задач; уже начатая доигрывает до конца. Задачи закрывшегося подключения снимаются.")
+        )
+    }
+
+    private var footerLine: String {
+        let running = tasks.count - queuedCount
+        return String(localized: "Выполняется: \(running.plainDigits) · в очереди: \(queuedCount.plainDigits)")
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                if let selection { app.cancelTask(selection) }
+            } label: {
+                Label(String(localized: "Отменить задачу"), systemImage: "xmark.circle")
+            }
+            .help(String(localized: "Отменить выбранную задачу"))
+            .disabled(selection == nil)
+            // Надпись и значок меняются по состоянию: видно, что очередь
+            // сейчас на паузе, а не только что нажать.
+            Button {
+                setPaused(!isPaused)
+            } label: {
+                Label(isPaused ? String(localized: "Продолжить") : String(localized: "Пауза"),
+                      systemImage: isPaused ? "play.fill" : "pause.fill")
+            }
+            .help(isPaused
+                  ? String(localized: "Продолжить очередь")
+                  : String(localized: "Приостановить запуск новых задач"))
+        }
+    }
+
+    /// The same pause the «Источники» screen shows: one state, two places to
+    /// reach it. Через координатор — он ставит на паузу очередь и
+    /// перестраивает таймеры и слежение.
+    private func setPaused(_ paused: Bool) {
+        isPaused = paused
+        app.autoSync.setPaused(paused, app: app)
     }
 
     private static func kindTitle(_ kind: ResumableRequest.Kind) -> String {
@@ -172,20 +203,6 @@ struct TasksView: View {
         case .sync: return String(localized: "синхронизация источника")
         case .importDocuments: return String(localized: "импорт документов")
         case .reembedding: return String(localized: "пересчёт векторов")
-        }
-    }
-
-    /// Третий уровень текста — свёрнуто: читают один раз (правило 8).
-    private var explanation: some View {
-        HowItWorks(screen: "tasks") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(String(localized: "Порядок очереди: действие пользователя, запрос агента, ручная операция, автоматическая, фоновая проверка. Внутри одного приоритета — в порядке поступления."))
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(String(localized: "Долгая задача не прерывается на полпути: прерывание оставило бы наполовину записанный файл. Вместо этого она уступает очередь между батчами эмбеддинга — поэтому ваш поиск во время индексации папки ждёт не всю папку, а текущий батч."))
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(String(localized: "Пауза останавливает запуск новых задач; уже начатая доигрывает до конца. Задачи закрывшегося подключения снимаются: они работают с базой, которой больше нет."))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
     }
 

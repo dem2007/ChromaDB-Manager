@@ -14,7 +14,8 @@ import UniformTypeIdentifiers
 /// is marked as the lower-quality path it is.
 public struct IWorkExtractor: DocumentTextExtractor {
     public let id = "iwork"
-    public let version = 1
+    /// 2 — знаки нормализуются.
+    public let version = 2
 
     private let exporter: IWorkExporting
 

@@ -20,6 +20,9 @@ struct DocStyleTable {
         var base: Int?
         var isBold: Bool?
         var halfPoints: Int?
+        /// Нумерация стиля: экземпляр списка и уровень.
+        var listInstance: Int?
+        var listLevel: Int?
     }
 
     var styles: [Int: Style] = [:]
@@ -37,10 +40,20 @@ struct DocStyleTable {
             if result?.isBold == nil { result?.isBold = parent.isBold }
             if result?.halfPoints == nil { result?.halfPoints = parent.halfPoints }
             if result?.outline == nil { result?.outline = parent.outline }
+            if result?.listInstance == nil { result?.listInstance = parent.listInstance }
+            if result?.listLevel == nil { result?.listLevel = parent.listLevel }
             current = parent
             steps += 1
         }
         return result
+    }
+
+    /// Строка оглавления: встроенные «toc 1»…«toc 9» — номера
+    /// 19…27 по MS-DOC, — либо стиль с таким именем.
+    func isTableOfContents(_ istd: Int) -> Bool {
+        guard let style = styles[istd] else { return false }
+        if (19...27).contains(style.sti) { return true }
+        return DocxPartsReader.StyleTable.isTableOfContents(name: style.name)
     }
 
     /// Уровень заголовка, если этот стиль — заголовок.
@@ -134,6 +147,11 @@ extension DocPartsReader {
                     case .paragraphOutline:
                         let level = Int(CFBContainerReader.byte(value, 0))
                         if level <= 8 { style.outline = level }
+                    case .paragraphListInstance where isParagraphProperties:
+                        style.listInstance = listInstance(value)
+                    case .paragraphListLevel where isParagraphProperties:
+                        let level = Int(CFBContainerReader.byte(value, 0))
+                        if level <= 8 { style.listLevel = level }
                     case .characterBold:
                         style.isBold = CFBContainerReader.byte(value, 0) == 1
                     case .characterSize:

@@ -154,14 +154,60 @@ public enum MCPFileChunks {
     /// Без `chunk_index` — в конец, по идентификатору: документ, записанный
     /// не нашей синхронизацией (агентом через `add_documents`, импортом),
     /// номера чанка не имеет, и притворяться, что имеет, нельзя.
+    ///
+    /// Книга — лист за листом: по `sheet_index`, а у записанных
+    /// прежней сборкой — по имени листа; внутри листа строки идут по
+    /// `row_number`, куски листа-документа — по `chunk_index`. Раньше
+    /// строки таблицы, у которых номера чанка нет, шли по идентификатору —
+    /// то есть вразброс, — а куски двух листов-документов перемежались:
+    /// у каждого листа свой счёт с нуля.
     public static func ordered(_ documents: [MCPDocumentPayload]) -> [MCPDocumentPayload] {
-        documents.sorted { left, right in
-            switch (index(of: left), index(of: right)) {
-            case let (l?, r?): return l == r ? left.id < right.id : l < r
-            case (nil, _?): return false
-            case (_?, nil): return true
-            case (nil, nil): return left.id < right.id
+        let keyed = documents.map { (document: $0, key: Position($0)) }
+        return keyed.sorted { left, right in
+            left.key == right.key ? left.document.id < right.document.id : left.key < right.key
+        }.map(\.document)
+    }
+
+    /// Место куска в файле: сначала текст, потом листы по порядку, в конце —
+    /// куски без адреса.
+    struct Position: Comparable {
+        let tier: Int
+        let sheetIndex: Int
+        let sheetName: String
+        let offset: Int
+
+        init(_ document: MCPDocumentPayload) {
+            let metadata = document.metadata
+            func int(_ key: String) -> Int? {
+                if case .int(let value)? = metadata?[key] { return value }
+                return nil
             }
+            let sheet: String? = { if case .string(let name)? = metadata?["sheet_name"] { return name }; return nil }()
+            if let sheet, let position = int("row_number") ?? int(orderKey) {
+                tier = 1
+                sheetIndex = int("sheet_index") ?? Int.max
+                sheetName = sheet
+                offset = position
+            } else if let chunk = int(orderKey) {
+                tier = 0
+                sheetIndex = 0
+                sheetName = ""
+                offset = chunk
+            } else {
+                tier = 2
+                sheetIndex = 0
+                sheetName = ""
+                offset = 0
+            }
+        }
+
+        static func < (left: Position, right: Position) -> Bool {
+            if left.tier != right.tier { return left.tier < right.tier }
+            if left.sheetIndex != right.sheetIndex { return left.sheetIndex < right.sheetIndex }
+            if left.sheetName != right.sheetName {
+                return left.sheetName.localizedStandardCompare(right.sheetName) == .orderedAscending
+            }
+            return left.offset < right.offset
         }
     }
 
@@ -237,6 +283,7 @@ extension MetadataValue {
         case .double(let value): return .double(value)
         case .bool(let value): return .bool(value)
         case .null: return .null
+        case .list(let values): return .array(values.map(\.json))
         }
     }
 }
@@ -408,6 +455,20 @@ public enum MCPDocumentRendering {
             }
         }
 
+        collected += tableIntegrityNotes(payloads)
+
+        if payloads.contains(where: { ($0.text?.count ?? 0) > limits.documentCharacters }) {
+            collected.append("Long documents are cut to \(limits.documentCharacters.plainDigits) characters — take the full text with get_documents by id.")
+        }
+
+        return collected
+    }
+
+    /// Предупреждения о таблицах, по которым нельзя считать: плоский
+    /// текст вместо колонок и книга, размеченная не целиком. Общие для всех
+    /// выдач — и для чтения файла текстом, где их прежде не было вовсе.
+    static func tableIntegrityNotes(_ payloads: [MCPDocumentPayload]) -> [String] {
+        var collected: [String] = []
         // Таблица в этом фрагменте осталась плоским текстом: колонки
         // не разделены, и по числам оттуда нельзя сказать, где цена, а где
         // итог. Живой случай: агент посчитал по такой странице смету и
@@ -433,11 +494,6 @@ public enum MCPDocumentRendering {
         if let (indexed, total) = partial.first {
             collected.append("Warning: the workbook is not indexed whole — \(indexed.plainDigits) sheets of \(total.plainDigits) are mapped. Rows from unmapped sheets are not in the base, and no total may be built on this answer.")
         }
-
-        if payloads.contains(where: { ($0.text?.count ?? 0) > limits.documentCharacters }) {
-            collected.append("Long documents are cut to \(limits.documentCharacters.plainDigits) characters — take the full text with get_documents by id.")
-        }
-
         return collected
     }
 

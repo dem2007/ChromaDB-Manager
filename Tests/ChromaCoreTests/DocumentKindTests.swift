@@ -109,16 +109,17 @@ final class DocumentKindTests: XCTestCase {
         }
     }
 
-    /// И обратное: `pptx` не должен молча превращаться в условие поиска —
-    /// ни через тип, ни расширением напрямую.
+    /// И обратное: двоичный `ppt` не должен молча превращаться в условие
+    /// поиска — ни через тип, ни расширением напрямую. `pptx` сборка читает
+    /// с, и тип «презентации» его обещает.
     func testAFormatTheBuildCannotReadIsNotOfferedAtAll() throws {
-        XCTAssertFalse(try extensions(["presentation"]).contains("pptx"))
-        XCTAssertFalse(TextExtractor.supportedExtensions.contains("pptx"),
-                       "если сборка научилась читать pptx — перечень типов пора пересмотреть")
+        XCTAssertFalse(try extensions(["presentation"]).contains("ppt"))
+        XCTAssertFalse(TextExtractor.supportedExtensions.contains("ppt"),
+                       "если сборка научилась читать ppt — перечень типов пора пересмотреть")
+        XCTAssertTrue(try extensions(["presentation"]).contains("pptx"))
     }
 }
 
-/// Как параметр `file_types` доходит до базы.
 final class FileTypesInMCPTests: XCTestCase {
 
     private func filter(_ arguments: [String: JSONValue]) throws -> DocumentFilter? {

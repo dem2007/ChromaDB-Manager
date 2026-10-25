@@ -616,7 +616,7 @@ public enum MCPToolCatalogue {
         "description": .string("""
         Keep only documents that came from files of this kind. \
         Values: word — .docx, .doc, .odt, .rtf, .pages; excel — .xlsx, .xls, \
-        .xlsm, .ods, .numbers, .csv, .tsv; pdf; presentation — .key (Keynote); \
+        .xlsm, .ods, .numbers, .csv, .tsv; pdf; presentation — .pptx, .key; \
         text — .txt, .md; web; book; code; data. A bare extension works too, \
         «docx» for instance: every result carries it in file_ext. Several values \
         combine with «or»: ["word", "pdf"] returns both. Combines with «filter» \
@@ -631,7 +631,8 @@ public enum MCPToolCatalogue {
         matched: the usual spellings are tried (as given, lowercase, Capitalised, \
         and UPPERCASE for short words), so «astra» finds «Astra». A spelling like \
         «AsTrA» will not be found this way — the database compares substrings \
-        literally.
+        literally. This is the way to find codes, numbers, article and contract \
+        numbers and abbreviations: search by meaning alone often misses them.
         """),
     ])
 
@@ -705,7 +706,9 @@ public enum MCPToolCatalogue {
                     "type": .string("string"),
                     "description": .string("""
                     The query: a phrase or a question in natural language. Separate keywords \
-                    work worse — the search is by meaning.
+                    work worse — the search is by meaning. A code, a number or an abbreviation \
+                    («001», «1-100/24», «S3») the meaning barely carries: put it into \
+                    «contains» as well, and keep the query a phrase.
                     """),
                 ]),
                 "n_results": .object([
@@ -871,7 +874,7 @@ public enum MCPToolCatalogue {
                     «text» returns the document as continuous text instead of \
                     a list of chunks: no ids, no metadata, no mirror in \
                     structuredContent — the text travels once. Measured on \
-                    answers of the same size: 4 640 characters of the document \
+                    answers of the same size: 9 280 characters of the document \
                     as chunks against 20 880 as text. The document is described \
                     once, on the first page («document» in the structured \
                     answer: size, language, sections, extraction warnings); \
@@ -1207,6 +1210,18 @@ public enum MCPToolCatalogue {
     }
 }
 
+/// Что известно о том, откуда пришёл вызов инструмента.
+///
+/// Сервер инструментов один на оба транспорта, и знать, кто на том
+/// конце, он не может — знает прокси, принимающий HTTP. Поэтому значение
+/// ставит он, на время одного вызова.
+public enum MCPCallContext {
+    /// Можно ли называть пути на этом Маке. Агенту по сети — нельзя:
+    /// абсолютный путь говорит об имени учётной записи и раскладке папок,
+    /// а открыть файл там, где он сидит, агент всё равно не может.
+    @TaskLocal public static var revealsLocalPaths = true
+}
+
 /// Исполнение инструментов: права, вызов, форма ответа.
 public struct MCPToolService: Sendable {
     private let backend: any MCPToolBackend
@@ -1310,6 +1325,10 @@ public struct MCPToolService: Sendable {
         return .object([
             "resultType": .string("complete"),
             "tools": .array(tools.map(\.listing)),
+            // Подсказки кэша обязательны (`CacheableResult`). Список зависит
+            // от ключа — значит `private`: делить его между ключами нельзя.
+            "ttlMs": .int(MCPProtocol.toolsListCacheTTL),
+            "cacheScope": .string("private"),
         ])
     }
 
@@ -1319,13 +1338,37 @@ public struct MCPToolService: Sendable {
     /// может: неизвестного инструмента и неразобранных параметров. Всё
     /// остальное — отказ по правам, отсутствующая коллекция, сбой базы —
     /// возвращается как `isError: true` с причиной словами.
-    public func call(name: String, arguments: JSONValue?, key: String?) async -> Result<JSONValue, JSONRPCError> {
+    ///
+    /// Граница двух видов ошибок — по спецификации (`2026-07-28`, «Tools»,
+    /// «Error Handling»). Ошибка протокола — неизвестный инструмент и вызов,
+    /// не отвечающий форме `tools/call`; код `-32602`, а не `-32601`: по HTTP
+    /// «метод не найден» отвечается 404, и клиент решил бы, что сервер не
+    /// умеет `tools/call` вовсе. Неверные **аргументы** — не протокол, а
+    /// ошибка выполнения: `isError: true` с причиной, по которой модель
+    /// исправит вызов сама.
+    ///
+    /// Так — с ревизии `2025-11-25`. Клиенту более старой ревизии (`version`)
+    /// неверные аргументы отвечаются ошибкой протокола, как требовала его
+    /// спецификация.
+    public func call(
+        name: String, arguments: JSONValue?, key: String?, version: String = MCPProtocol.version
+    ) async -> Result<JSONValue, JSONRPCError> {
+        guard MCPToolCatalogue.all.contains(where: { $0.name == name }) else {
+            return .failure(.invalidParams("Unknown tool: \(name)"))
+        }
+        switch await perform(name: name, arguments: arguments, key: key) {
+        case .failure(let error) where error.code == JSONRPCError.invalidParams
+            && MCPProtocol.reportsArgumentErrorsAsToolResults(version):
+            return .success(MCPToolOutcome.failure(error.message).result)
+        case let other:
+            return other
+        }
+    }
+
+    private func perform(name: String, arguments: JSONValue?, key: String?) async -> Result<JSONValue, JSONRPCError> {
         let started = Date()
         guard let tool = MCPToolCatalogue.all.first(where: { $0.name == name }) else {
-            return .failure(JSONRPCError(
-                code: JSONRPCError.methodNotFound,
-                message: "Unknown tool: \(name)"
-            ))
+            return .failure(.invalidParams("Unknown tool: \(name)"))
         }
 
         // Коллекция нужна до проверки прав: без неё whitelist проверить не по
@@ -1488,7 +1531,23 @@ public struct MCPToolService: Sendable {
                 switch Self.mentionsRequest(collection ?? "", arguments, limits: limits) {
                 case .failure(let error): return refused(error)
                 case .success(let parsed):
-                    return answered(try await mentions(parsed, limits: limits).result)
+                    // Один такой обход на ключ за раз: каждый перебирает до
+                    // двадцати тысяч кусков, и всплеск вызовов разом занимал
+                    // базу, которой пользуется и само приложение.
+                    guard await access.beginHeavyCall(for: client.id) else {
+                        auditNote = "refused: another collect_mentions of this key is running"
+                        return answered(MCPToolOutcome.failure(
+                            "Another collect_mentions call of this key is still running — wait for its answer, then call again."
+                        ).result)
+                    }
+                    do {
+                        let outcome = try await mentions(parsed, limits: limits)
+                        await access.endHeavyCall(for: client.id)
+                        return answered(outcome.result)
+                    } catch {
+                        await access.endHeavyCall(for: client.id)
+                        throw error
+                    }
                 }
             case MCPToolCatalogue.addDocuments.name:
                 guard let writing else {
@@ -1506,6 +1565,11 @@ public struct MCPToolService: Sendable {
                     // дневной нормы повторами одной и той же большой записи.
                     var written = 0
                     if case ChromaError.partialWrite(let failure) = error { written = failure.written }
+                    // Отмена: что успело лечь, неизвестно — запрос мог уйти
+                    // по сети и примениться. Норма не возвращается: вернуть её
+                    // значило бы дать ключу писать сверх дневного предела
+                    // отменами и повторами. Отменил вызов сам агент.
+                    if error is CancellationError { written = writing.payload.documentCount }
                     await access.refundWrite(writing.payload.documentCount - written, forKey: key)
                     throw error
                 }
@@ -2201,7 +2265,7 @@ public struct MCPToolService: Sendable {
         // ответ выглядит не так.
         let shape = argument("as")?.lowercased()
         if let shape, shape != "text", shape != "chunks" {
-            return .failure(.invalidParams("The «as» parameter takes «text» — the document as continuous text — or «chunks», the default."))
+            return .failure(.invalidParams("The «as» parameter takes «text» — the document as continuous text, the default — or «chunks», its chunks with ids and metadata."))
         }
         // Умолчание — **сплошной текст**, а не куски.
         //
@@ -2303,6 +2367,15 @@ public struct MCPToolService: Sendable {
         }
         var result: ChromaMetadata = [:]
         for (key, item) in object {
+            // Служебные поля ставит приложение: по ним документ числится
+            // куском файла, закреплённым или записанным тем-то. Принятые
+            // со слов агента, они выдавали бы его текст за часть чужого
+            // файла в get_file или подмешивали бы его в каждую выдачу.
+            if Self.isReservedMetadataKey(key) {
+                return .failure(.invalidParams(
+                    "Document \(documentNumber.plainDigits), field «\(key)»: this field is set by ChromaDB Manager itself — it ties a document to a file or a mark. Use another field name."
+                ))
+            }
             switch item {
             case .string(let text): result[key] = .string(text)
             case .int(let number): result[key] = .int(number)
@@ -2317,6 +2390,18 @@ public struct MCPToolService: Sendable {
         }
         return .success(result.isEmpty ? nil : result)
     }
+
+    /// Поля, которые агент не пишет: адрес куска в файле, происхождение,
+    /// пометки человека и всё служебное с приставкой `_cdbm_`.
+    static func isReservedMetadataKey(_ key: String) -> Bool {
+        key.hasPrefix("_cdbm_")
+            || SourceSyncService.autoMetadataKeys.contains(key)
+            || reservedMetadataKeys.contains(key)
+    }
+
+    static let reservedMetadataKeys: Set<String> = [
+        "parent_chunk_id", "chunk_level", "chunk_count", "file_name", "sheet_name", "sheet_index", "row_number",
+    ]
 
     private static func addRequest(
         _ collection: String, _ arguments: JSONValue?
@@ -2456,8 +2541,17 @@ public struct MCPToolService: Sendable {
 
     private func search(_ parsed: ParsedSearch, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.search(parsed.request)
+        // Шапка и пометки платят из того же бюджета, что и документы,
+        // как у get_file и collect_mentions: прибавленные после рендера, они
+        // выводили ответ за потолок ключа ровно на свою длину. Шапка — по
+        // числу всех найденных: показанных не больше, значит и запас не меньше.
+        let reserve = MCPDocumentRendering.overhead(
+            header: Self.searchHeader(parsed.request, shown: answer.documents.count, model: answer.model),
+            notes: (parsed.limitNote.map { [$0] } ?? []) + (answer.note.map { [$0] } ?? [])
+        )
         let rendered = MCPDocumentRendering.render(
             answer.documents, limits: limits, metric: answer.metric, fields: parsed.fields,
+            reserve: reserve,
             vocabulary: .searchResults
         )
 
@@ -2501,18 +2595,33 @@ public struct MCPToolService: Sendable {
             return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
         }
 
-        var header = parsed.request.isMultiCollection
-            ? "Found in collections \(parsed.request.collections.joined(separator: ", ")): \(EnglishCount.grouped(rendered.shown, "document", "documents"))"
-            : "Found in «\(parsed.request.collection)»: \(EnglishCount.grouped(rendered.shown, "document", "documents"))"
-        if let model = answer.model { header += ", model \(model)" }
+        let header = Self.searchHeader(parsed.request, shown: rendered.shown, model: answer.model)
         let text = ([header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
     }
 
+    /// Шапка выдачи поиска — одна на бюджет и на ответ.
+    private static func searchHeader(_ request: MCPSearchRequest, shown: Int, model: String?) -> String {
+        var header = request.isMultiCollection
+            ? "Found in collections \(request.collections.joined(separator: ", ")): \(EnglishCount.grouped(shown, "document", "documents"))"
+            : "Found in «\(request.collection)»: \(EnglishCount.grouped(shown, "document", "documents"))"
+        if let model { header += ", model \(model)" }
+        return header
+    }
+
     private func documents(_ parsed: ParsedDocuments, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         let answer = try await backend.documents(parsed.request)
+        // Шапка и пометки — из того же бюджета, см. `search`.
+        let continueNote = answer.hasMore && parsed.request.ids.isEmpty
+            ? Self.documentsContinueNote(next: parsed.request.offset + answer.documents.count)
+            : nil
+        let reserve = MCPDocumentRendering.overhead(
+            header: Self.documentsHeader(parsed.request, shown: answer.documents.count),
+            notes: (parsed.limitNote.map { [$0] } ?? []) + (continueNote.map { [$0] } ?? [])
+        )
         let rendered = MCPDocumentRendering.render(
             answer.documents, limits: limits, fields: parsed.fields,
+            reserve: reserve,
             // Выборку по идентификаторам «limit» не режет: советовать его
             // уменьшить значит советовать бездействие.
             vocabulary: parsed.request.ids.isEmpty ? .documents : .identifiedDocuments
@@ -2530,7 +2639,7 @@ public struct MCPToolService: Sendable {
         var notes = rendered.notes
         if let limitNote = parsed.limitNote { notes.insert(limitNote, at: 0) }
         if answer.hasMore, parsed.request.ids.isEmpty {
-            notes.append("There are more documents beyond this page: repeat the call with offset \((parsed.request.offset + rendered.shown).plainDigits).")
+            notes.append(Self.documentsContinueNote(next: parsed.request.offset + rendered.shown))
         }
         if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
 
@@ -2543,9 +2652,29 @@ public struct MCPToolService: Sendable {
             return MCPToolOutcome(text: lines.joined(separator: "\n"), structured: .object(structured))
         }
 
-        let header = "From the collection «\(parsed.request.collection)»: \(EnglishCount.grouped(rendered.shown, "document", "documents"))"
+        let header = Self.documentsHeader(parsed.request, shown: rendered.shown)
         let text = ([header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
+    }
+
+    private static func documentsHeader(_ request: MCPDocumentsRequest, shown: Int) -> String {
+        "From the collection «\(request.collection)»: \(EnglishCount.grouped(shown, "document", "documents"))"
+    }
+
+    private static func documentsContinueNote(next: Int) -> String {
+        "There are more documents beyond this page: repeat the call with offset \(next.plainDigits)."
+    }
+
+    /// Те же документы — с текстами, в том же порядке. Подложка, отдавшая
+    /// тексты сразу, второго обращения не получает.
+    private func withTexts(_ documents: [MCPDocumentPayload], collection: String) async throws -> [MCPDocumentPayload] {
+        let missing = documents.filter { $0.text == nil }.map(\.id)
+        guard !missing.isEmpty else { return documents }
+        let fetched = try await backend.documents(MCPDocumentsRequest(
+            collection: collection, ids: missing, filter: nil, limit: missing.count, offset: 0
+        ))
+        let byID = Dictionary(fetched.documents.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return documents.map { byID[$0.id] ?? $0 }
     }
 
     /// Один файл в ответе «собери по теме».
@@ -2590,9 +2719,13 @@ public struct MCPToolService: Sendable {
     /// кусков подошло, и агент, листавший то же самое страницами по сто,
     /// платил эту секунду за каждую страницу.
     private func mentions(_ parsed: ParsedMentions, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        // Без текстов: группировке по файлам хватает метаданных, а показаны
+        // будут один-три образца с файла. Тексты двадцати тысяч совпадений,
+        // взятые ради этого, — мегабайты на выброс; за текстами образцов
+        // ходим ниже, отдельно и только за ними.
         let answer = try await backend.documents(MCPDocumentsRequest(
             collection: parsed.collection, ids: [], filter: parsed.filter,
-            limit: Self.mentionsScanLimit, offset: 0
+            limit: Self.mentionsScanLimit, offset: 0, needsText: false
         ))
 
         // Сначала частые файлы: «где этого больше всего» — обычный первый
@@ -2684,9 +2817,10 @@ public struct MCPToolService: Sendable {
             notes.append("The list was trimmed by answer size: \(shown.count.plainDigits) of the \(page.count.plainDigits) matching files are shown.")
         }
 
-        let samples = shown.flatMap { file in
+        let chosen = shown.flatMap { file in
             MCPFileChunks.ordered(file.samples).prefix(parsed.perFile)
         }
+        let samples = try await withTexts(chosen, collection: parsed.collection)
 
         // Заголовок и пометки уезжают вместе с образцами и платят из того же
         // бюджета. У этой ветки оплаты не было вовсе: перечень
@@ -3190,13 +3324,78 @@ public struct MCPToolService: Sendable {
         guard ceiling >= overlapProbe else { return 0 }
         let tail = left.count > cap ? String(left.suffix(cap)) : left
         let head = String(right.prefix(overlapProbe))
-        var from = tail.startIndex
+        // Перекрытие длиннее потолка не берётся всё равно — значит и искать
+        // его начало раньше последних `ceiling` знаков незачем. На повторяющемся
+        // тексте (шапка таблицы в каждой строке) пробник находится в хвосте
+        // десятки раз, и каждая находка — сравнение на тысячи знаков.
+        var from = tail.index(tail.endIndex, offsetBy: -min(ceiling, tail.count))
         while let found = tail.range(of: head, range: from..<tail.endIndex) {
             let candidate = tail[found.lowerBound...]
             if candidate.count <= ceiling, right.hasPrefix(candidate) { return candidate.count }
             from = tail.index(after: found.lowerBound)
         }
         return 0
+    }
+
+    /// «Лист1, row 12» — у строки таблицы; `nil` у всего остального.
+    static func rowAddress(of payload: MCPDocumentPayload) -> String? {
+        guard case .int(let row)? = payload.metadata?["row_number"] else { return nil }
+        if case .string(let sheet)? = payload.metadata?["sheet_name"], !sheet.isEmpty {
+            return "\(sheet), row \(row.plainDigits)"
+        }
+        return "row \(row.plainDigits)"
+    }
+
+    /// Поля строк таблицы, которые стоит показать при тексте: не служебные
+    /// и **не одинаковые у всех строк** — одинаковое (год папки, клиент)
+    /// — свойство файла, а не строки, и в каждой строке было бы шумом.
+    /// У файла из одной строки сравнивать не с чем — показывается всё.
+    ///
+    /// Одинаковые не пропадают: они уходят в `shared` и называются один раз
+    /// пометкой — цена, совпавшая у всех строк, тоже данные.
+    static func rowColumnFields(_ payloads: [MCPDocumentPayload]) -> (varying: Set<String>, shared: ChromaMetadata) {
+        let rows = payloads.compactMap { payload -> ChromaMetadata? in
+            guard payload.metadata?["row_number"] != nil else { return nil }
+            return payload.metadata
+        }
+        guard !rows.isEmpty else { return ([], [:]) }
+        let keys = Set(rows.flatMap(\.keys)).filter {
+            !MetadataSchema.isTechnicalKey($0) && $0 != CollectionBindingKeys.legacySpace
+        }
+        guard rows.count > 1 else { return (keys, [:]) }
+        var varying: Set<String> = []
+        var shared: ChromaMetadata = [:]
+        for key in keys {
+            let first = rows[0][key]
+            if rows.contains(where: { $0[key] != first }) { varying.insert(key) } else if let first { shared[key] = first }
+        }
+        return (varying, shared)
+    }
+
+    /// «Цена: 12; Остаток: 5» — значения колонок строки из метаданных.
+    static func rowValues(of payload: MCPDocumentPayload, fields: Set<String>) -> String? {
+        guard let metadata = payload.metadata, !fields.isEmpty else { return nil }
+        let pairs = fields.sorted().compactMap { key -> String? in
+            guard let value = metadata[key], value != .null else { return nil }
+            return "\(key): \(value.displayString)"
+        }
+        return pairs.isEmpty ? nil : pairs.joined(separator: "; ")
+    }
+
+    /// Сколько знаков в начале куска — повторённая шапка таблицы.
+    ///
+    /// Мера пишется при нарезке; здесь она проверяется по тексту: срезается
+    /// только то, что и правда строки таблицы, заканчивающиеся переводом
+    /// строки. Мера, не сошедшаяся с текстом, — `nil`: лишний срез удалил
+    /// бы текст документа, повтор шапки — только место.
+    static func repeatedHeader(of payload: MCPDocumentPayload, text: String) -> Int? {
+        guard case .int(let length)? = payload.metadata?[TableChunkHeaders.lengthKey],
+              length > 1, length < text.count else { return nil }
+        let prefix = text.prefix(length)
+        guard prefix.hasSuffix("\n") else { return nil }
+        let lines = prefix.dropLast().components(separatedBy: "\n")
+        guard lines.allSatisfy(TableText.isRow) else { return nil }
+        return length
     }
 
     /// Куски — в сплошной текст документа, без повторов на швах.
@@ -3273,9 +3472,9 @@ public struct MCPToolService: Sendable {
         // а не объяснять, почему не стоит.
         if let onDiskPath {
             verdict.append("The whole document is on this machine at \(onDiskPath) — open it there, in one step.")
-            verdict.append("Through this channel: get_file with «as»: \"text\" carries about five times more of the document per call; «outline»: true gives the structure if you only need a part.")
+            verdict.append("Through this channel: get_file with «as»: \"text\" carries more than twice as much of the document per call; «outline»: true gives the structure if you only need a part.")
         } else {
-            verdict.append("Ask for it with «as»: \"text\" — the same file as continuous text, about five times more of the document per call. Or take its structure first with «outline»: true and read only the section you need.")
+            verdict.append("Ask for it with «as»: \"text\" — the same file as continuous text, more than twice as much of the document per call. Or take its structure first with «outline»: true and read only the section you need.")
         }
         return verdict
     }
@@ -3398,7 +3597,7 @@ public struct MCPToolService: Sendable {
         // именно из неё агент должен узнать, что весь документ лежит рядом
         // файлом: без этого он тратит второй вызов ровно на то, ради чего
         // поле и заведено.
-        let onDisk = await backend.fileOnDisk(metadata: documents.first?.metadata)
+        let onDisk = await localFile(metadata: documents.first?.metadata)
         if let onDisk {
             structured["sourcePath"] = .string(onDisk.path)
             if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
@@ -3450,11 +3649,13 @@ public struct MCPToolService: Sendable {
         // бы удвоением вместо экономии.
         guard !varying.isEmpty else { return (nil, [:], nil) }
         // Сэкономленное считается, а не объявляется: столько знаков этот
-        // ответ вёз бы повтором.
+        // ответ вёз бы повтором. Считается по полученным кускам, а пометка
+        // пишется до рендера, который может часть из них не показать, —
+        // поэтому «до»: верхняя граница правдива, точное число было бы нет.
         let saved = MCPDocumentRendering.metadataLine(shared).count * (payloads.count - 1)
         let note = """
         Metadata identical on every chunk here is in «sharedMetadata» once \
-        instead of on each: \(shared.count.plainDigits) fields, \
+        instead of on each: \(shared.count.plainDigits) fields, up to \
         \(saved.plainDigits) characters that went to text instead. Name the \
         fields you want per chunk with «fields».
         """
@@ -3481,9 +3682,7 @@ public struct MCPToolService: Sendable {
     /// Во сколько страниц сплошного текста укладывается документ.
     ///
     /// Знаки — из оценки токенов, той же, что карта показывает по разделам;
-    /// отсюда «около». На живом ТЗ оценка сошлась с правдой: 500 625 токенов
-    /// против 1 752 182 знаков — это 3,50 знака на токен при
-    /// `TokenEstimator.charactersPerToken` 3,5.
+    /// отсюда «около» (`TokenEstimator.charactersPerToken`).
     ///
     /// А вот **число вызовов** — оценка снизу, и сказано об этом вслух
     ///. Она делит знаки на бюджет страницы, то есть считает укладку
@@ -3746,7 +3945,7 @@ public struct MCPToolService: Sendable {
         // Где документ лежит целиком. Считается до всех выходов: тот, кто
         // промахнулся смещением, — первый, кому путь и нужен, а ответ
         // «за концом» его не нёс.
-        let onDisk = await backend.fileOnDisk(metadata: documents.first?.metadata)
+        let onDisk = await localFile(metadata: documents.first?.metadata)
         if let onDisk {
             structured["sourcePath"] = .string(onDisk.path)
             if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
@@ -3801,8 +4000,30 @@ public struct MCPToolService: Sendable {
         // Путь уезжает трижды: строкой заголовка, полем `file` и пометкой
         // про диск. Считать его один раз значило обещать потолок и выдавать
         // больше — на путях по четыреста знаков это восемьсот сверх.
+        /// Колонки строк таблицы, ушедшие в метаданные: текстом
+        /// ответа они иначе не видны вовсе, а «для арифметики берите файл
+        /// целиком» без цен и количеств — обещание впустую.
+        let rowFields = Self.rowColumnFields(scope.map(\.payload))
+        // Пометки о таблицах — по всему читаемому, а не по странице: их длина
+        // известна заранее и платит из бюджета, как описание. У общих колонок
+        // строк длины нет вовсе — сколько колонок, столько и строка, — и в
+        // запас под пометки она не помещается.
+        //
+        // Плоская таблица и книга не целиком — те же предупреждения, что
+        // у любой другой выдачи: текст по умолчанию их терял, и арифметика
+        // по такой странице ничем не останавливалась.
+        var tableNotes = MCPDocumentRendering.tableIntegrityNotes(scope.map(\.payload))
+        if !rowFields.shared.isEmpty {
+            let line = rowFields.shared.keys.sorted()
+                .map { "\($0): \(rowFields.shared[$0]?.displayString ?? "")" }
+                .joined(separator: "; ")
+            tableNotes.append("Every table row here also carries: \(line).")
+        }
         let overhead = Self.wholeTextOverhead(path: path, onDiskPath: onDisk?.path)
             + describingCost
+            // Строкой ответа и зеркалом в `notes` — дважды, как и описание.
+            + tableNotes.reduce(0) { $0 + $1.count + 1 }
+            + JSONValue.array(tableNotes.map(JSONValue.string)).deliveredSize
         // Пол бюджета выше потолка ключа — это превышение обещанного, и
         // молчать о нём нельзя: человек ставил число под контекст своей
         // модели. Правило 3 приложения 5 в обратную сторону.
@@ -3825,6 +4046,8 @@ public struct MCPToolService: Sendable {
         // только там, где раздел сменился: в каждой строке оно было бы
         // не меткой, а шумом.
         var lastHeading: String?
+        /// Сколько повторённых шапок таблиц убрано на швах.
+        var headersDropped = 0
         // Потолок по числу кусков — тот, что попросили.
         //
         // Пока текст выбирали явным «as», молчаливое «limit здесь не
@@ -3861,12 +4084,24 @@ public struct MCPToolService: Sendable {
             for (offsetInSlice, payload) in filled.enumerated() {
                 // Первый кусок отдаётся всегда, даже если он один больше
                 // бюджета: ответ без текста хуже урезанного.
-                let text = payload.text ?? ""
+                //
+                // Шапка таблицы, повторённая в начале куска, — только
+                // у первого куска ответа: дальше читатель её только
+                // что видел, и на таблицах она съедала до трети ответа.
+                var text = payload.text ?? ""
+                if !pieces.isEmpty, let header = Self.repeatedHeader(of: payload, text: text) {
+                    text.removeFirst(header)
+                    headersDropped += 1
+                }
                 let number = numbering[payload.id] ?? cursor
                 let heading = offsetInSlice < slice.count ? slice[offsetInSlice].heading : ""
-                let mark = heading != lastHeading && !heading.isEmpty
+                var mark = heading != lastHeading && !heading.isEmpty
                     ? "[chunk \(number.plainDigits) · \(heading)]"
                     : "[chunk \(number.plainDigits)]"
+                if let row = Self.rowAddress(of: payload) {
+                    mark = "[chunk \(number.plainDigits) · \(row)]"
+                    if let values = Self.rowValues(of: payload, fields: rowFields.varying) { text += "\n" + values }
+                }
                 // Столько кусков, сколько попросили, — раньше бюджета.
                 if pieces.count >= chunkCap {
                     stopped = true
@@ -3906,6 +4141,10 @@ public struct MCPToolService: Sendable {
         var notes: [String] = []
         if found.answer.orderUnavailable {
             notes.append("The file holds more than \(MCPFileChunks.maximumOrdered.plainDigits) chunks — they came back in an arbitrary order, so this text is not the document's order.")
+        }
+        notes += tableNotes
+        if headersDropped > 0 {
+            notes.append("The table header repeated at the top of \(EnglishCount.grouped(headersDropped, "chunk", "chunks")) was dropped — it is the one shown above them.")
         }
         if joined.trimmed > 0 {
             notes.append("The chunks of this collection overlap: \(joined.trimmed.plainDigits) repeated characters were trimmed at the seams, so the text reads as the document does.")
@@ -4043,7 +4282,7 @@ public struct MCPToolService: Sendable {
         // за концом»: тот, кто промахнулся, первым и нуждается в этом пути.
         // Но не раньше, чем файл найден: искать путь для несуществующего
         // файла — ход на главный поток впустую.
-        if let onDisk = await backend.fileOnDisk(metadata: found.answer.documents.first?.metadata) {
+        if let onDisk = await localFile(metadata: found.answer.documents.first?.metadata) {
             structured["sourcePath"] = .string(onDisk.path)
             if let bytes = onDisk.bytes { structured["sourceBytes"] = .int(bytes) }
         }
@@ -4197,7 +4436,7 @@ public struct MCPToolService: Sendable {
         // Путь на диске нужен **до** рендера: он уезжает в приговоре, и
         // приговор платит из того же бюджета, что и куски. На живом
         // пути в сто знаков он уходит туда дважды.
-        let onDisk = await backend.fileOnDisk(metadata: answer.documents.first?.metadata)
+        let onDisk = await localFile(metadata: answer.documents.first?.metadata)
         // Обвязка ответа — приговор, заголовок и пометки — по верхней оценке
         // чисел: короче они стать могут, длиннее нет.
         let pageOverhead = MCPDocumentRendering.overhead(
@@ -4340,6 +4579,12 @@ public struct MCPToolService: Sendable {
         // Приговор идёт первой строкой, а не пометкой внизу.
         let text = (verdict + [header] + rendered.lines + notes).joined(separator: "\n")
         return MCPToolOutcome(text: text, structured: .object(structured))
+    }
+
+    /// Файл на диске — только тому, кому его путь можно назвать.
+    private func localFile(metadata: ChromaMetadata?) async -> MCPFileOnDisk? {
+        guard MCPCallContext.revealsLocalPaths else { return nil }
+        return await backend.fileOnDisk(metadata: metadata)
     }
 
     /// Чанки файла — в любой форме записи пути.

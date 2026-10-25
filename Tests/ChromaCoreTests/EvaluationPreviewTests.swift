@@ -57,7 +57,7 @@ final class EvaluationPreviewTests: XCTestCase {
         )
     }
 
-    /// Окно не длиннее заказанного — карточка отведена под три строки.
+    /// Окно не длиннее заказанного — карточка отведена под пять строк.
     func testSnippetKeepsToTheLimit() {
         let text = String(repeating: "слово ", count: 200) + "лицензирование " + String(repeating: "слово ", count: 200)
         let snippet = EvaluationPreview.snippet(of: text, matching: "лицензирование")
@@ -73,6 +73,46 @@ final class EvaluationPreviewTests: XCTestCase {
             of: text, matching: "порядок обновления справочников"
         )
         XCTAssertTrue(snippet.contains("справочников"), snippet)
+    }
+
+    // MARK: - Редкость слов
+
+    /// Слова, которые есть почти в каждом куске выдачи, не перетягивают окно
+    /// у редких: общая фраза о «государственных информационных системах»
+    /// обходила место, где стоят «комплексное тестирование» и «дней».
+    func testRareWordsOutweighCommonOnes() {
+        let boilerplate = "услуг по сопровождению и доработке государственных информационных систем"
+        let text = boilerplate + ". " + String(repeating: "Прочий текст положения. ", count: 14)
+            + "Общий срок проведения комплексного тестирования — не менее 10 дней."
+        let query = "Сколько дней длится комплексное тестирование при развитии государственных информационных систем"
+        let others = (0..<20).map { "\(boilerplate) номер \($0)" }
+        let rarity = EvaluationPreview.Rarity(texts: others + [text], queries: [query])
+
+        let weighted = EvaluationPreview.snippet(of: text, matching: query, rarity: rarity)
+        XCTAssertTrue(weighted.contains("10 дней"), weighted)
+        let plain = EvaluationPreview.snippet(of: text, matching: query)
+        XCTAssertTrue(plain.contains("государственных информационных"), "без весов побеждает общая фраза: \(plain)")
+    }
+
+    /// Ответ обычно стоит за словами вопроса — перед совпадением окно берёт
+    /// немного, и «КС3» не уходит за край.
+    func testTheAnswerAfterTheWordsStaysInTheWindow() {
+        let text = String(repeating: "Требования к пропускной способности порта оборудования. ", count: 6)
+            + "Канал к шлюзу обмена шифруется средствами защиты. Средства защиты берутся класса не ниже КС3 и "
+            + "работают в паре с резервным узлом. "
+            + String(repeating: "Прочие требования. ", count: 10)
+        let snippet = EvaluationPreview.snippet(of: text, matching: "Какой класс средств защиты нужен для канала к шлюзу обмена")
+        XCTAssertTrue(snippet.contains("КС3"), snippet)
+        XCTAssertTrue(snippet.hasPrefix("…"), snippet)
+    }
+
+    /// Из окон равного веса берётся то, где слова стоят теснее.
+    func testTheTighterWindowWinsATie() {
+        let text = "Подключение " + String(repeating: "прокладка ", count: 12) + "СМЭВ. "
+            + String(repeating: "Прочий текст. ", count: 12)
+            + "Подключение к СМЭВ — защищённое, класс КС3. " + String(repeating: "Хвост. ", count: 30)
+        let snippet = EvaluationPreview.snippet(of: text, matching: "подключение СМЭВ", limit: 80)
+        XCTAssertTrue(snippet.contains("КС3"), snippet)
     }
 
     // MARK: - Длина и уровень

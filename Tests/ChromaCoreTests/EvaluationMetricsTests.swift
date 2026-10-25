@@ -493,6 +493,71 @@ final class EvaluationMetricsTests: XCTestCase {
 
     // MARK: - Запрещённое
 
+    // MARK: - Знаков на полезный @k
+
+    /// Все знаки первых k по всем запросам, делённые на полезные результаты
+    /// среди них: «текст a1» — 8 знаков, «текст x» — 7. Запрос без полезного
+    /// результата отдаёт свои знаки в числитель, а не выпадает.
+    func testCharactersPerUsefulOnAHandCountedExample() {
+        let first = query("а", relevant: ["a1"])
+        let second = query("б", relevant: ["b1"])
+        let v = UUID()
+        let results = [result(first.id, v, ["a1", "x"]), result(second.id, v, ["x", "y"])]
+        let all = EvaluationMetrics.charactersPerUsefulScore(results: results, truth: truth([first, second]), k: 10)
+        XCTAssertEqual(all.value ?? 0, 29, accuracy: 0.001)
+        XCTAssertEqual(all.queries, 2)
+        let top = EvaluationMetrics.charactersPerUsefulScore(results: results, truth: truth([first, second]), k: 1)
+        XCTAssertEqual(top.value ?? 0, 15, accuracy: 0.001)
+    }
+
+    /// Делить не на что — мера неприменима, а не бесконечна и не ноль.
+    func testCharactersPerUsefulWithoutAnythingUsefulIsInapplicable() {
+        let q = query("а", relevant: ["a1"])
+        let score = EvaluationMetrics.charactersPerUsefulScore(
+            results: [result(q.id, UUID(), ["x", "y"])], truth: truth([q]), k: 10
+        )
+        XCTAssertNil(score.value)
+        XCTAssertNotNil(score.reason)
+    }
+
+    /// Результат без текста не считается за ноль знаков: цена вышла бы ниже
+    /// настоящей.
+    func testCharactersPerUsefulWithoutTextIsInapplicable() {
+        let q = query("а", relevant: ["a1"])
+        let hits = [EvaluationHit(id: "a1", text: nil, distance: nil, position: 1)]
+        let score = EvaluationMetrics.charactersPerUsefulScore(
+            results: [EvaluationResult(queryID: q.id, variantID: UUID(), hits: hits)], truth: truth([q]), k: 10
+        )
+        XCTAssertNil(score.value)
+    }
+
+    /// Присоединённый к результату контекст — соседи, раздел-родитель —
+    /// агент читает тоже, и цена попадания его учитывает: «текст a1» —
+    /// 8 знаков, контекста при нём — 92.
+    func testCharactersPerUsefulCountsAttachedContext() {
+        let q = query("а", relevant: ["a1"])
+        let hits = [EvaluationHit(id: "a1", text: "текст a1", distance: nil, position: 1, contextCharacters: 92)]
+        let score = EvaluationMetrics.charactersPerUsefulScore(
+            results: [EvaluationResult(queryID: q.id, variantID: UUID(), hits: hits)], truth: truth([q]), k: 10
+        )
+        XCTAssertEqual(score.value ?? 0, 100, accuracy: 0.001)
+    }
+
+    /// Стенд хранит объём контекста при каждом результате — сам контекст
+    /// результатом не становится.
+    func testTheRunKeepsHowMuchContextCameWithAResult() {
+        var match = RetrievalHit(id: "a1", document: "текст a1", metadata: nil, distance: 0.1)
+        match.context = [
+            RetrievalHit(id: "a0", document: String(repeating: "с", count: 40), metadata: nil, distance: nil,
+                         role: .context, contextKind: .neighbour),
+            RetrievalHit(id: "a2", document: String(repeating: "с", count: 52), metadata: nil, distance: nil,
+                         role: .context, contextKind: .neighbour),
+        ]
+        let hits = EvaluationRunner.hits(from: RetrievalOutcome(hits: [match], diagnostics: RetrievalDiagnostics()))
+        XCTAssertEqual(hits.map(\.id), ["a1"])
+        XCTAssertEqual(hits.first?.contextCharacters, 92)
+    }
+
     /// «Общей оценки качества» одним числом не существует — ни в модели, ни в
     /// отчёте. Тест держит границу: свойство с таким именем не должно завестись.
     func testThereIsNoSingleQualityScore() {

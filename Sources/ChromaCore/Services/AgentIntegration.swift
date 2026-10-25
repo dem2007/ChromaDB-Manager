@@ -176,6 +176,9 @@ public enum AgentIntegrationError: LocalizedError {
     /// Настройка записана, но ограничить права на неё не вышло: путь,
     /// снимок прежнего файла и причина.
     case writtenButUnprotected(String, String?, String)
+    /// Копирование скилла оборвалось на середине: папка, снимок прежней
+    /// версии (если был) и причина.
+    case skillHalfUpdated(String, String?, String)
 
     public var errorDescription: String? {
         switch self {
@@ -193,6 +196,11 @@ public enum AgentIntegrationError: LocalizedError {
             return String(localized: "В папке \(path) нет файла SKILL.md — скилла там нет. Выберите папку самого скилла, а не хранилище, в котором он лежит.")
         case .badSkillName(let name):
             return String(localized: "Имя скилла «\(name)» в шапке SKILL.md — это путь, а не имя: положить такую папку значит записать мимо папки скиллов. Исправьте строку name в шапке.")
+        case .skillHalfUpdated(let path, let backup, let reason):
+            var text = String(localized: "Скилл в \(path) обновлён не до конца: \(reason). В папке смесь новых и прежних файлов.")
+            text += " " + (backup.map { String(localized: "Прежняя версия целиком — в \($0): верните её оттуда или нажмите ещё раз.") }
+                ?? String(localized: "Нажмите ещё раз, когда причина устранена."))
+            return text
         case .writtenButUnprotected(let path, let backup, let reason):
             var text = String(localized: "Настройка записана в \(path), но закрыть её от чужих учётных записей не удалось: \(reason). В файле лежит ключ — закройте его сами: chmod 600.")
             if let backup {
@@ -273,7 +281,19 @@ public enum AgentIntegration {
         // и ссылаются на неё из `~`: после кнопки связь молча рвётся, и все
         // дальнейшие правки в своей папке перестают доходить до агента.
         let target = resolvingLink(url, fileManager: fileManager)
-        try merged.text.write(to: target, atomically: true, encoding: .utf8)
+        if fileManager.fileExists(atPath: target.path) {
+            try merged.text.write(to: target, atomically: true, encoding: .utf8)
+        } else {
+            // Нового файла ещё нет — он и рождается закрытым. Запись с
+            // `atomically` создаёт его с правами по umask (0644), и до
+            // `restrictToOwner` ниже ключ был открыт на чтение всем.
+            guard fileManager.createFile(
+                atPath: target.path, contents: Data(merged.text.utf8),
+                attributes: [.posixPermissions: NSNumber(value: 0o600)]
+            ) else {
+                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: target.path])
+            }
+        }
         // В файл ушёл ключ — значит читать его посторонним нельзя, и
         // неважно, кто файл завёл.
         //
@@ -701,13 +721,22 @@ public enum AgentIntegration {
         // (то же правило, что у одиночного файла).
         let changed = files.filter { relative in
             !sameFile(
-                source.appendingPathComponent(relative),
+                source.appendingPathComponent(relative).resolvingSymlinksInPath(),
                 folder.appendingPathComponent(relative),
                 fileManager: fileManager
             )
         }
         let existed = fileManager.fileExists(atPath: folder.path)
-        guard !changed.isEmpty else {
+        // Файлы, которых в новой версии скилла нет. Без этого справочник,
+        // убранный из скилла, оставался у агента навсегда — и агент читал
+        // правила, которых больше нет. Скрытые (`.…`) не трогаются: их
+        // заводит не скилл. Убранное остаётся в снимке ниже.
+        let installed = Set(files)
+        let removed = existed
+            ? skillFiles(in: folder, fileManager: fileManager)
+                .filter { !installed.contains($0) && !($0.split(separator: "/").last ?? "").hasPrefix(".") }
+            : []
+        guard !changed.isEmpty || !removed.isEmpty else {
             return AgentInstallOutcome(
                 path: folder.path, backup: nil, replacedExisting: existed,
                 changedNothing: true, filesWritten: 0
@@ -716,15 +745,30 @@ public enum AgentIntegration {
         let backup = existed
             ? try snapshotFolder(folder, named: name, in: backupRoot, fileManager: fileManager)
             : nil
-        for relative in changed {
-            let target = folder.appendingPathComponent(relative)
-            try fileManager.createDirectory(
-                at: target.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
-            if fileManager.fileExists(atPath: target.path) {
-                try fileManager.removeItem(at: target)
+        do {
+            for relative in changed {
+                let target = folder.appendingPathComponent(relative)
+                try fileManager.createDirectory(
+                    at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                if fileManager.fileExists(atPath: target.path) {
+                    try fileManager.removeItem(at: target)
+                }
+                // Содержимое, а не ссылка: `copyItem` переносит символическую
+                // ссылку как есть, и агент получал ссылку в чужой репозиторий —
+                // она ломалась, стоило тому переехать, и тянула за собой
+                // правки, которых человек агенту не ставил.
+                let origin = source.appendingPathComponent(relative).resolvingSymlinksInPath()
+                try fileManager.copyItem(at: origin, to: target)
             }
-            try fileManager.copyItem(at: source.appendingPathComponent(relative), to: target)
+            for relative in removed {
+                try fileManager.removeItem(at: folder.appendingPathComponent(relative))
+            }
+        } catch {
+            // Копирование оборвалось на середине: в папке агента уже смесь
+            // новых и старых файлов. Молча это не оставляется — ошибка
+            // называет снимок, из которого вернуть прежний скилл.
+            throw AgentIntegrationError.skillHalfUpdated(folder.path, backup, error.localizedDescription)
         }
         return AgentInstallOutcome(
             path: folder.path, backup: backup, replacedExisting: existed,

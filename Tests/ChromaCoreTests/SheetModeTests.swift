@@ -295,6 +295,22 @@ final class SheetRenderingTests: XCTestCase {
         XCTAssertEqual(result.map(\.level), [1, 0])
         XCTAssertEqual(result[1].parentIndex, 7)
     }
+
+    /// Название, объединённое над таблицей, читалка раскладывает по всем
+    /// колонкам. Шапкой оно от этого не становится: у шапки подписи
+    /// разные, и шапка — следующая строка.
+    func testATitleSpreadAcrossTheSheetIsNotItsHeader() {
+        let title = CellValue.text("Расчёт трудозатрат")
+        let rendered = SheetRenderer.render(rows: rows([
+            [title, title, title],
+            [.text("Роль"), .text("Часы"), .text("Ставка")],
+            [.text("Архитектор"), .number(40), .number(3000)],
+        ]), headerRow: nil, merges: [
+            XLSXReader.MergedRange(firstRow: 1, lastRow: 1, firstColumn: 0, lastColumn: 2),
+        ])
+        XCTAssertEqual(rendered.header, "| Роль | Часы | Ставка |\n| --- | --- | --- |", rendered.text)
+        XCTAssertTrue(rendered.text.hasPrefix("Расчёт трудозатрат\n"), rendered.text)
+    }
 }
 
 // MARK: - Whole workbooks

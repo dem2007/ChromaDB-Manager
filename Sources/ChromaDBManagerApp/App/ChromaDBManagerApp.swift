@@ -5,12 +5,17 @@ import ChromaCore
 
 struct ChromaDBManagerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    // Общий экземпляр, а не новый на каждое построение сцены:
-    // автозамыкание `@StateObject` SwiftUI зовёт по многу раз, отбрасывая
-    // лишние объекты уже после того, как их `init` открыл кеш и прочитал
-    // журнал задач.
-    @StateObject private var app = AppEnvironment.shared
-    @StateObject private var quickSearch = QuickSearchViewModel()
+    // Общий экземпляр, а не новый на каждое построение сцены.
+    //
+    // Ссылкой, а не `@StateObject`: со `@StateObject` любое изменение
+    // окружения пересчитывало все сцены, в том числе значок строки меню, и
+    // SwiftUI заново ставил ему картинку — посреди раскладки главного окна
+    // AppKit на это бросает исключение, приложение падало (отчёты 29 и 30
+    // сентября 2026). Окна подписываются на окружение сами, через
+    // `chromaEnvironment`; сцене следить за ним незачем.
+    private let app = AppEnvironment.shared
+    private let quickSearch = Self.quickSearchModel
+    static let quickSearchModel = QuickSearchViewModel()
 
     var body: some Scene {
         // Одиночной сценой, а не группой: у приложения всегда одно главное
@@ -19,20 +24,22 @@ struct ChromaDBManagerApp: App {
         Window(String(localized: "ChromaDB Manager"), id: Self.mainWindowID) {
             RootView()
                 .chromaEnvironment(app)
-                .frame(minWidth: 900, minHeight: 620)
                 .modifier(MenuBarSupport(
                     app: app, quickSearch: quickSearch, delegate: appDelegate
                 ))
         }
-        // Заголовок окна прячется, а кнопки закрытия, сворачивания и
-        // разворачивания остаются: они принадлежат окну, а не тулбару.
-        // Скрытие самого тулбара (`.toolbar(.hidden, for: .windowToolbar)`)
-        // забирало и их, и двойной клик по титульной полосе.
-        .windowToolbarStyle(.unifiedCompact)
-        // Opens wide enough for the collections screen without resizing.
-        .defaultSize(width: 1180, height: 780)
+        // Тулбар системный, заголовок раздела — в нём (`navigationTitle`).
+        // Минимальный размер окна задаёт корень `RootView` (900×560).
+        .windowToolbarStyle(.unified)
+        .defaultSize(MainWindowSize.initial)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            MainWindowCommands()
+        }
+
+        // Окно «Настройки» (⌘) — настройки самого приложения.
+        Settings {
+            SettingsWindow()
+                .chromaEnvironment(app)
         }
 
         // Отдельное окно просмотра исходника — его открывает быстрый
@@ -42,25 +49,11 @@ struct ChromaDBManagerApp: App {
             DocumentViewerSheet(model: app.documentViewer)
                 .chromaEnvironment(app)
         }
-        .defaultSize(width: 900, height: 760)
+        .defaultSize(MainWindowSize.viewer)
 
-        // Значок показывается или не показывается — оба варианта
-        // доступны, навязывать «жизнь в строке меню» нельзя.
-        MenuBarExtra(
-            isInserted: Binding(
-                get: { app.settings.configuration.menuBar.showsIcon },
-                set: { app.settings.configuration.menuBar.showsIcon = $0 }
-            )
-        ) {
-            MenuBarRoot(app: app, quickSearch: quickSearch, delegate: appDelegate)
-        } label: {
-            Image(systemName: MenuBarSummary(
-                tasks: app.queueMirror.tasks,
-                paused: app.settings.configuration.automaticSyncPaused,
-                lastSync: app.lastSyncSummary
-            ).symbol)
-        }
-        .menuBarExtraStyle(.window)
+        // Значок в строке меню — `StatusItemController` (AppKit), не
+        // `MenuBarExtra`: тот падал, обновляя кнопку значка посреди
+        // раскладки главного окна. Заводит его делегат при запуске.
     }
 
     static let mainWindowID = "main"
@@ -92,6 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var openViewer: (() -> Void)?
     /// Как создать главное окно, когда ни одного нет.
     var openMain: (() -> Void)?
+    /// `openViewer` и `openMain` дало главное окно, а не окно значка.
+    var hasMainWindowActions = false
 
     /// Показывает главное окно: уже открытое выносит вперёд и новое
     /// заводит только если открытых нет.
@@ -116,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Глобальная клавиша и панель поиска живут здесь, а не в сцене:
     /// они обязаны работать и тогда, когда ни одного окна нет.
+    private var statusItem: StatusItemController?
     private var hotKey: GlobalHotKey?
     private var panel: QuickSearchPanelController?
     private var settingsObserver: AnyCancellable?
@@ -170,7 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Открывает окно просмотра исходника по требованию из строки меню.
     @MainActor
-    private func openViewerWindow() {
+    func openViewerWindow() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         openViewer?()
@@ -183,6 +179,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesProvider = self
         applyDockIconWhenUnbundled()
         DispatchQueue.main.async { self.sizeInitialWindowIfNeeded() }
+        // Значок в строке меню — с самого запуска, до первого окна.
+        quickSearch = quickSearch ?? ChromaDBManagerApp.quickSearchModel
+        if let environment, let quickSearch {
+            statusItem = StatusItemController(app: environment, quickSearch: quickSearch, delegate: self)
+            // Клавиша и мост MCP — с запуска, а не с первого окна: приложение,
+            // живущее в строке меню, могло запуститься вовсе без окна.
+            // Повторные вызовы из окна безвредны. Следующим ходом, как и
+            // размер окна: `startMenuBarSupport` выставляет политику Dock по
+            // тому, видно ли окно, а сейчас его ещё нет — значок ушёл бы из
+            // Dock на старте.
+            DispatchQueue.main.async {
+                self.startMenuBarSupport()
+                environment.mcp.start(environment)
+            }
+        }
     }
 
     /// `Scene.defaultSize` is treated as a hint and macOS ignores it here, so
@@ -194,7 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !UserDefaults.standard.bool(forKey: key) else { return }
         guard let window = NSApp.windows.first(where: { $0.isVisible }) else { return }
 
-        let preferred = CGSize(width: 1180, height: 780)
+        let preferred = MainWindowSize.initial
         let available = (window.screen ?? NSScreen.main)?.visibleFrame.size
             ?? CGSize(width: preferred.width, height: preferred.height)
         window.setContentSize(CGSize(

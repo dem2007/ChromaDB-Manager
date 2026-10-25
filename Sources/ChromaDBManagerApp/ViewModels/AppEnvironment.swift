@@ -123,7 +123,25 @@ final class AppEnvironment: ObservableObject {
     @Published private(set) var collectionsRevision = 0
 
     /// Сказать экранам, что список коллекций устарел.
-    func collectionsMayHaveChanged() { collectionsRevision += 1 }
+    ///
+    /// `recount` — коллекции, в которые только что писали: их число
+    /// документов спрашивается у сервера заново, у остальных берётся
+    /// последнее известное.
+    func collectionsMayHaveChanged(recount names: [String] = []) {
+        pendingRecount.formUnion(names)
+        collectionsRevision += 1
+    }
+
+    /// Коллекции, чьё число документов устарело.
+    private(set) var pendingRecount: Set<String> = []
+
+    func takePendingRecount() -> Set<String> {
+        defer { pendingRecount = [] }
+        return pendingRecount
+    }
+
+    /// Последние известные числа документов.
+    let collectionCounts = CollectionCountStore()
 
     /// Что показать в главном окне по требованию извне: из строки меню,
     /// из «Служб» или из интента. Окно разбирает это и обнуляет.
@@ -262,7 +280,8 @@ final class AppEnvironment: ObservableObject {
         self.trash = TrashService(
             retentionDays: configuration.trashRetentionDays,
             limitBytes: configuration.trashLimitBytes,
-            log: handler
+            log: handler,
+            loadsInBackground: true
         )
         let cache = EmbeddingCache(limitBytes: configuration.embeddingCacheLimitBytes, log: handler)
         self.embeddingCache = cache
@@ -366,6 +385,12 @@ final class AppEnvironment: ObservableObject {
                 throw ProxyServer.ProxyError.tlsUnavailable
             }
         }
+        // Прокси пускает только в базу подключения (тенант и база): каталог
+        // и права знают только её. Ставится до запуска — первый же запрос
+        // сверяется с тем, что подключено сейчас, а не с прошлым подключением.
+        let access = proxy.access
+        let scope = (tenant: endpoint.tenant, database: endpoint.database)
+        Task { await access.setScope(tenant: scope.tenant, database: scope.database) }
         try proxy.start(
             upstreamHost: endpoint.host,
             upstreamPort: endpoint.port,

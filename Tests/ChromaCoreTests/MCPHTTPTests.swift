@@ -25,6 +25,7 @@ final class MCPHTTPTests: XCTestCase {
         if let version {
             parameters[MCPProtocol.metaKey] = .object([
                 MCPProtocol.metaProtocolVersion: .string(version),
+                MCPProtocol.metaClientCapabilities: .object([:]),
             ])
         }
         if !parameters.isEmpty { payload["params"] = .object(parameters) }

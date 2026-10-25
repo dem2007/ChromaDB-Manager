@@ -30,6 +30,8 @@ struct XLSXFixtureBuilder {
         case builtInFormat(Double, id: Int)
         /// Written as no cell at all, so the row is genuinely sparse.
         case absent
+        /// Ячейка как есть, XML целиком; `REF` заменяется ссылкой ячейки.
+        case raw(String)
     }
 
     struct Sheet {
@@ -77,6 +79,8 @@ struct XLSXFixtureBuilder {
                     switch cell {
                     case .absent:
                         continue
+                    case .raw(let xml):
+                        body += xml.replacingOccurrences(of: "REF", with: reference)
                     case .shared(let text):
                         body += "<c r=\"\(reference)\" t=\"s\"><v>\(indexOf(text))</v></c>"
                     case .inline(let text):

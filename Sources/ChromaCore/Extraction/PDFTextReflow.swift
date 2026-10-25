@@ -224,6 +224,37 @@ public enum PDFTextReflow {
         return vocabulary.usesHyphenation ? String(paragraph.dropLast()) + line : paragraph + line
     }
 
+    /// Чем склеить две соседние страницы, если абзац перенесён через их
+    /// границу: сколько знаков снять с конца первой и что поставить
+    /// между. `nil` — граница абзаца, страницы идут через пустую строку.
+    ///
+    /// Страницы сшиваются по отдельности, и абзац, перенесённый на следующую
+    /// страницу, рвался пустой строкой посреди предложения: «…сторона
+    /// направляет ‖ уведомление в течение срока…». Замер
+    /// на 58 PDF корпуса — 92 границы страницы из 907. Пока внизу страницы
+    /// стоял штамп Диадока, склеивать было нечего; теперь он вырезается.
+    ///
+    /// Склеивается, только если всё сразу: первая кончается не знаком конца
+    /// предложения и не таблицей, вторая начинается со строчной буквы, а
+    /// последний абзац первой — не сноска («1 Постановление…» под чертой).
+    /// Дефис на стыке решается словарём документа, как внутри страницы.
+    static func bridge(_ previous: String, _ next: String, vocabulary: Vocabulary) -> (drop: Int, separator: String)? {
+        guard let last = previous.last, let first = next.first,
+              last != "|", first != "|", first.isLetter, first.isLowercase,
+              !".!?:;…»)".contains(last) else { return nil }
+        let paragraph = previous.components(separatedBy: "\n\n").last ?? previous
+        if paragraph.count < 400, paragraph.range(of: #"^[0-9¹²³⁴⁵⁶⁷⁸⁹⁰*]{1,3}\s"#, options: .regularExpression) != nil {
+            return nil
+        }
+        guard last == "-" || last == "\u{2010}" else { return (0, " ") }
+        // Дефис на стыке страниц — так же, как на стыке строк: по словарю.
+        let joinedTail = joined(String(previous.suffix(60)), String(next.prefix(60)), vocabulary: vocabulary)
+        let expectedSpaced = String(previous.suffix(60)) + " " + String(next.prefix(60))
+        if joinedTail == expectedSpaced { return (0, " ") }
+        let hyphenKept = joinedTail.count == previous.suffix(60).count + next.prefix(60).count
+        return hyphenKept ? (0, "") : (1, "")
+    }
+
     /// Строка, которая начинает новый блок, чем бы ни кончилась предыдущая.
     ///
     /// Знак списка и номер пункта — разметка, уцелевшая в тексте, и склеивать

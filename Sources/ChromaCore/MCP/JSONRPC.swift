@@ -49,8 +49,13 @@ public struct JSONRPCError: Codable, Hashable, Sendable, Error {
     /// которую сервер не поддерживает.
     public static let unsupportedProtocolVersion = -32022
 
+    /// Ошибки читает агент — по-английски.
     public static func methodNotFound(_ method: String) -> JSONRPCError {
-        JSONRPCError(code: methodNotFound, message: "Неизвестный метод: \(method)")
+        JSONRPCError(code: methodNotFound, message: "Method not found: \(method)")
+    }
+
+    public static func invalidRequest(_ reason: String) -> JSONRPCError {
+        JSONRPCError(code: invalidRequest, message: reason)
     }
 
     public static func invalidParams(_ reason: String) -> JSONRPCError {
@@ -150,8 +155,8 @@ public enum JSONRPCOutgoing: Sendable {
     case result(id: JSONRPCID, JSONValue)
     case failure(id: JSONRPCID, JSONRPCError)
     /// Ошибка, когда идентификатор запроса неизвестен: строка не разобралась
-    /// вовсе. JSON-RPC предписывает в этом случае `"id": null` — молчание
-    /// оставило бы клиента ждать ответа, которого не будет.
+    /// вовсе. Ответ всё равно нужен — молчание оставило бы клиента ждать, —
+    /// но без поля `id`: схема MCP не допускает в нём `null`.
     case unidentifiedFailure(JSONRPCError)
     case notification(method: String, params: JSONValue?)
 
@@ -166,7 +171,8 @@ public enum JSONRPCOutgoing: Sendable {
             object["id"] = try id.asJSON()
             object["error"] = Self.payload(for: error)
         case .unidentifiedFailure(let error):
-            object["id"] = .null
+            // Без `id`, а не с `null`: схема MCP разрешает ошибке без
+            // прочитанного идентификатора только его отсутствие.
             object["error"] = Self.payload(for: error)
         case .notification(let method, let params):
             object["method"] = .string(method)

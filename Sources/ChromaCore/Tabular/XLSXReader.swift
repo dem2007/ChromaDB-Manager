@@ -51,7 +51,26 @@ public enum CellValue: Hashable, Sendable {
         }
     }
 
+    /// Число без хвоста двоичной дроби: пятнадцать значащих цифр.
+    ///
+    /// Формула в книге даёт 98 097,3 как 98097.29999999997 — так это число
+    /// хранится в двоичном виде, — и оно уходило в текст куска и в метаданные
+    /// целиком: «98097.29999999997», «111.12385200000001». Поиск по «98097.3»
+    /// такой кусок не находил, фильтр `= 98097.3` — строку, а агент читал
+    /// мусорные разряды как значащие. Пятнадцать значащих цифр — столько
+    /// Excel хранит и показывает: хвост за ними — погрешность вычисления, а не
+    /// данные. (Проценты и прочие числа с множителем округлялись и раньше —
+    /// `NumberUnit.displayed`,.) Целое возвращается как есть: таких
+    /// ячеек в книге большинство, и форматировать их незачем.
+    static func significant(_ value: Double) -> Double {
+        guard value != value.rounded() else { return value }
+        return Double(String(format: "%.15g", value)) ?? value
+    }
+
+    /// Число так, как его показывает книга: 4820, а не 4820.0, и без хвоста
+    /// двоичной дроби.
     static func plainNumber(_ value: Double) -> String {
+        let value = significant(value)
         if value == value.rounded(), abs(value) < 1e15 { return String(Int64(value)) }
         return String(value)
     }
@@ -70,11 +89,16 @@ public struct NumberUnit: Hashable, Sendable {
     public var prefix: String
     /// Что стоит после: `%`, `₽`, `кг`.
     public var suffix: String
+    /// Сколько знаков после запятой показывает формат ячейки:
+    /// `#,##0.00` — два, `0` — ни одного. `nil` — формат не говорит
+    /// («Общий»), и число пишется как есть.
+    public var decimals: Int?
 
-    public init(scale: Double = 1, prefix: String = "", suffix: String) {
+    public init(scale: Double = 1, prefix: String = "", suffix: String, decimals: Int? = nil) {
         self.scale = scale
         self.prefix = prefix
         self.suffix = suffix
+        self.decimals = decimals
     }
 
     public static let percent = NumberUnit(scale: 100, suffix: "%")
@@ -103,8 +127,18 @@ public struct NumberUnit: Hashable, Sendable {
     /// Пробел перед подписью — везде, кроме знака процента, приклеенного
     /// к числу в исходном формате; но и там пробел не мешает поиску, а
     /// единообразие важнее: «15 %» и «15%» токенизируются одинаково.
+    ///
+    /// Знаков после запятой — столько, сколько показывает формат:
+    /// «552.32», а не «552.31665911856», как и видно в книге. Округление —
+    /// только в тексте; в метаданные идёт само число (`displayed`), по
+    /// нему считают и фильтруют.
     public func rendered(_ value: Double) -> String {
-        let number = CellValue.plainNumber(displayed(value))
+        var shown = displayed(value)
+        if let decimals {
+            let factor = pow(10, Double(decimals))
+            shown = (shown * factor).rounded() / factor
+        }
+        let number = CellValue.plainNumber(shown)
         var result = number
         if !prefix.isEmpty { result = prefix + " " + result }
         if !suffix.isEmpty { result += " " + suffix }
@@ -134,6 +168,19 @@ public struct SheetRow: Hashable, Sendable {
 
     public var isEmpty: Bool { cells.values.allSatisfy(\.isEmpty) }
 
+    /// Одно и то же значение во всех занятых клетках, и клеток больше одной.
+    ///
+    /// Так выглядит строка, которую объединение растянуло на всю таблицу
+    /// и читалка разложила по колонкам: название над таблицей или
+    /// строка-раздел («Крепёж» над своими позициями). Это не шапка и не
+    /// запись: у шапки подписи разные, а у записи «Крепёж» не может быть
+    /// заодно артикулом и ценой.
+    public var isUniform: Bool {
+        let values = cells.values.filter { !$0.isEmpty }
+        guard values.count > 1, let first = values.first else { return false }
+        return values.allSatisfy { $0 == first }
+    }
+
     /// The row as a dense array, `width` cells wide.
     public func values(width: Int) -> [CellValue] {
         (0..<max(0, width)).map { value(at: $0) }
@@ -146,6 +193,9 @@ public struct SheetInfo: Hashable, Sendable, Identifiable {
     public let isHidden: Bool
     /// Path of the sheet part inside the container.
     let path: String
+    /// Объединённые ячейки листа. Заполняет сбор листов синхронизации:
+    /// по ним шапка в несколько строк складывается в названия колонок.
+    public var merges: [XLSXReader.MergedRange] = []
 
     public init(name: String, isHidden: Bool, path: String) {
         self.name = name
@@ -163,8 +213,6 @@ public enum XLSXWarning: Hashable, Sendable {
     case rowLimitReached(limit: Int)
     /// Excel's non-existent 29 February 1900.
     case phantomLeapDay(cells: Int)
-    /// Объединения вбок, которые остались как есть.
-    case mergedSideways(cells: Int)
 
     public var text: String {
         switch self {
@@ -174,8 +222,6 @@ public enum XLSXWarning: Hashable, Sendable {
             return String(localized: "прочитаны первые \(limit) строк — лист длиннее предела")
         case .phantomLeapDay(let count):
             return String(localized: "ячеек с 29 февраля 1900 года: \(count) — такой даты не было, это известная ошибка Excel; значения оставлены числами")
-        case .mergedSideways(let count):
-            return String(localized: "объединений ячеек вбок: \(count) — значение оставлено в первой колонке диапазона; вниз объединения размазаны по строкам")
         }
     }
 }
@@ -184,11 +230,15 @@ public enum XLSXError: LocalizedError, Equatable {
     case notAWorkbook(String)
     case noSheets
     case sheetMissing(String)
+    /// XML листа оборвался посреди файла.
+    case sheetBroken(sheet: String, detail: String)
 
     public var errorDescription: String? {
         switch self {
         case .notAWorkbook(let detail):
             return String(localized: "файл не читается как книга XLSX: \(detail)")
+        case .sheetBroken(let sheet, let detail):
+            return String(localized: "лист «\(sheet)» обрывается посреди файла (\(detail)) — книга не записана: недочитанные строки сочлись бы удалёнными")
         case .noSheets:
             return String(localized: "в книге нет листов")
         case .sheetMissing(let name):
@@ -225,22 +275,8 @@ public struct XLSXReader {
 
     public struct Limits: Sendable {
         public var maxRows: Int
-        /// Размазывать ли объединения **вбок**.
-        ///
-        /// Off by default, as asks: in a data table a merged cell usually
-        /// means a heading spanning columns, and repeating it into every row
-        /// would invent values nobody typed. It earns its keep in «document»
-        /// mode, where the sheet is rendered as a whole.
-        ///
-        /// Объединения **вниз** к этому переключателю отношения не имеют:
-        /// они размазываются всегда и в обоих проходах. «Категория»,
-        /// объединённая на двадцать строк, относится ко всем двадцати — это
-        /// не заголовок, а значение, и без него девятнадцать строк уходили
-        /// в базу без поля.
-        public var spreadMergedCells: Bool
-        public init(maxRows: Int = 200_000, spreadMergedCells: Bool = false) {
+        public init(maxRows: Int = 200_000) {
             self.maxRows = maxRows
-            self.spreadMergedCells = spreadMergedCells
         }
     }
 
@@ -301,7 +337,7 @@ public struct XLSXReader {
             sharedStrings: sharedStrings,
             dateStyles: styles.dateStyles,
             unitStyles: styles.units,
-            verticalMerges: merges.filter(\.isVertical),
+            merges: merges,
             epoch: epoch,
             uses1904: uses1904Dates,
             limit: limits.maxRows,
@@ -310,17 +346,40 @@ public struct XLSXReader {
         let parser = XMLParser(data: data)
         parser.delegate = delegate
         parser.parse()
+        try Self.checkParsed(parser, stopped: delegate.stopped, sheet: sheet.name)
         return delegate.warnings
+    }
+
+    /// Разбор листа дошёл до конца — или остановлен нами.
+    ///
+    /// Результат `parse()` не проверялся: лист с недопустимым знаком или
+    /// оборванной записью посередине отдавал прочитанное до сбоя как весь
+    /// лист. Строки после сбоя считались исчезнувшими, а куски листа-
+    /// документа — устаревшими и удалялись из коллекции.
+    static func checkParsed(_ parser: XMLParser, stopped: Bool, sheet: String) throws {
+        guard !stopped, let error = parser.parserError else { return }
+        throw XLSXError.sheetBroken(
+            sheet: sheet,
+            detail: String(localized: "ошибка XML в строке \(parser.lineNumber): \(error.localizedDescription)")
+        )
     }
 
     /// All rows of a sheet, for callers small enough not to care.
     public func rows(of sheet: SheetInfo, limits: Limits = Limits()) throws -> (rows: [SheetRow], warnings: [XLSXWarning]) {
+        let read = try rowsAndMerges(of: sheet, limits: limits)
+        return (read.rows, read.warnings)
+    }
+
+    /// Строки листа и его объединения — за одно чтение XML листа.
+    public func rowsAndMerges(
+        of sheet: SheetInfo, limits: Limits = Limits()
+    ) throws -> (rows: [SheetRow], warnings: [XLSXWarning], merges: [MergedRange]) {
         var result: [SheetRow] = []
         let data = try container.read(sheet.path)
         let merges = Self.mergeRanges(in: data)
         let delegate = SheetParser(
             sharedStrings: sharedStrings, dateStyles: styles.dateStyles,
-            unitStyles: styles.units, verticalMerges: merges.filter(\.isVertical),
+            unitStyles: styles.units, merges: merges,
             epoch: epoch,
             uses1904: uses1904Dates, limit: limits.maxRows,
             onRow: { result.append($0); return true }
@@ -328,34 +387,11 @@ public struct XLSXReader {
         let parser = XMLParser(data: data)
         parser.delegate = delegate
         parser.parse()
+        try Self.checkParsed(parser, stopped: delegate.stopped, sheet: sheet.name)
 
-        // Объединения вниз уже подставлены потоком. Вбок — только по просьбе:
-        // там это обычно заголовок над колонками, и размазать его значит
-        // выдумать значения, которых никто не писал.
-        var warnings = delegate.warnings
-        let others = merges.filter { !$0.isVertical }
-        if !others.isEmpty {
-            if limits.spreadMergedCells {
-                result = Self.spreading(others, over: result)
-            } else {
-                warnings.append(.mergedSideways(cells: others.count))
-            }
-        }
-        return (result, warnings)
-    }
-
-    /// Copies each merged range's top-left value across the range.
-    static func spreading(_ ranges: [MergedRange], over rows: [SheetRow]) -> [SheetRow] {
-        var byNumber = Dictionary(uniqueKeysWithValues: rows.map { ($0.number, $0.cells) })
-        for range in ranges {
-            guard let source = byNumber[range.firstRow]?[range.firstColumn], !source.isEmpty else { continue }
-            for row in range.firstRow...range.lastRow {
-                for column in range.firstColumn...range.lastColumn where !(row == range.firstRow && column == range.firstColumn) {
-                    byNumber[row, default: [:]][column] = source
-                }
-            }
-        }
-        return byNumber.keys.sorted().map { SheetRow(number: $0, cells: byNumber[$0] ?? [:]) }
+        // Объединения уже разложены потоком — по всему прямоугольнику
+        // (`MergeFill`).
+        return (result, delegate.warnings, merges)
     }
 
     /// `A1:B3` as numbers. Rows are 1-based as the file writes them, columns
@@ -386,6 +422,13 @@ public struct XLSXReader {
         /// Объединение **вниз** по одной колонке: значение относится
         /// к каждой строке диапазона, а не к одной верхней.
         public var isVertical: Bool { firstColumn == lastColumn && lastRow > firstRow }
+        /// Растянуто вниз — одной колонкой или блоком. Значение блока
+        /// «две колонки на восемь строк» относится ко всем восьми строкам
+        /// ровно так же, как значение одной колонки, а раньше вниз не шло
+        /// вовсе: блок числился «объединением вбок».
+        public var spansRows: Bool { lastRow > firstRow }
+        /// Растянуто вбок — строкой или блоком.
+        public var spansColumns: Bool { lastColumn > firstColumn }
     }
 
     // MARK: - Column addressing

@@ -374,10 +374,9 @@ final class MCPFileToolTests: XCTestCase {
             arguments: .object(["collection": .string("заметки")]),
             key: key
         )
-        guard case .failure(let error) = result else {
+        guard let error = result.inputRefusal else {
             return XCTFail("вызов без «file» обязан быть отвергнут")
         }
-        XCTAssertEqual(error.code, -32602)
     }
 }
 
@@ -505,11 +504,10 @@ final class MCPMultiCollectionToolTests: XCTestCase {
                 ]),
                 key: key
             )
-            guard case .failure(let error) = result else {
+            guard let error = result.inputRefusal else {
                 XCTFail("\(tool): надо отказать до обращения к базе")
                 continue
             }
-            XCTAssertEqual(error.code, -32602)
             XCTAssertTrue(error.message.contains("collection"), "\(tool): \(error.message)")
         }
     }
@@ -520,8 +518,7 @@ final class MCPMultiCollectionToolTests: XCTestCase {
             "collections": .array([.string("код")]),
             "query": .string("запрос"),
         ])
-        guard case .failure(let error) = result else { return XCTFail("надо отказать") }
-        XCTAssertEqual(error.code, -32602)
+        guard let error = result.inputRefusal else { return XCTFail("надо отказать") }
         XCTAssertTrue(error.message.contains("keep one of them"), error.message)
     }
 
@@ -569,7 +566,7 @@ final class MCPMultiCollectionToolTests: XCTestCase {
 
     func testNeitherParameterIsRefusedWithAnUnderstandableReason() async {
         let result = await call(await service(Backend()), ["query": .string("запрос")])
-        guard case .failure(let error) = result else { return XCTFail("надо отказать") }
+        guard let error = result.inputRefusal else { return XCTFail("надо отказать") }
         XCTAssertTrue(error.message.contains("collections"), error.message)
     }
 }

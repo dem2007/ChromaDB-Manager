@@ -94,16 +94,23 @@ public struct EvaluationHit: Codable, Hashable, Sendable, Identifiable {
     /// обязан оставаться читаемым через месяц, когда коллекции уже может
     /// не быть, — а без `source_id` и `source_file` файл не найти.
     public var metadata: ChromaMetadata?
+    /// Знаков в тексте, присоединённом к результату, — соседи, раздел-родитель
+    ///. Сам этот текст в прогоне не хранится: результатом он не
+    /// является и в оценку не идёт. Но агент читает и его, и цена попадания
+    /// без него у варианта с соседями выходила такой же, как без них.
+    /// `nil` — контекста нет или прогон записан до того, как его считали.
+    public var contextCharacters: Int?
 
     public init(
         id: String, text: String?, distance: Double?, position: Int,
-        metadata: ChromaMetadata? = nil
+        metadata: ChromaMetadata? = nil, contextCharacters: Int? = nil
     ) {
         self.id = id
         self.text = text
         self.distance = distance
         self.position = position
         self.metadata = metadata
+        self.contextCharacters = contextCharacters
     }
 
     /// Прогоны, записанные до появления метаданных, обязаны читаться.
@@ -119,6 +126,7 @@ public struct EvaluationHit: Codable, Hashable, Sendable, Identifiable {
         distance = try container.decodeIfPresent(Double.self, forKey: .distance)
         position = try container.decode(Int.self, forKey: .position)
         metadata = try container.decodeIfPresent(ChromaMetadata.self, forKey: .metadata)
+        contextCharacters = try container.decodeIfPresent(Int.self, forKey: .contextCharacters)
     }
 }
 

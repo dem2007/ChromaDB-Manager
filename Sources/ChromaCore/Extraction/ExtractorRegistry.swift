@@ -24,6 +24,7 @@ public struct ExtractorRegistry: Sendable {
                 PDFExtractor(),
                 EPUBExtractor(),
                 OfficeExtractor(),
+                PPTXExtractor(),
                 IWorkExtractor(),
                 // Раньше текстового: `.html` формально текст, и текстовый
                 // экстрактор проиндексировал бы разметку вместе с текстом.
@@ -122,9 +123,11 @@ public struct ExtractorRegistry: Sendable {
         var lastError: Error?
         for extractor in candidates {
             do {
-                return try await withTimeout(extractor.timeout(for: options)) {
+                // Знаки, которые мешают поиску, — одним правилом на все
+                // форматы.
+                return TextNormalization.normalized(try await withTimeout(extractor.timeout(for: options)) {
                     try await extractor.extract(from: url, options: options)
-                }
+                })
             } catch let error as ExtractionError {
                 lastError = error
                 guard case .noTextLayer = error, candidates.count > 1 else { throw error }
@@ -163,7 +166,13 @@ public struct PlainTextExtractor: DocumentTextExtractor {
     public let id = "plaintext"
     /// 2 — ставится `has_tables` для Markdown с таблицей. Сам текст
     /// не меняется: в Markdown таблица уже написана нужным видом.
-    public let version = 2
+    ///
+    /// 3 — знаки нормализуются.
+    ///
+    /// 4 — узнаются KOI8-R и CP866.
+    ///
+    /// 5 — переводы строк Windows приводятся к «\n».
+    public let version = 5
 
     public init() {}
 
@@ -183,7 +192,14 @@ public struct PlainTextExtractor: DocumentTextExtractor {
         guard let raw = Self.read(at: url) else {
             throw ExtractionError.corrupted(String(localized: "двоичный файл или неизвестная кодировка"))
         }
-        guard let text = Self.sanitized(raw) else { throw ExtractionError.empty }
+        // Двоичное содержимое под текстовым расширением — не «пустой файл»
+        //: так он раньше и назывался в итоге и в диагностике, и
+        // человек искал, почему пуст файл на четыре килобайта.
+        guard let text = Self.sanitized(raw) else {
+            throw Self.isBinary(raw)
+                ? ExtractionError.corrupted(String(localized: "двоичный файл, а не текст"))
+                : ExtractionError.empty
+        }
 
         return ExtractedDocument(
             plainText: text,
@@ -201,28 +217,44 @@ public struct PlainTextExtractor: DocumentTextExtractor {
     }
 
     /// Кодировка угадывается тем же правилом, что у CSV: метка BOM,
-    /// потом UTF-8, потом Windows-1251.
+    /// потом UTF-8, потом Windows-1251, KOI8-R или CP866 — какое из прочтений
+    /// похоже на русский текст.
     ///
     /// Прежде вторым шёл UTF-16 без метки, а он принимает почти любую
     /// последовательность чётной длины: русский текст в cp1251 становился
     /// набором иероглифов, индексировался и не находился ни по одному
     /// своему слову. Latin-1 — последним: он читает всё и ничего не
     /// гарантирует.
+    ///
+    /// Переводы строк Windows и старого Mac — одним «\n»: абзац
+    /// узнаётся по «\n\n», а в «\r\n\r\n» его нет — текст из Windows
+    /// резался по строкам внутри абзацев, а не по абзацам. Здесь, до любых
+    /// смещений.
     static func read(at url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
+        let text: String?
         if let guess = DelimitedTableReader.detectEncoding(data),
-           let text = DelimitedTableReader.decode(data, as: guess) {
-            return text
+           let decoded = DelimitedTableReader.decode(data, as: guess) {
+            text = decoded
+        } else {
+            text = String(data: data, encoding: .isoLatin1)
         }
-        return String(data: data, encoding: .isoLatin1)
+        // «\r\n» в Swift — один знак, и `contains("\r")` его не видит.
+        guard let text, text.unicodeScalars.contains("\r") else { return text }
+        return text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     }
 
     /// Trims, and refuses anything that is clearly not text whatever its
     /// extension claims.
     static func sanitized(_ text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if trimmed.unicodeScalars.prefix(2000).filter({ $0.value == 0 }).count > 5 { return nil }
+        guard !trimmed.isEmpty, !isBinary(trimmed) else { return nil }
         return trimmed
+    }
+
+    /// Нулевые байты в начале — двоичные данные, что бы ни говорило
+    /// расширение.
+    static func isBinary(_ text: String) -> Bool {
+        text.unicodeScalars.prefix(2000).filter { $0.value == 0 }.count > 5
     }
 }

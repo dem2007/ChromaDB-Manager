@@ -58,7 +58,7 @@ final class TrashServiceTests: XCTestCase {
     /// still be readable afterwards, from a fresh instance (i.e. after a
     /// restart), exactly like the audit log survives one.
     @MainActor
-    func testARecordedEntrySurvivesAFreshInstance() throws {
+    func testARecordedEntrySurvivesAFreshInstance() async throws {
         let trash = TrashService(fileURL: fileURL)
         try trash.record(makeEntry(documentID: "doc-42"))
         waitForFile(fileURL)
@@ -67,7 +67,46 @@ final class TrashServiceTests: XCTestCase {
         let reloaded = TrashService(fileURL: fileURL)
         XCTAssertEqual(reloaded.entries.count, 1)
         XCTAssertEqual(reloaded.entries.first?.documentID, "doc-42")
-        XCTAssertEqual(reloaded.entries.first?.embedding, [0.1, 0.2, 0.3])
+        // В памяти — без вектора, целиком — из файла.
+        XCTAssertNil(reloaded.entries.first?.embedding)
+        XCTAssertTrue(reloaded.entries.first?.hasEmbedding ?? false)
+        let full = await reloaded.fullEntries(withIDs: Set(reloaded.entries.map(\.id)))
+        XCTAssertEqual(full.first?.embedding, [0.1, 0.2, 0.3])
+        XCTAssertEqual(full.first?.metadata?["k"], .string("v"))
+    }
+
+    /// перезапись после восстановления берёт строки из файла —
+    /// у оставшихся записей векторы не пропадают, хотя в памяти их нет.
+    @MainActor
+    func testRewritingKeepsTheVectorsOfTheRemainingEntries() async throws {
+        let trash = TrashService(fileURL: fileURL)
+        let kept = makeEntry(documentID: "остаётся")
+        let gone = makeEntry(documentID: "уходит")
+        try trash.record([kept, gone])
+        trash.forget(ids: [gone.id])
+        waitUntil {
+            JSONLines.read(at: self.fileURL).count == 1
+        }
+        let reloaded = TrashService(fileURL: fileURL)
+        XCTAssertEqual(reloaded.entries.map(\.documentID), ["остаётся"])
+        let keptFull = await reloaded.fullEntries(withIDs: [kept.id])
+        XCTAssertEqual(keptFull.first?.embedding, [0.1, 0.2, 0.3])
+        let goneFull = await reloaded.fullEntries(withIDs: [gone.id])
+        XCTAssertTrue(goneFull.isEmpty)
+    }
+
+    /// Идентификатор ищется и тогда, когда «"id":"» встречается в тексте.
+    @MainActor
+    func testAnIDInsideTheTextDoesNotConfuseTheLookup() async throws {
+        let trash = TrashService(fileURL: fileURL)
+        let tricky = TrashEntry(
+            documentID: "d", document: #"в тексте "id":"не-uuid" и ещё"#, metadata: nil,
+            embedding: [1], collectionName: "c", collectionMetric: nil, collectionModel: nil,
+            collectionDimension: nil, reason: .document
+        )
+        try trash.record(tricky)
+        let found = await trash.fullEntries(withIDs: [tricky.id])
+        XCTAssertEqual(found.first?.document, tricky.document)
     }
 
     /// A batch (whole-collection capture) writes every line, not just the last.
@@ -268,3 +307,98 @@ private extension String {
     }
 
 }
+
+/// корзина читается в фоне и не теряет того, что изменилось за это время.
+final class TrashBackgroundLoadTests: XCTestCase {
+    @MainActor
+    func testWhatChangedDuringLoadingSurvivesIt() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("trash-bg-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        func entry(_ name: String) -> TrashEntry {
+            TrashEntry(documentID: name, document: name, metadata: ["k": .string("v")], embedding: [1, 2, 3],
+                       collectionName: "c", collectionMetric: nil, collectionModel: nil,
+                       collectionDimension: nil, reason: .document)
+        }
+        let old = entry("старая"), gone = entry("снятая")
+        try TrashService(fileURL: url).record([old, gone])
+
+        let trash = TrashService(fileURL: url, loadsInBackground: true)
+        let fresh = entry("новая")
+        try trash.record(fresh)
+        trash.forget(ids: [gone.id])
+        for _ in 0..<200 where trash.isLoading { try await Task.sleep(nanoseconds: 10_000_000) }
+
+        XCTAssertFalse(trash.isLoading)
+        XCTAssertEqual(Set(trash.entries.map(\.documentID)), ["старая", "новая"])
+        let oldFull = await trash.fullEntries(withIDs: [old.id])
+        XCTAssertEqual(oldFull.first?.embedding, [1, 2, 3], "вектор остался в файле")
+        XCTAssertEqual(trash.entries.first { $0.id == old.id }?.embeddingLength, 3)
+        var goneFull = await trash.fullEntries(withIDs: [gone.id])
+        for _ in 0..<200 where !goneFull.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            goneFull = await trash.fullEntries(withIDs: [gone.id])
+        }
+        XCTAssertTrue(goneFull.isEmpty, "снятая за время чтения ушла и из файла")
+    }
+}
+
+/// в памяти корзины только начало текста; файлы удалённого источника.
+final class TrashPreviewTests: XCTestCase {
+    @MainActor
+    func testOnlyTheStartOfTheTextIsKeptInMemory() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("trash-preview-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let long = String(repeating: "абв ", count: 1000)
+        let entry = TrashEntry(documentID: "d", document: long, metadata: nil, embedding: [1],
+                               collectionName: "c", collectionMetric: nil, collectionModel: nil,
+                               collectionDimension: nil, reason: .document)
+        let trash = TrashService(fileURL: url)
+        try trash.record(entry)
+        let kept = try XCTUnwrap(trash.entries.first)
+        XCTAssertEqual(kept.document?.count, TrashEntry.previewCharacters)
+        XCTAssertTrue(kept.isDocumentTruncated)
+        let full = await trash.fullEntries(withIDs: [entry.id])
+        XCTAssertEqual(full.first?.document, long)
+
+        let reloaded = TrashService(fileURL: url)
+        XCTAssertEqual(reloaded.entries.first?.document?.count, TrashEntry.previewCharacters)
+        XCTAssertEqual(reloaded.totalBytes, trash.totalBytes, "оценка объёма — по полному тексту")
+    }
+
+    func testOrphanedStateFilesAreFoundButOnlyForMissingSources() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("orphans-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let alive = UUID(), gone = UUID()
+        func files(_ id: UUID) -> [URL] {
+            ["\(id).json", "\(id).previous.json", "\(id)-tables.json", "\(id)-tables.previous.json"]
+                .map { directory.appendingPathComponent($0) }
+        }
+        for url in files(alive) + files(gone) {
+            try Data("{}".utf8).write(to: url)
+        }
+        try Data("{}".utf8).write(to: directory.appendingPathComponent("прочее.json"))
+        let orphans = SourceStateFiles.orphans(keeping: [alive], in: directory)
+        XCTAssertEqual(Set(orphans.files.map(\.lastPathComponent)), Set(files(gone).map(\.lastPathComponent)))
+        XCTAssertEqual(orphans.bytes, 8)
+    }
+
+    /// Удаление источника стирает и прежние версии манифестов — каждое
+    /// хранилище своё.
+    func testRemovingASourceRemovesThePreviousVersionsToo() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("manifests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = UUID()
+        let manifests = ManifestStore(directory: directory)
+        let tables = TableManifestStore(directory: directory)
+        for url in [manifests.fileURL(for: id), tables.fileURL(for: id)] {
+            try Data("{}".utf8).write(to: url)
+            try Data("{}".utf8).write(to: JSONFileVersions.previousVersionURL(of: url))
+        }
+        manifests.remove(sourceID: id)
+        tables.remove(sourceID: id)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+}
+

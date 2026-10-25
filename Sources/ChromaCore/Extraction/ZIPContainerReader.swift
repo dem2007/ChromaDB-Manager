@@ -289,11 +289,45 @@ public final class ZIPContainerReader {
     ///
     /// Флаг выставлен, а UTF-8 не разбирается — запись пропускается, как и
     /// раньше: угадывать вопреки объявленному незачем.
+    ///
+    /// Какая из двух DOS-кодировок — решают сами байты. Русское слово в
+    /// CP866 — это несколько старших байтов **подряд** («Отчёт» — пять);
+    /// западное имя в CP437 — одиночные буквы с диакритикой между латиницей
+    /// («Café», «Müller»). Имя, где каждый старший байт стоит один между
+    /// буквами ASCII, читается как CP437: иначе «Müller» приезжал бы
+    /// кириллицей.
     static func entryName(_ raw: Data, declaresUTF8: Bool) -> String? {
         if let utf8 = String(data: raw, encoding: .utf8) { return utf8 }
         guard !declaresUTF8 else { return nil }
+        if looksWestern(raw), let western = String(data: raw, encoding: dosLatinUS) {
+            return western
+        }
         return String(data: raw, encoding: FileNameEncoding.dosRussian)
             ?? String(data: raw, encoding: .isoLatin1)
+    }
+
+    /// CP437 — кодировка имён ZIP по умолчанию.
+    static let dosLatinUS = String.Encoding(
+        rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.dosLatinUS.rawValue))
+    )
+
+    /// Каждый старший байт — одиночный и стоит рядом с буквой ASCII.
+    static func looksWestern(_ raw: Data) -> Bool {
+        let bytes = [UInt8](raw)
+        var sawHigh = false
+        for (index, byte) in bytes.enumerated() where byte >= 0x80 {
+            sawHigh = true
+            let before = index > 0 ? bytes[index - 1] : nil
+            let after = index + 1 < bytes.count ? bytes[index + 1] : nil
+            if let before, before >= 0x80 { return false }
+            if let after, after >= 0x80 { return false }
+            func isLetter(_ value: UInt8?) -> Bool {
+                guard let value else { return false }
+                return (0x41...0x5A).contains(value) || (0x61...0x7A).contains(value)
+            }
+            guard isLetter(before) || isLetter(after) else { return false }
+        }
+        return sawHigh
     }
 
     /// Zip-slip. The path is never written to disk here, but it *is*

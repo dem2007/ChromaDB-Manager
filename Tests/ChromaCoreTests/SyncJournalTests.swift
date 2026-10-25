@@ -11,6 +11,8 @@ actor FailingDatabase: SyncDatabase {
     enum Step: Hashable {
         case upsert
         case delete
+        /// Поиск коллекции по имени — сбой связи, а не «коллекции нет».
+        case resolve
     }
 
     /// Collection name → document id → document text.
@@ -78,6 +80,7 @@ actor FailingDatabase: SyncDatabase {
     }
 
     func resolveID(of name: String) async throws -> String {
+        try checkFailure(.resolve)
         guard let id = ids[name] else { throw ChromaError.collectionNotFound(name) }
         return id
     }

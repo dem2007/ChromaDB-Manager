@@ -355,3 +355,29 @@ final class SavedFilterStoreTests: XCTestCase {
         XCTAssertEqual(plain.identityKey, worded.identityKey)
     }
 }
+
+/// Фильтр одной строкой — подпись запроса на стенде оценки.
+final class FilterSummaryTests: XCTestCase {
+    func testConditionsAndTextReadAsOneLine() {
+        var filter = DocumentFilter(root: .group(.and, [
+            .leaf(MetadataCondition(field: "source_file", op: .equals, value: "ТЗ.docx")),
+            .group(.or, [
+                .leaf(MetadataCondition(field: "year", op: .greaterOrEqual, value: "2025")),
+                .leaf(MetadataCondition(field: "kind", op: .equals, value: "договор")),
+            ]),
+            .leaf(MetadataCondition(field: "", op: .equals, value: "")),
+        ]))
+        filter.textConditions = [DocumentTextCondition(text: "КС3")]
+        XCTAssertEqual(filter.summary, "source_file = ТЗ.docx И (year ≥ 2025 ИЛИ kind = договор); текст содержит «КС3»")
+    }
+
+    func testAnEmptyFilterSaysNothing() {
+        XCTAssertNil(DocumentFilter().summary)
+    }
+
+    func testRawJSONIsShownCompacted() {
+        var filter = DocumentFilter()
+        filter.rawWhereJSON = "{\n  \"year\": 2025\n}"
+        XCTAssertEqual(filter.summary, "{ \"year\": 2025 }")
+    }
+}

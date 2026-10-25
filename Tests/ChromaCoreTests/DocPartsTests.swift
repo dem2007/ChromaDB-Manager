@@ -254,4 +254,67 @@ final class DocTextTests: XCTestCase {
         XCTAssertEqual(document.paragraphs.first?.isBold, true)
         XCTAssertEqual(document.paragraphs.last?.isBold, false)
     }
+
+    // MARK: - Нумерация списков
+
+    private let outline = DocFixture.DocList(id: 7, levels: [
+        (format: 0, text: "%1.", start: 1),
+        (format: 0, text: "%1.%2.", start: 1),
+    ])
+
+    /// Номер пункта — свойство абзаца, а не текст: без разбора таблиц
+    /// списков договор приходил в базу без единого номера.
+    func testListNumbersComeFromTheListTables() throws {
+        let document = try parts(DocFixture(
+            paragraphs: ["Общие положения", "Предмет договора", "Сроки", "Требования", "Состав работ"],
+            lists: [outline],
+            listInstances: [DocFixture.DocListInstance(listID: 7)],
+            paragraphLists: [0: (1, 0), 1: (1, 1), 2: (1, 1), 3: (1, 0), 4: (1, 1)]
+        ))
+        XCTAssertEqual(document.paragraphs.map(\.rendered), [
+            "1. Общие положения", "1.1. Предмет договора", "1.2. Сроки", "2. Требования", "2.1. Состав работ",
+        ])
+    }
+
+    /// «Начать заново» в `.doc` перезапускает общий счёт — с уровня
+    /// абзаца — и дальше экземпляры считают вместе (правило сверено
+    /// по оглавлениям 296 файлов).
+    func testARestartContinuesTheSharedCountFromItsOwnLevel() throws {
+        let document = try parts(DocFixture(
+            paragraphs: ["Раздел", "Пункт", "Пункт", "Заново", "Дальше", "Новый раздел"],
+            lists: [outline],
+            listInstances: [
+                DocFixture.DocListInstance(listID: 7),
+                DocFixture.DocListInstance(listID: 7, restarts: Dictionary(uniqueKeysWithValues: (0..<9).map { ($0, 1) })),
+            ],
+            paragraphLists: [0: (1, 0), 1: (1, 1), 2: (1, 1), 3: (2, 1), 4: (1, 1), 5: (1, 0)]
+        ))
+        XCTAssertEqual(document.paragraphs.compactMap(\.marker), ["1.", "1.1.", "1.2.", "1.1.", "1.2.", "2."])
+    }
+
+    /// Экземпляр 0 — «без списка»; русские буквы — свой вид номера.
+    func testInstanceZeroRemovesNumberingAndRussianLettersAreKept() throws {
+        let letters = DocFixture.DocList(id: 9, levels: [(format: 58, text: "%1)", start: 1)])
+        let document = try parts(DocFixture(
+            paragraphs: ["первое", "без номера", "второе"],
+            lists: [letters],
+            listInstances: [DocFixture.DocListInstance(listID: 9)],
+            paragraphLists: [0: (1, 0), 1: (0, 0), 2: (1, 0)]
+        ))
+        XCTAssertEqual(document.paragraphs.map(\.rendered), ["а) первое", "без номера", "б) второе"])
+    }
+
+    /// Разрыв раздела закрывает абзац: подпись перед ним и заголовок
+    /// после него — два абзаца, у каждого свой стиль. Раньше разрыв читался
+    /// пробелом, и заголовок пропадал внутри подписи.
+    func testASectionBreakEndsTheParagraph() async throws {
+        let document = try await extracted(DocFixture(
+            paragraphs: ["Рисунок 1 – Схема", "Требования к ролевой модели", "Текст раздела."],
+            styles: [DocFixture.DocStyle(name: "heading 4", sti: 4, outlineLevel: 3)],
+            paragraphStyles: [1: 1],
+            sectionBreaks: [0]
+        ))
+        XCTAssertEqual(document.structure.map(\.title), ["Требования к ролевой модели"])
+        XCTAssertTrue(document.plainText.contains("Рисунок 1 – Схема\n"), document.plainText)
+    }
 }

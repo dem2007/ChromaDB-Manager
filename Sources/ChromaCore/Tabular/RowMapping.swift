@@ -226,6 +226,17 @@ public struct TableRowDocument: Hashable, Sendable {
         self.rowKey = rowKey
         self.truncatedColumns = truncatedColumns
     }
+
+    /// Тот же документ с полями файла: имя, отпечаток, уровни пути,
+    /// свои поля источника. Колонка строки с тем же именем важнее — она
+    /// говорит о самой записи.
+    public func with(shared: ChromaMetadata) -> TableRowDocument {
+        guard !shared.isEmpty else { return self }
+        return TableRowDocument(
+            id: id, text: text, metadata: shared.merging(metadata) { _, own in own },
+            rowKey: rowKey, truncatedColumns: truncatedColumns
+        )
+    }
 }
 
 /// Сколько листов книги вообще попало в базу.
@@ -257,7 +268,7 @@ public struct SheetCoverage: Sendable, Hashable {
 public enum RowMapper {
     /// Auto fields every table row carries (Приложение 4).
     public static let autoMetadataKeys = [
-        "source_file", "file_id", "sheet_name", "row_number", "row_key", "table_mode",
+        "source_file", "file_id", "sheet_name", "sheet_index", "row_number", "row_key", "table_mode",
         "sheets_indexed", "sheets_total",
     ]
 
@@ -273,13 +284,18 @@ public enum RowMapper {
     ///   Выключается там, где нужен **свой** текст строки: строка, у которой
     ///   заполнен один артикул, документом не становится, и решать это
     ///   по тексту с дописанным артикулом нельзя — он не пуст никогда.
+    /// - Parameter overrides: значения колонок для текста вместо значений
+    /// из файла — путь записи в её главной колонке. Метаданные
+    ///   их не видят: там остаётся то, что в ячейке.
     public static func text(
         for row: SheetRow,
         mapping: TableMapping,
         layout: SheetLayout,
-        includingKey: Bool = true
+        includingKey: Bool = true,
+        overrides: [String: String] = [:]
     ) -> String {
         func value(_ column: String) -> String {
+            if let override = overrides[column] { return override }
             guard let index = layout.index(of: column) else { return "" }
             return row.value(at: index).displayText
         }
@@ -401,7 +417,12 @@ public enum RowMapper {
 
     // MARK: - Metadata
 
+    /// Число в метаданные — без хвоста двоичной дроби, как и в тексте
+    /// строки: текст «98097.3» при поле 98097.29999999997 не находил
+    /// фильтр `= 98097.3`, а агент, читающий колонку полем, видел мусорные
+    /// разряды.
     private static func numeric(_ value: Double) -> MetadataValue {
+        let value = CellValue.significant(value)
         if value == value.rounded(), abs(value) < 9e15 { return .int(Int(value)) }
         return .double(value)
     }
@@ -479,7 +500,8 @@ public enum RowMapper {
         /// (П6.16) — тем же правилом, что у обычных документов.
         sourceID: UUID?,
         rowKey: String?,
-        coverage: SheetCoverage? = nil
+        coverage: SheetCoverage? = nil,
+        sheetIndex: Int? = nil
     ) -> (metadata: ChromaMetadata, truncated: [String]) {
         var result: ChromaMetadata = [
             "source_file": .string(sourceFile),
@@ -492,6 +514,7 @@ public enum RowMapper {
             "table_mode": .string(mapping.mode.rawValue),
         ]
         if let rowKey, !rowKey.isEmpty { result["row_key"] = .string(rowKey) }
+        if let sheetIndex { result["sheet_index"] = .int(sheetIndex) }
 
         // Книга в базе не целиком: строка несёт это с собой, чтобы
         // тот, кто по ней считает, знал, что видит часть.
@@ -567,14 +590,24 @@ public enum RowMapper {
     ///
     /// The row *number* is never the id on its own: inserting one row in the
     /// middle would shift everything below it and re-index the whole sheet.
+    ///
+    /// Файл — часть идентификатора. Без него строки с одним ключом из разных
+    /// файлов источника — помесячные прайсы, отчёты отделов, всё, что читается
+    /// одним профилем «любой подходящий лист», — получали один id: последний
+    /// записанный файл затирал остальные, оба манифеста считали документ
+    /// своим, и решение об исчезнувших строках одного файла удаляло строку
+    /// другого. Лист — настоящий лист книги, а не тот, на котором профиль
+    /// размечали.
     public static func identifier(
         sourceID: UUID,
+        sourceFile: String,
         sheetName: String,
         key: String?,
         rowContent: String
     ) -> String {
-        let seed = key.map { "\(sourceID.uuidString)\u{0}\(sheetName)\u{0}key\u{0}\($0)" }
-            ?? "\(sourceID.uuidString)\u{0}\(sheetName)\u{0}row\u{0}\(rowContent)"
+        let scope = "\(sourceID.uuidString)\u{0}\(sourceFile)\u{0}\(sheetName)"
+        let seed = key.map { "\(scope)\u{0}key\u{0}\($0)" }
+            ?? "\(scope)\u{0}row\u{0}\(rowContent)"
         return SHA256.hash(data: Data(seed.utf8))
             .compactMap { String(format: "%02x", $0) }
             .joined()
@@ -587,6 +620,26 @@ public enum RowMapper {
         row.values(width: width).map(\.displayText).joined(separator: "\u{1}")
     }
 
+    // MARK: - Строки данных
+
+    /// Строки, из которых получаются записи: непустые, под заголовком, без
+    /// ряда нумерации граф сразу под ним. Ряд «1 | 2 | 3 | …» ставят
+    /// под шапкой формы, чтобы ссылаться на графы; записью он становился
+    /// с полями 1…102 и текстом «Наименование: 2 / Роль: 3».
+    /// Строки, которые закрывают объединённые вниз подписи шапки, — её
+    /// продолжение, а не записи.
+    public static func dataRows(
+        _ rows: [SheetRow], below headerRow: Int?, layout: SheetLayout, merges: [XLSXReader.MergedRange] = []
+    ) -> [SheetRow] {
+        let first = headerRow.map { SheetHeaderLabels.continuationEnd(headerRow: $0, merges: merges) + 1 } ?? Int.min
+        var result = rows.filter { $0.number >= first && !$0.isEmpty }
+        if headerRow != nil, let top = result.first {
+            let cells = (0..<max(layout.width, top.lastColumn + 1)).map { top.value(at: $0).displayText }
+            if TableText.isColumnNumbering(cells) { result.removeFirst() }
+        }
+        return result
+    }
+
     // MARK: - Whole document
 
     public static func document(
@@ -595,7 +648,9 @@ public enum RowMapper {
         layout: SheetLayout,
         sourceID: UUID,
         sourceFile: String,
-        coverage: SheetCoverage? = nil
+        coverage: SheetCoverage? = nil,
+        sheetIndex: Int? = nil,
+        overrides: [String: String] = [:]
     ) -> TableRowDocument? {
         // A row whose text columns are all empty has nothing to embed. It is
         // not an error and not a silent drop — the caller counts it. Считается
@@ -605,8 +660,13 @@ public enum RowMapper {
         //
         // Текст считается **один раз**: ключ дописывается к готовому телу,
         // а не вторым проходом по шаблону.
-        let body = text(for: row, mapping: mapping, layout: layout, includingKey: false)
-        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        //
+        // Пуста ли строка — по её **собственному** тексту: путь записи
+        // пустую строку документом не делает.
+        let own = text(for: row, mapping: mapping, layout: layout, includingKey: false)
+        guard !own.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let body = overrides.isEmpty ? own
+            : text(for: row, mapping: mapping, layout: layout, includingKey: false, overrides: overrides)
         let text = keyed(body, for: row, mapping: mapping, layout: layout)
 
         let rowKey = mapping.keyColumn
@@ -617,13 +677,15 @@ public enum RowMapper {
         let width = layout.width
         let id = identifier(
             sourceID: sourceID,
+            sourceFile: sourceFile,
             sheetName: mapping.sheetName,
             key: rowKey,
             rowContent: contentSeed(for: row, width: width)
         )
         let fields = metadataAndTruncations(
             for: row, mapping: mapping, layout: layout,
-            sourceFile: sourceFile, sourceID: sourceID, rowKey: rowKey, coverage: coverage
+            sourceFile: sourceFile, sourceID: sourceID, rowKey: rowKey, coverage: coverage,
+            sheetIndex: sheetIndex
         )
         return TableRowDocument(
             id: id,

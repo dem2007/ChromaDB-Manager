@@ -22,6 +22,11 @@ enum TableGeometry {
     struct Word {
         var box: CGRect
         var text: String
+        /// Перед знаком в тексте страницы стоит пробел. Граница слова
+        /// по тексту, а не по промежутку: в ужатой ячейке пробел шириной
+        /// 0,2 пункта, и по промежутку «Наименование характеристики»
+        /// склеивалось в одно слово.
+        var spaceBefore = false
     }
 
     /// Одна ячейка: где стоит и что в ней.
@@ -127,9 +132,12 @@ enum TableGeometry {
                     start = Double(word.box.minX)
                 } else if previous != nil, separated {
                     current.append(" ")
-                } else if let previous, Double(word.box.minX - previous.maxX) > space {
-                    // Обычный пробел между словами: у знаков его в тексте нет,
-                    // потому что пробелы отброшены вместе с прочими пустыми.
+                } else if let previous,
+                          Double(word.box.minX - previous.maxX) > space || word.spaceBefore {
+                    // Пробел между словами. Сами пробелы как куски не идут —
+                    // у них нет начертания, — поэтому он ставится по промежутку
+                    // или по пробелу документа перед знаком: в ужатой
+                    // ячейке промежутка не видно, а пробел в тексте есть.
                     current.append(" ")
                 }
                 current.append(word.text)
@@ -137,7 +145,7 @@ enum TableGeometry {
                 previous = word.box
             }
             cells.append(Cell(minX: start, maxX: end, text: current.trimmingCharacters(in: .whitespaces)))
-            let filled = cells.filter { !$0.text.isEmpty }
+            let filled = joiningJustified(cells.filter { !$0.text.isEmpty })
             guard !filled.isEmpty else { continue }
             result.append(Line(y: Double(sorted[0].box.midY), height: height, cells: filled))
         }
@@ -194,7 +202,63 @@ enum TableGeometry {
         return result.filter { !$0.isEmpty }
     }
 
+    /// Строка, выровненная по ширине, — одна ячейка, а не столько, сколько
+    /// в ней слов.
+    ///
+    /// **Что было.** Порог «граница колонки» считается от роста знака,
+    /// а рост — по строчным буквам: у кегля 12 это 5,2 пункта, и граница
+    /// выходила в 5 пунктов. Выключка по формату растягивает пробелы до 5–11
+    /// пунктов, и каждая растянутая строка договора резалась по словам. Слов
+    /// на странице много, начала их случайно совпадают по вертикали — и
+    /// страница текста уходила в базу таблицей в десять колонок, без сшивки
+    /// абзацев. Замер на 58 PDF корпуса: 159 «табличных» страниц, из них
+    /// 12 — обычный текст, и 447 ложных оговорок «таблица не собрана».
+    ///
+    /// **Признак — ровность промежутков.** Выключка растягивает все пробелы
+    /// строки одинаково; между колонками таблицы промежутки разные, потому
+    /// что разной длины значения. Строка от четырёх ячеек, где хотя бы три
+    /// промежутка и семь десятых всех почти равны медиане, а в ячейках
+    /// буквы, — это текст: ровные промежутки склеиваются, заметно более
+    /// широкий (номер пункта с табуляцией) остаётся границей. Числовая
+    /// строка таблицы букв не содержит и под правило не попадает.
+    static func joiningJustified(_ cells: [Cell]) -> [Cell] {
+        guard cells.count >= 4 else { return cells }
+        var gaps: [Double] = []
+        for index in 1..<cells.count { gaps.append(cells[index].minX - cells[index - 1].maxX) }
+        let sorted = gaps.sorted()
+        let median = sorted[sorted.count / 2]
+        let band = max(1.5, median * 0.2)
+        let even = gaps.filter { abs($0 - median) <= band }.count
+        guard even >= 3, Double(even) >= Double(gaps.count) * 0.7 else { return cells }
+        let wordy = cells.filter { $0.text.contains { $0.isLetter } }.count
+        guard Double(wordy) >= Double(cells.count) * 0.6 else { return cells }
+        var result = [cells[0]]
+        for index in 1..<cells.count {
+            if gaps[index - 1] <= median + band {
+                result[result.count - 1].maxX = cells[index].maxX
+                result[result.count - 1].text += " " + cells[index].text
+            } else {
+                result.append(cells[index])
+            }
+        }
+        return result
+    }
+
     // MARK: - Строки в таблицу
+
+    /// Кусок страницы: таблица в Markdown или строки обычного текста.
+    ///
+    /// Строки текста отдаются как есть, а сшиваются в абзацы потом — тем,
+    /// у кого есть словарь документа для дефисов. Раньше каждая
+    /// строка текста на «табличной» странице становилась своим абзацем,
+    /// и предложение, перенесённое на две строки, рвалось пустой строкой.
+    enum PageBlock: Equatable {
+        /// Строки таблицы, первая — шапка. `edges` — границы колонок
+        /// таблицы по рамке: по ним таблица, продолженная на следующей
+        /// странице, узнаётся как та же самая.
+        case table(rows: [[String]], edges: [Double]?)
+        case text([String])
+    }
 
     /// Страница, собранная по координатам. `nil` — таблиц на ней нет,
     /// и тогда всё остаётся как было.
@@ -204,7 +268,24 @@ enum TableGeometry {
     /// отступ, и номер страницы в углу. Признак — **повторяемость отступа**:
     /// три и более строки подряд, у которых ячейки начинаются на одних и тех же
     /// отступах. Без этого условия таблицей объявлялись три страницы из четырёх.
-    static func text(of lines: [Line]) -> String? { assess(lines).text }
+    static func text(of lines: [Line]) -> String? {
+        assess(lines).blocks.map { render($0, vocabulary: .empty) }
+    }
+
+    /// Блоки — в текст: таблицы как есть, строки текста — сшитыми.
+    static func render(_ blocks: [PageBlock], vocabulary: PDFTextReflow.Vocabulary) -> String {
+        blocks.map { block -> String in
+            switch block {
+            // Записи сводятся здесь, при выводе: к этому времени таблица,
+            // продолженная со страницы на страницу, уже получила шапку
+            // и все свои строки.
+            case .table(let rows, _): return TableText.render(TableRecords.merged(rows))
+            case .text(let lines): return PDFTextReflow.page(lines.joined(separator: "\n"), vocabulary: vocabulary)
+            }
+        }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n\n")
+    }
 
     /// То же, но со вторым ответом: **была ли на странице таблица**, которую
     /// собрать не удалось.
@@ -214,7 +295,7 @@ enum TableGeometry {
     /// для агента, считающего смету, совершенно разные страницы, а в тексте
     /// они выглядят одинаково. Живой случай: из семи страниц собрались три,
     /// остальные ушли плоским текстом, и по ним посчитали смету.
-    static func assess(_ lines: [Line]) -> (text: String?, unassembledTable: Bool) {
+    static func assess(_ lines: [Line], separated: Bool = false) -> (blocks: [PageBlock]?, unassembledTable: Bool) {
         guard !lines.isEmpty else { return (nil, false) }
         let tolerance = max(minimumColumnGap, (lines.first?.height ?? 10) * columnGapRatio)
         let columns = supportedColumns(in: lines, tolerance: tolerance)
@@ -225,47 +306,249 @@ enum TableGeometry {
                 columns.firstIndex { abs($0 - cell.minX) <= tolerance }
             })
         }
+        let indexes = lines.map(columnIndexes)
 
-        var blocks: [String] = []
+        var blocks: [PageBlock] = []
+        var prose: [String] = []
         var table: [Line] = []
         var found = 0
         /// Строки, стоявшие по колонкам, но в таблицу не сложившиеся.
         var refused = 0
 
+        func text(_ line: String) {
+            guard !line.isEmpty else { return }
+            prose.append(line)
+        }
+        func closeProse() {
+            if !prose.isEmpty { blocks.append(.text(prose)) }
+            prose = []
+        }
         func flush() {
             defer { table = [] }
+            // Нумерованные пункты с номером на табуляции («1.1.1.» и текст
+            // пункта) встают по двум отступам, как колонки. Это список,
+            // а не таблица: он идёт текстом и несобранной таблицей
+            // не считается — иначе оговорка «таблица осталась плоским
+            // текстом» стояла на каждой странице договора.
+            // Между пунктами бывают строки текста, случайно вставшие в две
+            // «ячейки», поэтому — по большинству.
+            let split = table.filter { $0.cells.count >= 2 }
+            let numbered = split.filter(isNumberedItem).count
+            if numbered > 0, numbered * 2 >= split.count {
+                table.map(\.text).forEach(text)
+                return
+            }
             let grid = table.count >= minimumRows ? aligned(table) : []
+            // Схема со скана — не таблица, и не «несобранная таблица» тоже:
+            // оговорка про числа, на которые нельзя опираться, о ней ложна.
+            if separated, isSplitAcrossRows(grid) {
+                table.map(\.text).forEach(text)
+                return
+            }
             guard let width = grid.first?.count, width > 1, width <= maximumColumns,
                   looksLikeTable(grid)
             else {
-                if table.count >= minimumRows { refused += table.count }
-                blocks.append(contentsOf: table.map(\.text).filter { !$0.isEmpty })
+                // Несобранной таблицей считается та, где есть числа: оговорка
+                // говорит «на числа оттуда опираться нельзя», и для подписей
+                // сторон в две колонки или строк с прочерками она ложна
+                //. Замер на договоре: 41 страница с оговоркой, из них
+                // с числами — меньше половины.
+                let cells = table.flatMap(\.cells)
+                let numeric = cells.filter { $0.text.contains(where: \.isNumber) }.count
+                if table.count >= minimumRows, numeric * 3 >= cells.count { refused += table.count }
+                table.map(\.text).forEach(text)
                 return
             }
             found += grid.count
-            blocks.append(TableText.render(grid))
+            closeProse()
+            blocks.append(.table(rows: grid, edges: nil))
         }
 
-        for line in lines {
-            if columnIndexes(of: line).count >= 2 {
+        for (index, line) in lines.enumerated() {
+            if indexes[index].count >= 2 {
                 table.append(line)
                 continue
             }
+            // Перенос внутри ячейки: строка из одной ячейки, стоящая
+            // ровно в колонке таблицы, — продолжение длинного значения, если
+            // таблица уже идёт и продолжается следом. Раньше такая строка
+            // рвала таблицу, и страница прайса, где у каждой позиции название
+            // в две строки, уходила плоским текстом — цены отдельно от
+            // позиций. Строка не в первой колонке — перенос наверняка: так
+            // текст абзаца не начинается.
+            if !table.isEmpty, line.cells.count == 1, let only = indexes[index].first {
+                let resumes = lines.indices.dropFirst(index + 1).prefix(2).contains { indexes[$0].count >= 2 }
+                if only > 0 || resumes {
+                    table.append(line)
+                    continue
+                }
+            }
             flush()
-            let text = line.text
-            if !text.isEmpty { blocks.append(text) }
+            text(line.text)
         }
         flush()
+        closeProse()
 
         // Страница не сложилась в таблицу. Но если табличные строки на ней
         // были — а их набралось на целую таблицу, — молчать об этом нельзя:
         // текст уйдёт к агенту сеткой чисел без названий колонок.
+        //
+        // Таблица на малой доле страницы уходит текстом: так подписи блоков
+        // на схеме и маркированные списки не становятся «таблицами». Но
+        // оговорки «не собрана» она больше не даёт: собраться она
+        // собралась, а страница просто не табличная. Оговорку дают только
+        // несобранные строки с числами.
         guard found >= minimumRows, Double(found) / Double(lines.count) >= tableShare else {
-            return (nil, refused + found >= minimumRows)
+            return (nil, refused >= minimumRows)
         }
-        let text = blocks.joined(separator: "\n\n")
         // Часть страницы собралась, часть — нет: та часть тоже уйдёт плоской.
-        return (text.isEmpty ? nil : text, refused >= minimumRows)
+        return (blocks, refused >= minimumRows)
+    }
+
+    /// Страница с таблицами по рамке и текстом вокруг.
+    ///
+    /// Таблицы по рамке собираются первыми и забирают свой текст; остальной
+    /// текст идёт по порядку сверху вниз, кусками между таблицами, и каждый
+    /// кусок ещё проверяется на таблицу без рамки. Без рамки на странице —
+    /// всё как раньше.
+    /// Подпись колонки длиннее этого — не подпись: так выглядит схема,
+    /// рамки которой сложились в сетку.
+    static let maximumHeaderCell = 300
+
+    /// Сетка — схема, а не таблица: в первой строке ячейка длиннее подписи.
+    static func isDiagram(_ rows: [[String]]) -> Bool {
+        rows.first?.contains { $0.count > maximumHeaderCell } ?? false
+    }
+
+    /// Сколько пар «ячейка над ячейкой» нужно, чтобы судить о разрывах:
+    /// у таблицы в две строки одна оборванная подпись — ещё не схема.
+    static let minimumSplitPairs = 3
+    /// Доля пар-продолжений, начиная с которой сетка — схема.
+    static let splitShare = 0.3
+
+    /// Текст ячеек разорван по строкам сетки: ячейка кончается переносом
+    /// («Предостав-»), а под ней — продолжение со строчной буквы («ление
+    /// АРІ-ин-», «терфейсов»).
+    ///
+    /// **Схема, а не таблица.** На распознанной схеме рамки блоков
+    /// складываются в сетку, но блоки не стоят рядами, и строки сетки режут
+    /// их поперёк: подпись блока в три строки уходит в три строки таблицы,
+    /// в соседние колонки — обрывки соседних блоков («(F», «Эле», «пре»).
+    /// У настоящей таблицы с рамкой многострочное значение остаётся
+    /// в одной ячейке — сетку там рисует сама рамка ячейки.
+    ///
+    /// Сетка с колонкой чисел — таблица, даже с разрывами: у прайса со скана
+    /// распознавание срезает заглавные («програминое обеспечение #6.1»),
+    /// и строки начинаются со строчной, но количество и цены стоят своей
+    /// колонкой. В блоках схемы чистых чисел нет.
+    ///
+    /// Замер на корпусе (сканы): из 149 «таблиц» со схем архитектуры
+    /// отбраковано 122; из 31 настоящей распознанной таблицы (прайсы,
+    /// спецификации) — ни одной. На векторных PDF и Word признак не годится:
+    /// там ячейка законно начинается со строчной («шт.», «да», «в т. ч.»), —
+    /// и проверяется он только у сканов.
+    static func isSplitAcrossRows(_ rows: [[String]]) -> Bool {
+        guard !hasNumericColumn(rows) else { return false }
+        var pairs = 0
+        var continued = 0
+        for (upper, lower) in zip(rows, rows.dropFirst()) {
+            for (above, below) in zip(upper, lower) where !above.isEmpty && !below.isEmpty && above != below {
+                pairs += 1
+                if above.hasSuffix("-") || (below.first.map { $0.isLetter && $0.isLowercase } ?? false) {
+                    continued += 1
+                }
+            }
+        }
+        return pairs >= minimumSplitPairs && Double(continued) >= Double(pairs) * splitShare
+    }
+
+    /// Есть ли колонка, где не меньше половины значений — числа («1»,
+    /// «2 345 678,00»), и таких значений хотя бы три.
+    static func hasNumericColumn(_ rows: [[String]]) -> Bool {
+        let width = rows.map(\.count).max() ?? 0
+        return (0..<width).contains { column in
+            let values = rows.compactMap { column < $0.count && !$0[column].isEmpty ? $0[column] : nil }
+            let numbers = values.filter { value in
+                value.contains(where: \.isNumber)
+                    && value.allSatisfy { $0.isNumber || $0 == " " || $0 == "." || $0 == "," || $0 == "\u{00A0}" }
+            }
+            return numbers.count >= 3 && numbers.count * 2 >= values.count
+        }
+    }
+
+    static func page(
+        words: [Word], grids: [TableLattice.Grid], height: Double, separated: Bool = false
+    ) -> (blocks: [PageBlock]?, unassembledTable: Bool) {
+        var tables: [(top: Double, block: PageBlock)] = []
+        var used: Set<Int> = []
+        for grid in grids {
+            guard let (spanned, taken) = TableLattice.table(grid, words: words, height: height, separated: separated)
+            else { continue }
+            // Название таблицы первой строкой внутри рамки — строкой текста
+            // над таблицей.
+            let (caption, table) = spanned.separatingCaption()
+            let rows = table.rows(mergingRecords: false)
+            guard rows.count >= 1 else { continue }
+            // Схема со скана: рамки блоков сложились в сетку, а её
+            // строки режут блоки поперёк. Сетку не берём совсем — слова
+            // остаются строками текста страницы, в своём порядке.
+            if separated, isSplitAcrossRows(rows) { continue }
+            // Схема-рисунок, а не таблица: рамки блоков на схеме
+            // складываются в сетку, и в «шапку» уходит распознанный текст
+            // целого блока — 1666 знаков в одной ячейке. Подпись колонки
+            // такой не бывает. Текст схемы остаётся, но строками: шапка
+            // из него, дописанная к каждому куску, раздувала бы их вдвое.
+            if isDiagram(rows) {
+                // Блок, объединённый вниз, нормализация повторила в каждой
+                // строке; у схемы строк нет, и повтор — просто дубль.
+                var seen: Set<String> = []
+                let text = ([caption].compactMap { $0 } + rows.flatMap { $0 })
+                    .filter { !$0.isEmpty && seen.insert($0).inserted }
+                tables.append((grid.ys[0], .text(text)))
+                used.formUnion(taken)
+                continue
+            }
+            if let caption { tables.append((grid.ys[0] + 0.001, .text([caption]))) }
+            tables.append((grid.ys[0], .table(rows: rows, edges: grid.xs)))
+            used.formUnion(taken)
+        }
+        let outside = words.enumerated().filter { !used.contains($0.offset) }.map(\.element)
+        let lines = lines(from: outside, height: height, separated: separated)
+        guard !tables.isEmpty else { return assess(lines, separated: separated) }
+
+        var blocks: [PageBlock] = []
+        var unassembled = false
+        var run: [Line] = []
+        func closeRun() {
+            defer { run = [] }
+            guard !run.isEmpty else { return }
+            let assessed = assess(run, separated: separated)
+            if let found = assessed.blocks {
+                blocks += found
+                unassembled = unassembled || assessed.unassembledTable
+            } else {
+                blocks.append(.text(run.map(\.text).filter { !$0.isEmpty }))
+                unassembled = unassembled || assessed.unassembledTable
+            }
+        }
+        var pending = tables.sorted { $0.top > $1.top }
+        for line in lines {
+            while let next = pending.first, next.top >= line.y {
+                closeRun()
+                blocks.append(next.block)
+                pending.removeFirst()
+            }
+            run.append(line)
+        }
+        closeRun()
+        blocks += pending.map(\.block)
+        return (blocks, unassembled)
+    }
+
+    /// Строка — пункт с номером: номер отдельной ячейкой, за ним текст.
+    static func isNumberedItem(_ line: Line) -> Bool {
+        guard line.cells.count == 2, let first = line.cells.first?.text, first.count <= 12 else { return false }
+        return PDFTextReflow.startsWithListMarker(first + " x")
     }
 
     /// Отступы, на которых начинаются ячейки **нескольких** строк.

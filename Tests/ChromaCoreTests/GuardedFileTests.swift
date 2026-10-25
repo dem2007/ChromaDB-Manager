@@ -270,7 +270,7 @@ final class GuardedFileTests: XCTestCase {
     func testAMissingFileIsNotWaitedFor() {
         let missing = root.appendingPathComponent("никогда-не-было.json")
         let started = Date()
-        XCTAssertNil(GuardedJSONFile<[String]>.readDataWithRetry(at: missing))
+        XCTAssertNil(JSONFileVersions.readDataWithRetry(at: missing))
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertLessThan(
             elapsed, 0.05,
@@ -282,7 +282,7 @@ final class GuardedFileTests: XCTestCase {
     func testAnExistingFileIsStillRead() throws {
         let url = root.appendingPathComponent("есть.json")
         try Data(#"["а"]"#.utf8).write(to: url)
-        XCTAssertEqual(GuardedJSONFile<[String]>.readDataWithRetry(at: url), try Data(contentsOf: url))
+        XCTAssertEqual(JSONFileVersions.readDataWithRetry(at: url), try Data(contentsOf: url))
     }
 
     /// И нечитаемый существующий — тот случай, ради которого повтор и есть, —
@@ -293,7 +293,7 @@ final class GuardedFileTests: XCTestCase {
         try unreadable(url)
 
         let started = Date()
-        XCTAssertNil(GuardedJSONFile<[String]>.readDataWithRetry(at: url))
+        XCTAssertNil(JSONFileVersions.readDataWithRetry(at: url))
         XCTAssertGreaterThan(
             Date().timeIntervalSince(started), 0.09,
             "файл на месте, но не читается — вот его и стоит подождать"

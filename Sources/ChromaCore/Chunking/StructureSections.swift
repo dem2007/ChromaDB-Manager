@@ -33,7 +33,58 @@ public enum DocumentStructureSections {
             let end = index + 1 < boundaries.count ? boundaries[index + 1] : length
             if end > start { result.append(start..<end) }
         }
+        return joiningBareHeadings(result, in: text, structure: structure)
+    }
+
+    /// Раздел, в котором нет ничего, кроме своего заголовка, — начало
+    /// следующего, а не кусок.
+    ///
+    /// «Раздел 2» и сразу «2.1 Общие положения» — две границы подряд, и
+    /// между ними один заголовок. Отдельным куском он не находится поиском
+    /// ни по чему, кроме своего названия, а у первого подраздела этого
+    /// названия нет (замер). Заголовок уходит в начало
+    /// следующего раздела: кусок остаётся вырезкой из текста, границы
+    /// разделов не сдвигаются, а у первого подраздела появляется раздел,
+    /// которому он принадлежит. Последний раздел текста не к чему
+    /// приклеить — он остаётся как есть.
+    static func joiningBareHeadings(
+        _ ranges: [Range<Int>], in text: String, structure: [DocumentNode]
+    ) -> [Range<Int>] {
+        guard ranges.count > 1 else { return ranges }
+        let titles = Dictionary(grouping: structure, by: \.start)
+            .mapValues { nodes in nodes.map { compact($0.title) }.joined() }
+        var result: [Range<Int>] = []
+        var pendingStart: Int?
+        // Разделы идут подряд: строка проходится один раз, от раздела к
+        // разделу, а не индексируется от начала для каждого.
+        var cursor = text.startIndex
+        var cursorOffset = 0
+        for (position, range) in ranges.enumerated() {
+            let start = pendingStart ?? range.lowerBound
+            pendingStart = nil
+            let lower = text.index(cursor, offsetBy: range.lowerBound - cursorOffset)
+            let upper = text.index(lower, offsetBy: range.count)
+            cursor = upper
+            cursorOffset = range.upperBound
+            // Голым может быть только раздел не длиннее своего заголовка
+            // с пробелами и переносами — длинный и сжимать незачем.
+            if position < ranges.count - 1, let title = titles[range.lowerBound], !title.isEmpty,
+               range.count <= title.count * 2 + 16 {
+                let body = compact(String(text[lower..<upper]))
+                if !body.isEmpty, title.hasPrefix(body) {
+                    pendingStart = start
+                    continue
+                }
+            }
+            result.append(start..<range.upperBound)
+        }
         return result
+    }
+
+    /// Текст без пробелов и переводов строк — заголовок в тексте и в оглавлении
+    /// разбит на строки по-разному.
+    private static func compact(_ text: String) -> String {
+        String(text.filter { !$0.isWhitespace })
     }
 
     /// The same ranges as text, trimmed, with empty sections dropped.

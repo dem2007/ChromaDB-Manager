@@ -85,6 +85,8 @@ public final class BackupService: @unchecked Sendable {
 
     /// Present while a copy is in flight; removed when the copy is verified.
     static let incompleteMarker = "_chromadbmanager_incomplete"
+    /// Заметка к копии: откуда она, когда и зачем.
+    static let noteFile = "_chromadbmanager_backup.txt"
     /// Free space required on top of the database size, as a fraction.
     public static let freeSpaceHeadroom = 0.2
 
@@ -124,6 +126,9 @@ public final class BackupService: @unchecked Sendable {
         guard fileManager.fileExists(atPath: source.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw BackupError.sourceMissing(source.path)
         }
+        if let holder = Self.liveServer(holding: source) {
+            throw BackupError.serverStillRunning(pid: holder.pid)
+        }
 
         try AppPaths.ensureDirectory(directory)
 
@@ -135,7 +140,16 @@ public final class BackupService: @unchecked Sendable {
         }
 
         let stamp = Self.stampFormatter.string(from: Date())
-        let name = "\(source.lastPathComponent)_\(stamp)"
+        // Имя — до секунды, и две копии в одну секунду (ручная и «перед
+        // обслуживанием», двойное нажатие) получили бы одну папку: вторая
+        // клала метку «копия не завершена» в первую, готовую, и та переставала
+        // восстанавливаться. Занятое имя получает номер.
+        var name = "\(source.lastPathComponent)_\(stamp)"
+        var attempt = 2
+        while fileManager.fileExists(atPath: directory.appendingPathComponent(name).path) {
+            name = "\(source.lastPathComponent)_\(stamp)-\(attempt)"
+            attempt += 1
+        }
         let destination = directory.appendingPathComponent(name, isDirectory: true)
 
         log(.info, "Бэкап", "Копирование \(source.path) → \(destination.path)")
@@ -153,9 +167,13 @@ public final class BackupService: @unchecked Sendable {
         // содержимое копируется внутрь по одному элементу: `copyItem` на
         // готовую папку не соглашается.
         let marker = destination.appendingPathComponent(Self.incompleteMarker)
-        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        // Без `withIntermediateDirectories`: чужая папка с тем же именем,
+        // возникшая между проверкой и этой строкой, — отказ, а не слияние.
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
         fileManager.createFile(atPath: marker.path, contents: Data("copy in progress\n".utf8))
-        for entry in try fileManager.contentsOfDirectory(atPath: source.path) {
+        // Заметка, оставшаяся в папке базы от прежних восстановлений, — чужая:
+        // у этой копии своя (или никакой).
+        for entry in try fileManager.contentsOfDirectory(atPath: source.path) where entry != Self.noteFile {
             try fileManager.copyItem(
                 at: source.appendingPathComponent(entry),
                 to: destination.appendingPathComponent(entry)
@@ -166,7 +184,7 @@ public final class BackupService: @unchecked Sendable {
             let metadata = "source: \(source.path)\ncreated: \(Date())\nnote: \(note)\n"
             do {
                 try metadata.write(
-                    to: destination.appendingPathComponent("_chromadbmanager_backup.txt"),
+                    to: destination.appendingPathComponent(Self.noteFile),
                     atomically: true,
                     encoding: .utf8
                 )
@@ -198,13 +216,24 @@ public final class BackupService: @unchecked Sendable {
     /// SQLite file of the same size. Not a checksum — reading 40 GB twice to
     /// prove a copy the filesystem just made is not worth the wait.
     private func verify(copy: URL, of source: URL) throws {
+        // Пути — относительные, какими их отдаёт сам обход. Отрезать корень
+        // строкой нельзя: обход пишет пути так, как они записаны на диске, —
+        // с настоящим регистром букв и с «/private» у «/tmp» и «/var». У базы,
+        // путь к которой в настройках набран другим регистром, ключи
+        // оригинала и копии не сходились ни разу: проверка падала на каждой
+        // копии, и копии перед обновлением не проходили вовсе. (С «/private»
+        // замена строкой срабатывала в середине пути и портила обе стороны
+        // одинаково — сходилось по случайности.)
         func inventory(_ url: URL) -> [String: Int64] {
             var result: [String: Int64] = [:]
-            guard let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return result }
-            for case let fileURL as URL in enumerator {
-                let relative = fileURL.path.replacingOccurrences(of: url.path + "/", with: "")
-                guard relative != Self.incompleteMarker else { continue }
-                result[relative] = Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            guard let enumerator = fileManager.enumerator(atPath: url.path) else { return result }
+            for case let relative as String in enumerator {
+                guard relative != Self.incompleteMarker, relative != Self.noteFile else { continue }
+                // Размер — только у файлов, как и прежде: у папки он зависит
+                // от файловой системы, а не от содержимого.
+                let attributes = enumerator.fileAttributes
+                let isFile = attributes?[.type] as? FileAttributeType == .typeRegular
+                result[relative] = isFile ? ((attributes?[.size] as? NSNumber)?.int64Value ?? 0) : 0
             }
             return result
         }
@@ -233,6 +262,35 @@ public final class BackupService: @unchecked Sendable {
 
     /// JSON export of one collection, for a server whose files we cannot touch.
     ///
+    /// Кладёт выгрузку под свободным именем.
+    ///
+    /// Имя — до секунды, и две выгрузки одной коллекции в одну секунду
+    /// (повторное извлечение и пересчёт, подтверждённые подряд; повтор после
+    /// мгновенного сбоя) писались в один файл: вторая затирала первую, и
+    /// свидетельство первой операции указывало на чужое содержимое. Занятое
+    /// имя получает номер, как у копий папки базы. Свободное имя проверяется
+    /// переносом, а не заранее: выгрузка длится долго, и проверенное
+    /// в начале имя к концу могло быть уже занято.
+    func place(_ data: Data, named base: String) throws -> URL {
+        let pending = directory.appendingPathComponent(".\(base)-\(UUID().uuidString).partial")
+        try data.write(to: pending, options: .atomic)
+        var name = "\(base).json"
+        var attempt = 2
+        while true {
+            let destination = directory.appendingPathComponent(name)
+            do {
+                try fileManager.moveItem(at: pending, to: destination)
+                return destination
+            } catch CocoaError.fileWriteFileExists {
+                name = "\(base)-\(attempt).json"
+                attempt += 1
+            } catch {
+                try? fileManager.removeItem(at: pending)
+                throw error
+            }
+        }
+    }
+
     /// Documents and metadata only — vectors are left out on purpose: they are
     /// exactly what is about to be recomputed, and they would multiply the file
     /// size for nothing.
@@ -244,8 +302,6 @@ public final class BackupService: @unchecked Sendable {
     ) async throws -> BackupEvidence {
         try AppPaths.ensureDirectory(directory)
         let stamp = Self.stampFormatter.string(from: Date())
-        let destination = directory
-            .appendingPathComponent("\(collection.name)_\(stamp).json")
 
         var rows: [[String: Any]] = []
         var offset = 0
@@ -274,7 +330,7 @@ public final class BackupService: @unchecked Sendable {
             "documents": rows,
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: destination, options: .atomic)
+        let destination = try place(data, named: "\(collection.name)_\(stamp)")
 
         let size = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
         log(.success, "Бэкап", "Экспорт коллекции «\(collection.name)»: \(rows.count) документов → \(destination.lastPathComponent) (\(size))")
@@ -324,7 +380,7 @@ public final class BackupService: @unchecked Sendable {
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .map { url in
                 let created = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
-                let note = try? String(contentsOf: url.appendingPathComponent("_chromadbmanager_backup.txt"), encoding: .utf8)
+                let note = try? String(contentsOf: url.appendingPathComponent(Self.noteFile), encoding: .utf8)
                 let source = note?
                     .split(separator: "\n")
                     .first { $0.hasPrefix("source: ") }
@@ -342,18 +398,67 @@ public final class BackupService: @unchecked Sendable {
 
     /// Restores a backup over a database directory. The current content is
     /// moved aside first, never deleted outright.
+    ///
+    /// Копия разворачивается **рядом** с базой, во временную папку, и только
+    /// целиком встаёт на её место. Прежде живая база отодвигалась, а копия
+    /// писалась прямо в её папку: оборвись копирование (нет места, ошибка
+    /// ввода-вывода, выход из приложения) — и на месте базы оставалась её
+    /// половина, а сама база лежала под другим именем в папке копий.
     public func restore(_ record: BackupRecord, to destination: URL) throws {
         guard !record.isIncomplete else {
             throw BackupError.incompleteBackup(record.name)
         }
-        if fileManager.fileExists(atPath: destination.path) {
-            let asideName = destination.lastPathComponent + "_before_restore_" + Self.stampFormatter.string(from: Date())
-            let aside = directory.appendingPathComponent(asideName, isDirectory: true)
-            try AppPaths.ensureDirectory(directory)
-            try fileManager.moveItem(at: destination, to: aside)
-            log(.warning, "Бэкап", "Текущая база сохранена как \(aside.lastPathComponent)")
+        if let holder = Self.liveServer(holding: destination) {
+            throw BackupError.serverStillRunning(pid: holder.pid)
         }
-        try fileManager.copyItem(at: record.url, to: destination)
+        let parent = destination.deletingLastPathComponent()
+        try AppPaths.ensureDirectory(parent)
+
+        // Места — на всю копию, до первого записанного байта: копия, упавшая
+        // посередине, хуже копии, которая не началась.
+        let required = directorySize(record.url)
+        if let available = (try? parent.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage, available < required {
+            throw BackupError.notEnoughSpace(required: required, available: available, directory: parent.path)
+        }
+
+        let stamp = Self.stampFormatter.string(from: Date())
+        let staging = parent.appendingPathComponent(
+            ".\(destination.lastPathComponent)_restoring_\(stamp)", isDirectory: true
+        )
+        try? fileManager.removeItem(at: staging)
+        do {
+            try fileManager.copyItem(at: record.url, to: staging)
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            throw error
+        }
+        // Заметка копии — про копию, а не про базу: оставленная в папке базы,
+        // она уехала бы в следующую копию и подписала бы её чужими словами.
+        try? fileManager.removeItem(at: staging.appendingPathComponent(Self.noteFile))
+
+        var aside: URL?
+        if fileManager.fileExists(atPath: destination.path) {
+            let asideName = destination.lastPathComponent + "_before_restore_" + stamp
+            let target = directory.appendingPathComponent(asideName, isDirectory: true)
+            try AppPaths.ensureDirectory(directory)
+            do {
+                try fileManager.moveItem(at: destination, to: target)
+            } catch {
+                try? fileManager.removeItem(at: staging)
+                throw error
+            }
+            aside = target
+            log(.warning, "Бэкап", "Текущая база сохранена как \(target.lastPathComponent)")
+        }
+        do {
+            try fileManager.moveItem(at: staging, to: destination)
+        } catch {
+            // Подмена не удалась — прежняя база возвращается на своё место.
+            if let aside { try? fileManager.moveItem(at: aside, to: destination) }
+            try? fileManager.removeItem(at: staging)
+            throw error
+        }
         log(.success, "Бэкап", "Резервная копия \(record.name) восстановлена в \(destination.path)")
     }
 
@@ -374,8 +479,32 @@ public final class BackupService: @unchecked Sendable {
     }
 }
 
+extension BackupService {
+    /// Наш сервер, который всё ещё держит эту папку базы.
+    ///
+    /// Копию снимают и восстанавливают, остановив сервер, — но остановка
+    /// может и не удаться: процесс в непрерываемом вводе-выводе переживает
+    /// SIGKILL, и запись о нём тогда остаётся. Копия папки из-под живого
+    /// SQLite — испорченная копия, а восстановление поверх живого — порча
+    /// самой базы. Проверка здесь, а не у каждого вызывающего: путей к копии
+    /// шесть, и один забытый — это ровно та копия, на которую понадеются.
+    ///
+    /// «Не удалось опознать» считается живым: процесс есть, и, возможно, наш.
+    static func liveServer(
+        holding folder: URL, records: [RunningServerRecord] = RunningServerStore.load()
+    ) -> RunningServerRecord? {
+        let target = folder.standardizedFileURL.resolvingSymlinksInPath().path
+        return records.first { record in
+            URL(fileURLWithPath: record.path).standardizedFileURL.resolvingSymlinksInPath().path == target
+                && !ServerIdentity.verify(record).allowsForgetting
+        }
+    }
+}
+
 public enum BackupError: LocalizedError {
     case sourceMissing(String)
+    /// Папку держит работающий сервер — копировать или восстанавливать нельзя.
+    case serverStillRunning(pid: Int32)
     case notEnoughSpace(required: Int64, available: Int64, directory: String)
     case verificationFailed(String, String)
     case incompleteBackup(String)
@@ -392,6 +521,8 @@ public enum BackupError: LocalizedError {
             return String(localized: "Резервная копия \(name) не прошла проверку: \(reason)")
         case .incompleteBackup(let name):
             return String(localized: "Копия \(name) не была завершена и не годится для восстановления.")
+        case .serverStillRunning(let pid):
+            return String(localized: "Папку базы держит работающий сервер ChromaDB (PID \(pid.plainDigits)) — копия из-под живого процесса была бы испорченной. Остановите его на экране «Сервер» и повторите.")
         }
     }
 

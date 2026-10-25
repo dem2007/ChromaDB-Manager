@@ -259,6 +259,11 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// действует и для назначенного профиля, потому что оно про молча
     /// пропавшие метаданные, а не про способ выбора профиля.
     public var tableProfileAssignments: [String: UUID]
+    /// Лист, под который не подошёл ни один профиль, записывается текстом —
+    /// режимом «Документ», — а не пропадает из базы. Включено
+    /// по умолчанию: строки с колонками-фильтрами такой лист не даёт, но его
+    /// текст находится.
+    public var unmatchedSheetsAsText: Bool
     /// Whether `.numbers` may be converted by Numbers itself — the same
     /// two switches as Pages and Keynote, and for the same reason: the export
     /// raises a window.
@@ -270,6 +275,12 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// репозиторий — это папка, просто про неё есть кому рассказать больше.
     public var git: GitSourceSettings?
     public var lastSyncedAt: Date?
+    /// Имена коллекций из подпапок и правила — с транслитерацией
+    /// (`CollectionNaming.sanitize`). У источников, записанных до неё, поля
+    /// нет, и для них правило прежнее: их файлы уже лежат в коллекциях под
+    /// прежними именами, и новое правило перевело бы каждый файл в другую
+    /// коллекцию с пересчётом векторов — без вопроса и без копии.
+    public var transliteratesCollectionNames: Bool
 
     /// Источник берёт документы из сети, а не с диска.
     public var isWeb: Bool { web != nil }
@@ -304,10 +315,12 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         volume: SourceVolume? = nil,
         tableProfiles: [TableProfile] = [],
         tableProfileAssignments: [String: UUID] = [:],
+        unmatchedSheetsAsText: Bool = true,
         numbersExportEnabled: Bool = false,
         web: WebSourceSettings? = nil,
         git: GitSourceSettings? = nil,
-        lastSyncedAt: Date? = nil
+        lastSyncedAt: Date? = nil,
+        transliteratesCollectionNames: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -336,10 +349,12 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         self.volume = volume
         self.tableProfiles = tableProfiles
         self.tableProfileAssignments = tableProfileAssignments
+        self.unmatchedSheetsAsText = unmatchedSheetsAsText
         self.numbersExportEnabled = numbersExportEnabled
         self.web = web
         self.git = git
         self.lastSyncedAt = lastSyncedAt
+        self.transliteratesCollectionNames = transliteratesCollectionNames
     }
 
     /// What about *extraction* shapes the stored chunks, as opposed to what
@@ -422,10 +437,14 @@ public struct DataSource: Identifiable, Codable, Hashable, Sendable {
         // при этом придётся собрать заново, и об этом сказано в README.
         tableProfiles = (try? container.decodeIfPresent([TableProfile].self, forKey: .tableProfiles)) ?? []
         tableProfileAssignments = try container.decodeIfPresent([String: UUID].self, forKey: .tableProfileAssignments) ?? [:]
+        unmatchedSheetsAsText = try container.decodeIfPresent(Bool.self, forKey: .unmatchedSheetsAsText) ?? true
         numbersExportEnabled = try container.decodeIfPresent(Bool.self, forKey: .numbersExportEnabled) ?? false
         web = (try? container.decodeIfPresent(WebSourceSettings.self, forKey: .web)) ?? nil
         git = (try? container.decodeIfPresent(GitSourceSettings.self, forKey: .git)) ?? nil
         lastSyncedAt = try container.decodeIfPresent(Date.self, forKey: .lastSyncedAt)
+        transliteratesCollectionNames = try container.decodeIfPresent(
+            Bool.self, forKey: .transliteratesCollectionNames
+        ) ?? false
     }
 
     /// Для папки — сама папка; для веб-источника — его стартовый адрес.
@@ -937,6 +956,10 @@ public struct ConfigurationLoss: Sendable, Hashable {
 /// того, что было до неё.
 public struct ConfigurationLossNotice: Sendable, Hashable {
     public let loss: ConfigurationLoss
+    /// Что из файла эта сборка не смогла представить — пути в настройках.
+    /// Непусто, когда настройки записаны более новой сборкой: прочитанные
+    /// здесь, они при следующей записи потеряли бы то, чего она не знает.
+    public let unrepresented: [String]
     /// Файл со старыми настройками целиком. Не перезаписывается следующей
     /// записью — в отличие от `config.previous.json`, которого хватает ровно
     /// на один шаг назад и который вторая такая запись затирает.
@@ -947,13 +970,22 @@ public struct ConfigurationLossNotice: Sendable, Hashable {
     public let snapshot: URL?
     public let date: Date
 
-    public init(loss: ConfigurationLoss, snapshot: URL?, date: Date = Date()) {
+    public init(loss: ConfigurationLoss, snapshot: URL?, date: Date = Date(), unrepresented: [String] = []) {
         self.loss = loss
         self.snapshot = snapshot
         self.date = date
+        self.unrepresented = unrepresented
     }
 
     public var message: String {
+        if !unrepresented.isEmpty {
+            let what = unrepresented.prefix(3).joined(separator: ", ")
+                + (unrepresented.count > 3 ? String(localized: " и ещё \(unrepresented.count - 3)") : "")
+            guard let snapshot else {
+                return String(localized: "Часть настроек записана более новой версией приложения, и эта версия их не понимает (\(what)) — при следующей записи они пропадут. Снимок сохранить не удалось: скопируйте config.json прямо сейчас.")
+            }
+            return String(localized: "Часть настроек записана более новой версией приложения, и эта версия их не понимает (\(what)) — при следующей записи они пропадут. Прежние настройки целиком сохранены в \(snapshot.lastPathComponent): верните их, запустив версию, которая их записала.")
+        }
         guard let snapshot else {
             return String(localized: "Из настроек исчезло разом — \(loss.summary). Снимок прежних настроек сохранить не удалось: рядом с config.json остаётся только config.previous.json, и он живёт до следующей записи. Если это не ваше действие, скопируйте его прямо сейчас.")
         }
@@ -983,6 +1015,10 @@ public final class SettingsStore: ObservableObject {
     /// не сказал вслух: «сейчас записывается настройка, в которой на
     /// одиннадцать источников меньше».
     @Published public private(set) var loss: ConfigurationLossNotice?
+    /// Настройки переписаны другой сборкой, и ручная работа из них пропала
+    ///. Пока это не решено, своя копия не обновляется: иначе первая
+    /// же запись затёрла бы то, из чего пропавшее возвращается.
+    @Published public private(set) var foreignRewrite: ForeignRewrite?
 
     /// Настройки подняты не из своего файла, а из копии «как было».
     ///
@@ -1000,12 +1036,20 @@ public final class SettingsStore: ObservableObject {
         fileURL.deletingLastPathComponent().appendingPathComponent("config.previous.json")
     }
 
+    /// Что эта сборка записала последним. Старые сборки о файле
+    /// не знают, и он переживает их запись.
+    public var ownCopyURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent("config.own.json")
+    }
+
     public init(fileURL: URL = AppPaths.configFile, log: @escaping LogHandler = noopLogHandler) {
         self.fileURL = fileURL
         self.log = log
         switch SettingsStore.read(from: fileURL, log: log) {
         case .loaded(let configuration):
             self.configuration = configuration
+            noteUnrepresented(in: configuration)
+            noteForeignRewrite(of: configuration)
         case .recovered(let configuration):
             self.configuration = configuration
             self.recoveredFromPreviousCopy = true
@@ -1124,6 +1168,107 @@ public final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Что из файла эта сборка прочитала не целиком — и снимок до первой записи.
+    ///
+    /// Разбор щадящий: незнакомое значение не роняет чтение, а сбрасывается
+    /// к умолчанию или выпадает — один профиль таблиц с вариантом листа,
+    /// которого эта сборка не знает, уносил **все** профили источника.
+    /// Прочитать так можно, а записать обратно — нет: следующее сохранение
+    /// стирало с диска то, что записала более новая сборка, и вернуться на неё
+    /// было уже не к чему. Человек, переключающийся между сборками, терял
+    /// разметку таблиц и настройки без единого слова.
+    ///
+    /// Поэтому сразу после чтения файл сравнивается с тем, что из него
+    /// запишется: всё, что пропало бы, называется, а файл кладётся снимком.
+    /// Запись при этом не запрещается — как и у `announceLoss`.
+    private func noteUnrepresented(in configuration: AppConfiguration) {
+        guard let raw = try? Data(contentsOf: fileURL),
+              let original = try? JSONSerialization.jsonObject(with: raw),
+              let rewritten = try? Self.encoded(configuration),
+              let kept = try? JSONSerialization.jsonObject(with: rewritten)
+        else { return }
+        var lost: [String] = []
+        Self.unrepresented(original, in: kept, path: "", into: &lost)
+        guard !lost.isEmpty else { return }
+
+        let stamp = Self.snapshotStamp.string(from: Date())
+        let snapshot = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("config.before-downgrade-\(stamp).json")
+        let saved = (try? raw.write(to: snapshot, options: .atomic)) != nil
+        log(.warning, "Настройки",
+            "Эта версия не понимает часть сохранённых настроек — при записи пропало бы: \(lost.prefix(10).joined(separator: ", ")). "
+            + (saved ? "Файл сохранён как \(snapshot.lastPathComponent)." : "Снимок сохранить НЕ удалось."))
+        loss = ConfigurationLossNotice(
+            loss: ConfigurationLoss(), snapshot: saved ? snapshot : nil, unrepresented: lost
+        )
+    }
+
+    /// Файл записан не этой сборкой — сверить с её копией.
+    private func noteForeignRewrite(of configuration: AppConfiguration) {
+        guard let own = try? Data(contentsOf: ownCopyURL),
+              let raw = try? Data(contentsOf: fileURL), raw != own else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let ownConfiguration = try? decoder.decode(AppConfiguration.self, from: own) else { return }
+        let rewrite = ForeignRewrite.between(own: ownConfiguration, current: configuration)
+        guard !rewrite.isEmpty else { return }
+        foreignRewrite = rewrite
+        log(.warning, "Настройки",
+            "Файл настроек переписан другой версией приложения, и из него пропало: \(rewrite.lost.prefix(10).joined(separator: "; ")). "
+            + "Своя копия — \(ownCopyURL.lastPathComponent); вернуть можно кнопкой наверху окна.")
+    }
+
+    /// Вернуть пропавшее из своей копии.
+    public func restoreForeignLosses() {
+        guard foreignRewrite != nil, let own = try? Data(contentsOf: ownCopyURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let ownConfiguration = try? decoder.decode(AppConfiguration.self, from: own) else { return }
+        let lost = foreignRewrite?.lost ?? []
+        foreignRewrite = nil
+        configuration = ForeignRewrite.restored(configuration, from: ownConfiguration)
+        log(.info, "Настройки", "Возвращено из своей копии: \(lost.joined(separator: "; "))")
+    }
+
+    /// Оставить как есть: следующая запись обновит и свою копию.
+    public func acceptForeignRewrite() {
+        guard let lost = foreignRewrite?.lost else { return }
+        foreignRewrite = nil
+        log(.info, "Настройки", "Оставлено как есть после записи другой версией: \(lost.joined(separator: "; "))")
+        saveNow()
+    }
+
+    nonisolated static func encoded(_ configuration: AppConfiguration) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(configuration)
+    }
+
+    /// Пути, по которым в `original` есть то, чего нет в `kept`.
+    ///
+    /// Записи списков называются по имени, если оно есть: «dataSources[Прайсы]
+    /// .tableProfiles» человеку говорит больше, чем «dataSources[3]».
+    nonisolated static func unrepresented(_ original: Any, in kept: Any, path: String, into lost: inout [String]) {
+        switch original {
+        case let object as [String: Any]:
+            guard let other = kept as? [String: Any] else { lost.append(path); return }
+            for (key, value) in object.sorted(by: { $0.key < $1.key }) {
+                let child = path.isEmpty ? key : "\(path).\(key)"
+                guard let counterpart = other[key] else { lost.append(child); continue }
+                unrepresented(value, in: counterpart, path: child, into: &lost)
+            }
+        case let array as [Any]:
+            guard let other = kept as? [Any], other.count == array.count else { lost.append(path); return }
+            for (index, value) in array.enumerated() {
+                let label = ((value as? [String: Any])?["name"] as? String) ?? String(index)
+                unrepresented(value, in: other[index], path: "\(path)[\(label)]", into: &lost)
+            }
+        default:
+            if !(original as AnyObject).isEqual(kept) { lost.append(path) }
+        }
+    }
+
     /// Человек увидел предупреждение о потере — убираем его с экрана.
     ///
     /// Снимок при этом остаётся на диске: закрыть сообщение и удалить
@@ -1152,6 +1297,7 @@ public final class SettingsStore: ObservableObject {
             persistenceProblem = nil
             recoveredFromPreviousCopy = false
             configuration = loaded
+            noteUnrepresented(in: loaded)
             log(.info, "Настройки", "Файл настроек прочитан заново, сохранение снова разрешено")
             return true
         case .recovered(let loaded):
@@ -1190,13 +1336,11 @@ public final class SettingsStore: ObservableObject {
         }
         do {
             try AppPaths.ensureDirectory(fileURL.deletingLastPathComponent())
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(configuration)
+            let data = try Self.encoded(configuration)
             announceLoss(before: configuration)
             keepPreviousVersion(before: data)
             try data.write(to: fileURL, options: .atomic)
+            if foreignRewrite == nil { try? data.write(to: ownCopyURL, options: .atomic) }
         } catch {
             log(.error, "Настройки", "Не удалось сохранить конфигурацию: \(error.localizedDescription)")
         }
@@ -1296,6 +1440,22 @@ public final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Поменять у источника своё поле — в том источнике, что сейчас в
+    /// настройках, а не в копии, взятой когда-то раньше. Копия, записанная
+    /// целиком, откатила бы всё, что поменяли после того, как её взяли:
+    /// кнопка «Включить OCR» в «Диагностике» стёрла бы вписанные тем
+    /// временем поля из пути. Источника больше нет — ничего не делается.
+    /// - Returns: изменился ли источник.
+    @discardableResult
+    public func updateSource(id: UUID, _ change: (inout DataSource) -> Void) -> Bool {
+        guard let index = configuration.dataSources.firstIndex(where: { $0.id == id }) else { return false }
+        var source = configuration.dataSources[index]
+        change(&source)
+        guard source != configuration.dataSources[index] else { return false }
+        configuration.dataSources[index] = source
+        return true
+    }
+
     public func removeSource(id: UUID) {
         configuration.dataSources.removeAll { $0.id == id }
     }
@@ -1321,4 +1481,103 @@ private struct AnyDecodableSkip: Decodable {
 public extension DataSource {
     /// Предел размера файла в байтах.
     var maxFileSizeBytes: Int64 { Int64(max(1, maxFileSizeMB)) * 1024 * 1024 }
+
+    /// Новый источник с настройками этого: «Скопировать источник» в
+    /// перечне.
+    ///
+    /// Копируется всё, что человек настраивал: папка, расширения, раскладка
+    /// по коллекциям, нарезка, модель, метаданные, профили таблиц и их
+    /// назначения файлам, исключённые файлы, расписание. Не копируется то,
+    /// что принадлежит прогонам оригинала: идентификатор (по нему живут
+    /// манифесты — у копии их нет, и первый прогон у неё полный), время
+    /// последней синхронизации и запомненный том — он запомнится при первом
+    /// сканировании, как у любого нового источника.
+    ///
+    /// Имена коллекций — по нынешнему правилу, с транслитерацией: старое
+    /// правило держится только у источников, чьи файлы уже лежат под
+    /// прежними именами, а у копии файлов в базе нет.
+    public func copied() -> DataSource {
+        var copy = self
+        copy.id = UUID()
+        copy.name = String(localized: "\(name) — копия")
+        copy.lastSyncedAt = nil
+        copy.volume = nil
+        copy.transliteratesCollectionNames = true
+        return copy
+    }
+
+    /// Пишет ли источник те же файлы в те же коллекции, что `other`: та же
+    /// папка (или адрес) и та же раскладка. Два таких источника кладут
+    /// каждый файл дважды — копия, у которой не сменили ни папку, ни
+    /// коллекцию, ровно такая.
+    public func writesSameDocuments(as other: DataSource) -> Bool {
+        location == other.location && mapping == other.mapping
+            && CollectionNaming.sanitize(collectionName) == CollectionNaming.sanitize(other.collectionName)
+            && (!mapping.needsRule || (rulePattern == other.rulePattern && ruleTemplate == other.ruleTemplate))
+    }
+
+    /// Откуда источник читает: папка — путём, веб-источник — адресом.
+    ///
+    /// Адрес — из настроек обхода, а не из `path`: в окне правят адрес, а
+    /// `path` переписывается из него только при сохранении, и сравнение по
+    /// нему видело бы прежний адрес.
+    private var location: String {
+        if let web { return web.startURL.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return (path as NSString).standardizingPath
+    }
+
+    /// Отметки прогона — из источника, что сейчас в настройках.
+    ///
+    /// Их пишет прогон, а не редактор: прогон, закончившийся, пока окно
+    /// редактора было открыто, иначе терял бы дату и запомненный том.
+    ///
+    /// Папка переехала — том не переносится: он запомнится первым
+    /// удачным прогоном по новому пути, как и обещает совет у ошибки
+    /// «другой том». Прежний том у нового пути не пускал бы сканирование
+    /// вовсе, и источник, перенесённый на другой диск, не синхронизировался
+    /// бы больше никогда.
+    mutating func takeRunStamps(from current: DataSource) {
+        lastSyncedAt = current.lastSyncedAt
+        let samePath = (current.path as NSString).standardizingPath == (path as NSString).standardizingPath
+        volume = samePath ? current.volume : nil
+    }
+
+    /// Правка редактора — поверх того, что сейчас в настройках.
+    ///
+    /// Редактор держит копию источника, взятую при открытии окна, и
+    /// «Сохранить» записывало её целиком: всё, что источнику записали, пока
+    /// окно было открыто, — прогон, импорт настроек в окне «Настройки» —
+    /// откатывалось. Теперь берётся источник из настроек, и в нём меняются
+    /// только поля, которые в окне и правда поменяли: отличные от копии,
+    /// взятой при открытии. Отметки прогона — по `takeRunStamps`.
+    ///
+    /// Сравнение — по полям в том виде, в каком источник хранится:
+    /// перечислять их здесь руками значило бы однажды забыть новое.
+    static func savingEdits(_ edited: DataSource, madeOn base: DataSource, onto current: DataSource) -> DataSource {
+        var result = mergedFields(edited, base: base, current: current) ?? edited
+        result.takeRunStamps(from: current)
+        return result
+    }
+
+    private static func mergedFields(_ edited: DataSource, base: DataSource, current: DataSource) -> DataSource? {
+        // Даты — числом, а не ISO 8601: доли секунды не теряются, и
+        // нетронутая дата не выглядит правкой.
+        let encoder = JSONEncoder()
+        func fields(_ source: DataSource) -> [String: Any]? {
+            guard let data = try? encoder.encode(source) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        func same(_ left: Any?, _ right: Any?) -> Bool {
+            let encode = { (value: Any?) in
+                try? JSONSerialization.data(withJSONObject: [value ?? NSNull()], options: [.sortedKeys])
+            }
+            return encode(left) == encode(right)
+        }
+        guard let edits = fields(edited), let original = fields(base), var merged = fields(current) else { return nil }
+        for key in Set(edits.keys).union(original.keys) where !same(edits[key], original[key]) {
+            merged[key] = edits[key]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: merged) else { return nil }
+        return try? JSONDecoder().decode(DataSource.self, from: data)
+    }
 }

@@ -96,15 +96,20 @@ public enum BatchSplitter {
         total += record.embedding.count * 25 + 2
         total += 2
         for (key, value) in record.metadata {
-            total += jsonStringBytes(key) + 2
-            switch value {
-            case .string(let text): total += jsonStringBytes(text)
-            case .int, .double: total += 25
-            case .bool: total += 5
-            case .null: total += 4
-            }
+            total += jsonStringBytes(key) + 2 + estimatedBytes(of: value)
         }
         return total
+    }
+
+    /// Верхняя граница JSON одного значения метаданных.
+    static func estimatedBytes(of value: MetadataValue) -> Int {
+        switch value {
+        case .string(let text): return jsonStringBytes(text)
+        case .int, .double: return 25
+        case .bool: return 5
+        case .null: return 4
+        case .list(let values): return 2 + values.reduce(0) { $0 + estimatedBytes(of: $1) + 1 }
+        }
     }
 
     /// Exactly what JSONSerialization writes for a string: quotes, plus two

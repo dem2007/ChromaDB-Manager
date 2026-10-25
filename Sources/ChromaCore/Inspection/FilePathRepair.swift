@@ -25,7 +25,14 @@ public enum FilePathRepair {
         // Отпечаток считается от пары «источник + путь» (П6.16). Источник
         // берётся из самой записи: у чанка, которому его не проставляли,
         // остаётся прежняя форма — и такая запись уборки не требует.
-        return fingerprint != SourceSyncService.fileFingerprint(path, sourceID: SourceSyncService.recordedSourceID(metadata))
+        //
+        // Прежняя форма годится и у записи **с** источником: так писали все
+        // сборки до П6.16, и идентификаторы их чанков построены на ней же.
+        // Иначе после обновления испорченным объявлялся каждый файл каждой
+        // коллекции, а уборка разводила `file_id` с идентификаторами.
+        let recorded = SourceSyncService.recordedSourceID(metadata)
+        return fingerprint != SourceSyncService.fileFingerprint(path, sourceID: recorded)
+            && fingerprint != SourceSyncService.fileFingerprint(path, sourceID: nil)
     }
 
     /// Что переписать у этих записей. Записи, которым уборка не нужна,

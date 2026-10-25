@@ -1,12 +1,21 @@
 import Foundation
 
-/// ChromaDB metadata values are scalars only (string / number / bool).
+/// Значение метаданных ChromaDB: строка, число, логическое — или список
+/// таких значений.
+///
+/// Списки сервер принимает с версий 1.x (схема `HashMap` в OpenAPI сервера:
+/// массивы строк, целых, дробных и логических). Приложение само их не пишет,
+/// но коллекцию, заполненную другим клиентом, обязано прочитать и **не
+/// испортить**: раньше список читался строкой `<unsupported>`, и правка
+/// метаданных такого документа записывала эту строку поверх списка.
 public enum MetadataValue: Codable, Hashable, Sendable {
     case string(String)
     case int(Int)
     case double(Double)
     case bool(Bool)
     case null
+    /// Список скаляров — вложенных списков у ChromaDB нет.
+    indirect case list([MetadataValue])
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -15,7 +24,8 @@ public enum MetadataValue: Codable, Hashable, Sendable {
         if let value = try? container.decode(Int.self) { self = .int(value); return }
         if let value = try? container.decode(Double.self) { self = .double(value); return }
         if let value = try? container.decode(String.self) { self = .string(value); return }
-        // Nested objects/arrays are not valid Chroma metadata; keep them readable anyway.
+        if let values = try? container.decode([MetadataValue].self) { self = .list(values); return }
+        // Объектов в метаданных ChromaDB не бывает; читаемым оставляем всё равно.
         self = .string("<unsupported>")
     }
 
@@ -27,6 +37,7 @@ public enum MetadataValue: Codable, Hashable, Sendable {
         case .double(let value): try container.encode(value)
         case .bool(let value): try container.encode(value)
         case .null: try container.encodeNil()
+        case .list(let values): try container.encode(values)
         }
     }
 
@@ -37,6 +48,7 @@ public enum MetadataValue: Codable, Hashable, Sendable {
         case .double(let value): return String(value)
         case .bool(let value): return value ? "true" : "false"
         case .null: return "—"
+        case .list(let values): return "[" + values.map(\.displayString).joined(separator: ", ") + "]"
         }
     }
 
@@ -48,6 +60,7 @@ public enum MetadataValue: Codable, Hashable, Sendable {
         case .double: return String(localized: "дробное")
         case .bool: return String(localized: "логическое")
         case .null: return String(localized: "пусто")
+        case .list: return String(localized: "список")
         }
     }
 

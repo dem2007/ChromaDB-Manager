@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // MARK: - Request
 
@@ -260,6 +261,14 @@ public struct ReembeddingCheckpoint: Codable, Hashable {
     public var doneIDs: [String]
     public var totalIDs: Int
     public var startedAt: Date
+    /// Метка прогона, которую несут перенарезанные им куски.
+    ///
+    /// По ней продолжение узнаёт документ, **уже** перенарезанный этим же
+    /// прогоном после последней сохранённой точки: прочитанный заново, он
+    /// оказался бы своим первым куском и нарезался бы ещё раз — а куски
+    /// `#1…#n` затёрлись бы обрывками первого. Необязательная — точки,
+    /// записанные до неё, читаются.
+    public var runStamp: String?
 
     public var processed: Int { doneIDs.count }
 }
@@ -303,8 +312,71 @@ public final class ReembeddingJournal {
         write(file)
     }
 
+    /// Контрольная точка вместе с тем, что дописано в построчный список
+    /// готовых документов.
     public func checkpoint(for collectionID: String) -> ReembeddingCheckpoint? {
-        load().checkpoints.first { $0.collectionID == collectionID }
+        guard var checkpoint = load().checkpoints.first(where: { $0.collectionID == collectionID }) else {
+            return nil
+        }
+        let appended = doneIDs(collectionID: collectionID)
+        if !appended.isEmpty {
+            var seen = Set(checkpoint.doneIDs)
+            checkpoint.doneIDs += appended.filter { seen.insert($0).inserted }
+        }
+        return checkpoint
+    }
+
+    /// Готовые документы прогона — построчно, дозаписью.
+    ///
+    /// Не внутри контрольной точки: та записывается целиком, и список,
+    /// растущий до размера коллекции, переписывался бы на каждой пачке —
+    /// на двухстах тысячах документов это гигабайты на диск ради того,
+    /// чтобы дописать тридцать два идентификатора (квадрат от размера).
+    func doneURL(collectionID: String) -> URL {
+        let safe = String(collectionID.unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+        }.map(Character.init))
+        return fileURL.deletingLastPathComponent().appendingPathComponent("reembedding-done-\(safe).jsonl")
+    }
+
+    /// Дописать готовые идентификаторы. Каждый — строкой JSON: в
+    /// идентификаторе бывает и перевод строки.
+    public func appendDone(_ ids: [String], collectionID: String) {
+        guard !ids.isEmpty else { return }
+        queue.sync {
+            let url = doneURL(collectionID: collectionID)
+            var data = Data()
+            for id in ids {
+                guard let line = try? JSONEncoder().encode(id) else { continue }
+                data.append(line)
+                data.append(UInt8(ascii: "\n"))
+            }
+            do {
+                try AppPaths.ensureDirectory(url.deletingLastPathComponent())
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {
+                log(.error, "Re-embedding", "Не удалось дописать контрольную точку: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Начать список заново — с тем, что уже известно готовым.
+    func resetDone(_ ids: [String], collectionID: String) {
+        queue.sync { try? FileManager.default.removeItem(at: doneURL(collectionID: collectionID)) }
+        appendDone(ids, collectionID: collectionID)
+    }
+
+    func doneIDs(collectionID: String) -> [String] {
+        queue.sync {
+            JSONLines.read(at: doneURL(collectionID: collectionID))
+                .compactMap { try? JSONDecoder().decode(String.self, from: Data($0.utf8)) }
+        }
     }
 
     public func save(_ checkpoint: ReembeddingCheckpoint) {
@@ -315,6 +387,7 @@ public final class ReembeddingJournal {
     }
 
     public func clearCheckpoint(collectionID: String) {
+        queue.sync { try? FileManager.default.removeItem(at: doneURL(collectionID: collectionID)) }
         var file = load()
         guard file.checkpoints.contains(where: { $0.collectionID == collectionID }) else { return }
         file.checkpoints.removeAll { $0.collectionID == collectionID }
@@ -513,10 +586,14 @@ public actor ReembeddingService {
                 : 0
             journal.record(Self.failureEntry(
                 request: request, started: started, dimension: dimension, done: done,
-                isCancellation: isCancellation, detail: error.localizedDescription
+                // У отмены причина одна — её остановили; «The operation
+                // couldn’t be completed (Swift.CancellationError)» в журнале
+                // операций читался как сбой.
+                isCancellation: isCancellation,
+                detail: isCancellation ? String(localized: "остановлено") : error.localizedDescription
             ))
             log(
-                isCancellation ? .warning : .error,
+                isCancellation ? .info : .error,
                 "Re-embedding",
                 isCancellation ? "Операция отменена" : "Операция не удалась: \(error.localizedDescription)"
             )
@@ -601,6 +678,7 @@ public actor ReembeddingService {
         var written = 0
         var offset = 0
         let pageSize = 100
+        let runStamp = Self.newRunStamp()
 
         do {
             while true {
@@ -612,26 +690,27 @@ public actor ReembeddingService {
                 let page = try await chroma.getDocuments(collectionID: request.collection.id, limit: pageSize, offset: offset)
                 if page.isEmpty { break }
 
+                progress(ReembeddingProgress(
+                    stage: String(localized: "Пересчёт в клон"),
+                    processed: processed, total: sourceCount, written: written
+                ))
+                // Куски всей страницы — и векторы пачками поверх границ
+                // документов: модель зовётся раз на `batchSize` кусков, а не
+                // раз на документ. Без перенарезки документ — один кусок, и
+                // прежде это было по вызову модели и записи в базу на каждый.
+                var records: [EmbeddedRecord] = []
                 for document in page {
                     try await waitWhilePaused(processed: processed, total: sourceCount, written: written, progress: progress)
                     try Task.checkCancellation()
-                    progress(ReembeddingProgress(
-                        stage: String(localized: "Пересчёт в клон"),
-                        processed: processed, total: sourceCount, written: written
-                    ))
-                    written += try await rewrite(
-                        document: document,
-                        into: target.id,
-                        request: request,
-                        dimension: dimension,
-                        embeddings: embeddings,
-                        chat: chat,
-                        chroma: chroma,
-                        batchSize: batchSize,
-                        keepOriginalID: true
+                    records += try await pendingRecords(
+                        of: document, request: request, embeddings: embeddings, chat: chat, runStamp: runStamp
                     )
-                    processed += 1
                 }
+                written += try await write(
+                    records, into: target.id, request: request, dimension: dimension,
+                    embeddings: embeddings, chroma: chroma, batchSize: batchSize
+                )
+                processed += page.count
 
                 if page.count < pageSize { break }
                 offset += pageSize
@@ -701,94 +780,127 @@ public actor ReembeddingService {
         // Ids are collected up front and processed by id, not by offset: an
         // in-place run rewrites rows as it goes, and offsets would shift under it.
         progress(ReembeddingProgress(stage: String(localized: "Сбор списка документов"), total: sourceCount))
-        var ids: [String] = []
-        var offset = 0
-        while true {
-            let page = try await chroma.getDocuments(collectionID: request.collection.id, limit: 200, offset: offset)
-            if page.isEmpty { break }
-            ids += page.map(\.id)
-            if page.count < 200 { break }
-            offset += 200
-        }
+        var ids = try await allIDs(of: request.collection.id, chroma: chroma)
+        /// Чем коллекция была занята до этого прогона — см. `freeingPieceIDs`.
+        let takenBefore = Set(ids)
 
         let signature = request.rechunk ? request.chunking.signature : ""
         var done: Set<String> = []
+        var runStamp = Self.newRunStamp()
         if resumeFromCheckpoint,
            let checkpoint = journal.checkpoint(for: request.collection.id),
            checkpoint.targetModel == request.targetModel,
            checkpoint.rechunk == request.rechunk,
            checkpoint.chunkingSignature == signature {
             done = Set(checkpoint.doneIDs)
+            if let stamp = checkpoint.runStamp { runStamp = stamp }
             log(.info, "Re-embedding", "Продолжаем с контрольной точки: уже пересчитано \(done.count) из \(checkpoint.totalIDs)")
         }
 
-        var checkpoint = ReembeddingCheckpoint(
+        // Готовые документы — построчным списком рядом с точкой: сама точка
+        // пишется один раз, а список только дописывается.
+        journal.save(ReembeddingCheckpoint(
             collectionID: request.collection.id,
             collectionName: request.collection.name,
             targetModel: request.targetModel,
             chunkingSignature: signature,
             rechunk: request.rechunk,
-            doneIDs: Array(done),
+            doneIDs: [],
             totalIDs: ids.count,
-            startedAt: started
-        )
-        journal.save(checkpoint)
+            startedAt: started,
+            runStamp: runStamp
+        ))
+        journal.resetDone(Array(done), collectionID: request.collection.id)
 
         var written = 0
-        var deleted = 0
-        let remaining = ids.filter { !done.contains($0) }
 
-        for id in remaining {
-            try await waitWhilePaused(processed: done.count, total: ids.count, written: written, progress: progress)
-            do {
+        // Пачками: документы пачки читаются одним запросом, векторы считаются
+        // одним вызовом модели и пишутся одной правкой. По одному документу
+        // это было три запроса на документ — триста тысяч на сто тысяч.
+        func process(_ remaining: [String]) async throws {
+            for start in stride(from: 0, to: remaining.count, by: max(1, batchSize)) {
+                try await waitWhilePaused(processed: done.count, total: ids.count, written: written, progress: progress)
+                // Точка уже на диске: готовое дописывается после каждой пачки,
+                // и следующий запуск продолжит отсюда.
                 try Task.checkCancellation()
-            } catch {
-                // The checkpoint is already on disk, so the next run picks up here.
-                checkpoint.doneIDs = Array(done)
-                journal.save(checkpoint)
-                throw error
-            }
 
-            progress(ReembeddingProgress(
-                stage: String(localized: "Пересчёт на месте"),
-                processed: done.count, total: ids.count, written: written
-            ))
+                progress(ReembeddingProgress(
+                    stage: String(localized: "Пересчёт на месте"),
+                    processed: done.count, total: ids.count, written: written
+                ))
 
-            let page = try await chroma.getDocuments(collectionID: request.collection.id, limit: 1, ids: [id])
-            guard let document = page.first else {
-                done.insert(id)
-                continue
-            }
+                let chunkIDs = Array(remaining[start..<min(start + max(1, batchSize), remaining.count)])
+                let documents = try await chroma.getDocuments(
+                    collectionID: request.collection.id, limit: chunkIDs.count, ids: chunkIDs
+                )
 
-            let result = try await rewriteInPlace(
-                document: document,
-                request: request,
-                dimension: dimension,
-                embeddings: embeddings,
-                chat: chat,
-                chroma: chroma,
-                batchSize: batchSize
-            )
-            written += result.written
-            deleted += result.deleted
-            done.insert(id)
+                if request.rechunk {
+                    var records: [EmbeddedRecord] = []
+                    for document in documents {
+                        // Уже перенарезан этим прогоном — после последней
+                        // дописанной пачки или как кусок `#k` другого документа.
+                        // Резать его снова нельзя: это первый кусок, и его части
+                        // затёрли бы соседние.
+                        if case .string(let stamp)? = document.metadata?[CollectionBindingKeys.rechunkRun],
+                           stamp == runStamp {
+                            continue
+                        }
+                        records += try await pendingRecords(
+                            of: document, request: request, embeddings: embeddings, chat: chat, runStamp: runStamp
+                        )
+                    }
+                    records = try await freeingPieceIDs(
+                        records, taken: takenBefore, runStamp: runStamp,
+                        collectionID: request.collection.id, chroma: chroma
+                    )
+                    // Первый кусок сохраняет исходный идентификатор, так что
+                    // удалять нечего: см. `pieceID`.
+                    written += try await write(
+                        records, into: request.collection.id, request: request, dimension: dimension,
+                        embeddings: embeddings, chroma: chroma, batchSize: batchSize
+                    )
+                } else if !documents.isEmpty {
+                    written += try await reembedInPlace(
+                        documents, request: request, dimension: dimension, embeddings: embeddings, chroma: chroma
+                    )
+                }
 
-            // Written every batch, not at the end: a run interrupted halfway must
-            // not have to start over.
-            if done.count % batchSize == 0 {
-                checkpoint.doneIDs = Array(done)
-                journal.save(checkpoint)
+                done.formUnion(chunkIDs)
+                journal.appendDone(chunkIDs, collectionID: request.collection.id)
             }
         }
 
-        journal.clearCheckpoint(collectionID: request.collection.id)
+        try await process(ids.filter { !done.contains($0) })
+
+        // Документы, появившиеся за время прогона. Запись снаружи на время
+        // пересчёта закрыта, но не вся: прерванный прогон продолжают позже,
+        // а между запусками синхронизация пишет в коллекцию старой моделью.
+        // Список собран в начале, и всё, что легло после, осталось бы на
+        // старых векторах — а привязка ниже объявит коллекцию новой. Круги
+        // ограничены: коллекция, в которую пишут без остановки, — не повод
+        // крутиться вечно, остаток покажет проверка.
+        for _ in 0..<3 {
+            let current = try await allIDs(of: request.collection.id, chroma: chroma)
+            let known = Set(ids)
+            let missed = current.filter { !done.contains($0) && !known.contains($0) }
+            guard !missed.isEmpty else { break }
+            log(.info, "Re-embedding", "За время прогона в коллекции появилось документов: \(missed.count) — пересчитываются")
+            ids += missed
+            try await process(missed)
+        }
 
         // The collection now holds vectors of the new model, and its binding must
         // say so — otherwise the next write would be checked against the old one.
+        //
+        // Привязка — **до** того, как забыть контрольную точку: сорвись её
+        // запись после, векторы были бы новой модели, привязка старой, а
+        // продолжать было бы не с чего. С точкой на месте повторный запуск
+        // пройдёт по готовому списку и допишет привязку.
         try await chroma.updateCollection(
             id: request.collection.id,
             metadata: request.collection.metadataBinding(model: request.targetModel, dimension: dimension)
         )
+        journal.clearCheckpoint(collectionID: request.collection.id)
 
         let verification = try await verify(
             request: request, resultCollectionID: request.collection.id, resultName: request.collection.name,
@@ -804,39 +916,49 @@ public actor ReembeddingService {
             dimension: dimension,
             processedDocuments: done.count,
             writtenDocuments: written,
-            deletedDocuments: deleted,
+            deletedDocuments: 0,
             duration: Date().timeIntervalSince(started),
             verification: verification,
             backup: backup.describedAs
         )
     }
 
+    /// Все идентификаторы коллекции — по идентификатору, а не по смещению:
+    /// пересчёт на месте переписывает строки, и смещения под ним плывут.
+    private func allIDs(of collectionID: String, chroma: ChromaClient) async throws -> [String] {
+        var ids: [String] = []
+        var offset = 0
+        while true {
+            let page = try await chroma.getDocuments(collectionID: collectionID, limit: 200, offset: offset)
+            if page.isEmpty { break }
+            ids += page.map(\.id)
+            if page.count < 200 { break }
+            offset += 200
+        }
+        return ids
+    }
+
     // MARK: - Document rewriting
 
-    /// Writes one source document into the target collection, re-chunked if asked.
-    private func rewrite(
-        document: DocumentRecord,
-        into collectionID: String,
+    /// Куски одного документа, готовые к записи, — пока без векторов.
+    private func pendingRecords(
+        of document: DocumentRecord,
         request: ReembeddingRequest,
-        dimension: Int,
         embeddings: EmbeddingProvider,
         chat: ChatProvider?,
-        chroma: ChromaClient,
-        batchSize: Int,
-        keepOriginalID: Bool
-    ) async throws -> Int {
+        runStamp: String
+    ) async throws -> [EmbeddedRecord] {
         guard let text = document.document, !text.isEmpty else {
             throw ReembeddingError.documentWithoutText(document.id)
         }
 
         let pieces = try await pieces(of: text, request: request, embeddings: embeddings, chat: chat)
-        // Метка этого прогона по этому документу. Ставится **на все** куски,
-        // включая первый, который сохраняет исходный идентификатор: по ней
-        // инспектор отличает текущие куски от вытесненных прошлым прогоном
-        //. Удалять их здесь нельзя — автоматических удалений в
-        // приложении нет (правило 1 приложения 5), поэтому вытесненное
-        // показывается человеку, а решает он.
-        let runStamp = ISO8601DateFormatter().string(from: Date()) + "/" + UUID().uuidString.prefix(8)
+        // Метка прогона ставится **на все** куски, включая первый, который
+        // сохраняет исходный идентификатор: по ней инспектор отличает текущие
+        // куски от вытесненных прошлым прогоном, а продолжение —
+        // уже перенарезанное этим. Удалять вытесненное здесь нельзя —
+        // автоматических удалений в приложении нет (правило 1 приложения 5),
+        // поэтому оно показывается человеку, а решает он.
         var records: [EmbeddedRecord] = []
         for (index, piece) in pieces.enumerated() {
             var metadata = document.metadata ?? [:]
@@ -850,6 +972,11 @@ public actor ReembeddingService {
                 metadata["chunk_index"] = .int(index)
             }
             if let note = piece.note { metadata["_cdbm_chunk_note"] = .string(note) }
+            // Мера шапки — от **этого** куска: унаследованная от исходного
+            // документа срезала бы на швах текст, а не шапку.
+            if let length = piece.repeatedHeaderLength {
+                metadata[TableChunkHeaders.lengthKey] = length > 0 ? .int(length) : nil
+            }
             records.append(EmbeddedRecord(
                 id: Self.pieceID(original: document.id, index: index, total: pieces.count),
                 document: piece.text,
@@ -857,10 +984,24 @@ public actor ReembeddingService {
                 metadata: metadata
             ))
         }
+        return records
+    }
 
+    /// Векторы и запись — пачками по `batchSize` кусков, какому бы документу
+    /// они ни принадлежали.
+    private func write(
+        _ records: [EmbeddedRecord],
+        into collectionID: String,
+        request: ReembeddingRequest,
+        dimension: Int,
+        embeddings: EmbeddingProvider,
+        chroma: ChromaClient,
+        batchSize: Int
+    ) async throws -> Int {
         var writtenCount = 0
-        for start in stride(from: 0, to: records.count, by: batchSize) {
-            let slice = Array(records[start..<min(start + batchSize, records.count)])
+        for start in stride(from: 0, to: records.count, by: max(1, batchSize)) {
+            try Task.checkCancellation()
+            let slice = Array(records[start..<min(start + max(1, batchSize), records.count)])
             let vectors = try await embed(slice.map(\.document), model: request.targetModel, embeddings: embeddings)
             guard vectors.count == slice.count else { throw LMStudioError.emptyResponse }
             if let unexpected = vectors.first(where: { $0.count != dimension }) {
@@ -878,64 +1019,47 @@ public actor ReembeddingService {
         return writtenCount
     }
 
-    private struct InPlaceResult {
-        let written: Int
-        let deleted: Int
-    }
-
-    private func rewriteInPlace(
-        document: DocumentRecord,
+    /// Пересчёт без перенарезки: новый вектор под тем же идентификатором,
+    /// одним вызовом модели и одной правкой на пачку — `update` оставляет
+    /// всё остальное в строке нетронутым.
+    private func reembedInPlace(
+        _ documents: [DocumentRecord],
         request: ReembeddingRequest,
         dimension: Int,
         embeddings: EmbeddingProvider,
-        chat: ChatProvider?,
-        chroma: ChromaClient,
-        batchSize: Int
-    ) async throws -> InPlaceResult {
-        guard let text = document.document, !text.isEmpty else {
-            throw ReembeddingError.documentWithoutText(document.id)
-        }
-
-        // No re-chunking: one document, one new vector, same id — `update` keeps
-        // everything else about the row untouched.
-        guard request.rechunk else {
-            let vectors = try await embed([text], model: request.targetModel, embeddings: embeddings)
-            guard let vector = vectors.first else { throw LMStudioError.emptyResponse }
-            guard vector.count == dimension else {
-                throw BindingError.dimensionConflict(collection: request.collection.id, stored: dimension, model: vector.count)
+        chroma: ChromaClient
+    ) async throws -> Int {
+        var texts: [String] = []
+        for document in documents {
+            guard let text = document.document, !text.isEmpty else {
+                throw ReembeddingError.documentWithoutText(document.id)
             }
+            texts.append(text)
+        }
+        let vectors = try await embed(texts, model: request.targetModel, embeddings: embeddings)
+        guard vectors.count == documents.count else { throw LMStudioError.emptyResponse }
+        if let unexpected = vectors.first(where: { $0.count != dimension }) {
+            throw BindingError.dimensionConflict(collection: request.collection.id, stored: dimension, model: unexpected.count)
+        }
+        let updates = zip(documents, vectors).map { document, vector -> DocumentUpdate in
             var metadata = document.metadata ?? [:]
             metadata[CollectionBindingKeys.model] = .string(request.targetModel)
             // Recomputing vectors does not change where the text came from; a
             // document that never had the field came from outside.
             metadata.carryOrigin(from: document.metadata)
-            try await chroma.updateDocuments(
-                collectionID: request.collection.id,
-                updates: [DocumentUpdate(id: document.id, embedding: vector, metadata: metadata)]
-            )
-            return InPlaceResult(written: 1, deleted: 0)
+            return DocumentUpdate(id: document.id, embedding: vector, metadata: metadata)
         }
-
-        let written = try await rewrite(
-            document: document,
-            into: request.collection.id,
-            request: request,
-            dimension: dimension,
-            embeddings: embeddings,
-            chat: chat,
-            chroma: chroma,
-            batchSize: batchSize,
-            keepOriginalID: true
-        )
-        // The first piece reuses the original id, so nothing is deleted when a
-        // document turns into one piece; a shorter result would strand nothing
-        // either, because ids are derived from the original.
-        return InPlaceResult(written: written, deleted: 0)
+        try await chroma.updateDocuments(collectionID: request.collection.id, updates: updates)
+        await yieldPoint?()
+        return updates.count
     }
 
     private struct Piece {
         let text: String
         let note: String?
+        /// Мера дописанной шапки нового куска; `nil` — текст
+        /// документа не менялся, и его собственная мера остаётся.
+        var repeatedHeaderLength: Int? = nil
     }
 
     private func pieces(
@@ -961,7 +1085,7 @@ public actor ReembeddingService {
             duration: Date().timeIntervalSince(started)
         )
         guard !chunks.isEmpty else { return [Piece(text: text, note: nil)] }
-        return chunks.map { Piece(text: $0.text, note: $0.note) }
+        return chunks.map { Piece(text: $0.text, note: $0.note, repeatedHeaderLength: $0.repeatedHeaderLength) }
     }
 
     private func embed(_ texts: [String], model: String, embeddings: EmbeddingProvider) async throws -> [[Double]] {
@@ -990,6 +1114,69 @@ public actor ReembeddingService {
         let vectors = try await embeddings.embed(texts: texts, model: model)
         await metrics?.recordEmbedding(model: model, texts: texts.count, duration: Date().timeIntervalSince(started))
         return vectors
+    }
+
+    /// Метка прогона перенарезки: одна на прогон, а не на документ —
+    /// по ней продолжение узнаёт уже сделанное этим прогоном.
+    static func newRunStamp() -> String {
+        ISO8601DateFormatter().string(from: Date()) + "/" + UUID().uuidString.prefix(8)
+    }
+
+    /// Куски, чей идентификатор уже занят **другим** документом коллекции,
+    /// получают свободный.
+    ///
+    /// Второй пересчёт с перенарезкой режет заново и первый кусок прошлого
+    /// прогона: «d1» снова даёт «d1» и «d1#1» — а «d1#1» в коллекции уже
+    /// есть, это второй кусок прошлого прогона, самостоятельный документ
+    /// со своим текстом. Запись поверх стирала этот текст (а в одной пачке
+    /// с ним — и вовсе давала два документа с одним id). Занятым считается
+    /// то, что было в коллекции до прогона и записано не этим прогоном:
+    /// свои куски, записанные до прерывания, продолжение переписывает
+    /// на месте. Свободный идентификатор выводится из метки прогона —
+    /// продолжение того же прогона получает те же.
+    private func freeingPieceIDs(
+        _ records: [EmbeddedRecord], taken: Set<String>, runStamp: String,
+        collectionID: String, chroma: ChromaClient
+    ) async throws -> [EmbeddedRecord] {
+        let suspects = records.filter { record in
+            guard taken.contains(record.id),
+                  case .string(let parent)? = record.metadata[CollectionBindingKeys.rechunkedFrom] else { return false }
+            return parent != record.id
+        }.map(\.id)
+        guard !suspects.isEmpty else { return records }
+        let existing = try await chroma.getDocuments(
+            collectionID: collectionID, limit: suspects.count, includeDocuments: false, ids: suspects
+        )
+        // Своё — кусок **этого же** документа, записанный **этим же** прогоном
+        // до прерывания. Всё прочее чужое, в том числе прошлый кусок, который
+        // этот прогон уже перенарезал как самостоятельный документ: у него
+        // метка прогона та же, но родитель — он сам.
+        let parents = Dictionary(records.compactMap { record -> (String, String)? in
+            guard case .string(let parent)? = record.metadata[CollectionBindingKeys.rechunkedFrom] else { return nil }
+            return (record.id, parent)
+        }, uniquingKeysWith: { first, _ in first })
+        let foreign = Set(existing.filter { document in
+            guard case .string(let stamp)? = document.metadata?[CollectionBindingKeys.rechunkRun], stamp == runStamp,
+                  case .string(let parent)? = document.metadata?[CollectionBindingKeys.rechunkedFrom],
+                  parent == parents[document.id] else { return true }
+            return false
+        }.map(\.id))
+        guard !foreign.isEmpty else { return records }
+        let tag = Self.runTag(runStamp)
+        return records.map { record in
+            guard foreign.contains(record.id),
+                  case .string(let parent)? = record.metadata[CollectionBindingKeys.rechunkedFrom],
+                  let index = record.id.split(separator: "#").last.flatMap({ Int($0) }) else { return record }
+            return EmbeddedRecord(
+                id: "\(parent)#\(tag).\(index)", document: record.document,
+                embedding: record.embedding, metadata: record.metadata
+            )
+        }
+    }
+
+    /// Короткая метка прогона для идентификатора куска.
+    static func runTag(_ runStamp: String) -> String {
+        SHA256.hash(data: Data(runStamp.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Ids of the pieces one document turns into. A single piece keeps the

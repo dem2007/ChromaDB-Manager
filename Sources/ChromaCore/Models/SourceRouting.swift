@@ -205,7 +205,9 @@ public struct CollectionRouter {
                 return adding(levels: source, to: .routed(CollectionRoute(collectionName: base)), path: path)
             }
             outcome = .routed(CollectionRoute(
-                collectionName: CollectionNaming.sanitize(components[0])
+                collectionName: CollectionNaming.sanitize(
+                    components[0], transliterating: source.transliteratesCollectionNames
+                )
             ))
 
         case .manualRule:
@@ -272,7 +274,9 @@ public struct CollectionRouter {
         guard !name.isEmpty else {
             return unmatched(source: source, fallback: fallback, path: path)
         }
-        return .routed(CollectionRoute(collectionName: CollectionNaming.sanitize(name)))
+        return .routed(CollectionRoute(
+            collectionName: CollectionNaming.sanitize(name, transliterating: source.transliteratesCollectionNames)
+        ))
     }
 
     private func unmatched(source: DataSource, fallback: String, path: String) -> RoutingOutcome {

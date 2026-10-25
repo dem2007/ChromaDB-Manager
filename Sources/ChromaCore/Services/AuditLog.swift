@@ -163,6 +163,34 @@ public final class AuditLog: ObservableObject {
 
     public var logFileURL: URL { fileURL }
 
+    /// Кого известить о записанном — кроме файла и экрана.
+    ///
+    /// Через журнал проходит **каждый** запрос внешнего клиента: и вызов
+    /// инструмента MCP, и запрос, проброшенный прокси прямо в ChromaDB.
+    /// Другого места, где приложение видит их все разом, нет — а тому, кто
+    /// что-то помнит о содержимом коллекции, знать о чужой записи обязательно
+    ///.
+    private let observer = Observer()
+
+    /// Подписчики — по имени, как у `ChromaClient.observeCollectionChanges`:
+    /// один слот означал, что второй подписчик молча вытесняет первого.
+    private final class Observer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var handlers: [String: @Sendable (AuditEntry) -> Void] = [:]
+        func set(_ name: String, _ handler: (@Sendable (AuditEntry) -> Void)?) {
+            lock.withLock { handlers[name] = handler }
+        }
+        func notify(_ entry: AuditEntry) {
+            for handler in lock.withLock({ Array(handlers.values) }) { handler(entry) }
+        }
+    }
+
+    /// Подписаться на записи журнала; `nil` — отписаться. Потокобезопасно:
+    /// журнал пишется из любого потока.
+    public nonisolated func observeRecords(as name: String, _ handler: (@Sendable (AuditEntry) -> Void)?) {
+        observer.set(name, handler)
+    }
+
     /// Callable from the proxy's own queues.
     public nonisolated func record(_ entry: AuditEntry) {
         // Masking happens before anything is stored, so an archive can never
@@ -173,6 +201,7 @@ public final class AuditLog: ObservableObject {
         entry.note = entry.note.map { SecretRegistry.shared.mask($0) }
         entry.parameters = entry.parameters.map { SecretRegistry.shared.mask($0) }
         appendToFile(entry)
+        observer.notify(entry)
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.entries.insert(entry, at: 0)

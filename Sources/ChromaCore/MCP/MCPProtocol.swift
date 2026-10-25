@@ -17,7 +17,11 @@ public enum MCPProtocol {
     ///
     /// Новее — раньше: при согласовании отвечаем самой новой из тех, что
     /// клиент готов принять.
-    public static let legacyVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
+    ///
+    /// `2025-11-25` — последняя из них, и спецификация называет именно её
+    /// границей старой эпохи. Без неё клиент этой ревизии получал в ответ на
+    /// рукопожатие `2025-06-18`, а по HTTP — отказ 400 на свой же заголовок.
+    public static let legacyVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 
     /// Всё, что приложение готово обслуживать, — от новой ревизии к старым.
     public static let supportedVersions = [version] + legacyVersions
@@ -35,12 +39,42 @@ public enum MCPProtocol {
         return requested
     }
 
+    /// Версия, которую сервер предполагает, когда клиент её не назвал:
+    /// ни в `_meta`, ни заголовком, ни рукопожатием на этом соединении.
+    /// Так велит транспорт старой эпохи (2025-06-18, «Protocol Version
+    /// Header»): без иных примет сервер **SHOULD** считать версию `2025-03-26`.
+    public static let assumedLegacyVersion = "2025-03-26"
+
+    /// Как сообщать о неверных аргументах инструмента.
+    ///
+    /// До `2025-11-25` спецификация относила «invalid arguments» к ошибкам
+    /// протокола (`-32602`); с `2025-11-25` ошибки проверки ввода — это
+    /// ошибки выполнения: результат с `isError: true`, по которому модель
+    /// исправит вызов сама. Каждой эпохе — её поведение.
+    public static func reportsArgumentErrorsAsToolResults(_ version: String) -> Bool {
+        version == self.version || version == "2025-11-25"
+    }
+
     /// Само поле, в котором едут версия, возможности и личность клиента.
     public static let metaKey = "_meta"
     /// Префикс полей `_meta`, зарезервированный спецификацией.
     public static let metaProtocolVersion = "io.modelcontextprotocol/protocolVersion"
     public static let metaClientInfo = "io.modelcontextprotocol/clientInfo"
     public static let metaClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
+    /// Сведения о сервере в `_meta` ответа — сервер **SHOULD** класть их
+    /// в каждый результат: он не опирается на прежние запросы, и клиент тоже.
+    public static let metaServerInfo = "io.modelcontextprotocol/serverInfo"
+
+    /// Подсказки кэша (`CacheableResult`). В новой ревизии обязательны для
+    /// `server/discover` и `tools/list`.
+    ///
+    /// Сведения о сервере одни для всех — `public` и надолго: меняются они
+    /// только с новой версией приложения, то есть с новым процессом.
+    public static let discoverCacheTTL = 3_600_000
+    /// Список инструментов зависит от ключа (права записи и удаления) и от
+    /// переключателя «только чтение» — поэтому `private` и минута: дольше
+    /// клиент держал бы список, урезанный или расширенный уже снятыми правами.
+    public static let toolsListCacheTTL = 60_000
 
     // Методы, которые обязан или может обслуживать сервер.
     public static let discoverMethod = "server/discover"

@@ -29,6 +29,10 @@ final class ReembeddingViewModel: ObservableObject {
     /// An interrupted in-place run for the collection being set up, if any.
     @Published var resumable: ReembeddingCheckpoint?
     @Published var confirmationText = ""
+    /// Разделители, как их набирают в поле. Своя строка, а не вывод из
+    /// разобранного списка: разбор отбрасывает пустое, и начатый
+    /// разделитель («\n\n | ») исчезал из поля прямо при наборе.
+    @Published var separatorsText = ""
     /// Vector size of the chosen model, probed as soon as it is chosen.
     @Published var targetDimension: Int?
     @Published var dimensionNote: String?
@@ -52,8 +56,13 @@ final class ReembeddingViewModel: ObservableObject {
             scenario: .clone
         )
         draft.newCollectionName = ReembeddingRequest.suggestedName(for: collection, model: draft.targetModel)
-        draft.chunking = ChunkingConfiguration()
+        // Нарезка — та, которой коллекцию наполнял источник, а не
+        // умолчания: клон с другой нарезкой сравнивают ровно по ней, и
+        // начинать надо с исходной.
+        draft.chunking = Self.sourceChunking(for: collection, in: app.settings.configuration)
+            ?? ChunkingConfiguration()
         request = draft
+        separatorsText = SourcesViewModel.formatSeparators(draft.chunking.separators)
         confirmationText = ""
         targetDimension = nil
         dimensionNote = nil
@@ -66,6 +75,17 @@ final class ReembeddingViewModel: ObservableObject {
             await MainActor.run { self?.resumable = checkpoint }
         }
         probeDimension(app)
+    }
+
+    /// Нарезка источника, наполнявшего коллекцию: по имени источника в
+    /// метаданных коллекции, иначе — по имени коллекции.
+    static func sourceChunking(for collection: ChromaCollection, in configuration: AppConfiguration) -> ChunkingConfiguration? {
+        let sources = configuration.dataSources
+        if case .string(let name)? = collection.metadata?["_cdbm_source_name"],
+           let source = sources.first(where: { $0.name == name }) {
+            return source.chunking
+        }
+        return sources.first { CollectionNaming.sanitize($0.collectionName) == collection.name }?.chunking
     }
 
     func cancelSetup() {
@@ -166,6 +186,14 @@ final class ReembeddingViewModel: ObservableObject {
             // замыкании: перезахват внешней переменной из параллельно
             // исполняемого кода — это гонка (см. InspectorViewModel).
             guard let self else { return }
+            // Запись снаружи — прокси и агентов MCP — в пересчитываемую
+            // коллекцию закрыта на весь прогон: агент вклинивается между
+            // пачками (его приоритет выше), и его документ лёг бы вектором
+            // старой модели в коллекцию, которую прогон объявит новой.
+            let frozen = request.scenario == .clone
+                ? [request.collection.name, request.newCollectionName]
+                : [request.collection.name]
+            await app.proxy.access.freezeWrites(to: frozen)
             do {
                 // The backup comes first and is not optional: `run` cannot even be
                 // called without the evidence it returns.
@@ -248,6 +276,7 @@ final class ReembeddingViewModel: ObservableObject {
                 }
                 app.report(error, category: "Re-embedding")
             }
+            await app.proxy.access.thawWrites(to: frozen)
             await MainActor.run {
                 self.isRunning = false
                 self.isPaused = false

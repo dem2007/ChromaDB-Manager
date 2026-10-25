@@ -58,13 +58,13 @@ public enum TextDocumentLoader {
     /// Простой текст, Markdown, код, CSV, JSON.
     public static func plainText(at url: URL) throws -> String {
         try checkSize(of: url)
-        // Тот же перебор кодировок, что у извлечения: UTF-8, UTF-16, latin-1.
-        // Порядок важен — UTF-8 сначала, иначе кириллица прочитается как
-        // мусор из latin-1 и «откроется», что хуже отказа.
-        for encoding in [String.Encoding.utf8, .utf16, .isoLatin1] {
-            if let text = try? String(contentsOf: url, encoding: encoding) { return text }
-        }
-        throw LoadError.unreadableEncoding
+        // Тем же чтением, что у извлечения: метка BOM, UTF-8, русские
+        // однобайтовые кодировки, latin-1 последним. Свой перебор пробовал
+        // UTF-16 без метки вторым, а он принимает почти любой файл чётной
+        // длины: текст в cp1251 открывался иероглифами, и фрагмент на нём
+        // не находился.
+        guard let text = PlainTextExtractor.read(at: url) else { throw LoadError.unreadableEncoding }
+        return text
     }
 
     /// `.docx`, `.rtf`, `.odt` — тем же механизмом, что извлечение (11.4).
@@ -73,7 +73,12 @@ public enum TextDocumentLoader {
     /// проверка мерила файл, и `.docx` на 22 МБ не открывался вовсе — при
     /// том, что текста в нём 765 КБ, остальное картинки, а разбор занимает
     /// 366 мс. Отказ был не по той причине, по которой предел заводили.
-    @MainActor
+    ///
+    /// **Не на главном потоке.** С пределом в 200 МБ по весу файла разбор
+    /// документа из сканов — это секунды, и на главном потоке окно замирало
+    /// на всё это время. Импорт `.docx`, `.rtf` и `.odt` к главному потоку
+    /// не привязан (привязан только HTML, а он сюда не ходит): просмотрщик
+    /// зовёт это из фоновой задачи, как и разбор простого текста.
     public static func richText(at url: URL) throws -> NSAttributedString {
         try checkSize(of: url, limit: maximumRichBytes)
         let text = try parseRichText(at: url)
@@ -86,7 +91,6 @@ public enum TextDocumentLoader {
         return text
     }
 
-    @MainActor
     private static func parseRichText(at url: URL) throws -> NSAttributedString {
         do {
             var attributes: NSDictionary?

@@ -32,6 +32,16 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// re-extract rather than into work.
     public var version: Int { Self.currentVersion }
 
+    /// 10 — записи нумерованной таблицы — одной строкой: строки без номера
+    /// под позицией вливаются в её ячейку.
+    ///
+    /// 9 — объединённые ячейки по одному правилу на все форматы:
+    /// значение, объединённое вниз, стоит в каждой строке, многоуровневая
+    /// шапка — одной строкой, строка-раздел — колонкой «Раздел». Заодно
+    /// `.docx`: текст ячейки на несколько колонок вставал в последнюю из них,
+    /// `w:gridBefore` сдвигал строку влево, вложенная таблица рвала внешнюю;
+    /// `.doc`: ячейка из двух абзацев рвала таблицу надвое.
+    ///
     /// 8 — замечания и сноски `.odt` извлекаются текстом: импортёр
     /// отдавал номер сноски и молчал про её текст, а замечание терял целиком.
     ///
@@ -51,7 +61,21 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// сноски, замечания рецензентов и надписи, которых системный импортёр
     /// не отдаёт вовсе, приходят текстом; удалённый правкой и скрытый текст
     /// в базу не идут.
-    public static let currentVersion = 8
+    ///
+    /// 13 — нумерация Word по спецификации (номера из стилей, общий счёт
+    /// экземпляров списка, перезапуски, скрытые пункты), неразрывный дефис
+    /// и символьные шрифты, оглавление не индексируется, знаки
+    /// нормализуются.
+    ///
+    /// 14 — номера списков двоичного `.doc`, разрыв раздела закрывает
+    /// абзац.
+    ///
+    /// 15 — таблица-бланк без колонок пишется строками текста, а не сеткой
+    ///.
+    ///
+    /// 16 — подпись во всю ширину таблицы один раз; пометка «шапка» глубже
+    /// трёх строк — не шапка.
+    public static let currentVersion = 16
 
     /// A paragraph this much larger than the body is a heading.
     static let headingSizeRatio: CGFloat = 1.15
@@ -178,6 +202,12 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// Строка сноски в тексте документа. Концевая называется своим именем:
     /// номера у обычных и концевых сносок свои, и «Сноска 1» дважды
     /// назвала бы разные вещи одинаково.
+    static func commentLine(_ comment: DocxPartsReader.Comment) -> String {
+        comment.author.isEmpty
+            ? String(localized: "Комментарий: \(comment.text)")
+            : String(localized: "Комментарий (\(comment.author)): \(comment.text)")
+    }
+
     static func noteLine(_ key: String, _ text: String) -> String {
         let label = DocxPartsReader.noteLabel(key)
         return label.isEndnote
@@ -188,7 +218,11 @@ public struct OfficeExtractor: DocumentTextExtractor {
     static func assemble(
         _ parts: DocxPartsReader.Document, url: URL, type: UTType, options: ExtractionOptions
     ) throws -> ExtractedDocument {
-        let paragraphs = parts.paragraphs.filter { !$0.isHidden }
+        // Оглавление не индексируется: в нём все заголовки документа
+        // разом, и кусок с ним находился по любому вопросу о любом разделе —
+        // а сами заголовки, теперь с номерами, стоят на своих местах.
+        let paragraphs = parts.paragraphs.filter { !$0.isHidden && !$0.isTableOfContents }
+        let contentsLines = parts.paragraphs.filter { !$0.isHidden && $0.isTableOfContents }.count
         let body = bodySize(of: paragraphs)
 
         var lines: [String] = []
@@ -236,10 +270,18 @@ public struct OfficeExtractor: DocumentTextExtractor {
         }
 
         var placed: Set<String> = []
+        // Замечание рецензента — под абзацем, к которому оно относится
+        //, как сноска. В конце документа «уточнить срок» оторвано
+        // от срока, о котором речь, и в вектор его куска не попадает.
+        let commentsByID = Dictionary(parts.comments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var placedComments: Set<String> = []
         func notes(of paragraph: DocxPartsReader.Paragraph) -> [String] {
             paragraph.footnotes.compactMap { id in
                 guard let text = parts.footnotes[id], placed.insert(id).inserted else { return nil }
                 return Self.noteLine(id, text)
+            } + paragraph.comments.compactMap { id in
+                guard let comment = commentsByID[id], placedComments.insert(id).inserted else { return nil }
+                return Self.commentLine(comment)
             }
         }
 
@@ -261,21 +303,29 @@ public struct OfficeExtractor: DocumentTextExtractor {
             // Таблица целиком: её строки идут подряд и разделяются переводом
             // строки, а не пустой строкой, — иначе нарезка по абзацам рвёт
             // таблицу на куски.
-            var cells: [(row: Int, column: Int, text: String, continuation: Bool)] = []
+            var cells: [(row: Int, column: Int, columnSpan: Int, text: String, continuation: Bool)] = []
+            var headerRows: Set<Int> = []
             // Сноска из ячейки — **после** таблицы, а не в ячейке: строкой
             // внутри ячейки она сломала бы разметку Markdown, по которой
             // таблица и читается.
             var tableNotes: [String] = []
             let tableStart = length
             while index < paragraphs.count, let current = paragraphs[index].cell, current.table == cell.table {
-                cells.append((current.row, current.column, decorated(paragraphs[index]), current.isVerticalContinuation))
+                cells.append((current.row, current.column, current.columnSpan,
+                              decorated(paragraphs[index]), current.isVerticalContinuation))
+                if current.isHeaderRow { headerRows.insert(current.row) }
                 tableNotes += notes(of: paragraphs[index])
                 // Ссылка из ячейки принадлежит таблице: точнее места у неё
                 // нет — таблица собирается в одну строку текста.
                 collectLinks(of: paragraphs[index], at: tableStart)
                 index += 1
             }
-            add(([renderTable(cells)] + tableNotes).joined(separator: "\n"))
+            // Шапка — строки, помеченные повторяемыми, если они идут сверху
+            // подряд; иначе догадка по форме.
+            var header = 0
+            while headerRows.contains(header) { header += 1 }
+            let table = SpannedTable.fromContinuations(cells, headerRows: header > 0 ? header : nil)
+            add(([table.rendered()] + tableNotes).joined(separator: "\n"))
         }
 
         // Сноска, ссылки на которую в тексте не нашлось, — всё равно текст,
@@ -289,10 +339,8 @@ public struct OfficeExtractor: DocumentTextExtractor {
         // Замечание рецензента — такой же написанный человеком текст, как
         // сноска: «уточнить срок поставки» ищут теми же словами.
         // Автор в подписи: у замечания он есть, и по нему их и разбирают.
-        for comment in parts.comments {
-            add(comment.author.isEmpty
-                ? String(localized: "Комментарий: \(comment.text)")
-                : String(localized: "Комментарий (\(comment.author)): \(comment.text)"))
+        for comment in parts.comments where !placedComments.contains(comment.id) {
+            add(Self.commentLine(comment))
         }
         for footer in parts.footers { add(String(localized: "Нижний колонтитул: \(footer)")) }
 
@@ -324,6 +372,9 @@ public struct OfficeExtractor: DocumentTextExtractor {
             warnings.append(.other(String(localized: "в документе есть правки: индексируется финальная редакция, удалённый текст в базу не идёт")))
         }
         if parts.commentsUnreadable { warnings.append(.commentsSkipped) }
+        if contentsLines > 0 {
+            warnings.append(.other(String(localized: "оглавление не индексируется: \(contentsLines.plainDigits) строк — те же заголовки есть в тексте документа")))
+        }
         if parts.hiddenParagraphs > 0 {
             warnings.append(.other(String(localized: "пропущено скрытых абзацев: \(parts.hiddenParagraphs.plainDigits) — Word их не показывает и не печатает")))
         }
@@ -385,48 +436,6 @@ public struct OfficeExtractor: DocumentTextExtractor {
     /// и на файлы рядом источником не являются.
     static func isExternal(_ link: String) -> Bool {
         link.hasPrefix("http") || link.hasPrefix("mailto:")
-    }
-
-    /// Строки таблицы — разметкой Markdown, как у книги Excel.
-    ///
-    /// Ячейка из нескольких абзацев остаётся **одной** ячейкой — раньше её
-    /// абзацы вставали соседними колонками, и таблица из двух колонок читалась
-    /// как таблица из трёх. Объединённая вниз ячейка повторяет значение
-    /// верхней: значение относится ко всем строкам диапазона.
-    static func renderTable(_ cells: [(row: Int, column: Int, text: String, continuation: Bool)]) -> String {
-        var byPosition: [Int: [Int: [String]]] = [:]
-        var continuations: Set<String> = []
-        for cell in cells {
-            byPosition[cell.row, default: [:]][cell.column, default: []].append(cell.text)
-            if cell.continuation { continuations.insert("\(cell.row)\u{0}\(cell.column)") }
-        }
-        var carried: [Int: String] = [:]
-        var rows: [[String]] = []
-        // Колонки перебираются по всей ширине таблицы, а не по тем, что
-        // в этой строке нашлись: пустая ячейка обязана остаться на своём
-        // месте, иначе значения соседних колонок съезжают влево, и строка
-        // «— — 400 м» читается как «400 м» в первой колонке.
-        let width = (cells.map(\.column).max() ?? 0) + 1
-        for row in byPosition.keys.sorted() {
-            var line: [String] = []
-            let columns = byPosition[row] ?? [:]
-            for column in 0..<width {
-                let joined = (columns[column] ?? []).filter { !$0.isEmpty }.joined(separator: " / ")
-                // Значение сверху подставляется только там, где ячейка
-                // **объединена** вниз. Пустая ячейка остаётся пустой: раньше
-                // она тоже брала значение верхней, и таблица, где цену просто
-                // не заполнили, приходила в базу с ценой соседней строки —
-                // выдуманные данные хуже отсутствующих.
-                if continuations.contains("\(row)\u{0}\(column)"), let value = carried[column], !value.isEmpty {
-                    line.append(value)
-                } else {
-                    if !joined.isEmpty { carried[column] = joined }
-                    line.append(joined)
-                }
-            }
-            rows.append(line)
-        }
-        return TableText.render(rows)
     }
 
     // MARK: - Reading
@@ -562,7 +571,7 @@ public struct OfficeExtractor: DocumentTextExtractor {
         var size: CGFloat
         var isBold: Bool
         /// Set when the paragraph is a table cell: which table, and where in it.
-        var table: (id: ObjectIdentifier, row: Int, column: Int)?
+        var table: (id: ObjectIdentifier, row: Int, column: Int, rowSpan: Int, columnSpan: Int)?
     }
 
     static func paragraphs(of attributed: NSAttributedString) -> [Paragraph] {
@@ -579,7 +588,9 @@ public struct OfficeExtractor: DocumentTextExtractor {
                 text: text,
                 size: font?.pointSize ?? 12,
                 isBold: font.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } ?? false,
-                table: block.map { (ObjectIdentifier($0.table), $0.startingRow, $0.startingColumn) }
+                table: block.map {
+                    (ObjectIdentifier($0.table), $0.startingRow, $0.startingColumn, $0.rowSpan, $0.columnSpan)
+                }
             ))
         }
         return result
@@ -600,25 +611,29 @@ public struct OfficeExtractor: DocumentTextExtractor {
                 index += 1
                 continue
             }
-            var cells: [(row: Int, column: Int, text: String)] = []
+            // Ячейка — по месту начала; абзацы одной ячейки склеиваются.
+            // Размах объединения импортёр отдаёт сам (`rowSpan`, `columnSpan`),
+            // и раньше он терялся: значение объединённой вниз ячейки стояло
+            // только в верхней строке.
+            var order: [String] = []
+            var anchors: [String: SpannedTable.Cell] = [:]
             while index < paragraphs.count, let current = paragraphs[index].table, current.id == table.id {
-                cells.append((current.row, current.column, paragraphs[index].text))
-                index += 1
-            }
-            let width = (cells.map(\.column).max() ?? 0) + 1
-            var rows: [[String]] = []
-            for (_, row) in Dictionary(grouping: cells, by: \.row).sorted(by: { $0.key < $1.key }) {
-                var line = Array(repeating: "", count: width)
-                for cell in row where cell.column < width {
-                    line[cell.column] = line[cell.column].isEmpty
-                        ? cell.text
-                        : line[cell.column] + " / " + cell.text
+                let key = "\(current.row)\u{0}\(current.column)"
+                if var cell = anchors[key] {
+                    cell.text = cell.text.isEmpty ? paragraphs[index].text : cell.text + " / " + paragraphs[index].text
+                    anchors[key] = cell
+                } else {
+                    order.append(key)
+                    anchors[key] = SpannedTable.Cell(
+                        text: paragraphs[index].text, row: current.row, column: current.column,
+                        rowSpan: current.rowSpan, columnSpan: current.columnSpan
+                    )
                 }
-                rows.append(line)
+                index += 1
             }
             // Таблица идёт одним куском: строки внутри неё разделяются переводом
             // строки, а не пустой, иначе нарезка по абзацам рвёт её на строки.
-            lines.append(TableText.render(rows))
+            lines.append(SpannedTable(cells: order.compactMap { anchors[$0] }).rendered())
         }
         return lines.joined(separator: "\n\n")
     }

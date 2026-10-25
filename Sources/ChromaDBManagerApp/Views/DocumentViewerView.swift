@@ -19,16 +19,13 @@ struct DocumentViewerSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if let note {
                 Divider()
-                Text(note)
-                    .font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.attention)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
+                Notice(.warning, note)
+                    .padding()
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .frame(minWidth: 720, idealWidth: 900, minHeight: 520, idealHeight: 760)
+        .documentSheetFrame()
     }
 
     /// Оговорка о точности — под документом, а не поверх него.
@@ -82,47 +79,42 @@ struct DocumentViewerSheet: View {
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+        HStack {
+            VStack(alignment: .leading) {
                 // Панель называется тем файлом, который открыла, а не тем,
                 // откуда её позвали: у результата стенда «заголовок» — это
                 // идентификатор чанка, и человеку он ничего не говорит.
                 Text(title)
-                    .font(Theme.Font.objectTitle)
+                    .font(.headline)
                     .lineLimit(1).truncationMode(.middle)
-                HStack(spacing: 8) {
+                HStack {
                     // Место в документе — первым и целиком: оно короткое и
                     // это главное, что человек ищет глазами. Ужимается путь:
                     // он длинный, и середина в нём не нужна.
                     if let placementLine {
                         Text(placementLine)
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                             .fixedSize()
                     }
                     if let url = model.fileURL {
                         Text(url.path)
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
                             .lineLimit(1).truncationMode(.middle)
                             .copyable(url.path)
                     }
                 }
+                .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 12)
+            Spacer()
 
             if model.fileURL != nil {
                 Button(String(localized: "Показать в Finder")) { model.revealInFinder() }
-                    .buttonStyle(.chromaNormal)
                 // Кнопка «во внешнем приложении» доступна всегда, когда файл
                 // найден, — для любого формата.
                 Button(String(localized: "Открыть во внешнем")) { model.openExternally() }
-                    .buttonStyle(.chromaNormal)
             }
             Button(String(localized: "Закрыть")) { model.close() }
-                .buttonStyle(.chromaPrimary)
                 .keyboardShortcut(.cancelAction)
         }
-        .padding(.horizontal, Theme.Padding.cardHorizontal)
-        .padding(.vertical, 14)
+        .padding()
     }
 
     @ViewBuilder
@@ -154,70 +146,51 @@ struct DocumentViewerSheet: View {
     }
 
     private func webPageView(_ url: URL) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: "globe")
-                .font(.system(size: 32)).foregroundStyle(Theme.Palette.captionText)
-            Text(String(localized: "Документ — страница сайта. Панель показывает файлы, а у этого документа есть только адрес."))
-                .font(Theme.Font.body).multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 520)
-            Text(url.absoluteString)
-                .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                .textSelection(.enabled)
-                .lineLimit(2).truncationMode(.middle)
-                .frame(maxWidth: 520)
+        ContentUnavailableView {
+            Label(String(localized: "Страница сайта"), systemImage: "globe")
+        } description: {
+            Text("Панель показывает файлы, а у этого документа есть только адрес: \(url.absoluteString)")
+        } actions: {
             Button(String(localized: "Открыть в браузере")) { NSWorkspace.shared.open(url) }
                 .keyboardShortcut(.defaultAction)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Файл не найден, источник не зарегистрирован или документ добавлен
     /// руками — три разных случая, и каждый чинится по-своему.
     private func problemView(_ text: String, reference: SourceReference?) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: "doc.questionmark")
-                .font(.system(size: 32)).foregroundStyle(Theme.Palette.captionText)
-            Text(text)
-                .font(Theme.Font.body).multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 520)
+        ContentUnavailableView {
+            Label(String(localized: "Документ не открыт"), systemImage: "doc.questionmark")
+        } description: {
             if let reference, let target = reference.target.line {
-                Text(String(localized: "При индексации фрагмент был здесь: \(target)."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Text("\(text) При индексации фрагмент был здесь: \(target).")
+            } else {
+                Text(text)
             }
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func externalOnlyView(_ url: URL) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: "arrow.up.forward.app")
-                .font(.system(size: 32)).foregroundStyle(Theme.Palette.captionText)
-            // Две разные причины, и путать их нельзя: формат не поддержан —
-            // это про приложение, а «не открылся» — про конкретный файл,
-            // и во втором случае человеку нужна сама причина.
+        // Две разные причины, и путать их нельзя: формат не поддержан —
+        // это про приложение, а «не открылся» — про конкретный файл,
+        // и во втором случае человеку нужна сама причина.
+        ContentUnavailableView {
+            Label(
+                model.showFailure != nil
+                    ? String(localized: "Показать внутри приложения не вышло")
+                    : String(localized: "Этот формат панель пока не показывает"),
+                systemImage: "arrow.up.forward.app"
+            )
+        } description: {
             if let failure = model.showFailure {
-                Text(String(localized: "Показать внутри приложения не вышло."))
-                    .font(Theme.Font.body)
                 Text(failure)
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: 520)
             } else {
-                Text(String(localized: "Этот формат панель пока не показывает — \(DocumentLocator.kind(of: url).title)."))
-                    .font(Theme.Font.body)
-                Text(String(localized: "Файл найден и цел; откройте его тем, чем открывает система."))
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.captionText)
+                Text("\(DocumentLocator.kind(of: url).title). Файл найден и цел; откройте его тем, чем открывает система.")
             }
+        } actions: {
             Button(String(localized: "Открыть во внешнем приложении")) { model.openExternally() }
                 .keyboardShortcut(.defaultAction)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -242,6 +215,7 @@ private struct PDFViewer: NSViewRepresentable {
         var shownDocument: PDFDocument?
         var shownPage: Int?
         var shownRange: Range<Int>?
+        var shownEnd: (pageIndex: Int, character: Int)?
     }
 
     func makeNSView(context: Context) -> PDFView {
@@ -261,10 +235,13 @@ private struct PDFViewer: NSViewRepresentable {
         guard coordinator.shownDocument !== document
                 || coordinator.shownPage != location.pageIndex
                 || coordinator.shownRange != location.characterRange
+                || coordinator.shownEnd?.pageIndex != location.end?.pageIndex
+                || coordinator.shownEnd?.character != location.end?.character
         else { return }
         coordinator.shownDocument = document
         coordinator.shownPage = location.pageIndex
         coordinator.shownRange = location.characterRange
+        coordinator.shownEnd = location.end
 
         if view.document !== document { view.document = document }
         guard let page = document.page(at: location.pageIndex) else { return }
@@ -477,14 +454,13 @@ private final class LineNumberTextView: NSTextView {
 private struct TableWindowView: View {
     let window: TableRowLoader.Window
 
-    private var columnWidths: [CGFloat] {
-        let count = max(window.header?.count ?? 0, window.rows.map(\.values.count).max() ?? 0)
-        return Array(repeating: 180, count: count)
+    private var columnCount: Int {
+        max(window.header?.count ?? 0, window.rows.map(\.values.count).max() ?? 0)
     }
 
     var body: some View {
         ScrollView([.horizontal, .vertical]) {
-            VStack(alignment: .leading, spacing: 0) {
+            Grid(alignment: .leading) {
                 if let header = window.header {
                     row(number: nil, values: header, isHeader: true, isTarget: false)
                     Divider()
@@ -496,30 +472,27 @@ private struct TableWindowView: View {
                         number: item.number, values: item.values,
                         isHeader: false, isTarget: item.isTarget
                     )
-                    Divider().opacity(0.3)
                 }
             }
-            .padding(10)
+            .padding()
         }
     }
 
     private func row(number: Int?, values: [String], isHeader: Bool, isTarget: Bool) -> some View {
-        HStack(spacing: 0) {
+        GridRow {
             Text(number.map(String.init) ?? "")
-                .font(Theme.Font.mono)
+                .monospacedDigit()
                 .foregroundStyle(.tertiary)
-                .frame(width: 46, alignment: .trailing)
-                .padding(.trailing, 8)
-            ForEach(Array(columnWidths.enumerated()), id: \.offset) { index, width in
+                .gridColumnAlignment(.trailing)
+            ForEach(0..<columnCount, id: \.self) { index in
                 Text(index < values.count ? values[index] : "")
-                    .font(Theme.Font.caption)
                     .fontWeight(isHeader ? .semibold : .regular)
                     .lineLimit(2)
-                    .frame(width: width, alignment: .leading)
-                    .padding(.trailing, 10)
+                    .tableCellWidth()
             }
         }
-        .padding(.vertical, 3)
-        .background(isTarget ? Color.yellow.opacity(0.35) : Color.clear)
+        // Найденная строка — системным цветом выделения текста, как
+        // подсветка фрагмента в тексте: человек ищет глазами один цвет.
+        .background(isTarget ? Color(nsColor: .findHighlightColor) : Color.clear)
     }
 }

@@ -589,6 +589,13 @@ final class ProxyConnection: @unchecked Sendable {
     private var parser = HTTPRequestParser()
     private var isHandling = false
     private var isClosed = false
+    /// Последний ответ отправлен, соединение закроется, как только он уйдёт:
+    /// новых запросов с него не читаем.
+    private var isClosing = false
+    /// Запрос, который сейчас обрабатывается. Клиент разорвал соединение —
+    /// это отмена запроса (`2026-07-28`, «Streamable HTTP», «Cancellation»):
+    /// работа останавливается, а не дорабатывает впустую.
+    private var current: Task<Void, Never>?
 
     init(
         client: NWConnection,
@@ -615,8 +622,17 @@ final class ProxyConnection: @unchecked Sendable {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
         configuration.timeoutIntervalForRequest = 120
-        self.session = URLSession(configuration: configuration)
+        self.session = URLSession(configuration: configuration, delegate: downloads, delegateQueue: nil)
     }
+
+    /// Сколько ответа сервера прокси готов держать в памяти.
+    ///
+    /// Тело запроса ограничено (`maximumBodyBytes`) ровно по этой причине:
+    /// прокси живёт в процессе приложения, и не должен быть способом его
+    /// уронить. Ответ ограничен не был: `get` всей коллекции с векторами —
+    /// сотни мегабайт в памяти приложения, по копии на каждый такой запрос.
+    static let maximumResponseBytes = 256 * 1024 * 1024
+    private let downloads = CappedDownloads(limit: ProxyConnection.maximumResponseBytes)
 
     func start() {
         client.stateUpdateHandler = { [weak self] state in
@@ -633,6 +649,7 @@ final class ProxyConnection: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.isClosed else { return }
             self.isClosed = true
+            self.current?.cancel()
             self.client.cancel()
             self.session.invalidateAndCancel()
             self.onClose(ObjectIdentifier(self))
@@ -659,7 +676,7 @@ final class ProxyConnection: @unchecked Sendable {
     /// One request at a time: HTTP/1.1 answers in order, and a permission check
     /// that overtook its own request would answer the wrong one.
     private func drain() {
-        guard !isHandling, !isClosed else { return }
+        guard !isHandling, !isClosed, !isClosing else { return }
         let request: ProxiedRequest?
         do {
             request = try parser.next()
@@ -668,23 +685,31 @@ final class ProxyConnection: @unchecked Sendable {
                 if case .malformed(let text) = failure { return text }
                 return "\(failure)"
             } ?? error.localizedDescription
-            respond(status: 400, message: reason)
+            // Соединение закрывается **после** того, как ответ ушёл: отмена
+            // сразу за отправкой могла опередить её, и клиент видел обрыв
+            // вместо причины — её знал бы только журнал аудита.
+            isClosing = true
+            respond(status: 400, message: reason, extraHeaders: [("connection", "close")])
             audit.record(AuditEntry(
                 client: peer, method: "?", path: "?", operation: "unparseable", access: .write,
                 collection: nil, requestBytes: 0, responseStatus: 400, responseBytes: 0,
                 durationSeconds: 0, note: reason
             ))
-            cancel()
+            client.send(
+                content: nil, contentContext: .finalMessage, isComplete: true,
+                completion: .contentProcessed { [weak self] _ in self?.cancel() }
+            )
             return
         }
         guard let request else { return }
 
         isHandling = true
-        Task { [weak self] in
+        current = Task { [weak self] in
             await self?.handle(request)
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 self.isHandling = false
+                self.current = nil
                 self.drain()
             }
         }
@@ -726,6 +751,20 @@ final class ProxyConnection: @unchecked Sendable {
             // back, or it will simply retry immediately.
             if let retryAfter { headers.append(("retry-after", String(retryAfter))) }
             respond(status: status, message: message, extraHeaders: headers)
+            // Перебор ключей сверх предела: в журнал и на экран — раз в минуту
+            // и с числом, а не каждым запросом. Иначе предел, поставленный
+            // ради того, чтобы перебор ничего не стоил, стоил бы ровно столько
+            // же — записью в журнал и уведомлением на каждый запрос.
+            var note = message
+            if status == 429, clientName == nil {
+                guard let suppressed = await access.reportAnonymousRefusal() else {
+                    onFinished(true, nil)
+                    return
+                }
+                if suppressed > 0 {
+                    note += " " + String(localized: "За прошлую минуту без записи в журнал отклонено ещё \(suppressed.plainDigits).")
+                }
+            }
             audit.record(AuditEntry(
                 client: clientName ?? peer,
                 method: request.method,
@@ -737,9 +776,9 @@ final class ProxyConnection: @unchecked Sendable {
                 responseStatus: status,
                 responseBytes: 0,
                 durationSeconds: Date().timeIntervalSince(started),
-                note: message
+                note: note
             ))
-            onRejected(clientName ?? peer, message)
+            onRejected(clientName ?? peer, note)
             onFinished(true, nil)
 
         case .allow(let clientID, let clientName, let filter):
@@ -750,6 +789,13 @@ final class ProxyConnection: @unchecked Sendable {
                 }
                 headers.append(contentsOf: corsHeaders)
                 respond(status: status, headers: headers, body: body)
+                // Запись, которую база не приняла, суточную норму не тратит —
+                // то же правило, что у инструментов MCP. Запрос в
+                // ChromaDB атомарен: отказ значит «не записано ничего».
+                if route.access.changesData, !(200..<300).contains(status),
+                   let payload = WritePayload.parse(request.body) {
+                    await access.refundWrite(payload.documentCount, forKey: request.accessKey)
+                }
                 audit.record(AuditEntry(
                     client: clientName,
                     method: request.method,
@@ -801,7 +847,7 @@ final class ProxyConnection: @unchecked Sendable {
             outgoing.setValue(value, forHTTPHeaderField: name)
         }
 
-        let (data, response) = try await session.data(for: outgoing)
+        let (data, response) = try await downloads.data(for: outgoing, in: session)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         let headers = http.allHeaderFields.compactMap { key, value -> (String, String)? in
             guard let name = key as? String, !Self.droppedHeaders.contains(name.lowercased()) else { return nil }
@@ -818,8 +864,14 @@ final class ProxyConnection: @unchecked Sendable {
     ]
 
     /// Trims the list of collections to the ones this client may see.
+    ///
+    /// Ответ другого вида — пустой список, а не ответ как есть: фильтр прав,
+    /// пропускающий всё, чего не понял, отдал бы ключу с одной коллекцией
+    /// имена и метаданные всех остальных при первой же смене формата.
     static func filterCollectionList(_ body: Data, allowed: [String]) -> Data {
-        guard let array = try? JSONSerialization.jsonObject(with: body) as? [[String: Any]] else { return body }
+        guard let array = try? JSONSerialization.jsonObject(with: body) as? [[String: Any]] else {
+            return Data("[]".utf8)
+        }
         let permitted = Set(allowed)
         let kept = array.filter { item in
             guard let name = item["name"] as? String else { return false }
@@ -924,6 +976,27 @@ final class ProxyConnection: @unchecked Sendable {
         // второй сходил бы к тому же актору за тем же ключом.
         let known = await access.client(withKey: request.accessKey)
         guard let client = known, client.isEnabled else {
+            // Перебор ключей — тот же предел, что у прокси, и та же тишина
+            // в журнале сверх него.
+            if known == nil, case .reject(let status, let message, _, let retryAfter)? = await access.throttleAnonymous() {
+                var headers = corsHeaders
+                if let retryAfter { headers.append(("retry-after", String(retryAfter))) }
+                respond(status: status, message: message, extraHeaders: headers)
+                if let suppressed = await access.reportAnonymousRefusal() {
+                    let note = suppressed > 0
+                        ? message + " " + String(localized: "За прошлую минуту без записи в журнал отклонено ещё \(suppressed.plainDigits).")
+                        : message
+                    audit.record(AuditEntry(
+                        client: peer, method: request.method, path: request.path,
+                        operation: "mcp_\(method)", access: .service, collection: nil,
+                        requestBytes: request.body.count, responseStatus: status, responseBytes: 0,
+                        durationSeconds: Date().timeIntervalSince(started), note: note
+                    ))
+                    onRejected(peer, note)
+                }
+                onFinished(true, nil)
+                return
+            }
             let message = known.map { String(localized: "Клиент «\($0.name)» отключён в ChromaDB Manager.") }
                 ?? String(localized: "Ключ доступа не передан или не зарегистрирован.")
             respond(
@@ -945,7 +1018,13 @@ final class ProxyConnection: @unchecked Sendable {
             return
         }
 
-        let response = await mcp(request.method, request.headers, request.body, request.accessKey)
+        // Пути на этом Маке называются только тому, кто сидит на этом Маке:
+        // агенту по сети абсолютный путь говорит об имени учётной записи
+        // и раскладке папок, а открыть файл он всё равно не может.
+        let local = !Self.isExternalPeer(self.client.endpoint)
+        let response = await MCPCallContext.$revealsLocalPaths.withValue(local) {
+            await mcp(request.method, request.headers, request.body, request.accessKey)
+        }
         respond(
             status: response.status,
             headers: response.headers.map { ($0.name, $0.value) } + corsHeaders,
@@ -974,24 +1053,56 @@ final class ProxyConnection: @unchecked Sendable {
             head += "\(name): \(value)\r\n"
         }
         head += "content-length: \(body.count)\r\n"
-        head += "connection: keep-alive\r\n\r\n"
+        if !headers.contains(where: { $0.0.lowercased() == "connection" }) {
+            head += "connection: keep-alive\r\n"
+        }
+        head += "\r\n"
 
-        var data = Data(head.utf8)
-        data.append(body)
-        client.send(content: data, completion: .contentProcessed { _ in })
+        // Заголовок и тело — двумя отправками, а не склейкой: склейка — это
+        // ещё одна полная копия ответа в памяти. Порядок соединение держит.
+        client.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
+        if !body.isEmpty { client.send(content: body, completion: .contentProcessed { _ in }) }
     }
 
-    private static func reason(for status: Int) -> String {
+    static func reason(for status: Int) -> String {
+        // Фраза — по самому коду, а не «OK» всему, что ниже 400: прокси
+        // отдаёт и свои 204 и 409, и чужие 304, 503, 504 — как есть. Строка
+        // «204 OK» сбивает строгих клиентов и посредников.
         switch status {
         case 200: return "OK"
         case 201: return "Created"
+        case 202: return "Accepted"
+        case 204: return "No Content"
+        case 206: return "Partial Content"
+        case 301: return "Moved Permanently"
+        case 302: return "Found"
+        case 304: return "Not Modified"
+        case 307: return "Temporary Redirect"
+        case 308: return "Permanent Redirect"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
         case 403: return "Forbidden"
         case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 409: return "Conflict"
+        case 410: return "Gone"
+        case 413: return "Content Too Large"
+        case 415: return "Unsupported Media Type"
+        case 422: return "Unprocessable Content"
         case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        case 501: return "Not Implemented"
         case 502: return "Bad Gateway"
-        default: return status < 400 ? "OK" : "Error"
+        case 503: return "Service Unavailable"
+        case 504: return "Gateway Timeout"
+        default:
+            switch status {
+            case 100..<200: return "Informational"
+            case 200..<300: return "Success"
+            case 300..<400: return "Redirection"
+            case 400..<500: return "Client Error"
+            default: return "Server Error"
+            }
         }
     }
 
@@ -1007,5 +1118,86 @@ final class ProxyConnection: @unchecked Sendable {
             return "\(host):\(port.rawValue.plainDigits)"
         }
         return String(describing: endpoint)
+    }
+}
+
+/// Ответы сервера — с потолком по размеру.
+///
+/// `URLSession.data(for:)` дочитывает ответ целиком, сколько бы он ни весил.
+/// Здесь куски копятся по мере прихода, и запрос обрывается, как только
+/// объявленная или накопленная длина переходит предел.
+final class CappedDownloads: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    struct TooLarge: LocalizedError {
+        let limit: Int
+        var errorDescription: String? {
+            String(localized: "ответ сервера больше \(ByteCountFormatter.string(fromByteCount: Int64(limit), countStyle: .memory)) — возьмите его частями (limit и offset)")
+        }
+    }
+
+    private struct Pending {
+        var data = Data()
+        var response: URLResponse?
+        var failure: Error?
+        let continuation: CheckedContinuation<(Data, URLResponse), Error>
+    }
+
+    let limit: Int
+    private let lock = NSLock()
+    private var pending: [Int: Pending] = [:]
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func data(for request: URLRequest, in session: URLSession) async throws -> (Data, URLResponse) {
+        let task = session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { pending[task.taskIdentifier] = Pending(continuation: continuation) }
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let tooLarge = response.expectedContentLength > Int64(limit)
+        lock.withLock {
+            pending[dataTask.taskIdentifier]?.response = response
+            if tooLarge { pending[dataTask.taskIdentifier]?.failure = TooLarge(limit: limit) }
+        }
+        completionHandler(tooLarge ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let overflow: Bool = lock.withLock {
+            guard var entry = pending[dataTask.taskIdentifier] else { return false }
+            entry.data.append(data)
+            let over = entry.data.count > limit
+            if over {
+                entry.failure = TooLarge(limit: limit)
+                entry.data = Data()
+            }
+            pending[dataTask.taskIdentifier] = entry
+            return over
+        }
+        if overflow { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let entry = lock.withLock({ pending.removeValue(forKey: task.taskIdentifier) }) else { return }
+        if let failure = entry.failure {
+            entry.continuation.resume(throwing: failure)
+        } else if let error {
+            entry.continuation.resume(throwing: error)
+        } else if let response = entry.response {
+            entry.continuation.resume(returning: (entry.data, response))
+        } else {
+            entry.continuation.resume(throwing: URLError(.badServerResponse))
+        }
     }
 }

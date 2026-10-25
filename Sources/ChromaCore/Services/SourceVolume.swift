@@ -80,6 +80,26 @@ public struct SourceVolume: Codable, Hashable, Sendable {
         return names && points
     }
 
+    /// Источники, которые принимают новый диск вместе.
+    ///
+    /// Резервный диск меняют целиком, и на нём обычно лежит не один
+    /// источник: спрашивать о каждом — это несколько одинаковых вопросов
+    /// подряд, и все, кроме последнего, терялись. Новый диск принимают те
+    /// источники, что запомнили **тот же прежний** диск и по чьему пути
+    /// сейчас лежит **тот же новый**: остальным отвечать за них нельзя.
+    public static func sourcesMoving(
+        from remembered: SourceVolume,
+        to accepted: SourceVolume,
+        among sources: [DataSource],
+        volumeAt: (URL) -> SourceVolume? = SourceVolume.of
+    ) -> [UUID] {
+        sources.filter { source in
+            guard !source.isWeb, let volume = source.volume, volume.isSame(as: remembered) else { return false }
+            return volumeAt(source.url)?.isSame(as: accepted) == true
+        }
+        .map(\.id)
+    }
+
     /// Как называть том человеку.
     public var title: String {
         name ?? mountPoint ?? String(localized: "неизвестный том")

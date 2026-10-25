@@ -73,6 +73,10 @@ final class InspectorViewModel: ObservableObject {
     /// коллекциями повторяются. Результат показывается, только если он про
     /// открытую коллекцию; в историю он записывается в любом случае.
     private var shownCollectionID: String?
+    /// Построенные за сеанс обзоры — по коллекции. Раньше обзор
+    /// пропадал при переходе на другую коллекцию и обратно, и вкладка снова
+    /// говорила «Обзор ещё не построен».
+    private var overviews: [String: CollectionOverview] = [:]
 
     private func isShown(_ collection: ChromaCollection) -> Bool {
         shownCollectionID == collection.id
@@ -83,7 +87,7 @@ final class InspectorViewModel: ObservableObject {
         history = store.reports(for: collection.name)
         report = history.first
         comparison = InspectionComparison.between(history.first ?? InspectionReport(collectionName: collection.name), and: history.dropFirst().first)
-        overview = nil
+        overview = overviews[collection.id]
         errorMessage = nil
         statusMessage = nil
         selectedFindings = []
@@ -291,6 +295,7 @@ final class InspectorViewModel: ObservableObject {
                 await MainActor.run {
                     self.isRunning = false
                     self.stage = nil
+                    self.overviews[collection.id] = built
                     guard self.isShown(collection) else { return }
                     self.overview = built
                 }

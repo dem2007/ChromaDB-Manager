@@ -131,7 +131,7 @@ public enum LMStudioError: LocalizedError {
         case .modelNotEmbedding(let model):
             return "Модель «\(model)» не вернула вектор — вероятно, это чат-модель, а не эмбеддинговая."
         case .timedOut(let what, let seconds):
-            return "LM Studio не ответила за \(Int(seconds)) с (\(what))."
+            return "LM Studio не ответила за \(seconds.secondsText) с (\(what))."
         case .truncatedByTokenLimit(let model):
             return "Ответ модели «\(model)» оборван по лимиту токенов (finish_reason: length) — это неполный результат, а не короткий."
         case .embeddingCountMismatch(let sent, let received):
@@ -168,7 +168,7 @@ extension LMStudioError: MCPReadableError {
         case .modelNotEmbedding(let model):
             return "the model «\(model)» returned no vector — it is most likely a chat model, not an embedding one"
         case .timedOut(let what, let seconds):
-            return "LM Studio did not answer in \(Int(seconds).plainDigits) seconds (\(what))"
+            return "LM Studio did not answer in \(seconds.secondsText) seconds (\(what))"
         case .truncatedByTokenLimit(let model):
             return "the answer of «\(model)» was cut off by the token limit, so it is a fragment"
         case .embeddingCountMismatch(let sent, let received):
@@ -253,12 +253,47 @@ public actor LMStudioClient {
            !payload.data.isEmpty {
             return payload.data.map(Self.describe)
         }
+        // Родной REST API v1 (LM Studio 0.4.0+) — его LM Studio советует для
+        // новых проектов. `/api/v0` она пока не убирает, и он остаётся первым:
+        // именно его ответы проверены вживую. Этот путь — на день,
+        // когда v0 не ответит.
+        if let native = try? await get("/api/v1/models"),
+           let models = try? Self.decodeV1Models(native), !models.isEmpty {
+            return models
+        }
 
         let data = try await get("/v1/models")
         guard let payload = try? JSONDecoder().decode(ModelsResponse.self, from: data) else {
             throw LMStudioError.emptyResponse
         }
         return payload.data.map(Self.describe)
+    }
+
+    /// Ответ `GET /api/v1/models`: тип, ключ модели, потолок контекста и
+    /// контекст загруженного экземпляра (`loaded_instances[].config`).
+    struct V1ModelsResponse: Decodable {
+        struct Model: Decodable {
+            struct Instance: Decodable {
+                struct Config: Decodable { let context_length: Int? }
+                let config: Config?
+            }
+            let key: String
+            let type: String?
+            let max_context_length: Int?
+            let loaded_instances: [Instance]?
+        }
+        let models: [Model]
+    }
+
+    static func decodeV1Models(_ data: Data) throws -> [LMStudioModel] {
+        try JSONDecoder().decode(V1ModelsResponse.self, from: data).models.map { model in
+            describe(ModelsResponse.Model(
+                id: model.key,
+                type: model.type,
+                max_context_length: model.max_context_length,
+                loaded_context_length: model.loaded_instances?.first?.config?.context_length
+            ))
+        }
     }
 
     static func describe(_ model: ModelsResponse.Model) -> LMStudioModel {

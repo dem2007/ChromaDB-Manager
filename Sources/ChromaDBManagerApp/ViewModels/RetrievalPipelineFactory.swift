@@ -97,7 +97,7 @@ extension AppEnvironment {
         // здесь решение может прийти извне. Выключенный умный поиск — это
         // профиль со всеми необязательными стадиями выключенными, то есть
         // поиск этапа 2.
-        let configured = searchProfiles.defaultProfile(for: collection.name)
+        let configured = searchProfiles.defaultProfile(for: collection.name, model: model)
         let profile = smartSearch
             ? configured
             : SearchProfile.plain(collectionName: collection.name, name: configured.name)

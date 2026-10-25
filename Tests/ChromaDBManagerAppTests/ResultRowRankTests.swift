@@ -25,28 +25,9 @@ final class ResultRowRankTests: XCTestCase {
         XCTAssertEqual(EvaluationView.rankLine(hit, card), "4. 503 знака · дочерний")
     }
 
-    // MARK: - Высота панели выдачи
-
-    /// Прогон из одного запроса не занимает весь экран пустотой.
-    func testASmallRunGetsASmallPane() {
-        let height = EvaluationView.paneHeight(for: EvaluationRunSamples.run(queries: 1, hits: 3, metadata: true), container: 1400)
-        XCTAssertEqual(height, 420, "меньше пола панель не бывает")
-        let taller = EvaluationView.paneHeight(for: EvaluationRunSamples.run(queries: 1, hits: 10, metadata: true), container: 1400)
-        XCTAssertGreaterThan(taller, 420)
-        XCTAssertLessThan(taller, 1260, "одному запросу столько не нужно")
-    }
-
-    /// А большой — во весь рост видимой части, без запаса сверх полей
-    /// карточки и страницы.
-    func testABigRunStopsAtTheVisiblePartOfThePage() {
-        let height = EvaluationView.paneHeight(for: EvaluationRunSamples.run(queries: 18, hits: 10, metadata: true), container: 900)
-        XCTAssertEqual(height, 900 - Theme.Padding.cardVertical - Theme.contentPadding)
-    }
-
-    /// В крошечном окне панель всё равно остаётся пригодной для разметки.
-    func testTheFloorHoldsInATinyWindow() {
-        XCTAssertEqual(EvaluationView.paneHeight(for: EvaluationRunSamples.run(queries: 18, hits: 10, metadata: true), container: 300), 420)
-    }
+    // Высота панели выдачи больше не считается: разметка — своя
+    // часть вкладки «Прогоны» и занимает всё место под шапкой. Сторож этого —
+    // `ComparisonAlignmentTests.testTheResultsScrollInTheirOwnPane`.
 
     /// У результата без текста показывается его идентификатор — иначе
     /// карточка пуста и опознать её нечем.

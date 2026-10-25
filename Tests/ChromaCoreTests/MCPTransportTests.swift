@@ -139,12 +139,14 @@ final class MCPTransportTests: XCTestCase {
         XCTAssertEqual(value["error"]?["code"], .int(-1))
     }
 
-    func testUnparseableMessageIsAnsweredWithNullIdentifier() async throws {
+    /// Ответ есть — молчание оставило бы клиента ждать вечно, — но без `id`:
+    /// схема MCP не допускает в нём `null`.
+    func testUnparseableMessageIsAnsweredWithoutIdentifier() async throws {
         let server = MCPServer(serverVersion: "1.0")
         let answered = await server.respond(to: Data("не json".utf8))
         let response = try XCTUnwrap(answered)
         let value = try json(try response.encoded())
-        XCTAssertEqual(value["id"], .null, "молчание оставило бы клиента ждать вечно")
+        XCTAssertNil(value["id"])
         XCTAssertEqual(value["error"]?["code"], .int(JSONRPCError.parseError))
     }
 
@@ -154,7 +156,10 @@ final class MCPTransportTests: XCTestCase {
         _ method: String, id: JSONRPCID? = .int(1), version: String? = MCPProtocol.version
     ) -> JSONRPCIncoming {
         var meta: [String: JSONValue] = [:]
-        if let version { meta[MCPProtocol.metaProtocolVersion] = .string(version) }
+        if let version {
+            meta[MCPProtocol.metaProtocolVersion] = .string(version)
+            meta[MCPProtocol.metaClientCapabilities] = .object([:])
+        }
         return JSONRPCIncoming(id: id, method: method, params: .object(["_meta": .object(meta)]))
     }
 

@@ -1,58 +1,62 @@
 import XCTest
 
-/// Сторож шкалы шрифтов.
+/// Сторож шрифтов после перехода на системные компоненты
+/// (`docs/UI-MIGRATION.md`, инструкции).
 ///
-/// Системные `.caption`, `.callout`, `.headline`, `.title`, `.footnote` дают
-/// свою шкалу, не совпадающую с макетом: рядом с `Theme.Font.caption` (12,5)
-/// системный `.caption` (10) читается как другой уровень текста, которого в
-/// дизайн-системе нет. Отсюда и расползались кегли — на «Замерах» в одной
-/// карточке жили четыре разных размера, ни один из которых не был из шкалы
-///.
+/// Прежнее правило 6 — «только `Theme.Font`, системная шкала
+/// запрещена» — перевёрнуто: текст задают системные стили (`.body`,
+/// `.callout`, `.caption`…), заголовки секций — сама `Form`/`List`, и числом
+/// размер шрифта не пишется нигде, кроме точки состояния в `StatusLabel`.
 ///
-/// Тест читает исходники экранов: проверять это глазами на пятнадцати экранах
-/// приходится заново после каждой правки.
+/// Все экраны переведены, и `Theme` удалён — поэтому правило проверяется на
+/// каждом файле `Views/` и `App/`, а не по списку.
 final class TypographyScaleTests: XCTestCase {
-    /// Где числа задавать можно: сама тема их и объявляет.
-    private let allowedFiles: Set<String> = ["Theme.swift"]
-
-    private var viewsDirectory: URL {
+    private var sources: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Sources/ChromaDBManagerApp/Views")
+            .appendingPathComponent("Sources/ChromaDBManagerApp")
     }
 
-    func testScreensUseTheApplicationScaleAndNotTheSystemOne() throws {
-        let manager = FileManager.default
-        let files = try manager.contentsOfDirectory(at: viewsDirectory, includingPropertiesForKeys: nil)
+    /// Строки кода без комментариев — с номерами.
+    private func codeLines(of file: URL) throws -> [(Int, String)] {
+        try String(contentsOf: file, encoding: .utf8)
+            .components(separatedBy: .newlines)
+            .enumerated()
+            .map { ($0.offset + 1, $0.element.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.1.hasPrefix("//") }
+    }
+
+    private func swiftFiles(in folder: String) throws -> [URL] {
+        let directory = sources.appendingPathComponent(folder)
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "swift" }
-            .filter { !allowedFiles.contains($0.lastPathComponent) }
+    }
 
-        // `.font(.caption)` и родня: точечные вызовы, а не любое упоминание
-        // слова — комментарий про системный `.caption` нарушением не является.
-        let forbidden = [
-            ".font(.caption)", ".font(.caption2)", ".font(.callout",
-            ".font(.headline", ".font(.subheadline", ".font(.footnote",
-            ".font(.title", ".font(.body)", ".font(.largeTitle",
-        ]
-
+    func testEveryScreenUsesTheSystemTextStyles() throws {
+        let files = try swiftFiles(in: "Views") + swiftFiles(in: "App")
+        XCTAssertFalse(files.isEmpty, "экраны не найдены рядом с тестами")
         var offences: [String] = []
         for file in files {
-            let text = try String(contentsOf: file, encoding: .utf8)
-            for (number, line) in text.components(separatedBy: .newlines).enumerated() {
-                let code = line.trimmingCharacters(in: .whitespaces)
-                guard !code.hasPrefix("//"), !code.hasPrefix("///") else { continue }
-                for pattern in forbidden where code.contains(pattern) {
-                    offences.append("\(file.lastPathComponent):\(number + 1): \(code)")
-                }
+            for (number, code) in try codeLines(of: file)
+            where code.contains("Theme.") || code.contains(".font(.system(size:") {
+                offences.append("\(file.lastPathComponent):\(number): \(code)")
             }
         }
-
         XCTAssertTrue(
             offences.isEmpty,
-            """
-            Системная шкала шрифтов вместо Theme.Font — правило 6:
-            \(offences.joined(separator: "\n"))
-            """
+            "Экран задаёт шрифт или цвет сам, а не системным стилем:\n" + offences.joined(separator: "\n")
         )
+    }
+
+    func testOnlyTheStatusDotHasANumericFontSize() throws {
+        let files = try swiftFiles(in: "UI")
+        XCTAssertFalse(files.isEmpty, "каталог UI/ не найден рядом с тестами")
+        var offences: [String] = []
+        for file in files where file.lastPathComponent != "StatusLabel.swift" {
+            for (number, code) in try codeLines(of: file) where code.contains(".font(.system(size:") {
+                offences.append("\(file.lastPathComponent):\(number): \(code)")
+            }
+        }
+        XCTAssertTrue(offences.isEmpty, "Размер шрифта числом — только у точки в StatusLabel:\n" + offences.joined(separator: "\n"))
     }
 }

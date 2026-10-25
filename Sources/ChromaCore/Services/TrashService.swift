@@ -26,6 +26,27 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
     public var collectionModel: String?
     public var collectionDimension: Int?
     public var reason: Reason
+    /// Сколько чисел в векторе и полей в метаданных — у записи, которую
+    /// держат в памяти без них. Корзина в сто тысяч документов
+    /// держала в памяти все их векторы: гигабайт ради столбца «Вектор: есть».
+    /// Сами данные читаются из файла при восстановлении (`fullEntries`).
+    public fileprivate(set) var embeddingLength = 0
+    public fileprivate(set) var metadataCount = 0
+    /// Длина полного текста в байтах — у записи, текст которой в памяти
+    /// обрезан до начала. Ноль — текст в памяти целиком.
+    public fileprivate(set) var documentBytes = 0
+
+    /// Сколько знаков текста держится в памяти: столько видно в таблице
+    /// корзины и столько ищется её поиском. Целиком — `fullEntries`.
+    public static let previewCharacters = 400
+
+    /// Текст в памяти — только начало.
+    public var isDocumentTruncated: Bool { documentBytes > (document?.utf8.count ?? 0) }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, deletedAt, documentID, document, metadata, embedding
+        case collectionName, collectionMetric, collectionModel, collectionDimension, reason
+    }
 
     public init(
         id: UUID = UUID(),
@@ -56,9 +77,31 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
     /// Rough size on disk, for the volume-limited eviction. Exact to the byte
     /// is not the point — knowing whether the trash is 10 MB or 10 GB is.
     var sizeEstimate: Int {
-        var bytes = (document?.utf8.count ?? 0) + (embedding?.count ?? 0) * 8
-        bytes += (metadata?.count ?? 0) * 32
+        var bytes = max(document?.utf8.count ?? 0, documentBytes) + max(embedding?.count ?? 0, embeddingLength) * 8
+        bytes += max(metadata?.count ?? 0, metadataCount) * 32
         return bytes
+    }
+
+    /// Есть ли у записи вектор — и у облегчённой тоже.
+    public var hasEmbedding: Bool { embedding != nil || embeddingLength > 0 }
+
+    /// Та же запись без вектора и метаданных — для памяти.
+    func lightened() -> TrashEntry {
+        var light = self
+        light.embeddingLength = embedding?.count ?? embeddingLength
+        light.metadataCount = metadata?.count ?? metadataCount
+        light.embedding = nil
+        light.metadata = nil
+        light.trimDocument()
+        return light
+    }
+
+    /// Текст — до начала: сто тысяч удалённых документов держали
+    /// в памяти четверть гигабайта текста ради столбца с его первой строкой.
+    fileprivate mutating func trimDocument() {
+        guard let text = document, text.count > Self.previewCharacters else { return }
+        documentBytes = max(documentBytes, text.utf8.count)
+        document = String(text.prefix(Self.previewCharacters))
     }
 }
 
@@ -83,8 +126,16 @@ public final class TrashService: ObservableObject {
     public nonisolated static let defaultLimitBytes: Int64 = 1024 * 1024 * 1024
     public nonisolated static let defaultRetentionDays = 14
 
-    /// Newest first.
+    /// Newest first. Без векторов и метаданных: полные записи —
+    /// `fullEntries(withIDs:)`.
     @Published public private(set) var entries: [TrashEntry] = []
+    /// Файл ещё читается. Корзина в сто тысяч записей читается
+    /// секунды, и запуск приложения их не ждёт.
+    @Published public private(set) var isLoading = false
+
+    /// Снятое из корзины, пока файл читался: прочитанное не должно его
+    /// вернуть. `nil` вместо набора — корзину очистили целиком.
+    private var removedWhileLoading: Set<UUID>? = []
 
     private let fileURL: URL
     private var retentionDays: Int
@@ -96,20 +147,53 @@ public final class TrashService: ObservableObject {
         fileURL: URL = AppPaths.trashFile,
         retentionDays: Int = TrashService.defaultRetentionDays,
         limitBytes: Int64 = TrashService.defaultLimitBytes,
-        log: @escaping LogHandler = noopLogHandler
+        log: @escaping LogHandler = noopLogHandler,
+        loadsInBackground: Bool = false
     ) {
         self.fileURL = fileURL
         self.retentionDays = retentionDays
         self.limitBytes = limitBytes
         self.log = log
-        entries = Self.load(from: fileURL)
+        guard loadsInBackground else {
+            entries = Self.load(from: fileURL)
+            applyRetention()
+            return
+        }
+        isLoading = true
+        let url = fileURL
+        Task.detached(priority: .utility) { [weak self] in
+            let loaded = Self.load(from: url)
+            await self?.finishLoading(loaded)
+        }
+    }
+
+    /// Прочитанное — к тому, что успели записать за время чтения; снятое
+    /// за это время не возвращается.
+    private func finishLoading(_ loaded: [TrashEntry]) {
+        defer { removedWhileLoading = [] }
+        // Дальше список полон: перезапись и вытеснение его больше не ждут.
+        isLoading = false
+        guard let removed = removedWhileLoading else { return }
+        let present = Set(entries.map(\.id))
+        entries = (entries + loaded.filter { !present.contains($0.id) && !removed.contains($0.id) })
+            .sorted { $0.deletedAt > $1.deletedAt }
+        if !removed.isEmpty { rewriteFile() }
         applyRetention()
+        MemoryRelief.soon()
     }
 
     public var fileLocation: URL { fileURL }
 
     public var collectionNames: [String] {
         Array(Set(entries.map(\.collectionName))).sorted()
+    }
+
+    /// Предел объёма корзины — по той же оценке, что и `totalBytes`.
+    public var capacityBytes: Int64 { limitBytes }
+
+    /// Оценка объёма записей — та, по которой работает вытеснение.
+    public static func estimatedBytes(of entries: [TrashEntry]) -> Int {
+        entries.reduce(0) { $0 + $1.sizeEstimate }
     }
 
     public var totalBytes: Int {
@@ -165,7 +249,7 @@ public final class TrashService: ObservableObject {
             log(.error, "Корзина", failure.errorDescription ?? "")
             throw failure
         }
-        entries.insert(contentsOf: batch, at: 0)
+        entries.insert(contentsOf: batch.map { $0.lightened() }, at: 0)
         applyRetention()
     }
 
@@ -183,11 +267,73 @@ public final class TrashService: ObservableObject {
         entries.filter { ids.contains($0.id) }
     }
 
+    /// Записи целиком — с векторами и метаданными, из файла.
+    ///
+    /// Строка разбирается, только если в ней есть идентификатор записи:
+    /// восстановить один документ из корзины в сто тысяч не значит
+    /// раскодировать все сто тысяч векторов. Файл читается в очереди
+    /// записи, а не на главном потоке: корзина бывает в полтора гигабайта.
+    public func fullEntries(withIDs ids: Set<UUID>) async -> [TrashEntry] {
+        guard !ids.isEmpty else { return [] }
+        let url = fileURL
+        let found = await withCheckedContinuation { (continuation: CheckedContinuation<[TrashEntry], Never>) in
+            writeQueue.async {
+                continuation.resume(returning: Self.readFullEntries(withIDs: ids, from: url))
+            }
+        }
+        return found.sorted { $0.deletedAt > $1.deletedAt }
+    }
+
+    private nonisolated static func readFullEntries(withIDs ids: Set<UUID>, from url: URL) -> [TrashEntry] {
+        let wanted = Set(ids.map { Data($0.uuidString.utf8) })
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var found: [TrashEntry] = []
+        JSONLines.forEachLine(at: url) { line in
+            guard let id = entryID(in: line), wanted.contains(id),
+                  let entry = try? decoder.decode(TrashEntry.self, from: line),
+                  ids.contains(entry.id) else { return }
+            found.append(entry)
+        }
+        return found
+    }
+
+    /// Идентификатор записи в строке файла — без разбора всей строки.
+    private nonisolated static let idMarker = Data(#""id":""#.utf8)
+
+    private nonisolated static func entryID(in line: Data) -> Data? {
+        // Внутри строк JSON кавычка экранирована, поэтому `"id":"` из текста
+        // документа сюда не попадает; проверка UUID — на всякий случай.
+        line.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data? in
+            guard let base = raw.baseAddress else { return nil }
+            var from = 0
+            while from < raw.count {
+                let found = idMarker.withUnsafeBytes { marker in
+                    memmem(base + from, raw.count - from, marker.baseAddress, marker.count)
+                }
+                guard let found else { return nil }
+                let start = base.distance(to: UnsafeRawPointer(found)) + idMarker.count
+                if start + 37 <= raw.count, raw[start + 36] == UInt8(ascii: "\"") {
+                    let candidate = Data(bytes: base + start, count: 36)
+                    if let text = String(data: candidate, encoding: .utf8), UUID(uuidString: text) != nil { return candidate }
+                }
+                from = start
+            }
+            return nil
+        }
+    }
+
     /// Removes entries after they were successfully written back to the
     /// database — a restored copy is not a backup of anything any more.
     public func forget(ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
         entries.removeAll { ids.contains($0.id) }
+        // Пока файл читается, перезаписывать его по неполному списку
+        // нельзя: стёрлись бы непрочитанные записи.
+        if isLoading {
+            removedWhileLoading?.formUnion(ids)
+            return
+        }
         rewriteFile()
     }
 
@@ -197,10 +343,12 @@ public final class TrashService: ObservableObject {
     public func emptyTrash() {
         let count = entries.count
         entries.removeAll()
+        if isLoading { removedWhileLoading = nil }
         writeQueue.async { [fileURL] in
             try? FileManager.default.removeItem(at: fileURL)
         }
         log(.warning, "Корзина", "Корзина очищена вручную: удалено записей \(count.plainDigits)")
+        MemoryRelief.soon()
     }
 
     // MARK: - Retention
@@ -209,6 +357,8 @@ public final class TrashService: ObservableObject {
     /// on the app's own backup copy, not on the database itself (rule 2): every
     /// sweep that removes something says so in the log.
     private func applyRetention() {
+        // По неполному списку и вытеснять, и перезаписывать файл нельзя.
+        guard !isLoading else { return }
         var removedForAge = 0
         if retentionDays > 0 {
             let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
@@ -288,27 +438,41 @@ public final class TrashService: ObservableObject {
     /// Removals (restore, expiry, manual purge) rewrite the whole file: unlike
     /// the audit log this store's entries can legitimately disappear one at a
     /// time, and there is no append-only way to do that.
+    ///
+    /// Из самого файла, а не из памяти: в памяти записи без векторов,
+    /// и перезапись из них стёрла бы векторы на диске. Строки оставленных
+    /// записей переносятся как есть — побайтно, без разбора.
     private func rewriteFile() {
-        let snapshot = entries
+        let kept = Set(entries.map { Data($0.id.uuidString.utf8) })
         writeQueue.async { [fileURL] in
-            guard !snapshot.isEmpty else {
+            guard !kept.isEmpty else {
                 try? FileManager.default.removeItem(at: fileURL)
                 return
             }
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            var data = Data()
-            for entry in snapshot {
-                guard var line = try? encoder.encode(entry) else { continue }
-                line.append(0x0A)
-                data.append(line)
+            let temporary = fileURL.appendingPathExtension("rewrite")
+            FileManager.default.createFile(atPath: temporary.path, contents: nil)
+            guard let output = try? FileHandle(forWritingTo: temporary) else { return }
+            var failed = false
+            JSONLines.forEachLine(at: fileURL) { line in
+                guard !failed, let id = Self.entryID(in: line), kept.contains(id) else { return }
+                do {
+                    try output.write(contentsOf: line)
+                    try output.write(contentsOf: Data([0x0A]))
+                } catch {
+                    failed = true
+                }
             }
-            _ = try? AppPaths.ensureDirectory(fileURL.deletingLastPathComponent())
-            try? data.write(to: fileURL, options: .atomic)
+            try? output.synchronize()
+            try? output.close()
+            guard !failed else {
+                try? FileManager.default.removeItem(at: temporary)
+                return
+            }
+            _ = try? FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
         }
     }
 
-    private static func load(from url: URL) -> [TrashEntry] {
+    private nonisolated static func load(from url: URL) -> [TrashEntry] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         // A truncated last line is normal after a crash and must not cost the
@@ -318,8 +482,74 @@ public final class TrashService: ObservableObject {
         // файл сперва раскодировался целиком, и обрыв **внутри** знака делал
         // негодным весь. Для корзины это стоило дороже всего: следующая
         // перезапись затирала записи, которых разбор не прочитал.
-        return JSONLines.read(at: url)
-            .compactMap { try? decoder.decode(TrashEntry.self, from: Data($0.utf8)) }
-            .sorted { $0.deletedAt > $1.deletedAt }
+        //
+        // Вектор при загрузке не разбирается вовсе: тысяча чисел на
+        // запись — почти весь файл и почти всё время разбора. Его длина
+        // считается по запятым в строке — она нужна оценке объёма.
+        var loaded: [TrashEntry] = []
+        JSONLines.forEachLine(at: url) { line in
+            let (stripped, length) = Self.withoutEmbedding(line)
+            guard let header = try? decoder.decode(LightEntry.self, from: stripped) else { return }
+            var entry = TrashEntry(
+                id: header.id, deletedAt: header.deletedAt, documentID: header.documentID,
+                document: header.document, metadata: nil, embedding: nil,
+                collectionName: header.collectionName, collectionMetric: header.collectionMetric,
+                collectionModel: header.collectionModel, collectionDimension: header.collectionDimension,
+                reason: header.reason
+            )
+            entry.embeddingLength = length
+            entry.trimDocument()
+            loaded.append(entry)
+        }
+        return loaded.sorted { $0.deletedAt > $1.deletedAt }
+    }
+
+    /// Запись без вектора и метаданных — то, что разбирается при загрузке.
+    ///
+    /// Метаданные не разбираются тоже: это половина оставшегося времени,
+    /// а для экрана корзины и оценки объёма они не нужны — в оценке
+    /// у прочитанных записей их нет (несколько процентов объёма).
+    private struct LightEntry: Decodable {
+        let id: UUID
+        let deletedAt: Date
+        let documentID: String
+        let document: String?
+        let collectionName: String
+        let collectionMetric: DistanceMetric?
+        let collectionModel: String?
+        let collectionDimension: Int?
+        let reason: TrashEntry.Reason
+    }
+
+    private nonisolated static let embeddingMarker = Data(#""embedding":["#.utf8)
+
+    /// Строка с пустым вектором — и сколько чисел в нём было.
+    ///
+    /// Разбор JSON идёт по всей строке, даже если поле не нужно: вектор
+    /// на тысячу чисел — почти вся строка, и 100 тысяч записей грузились
+    /// семнадцать секунд. Массив вырезается до разбора: внутри массива
+    /// чисел нет ни строк, ни вложенных скобок, поэтому его конец — первая
+    /// `]`, а чисел — запятых плюс одно.
+    nonisolated static func withoutEmbedding(_ line: Data) -> (line: Data, length: Int) {
+        line.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (line: Data, length: Int) in
+            guard let base = raw.baseAddress else { return (line, 0) }
+            let found = embeddingMarker.withUnsafeBytes { marker in
+                memmem(base, raw.count, marker.baseAddress, marker.count)
+            }
+            guard let found else { return (line, 0) }
+            let open = base.distance(to: UnsafeRawPointer(found)) + embeddingMarker.count
+            guard let closing = memchr(base + open, Int32(UInt8(ascii: "]")), raw.count - open) else { return (line, 0) }
+            let close = base.distance(to: UnsafeRawPointer(closing))
+            var commas = 0
+            var hasValue = false
+            let bytes = raw.bindMemory(to: UInt8.self)
+            for index in open..<close {
+                let byte = bytes[index]
+                if byte == UInt8(ascii: ",") { commas += 1 } else if byte != UInt8(ascii: " ") { hasValue = true }
+            }
+            var stripped = Data(bytes: base, count: open)
+            stripped.append(Data(bytes: base + close, count: raw.count - close))
+            return (stripped, hasValue ? commas + 1 : 0)
+        }
     }
 }

@@ -14,9 +14,10 @@ public enum TextExtractor {
     /// `.numbers` are read now — by the table pipeline rather than by the text
     /// extractors, which is why they were listed here in the first place. `.xls`
     /// followed when Numbers turned out to open it; `.xlsb` did not,
-    /// because Numbers does not open that one either.
+    /// because Numbers does not open that one either. `.pptx` left with
+    ///; the binary `.ppt` stays.
     public static let unsupportedExtensions: Set<String> = [
-        "xlsb", "pptx", "ppt", "mobi",
+        "xlsb", "ppt", "mobi",
     ]
 
     /// Everything this build can read, as file extensions.
@@ -41,7 +42,7 @@ public enum TextExtractor {
     /// disappearing, so listing them by default costs nothing but explains.
     public static let documentExtensions = [
         "md", "markdown", "txt", "rtf", "json", "xml", "yaml", "yml", "html", "htm",
-        "pdf", "docx", "doc", "odt", "epub", "pages", "key",
+        "pdf", "docx", "doc", "odt", "epub", "pages", "key", "pptx",
         "swift", "py", "js", "ts", "sh", "sql",
     ]
 

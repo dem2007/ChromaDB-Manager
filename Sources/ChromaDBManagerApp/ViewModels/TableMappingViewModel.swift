@@ -354,15 +354,22 @@ final class TableMappingViewModel: ObservableObject {
         // Строки выше заголовка — шапка отчёта, а не записи: показывать «что
         // получится из строки» на названии отчёта значит показывать документ,
         // которого не будет.
-        let first = mapping.headerRow.map { $0 + 1 } ?? Int.min
-        let dataRows = preview.rows.filter { $0.number >= first && !$0.isEmpty }
+        // Ряд нумерации граф пропускается, названия из шапки в несколько
+        // строк и путь записи — как при индексации.
+        let layout = SheetLayout(mapping: mapping)
+        let dataRows = RowMapper.dataRows(
+            preview.rows, below: mapping.headerRow, layout: layout, merges: preview.sheet.merges
+        )
         guard let row = dataRows.first else { return nil }
+        let recipe = mapping.labelled(rows: preview.rows, merges: preview.sheet.merges, layout: layout)
+        let paths = RecordPaths.overrides(rows: dataRows, mapping: recipe, layout: layout)
         return RowMapper.document(
             for: row,
-            mapping: mapping,
-            layout: SheetLayout(mapping: mapping),
+            mapping: recipe,
+            layout: layout,
             sourceID: UUID(),
-            sourceFile: fileName ?? ""
+            sourceFile: fileName ?? "",
+            overrides: paths[row.number] ?? [:]
         )
     }
 
@@ -370,7 +377,7 @@ final class TableMappingViewModel: ObservableObject {
     /// header that every chunk will repeat.
     var renderedDocument: SheetRenderer.Rendered? {
         guard let preview, let mapping = draft, mapping.mode == .document else { return nil }
-        return SheetRenderer.render(rows: preview.rows, headerRow: mapping.headerRow)
+        return SheetRenderer.render(rows: preview.rows, headerRow: mapping.headerRow, merges: preview.sheet.merges)
     }
 
     /// Placeholders in the template that name no column — a typo would otherwise
@@ -831,7 +838,14 @@ final class TableMappingViewModel: ObservableObject {
             sharedProfiles = shared
             app.settings.configuration.sharedTableProfiles = shared
         }
-        app.settings.upsert(source: source)
+        // Только поля профилей — в источнике, что сейчас в настройках
+        //: копия, взятая при открытии окна, откатила бы отметки
+        // прогона, закончившегося за это время, а удалённый тем временем
+        // источник `upsert` вернул бы в список.
+        app.settings.updateSource(id: source.id) { current in
+            current.tableProfiles = source.tableProfiles
+            current.tableProfileAssignments = source.tableProfileAssignments
+        }
     }
 
     // MARK: - Перенос профилей

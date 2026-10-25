@@ -289,11 +289,19 @@ public struct CollectionImporter: Sendable {
         guard let target else { return [] }
         // Пакет без векторов пересчитывается моделью самой коллекции: его
         // размерность и модель ни с чем не смешиваются, сверять их незачем.
-        guard manifest.includesEmbeddings else { return [] }
+        //
+        // Но только если модель у коллекции **есть**. Без привязки векторы
+        // считает модель пакета, и сверка нужна та же, что у пакета
+        // с векторами: иначе коллекция чужой модели той же размерности
+        // молча получала векторы двух моделей.
+        var warnings: [String] = []
+        if !manifest.includesEmbeddings {
+            guard target.boundModel == nil else { return [] }
+            warnings.append(String(localized: "К коллекции не привязана модель: векторы посчитает модель пакета\(manifest.model.map { " «\($0)»" } ?? ""). Проверьте, что ею же посчитаны документы коллекции, — векторы разных моделей в одной коллекции искать не дают."))
+        }
         if let expected = target.effectiveDimension, let got = manifest.dimension, expected != got {
             throw TransferError.dimensionMismatch(expected: expected, got: got)
         }
-        var warnings: [String] = []
         if let metric = manifest.metric, let targetMetric = target.space?.rawValue, metric != targetMetric {
             warnings.append(String(localized: "Метрика не совпадает: у коллекции \(targetMetric), в пакете \(metric). Данные останутся валидными, но результаты поиска изменятся."))
         }
