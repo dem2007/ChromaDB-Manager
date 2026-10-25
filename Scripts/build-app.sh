@@ -15,14 +15,22 @@ BUNDLE="$ROOT/dist/$APP_NAME.app"
 
 cd "$ROOT"
 
+# Пути к исходникам компилятор зашивает в бинарник — для сообщений об ошибках
+# и `#file`. Без подмены в каждом выпуске стояли сотни путей вида
+# «/Users/<логин>/…/ChromaDBManager/Sources/…»: имя пользователя и раскладка
+# папок машины сборки. Подмена делает их путями от корня проекта.
+# Компоновщик пишет в отладочную карту пути к объектным файлам в `.build` —
+# их отрезает `-oso_prefix`.
+SWIFT_FLAGS=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=/ChromaDBManager" -Xlinker -oso_prefix -Xlinker "$ROOT/")
+
 echo "==> swift build -c $CONFIG"
-swift build -c "$CONFIG" --product ChromaDBManager
+swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product ChromaDBManager
 # Вспомогательный файл MCP-сервера: его запускает агентское приложение,
 # путь к нему приложение выдаёт в готовой конфигурации, поэтому он обязан
 # лежать в бандле — иначе выданная конфигурация указывает в пустоту.
-swift build -c "$CONFIG" --product chromadb-mcp
+swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product chromadb-mcp
 
-BIN_DIR="$(swift build -c "$CONFIG" --product ChromaDBManager --show-bin-path)"
+BIN_DIR="$(swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product ChromaDBManager --show-bin-path)"
 BIN="$BIN_DIR/ChromaDBManager"
 MCP_BIN="$BIN_DIR/chromadb-mcp"
 if [[ ! -x "$BIN" ]]; then

@@ -220,7 +220,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Inside `ChromaDB Manager.app` the icon comes from `CFBundleIconFile`.
     /// A plain `swift run` binary has no bundle, so point the Dock at the icon
     /// in the source tree — a developer convenience, skipped in the shipped app.
+    ///
+    /// Only in a debug build: `#filePath` is the absolute path on the build
+    /// machine, and a release binary would carry the builder's home folder.
     private func applyDockIconWhenUnbundled() {
+        #if DEBUG
         guard Bundle.main.url(forResource: "AppIcon", withExtension: "icns") == nil else { return }
 
         let repositoryIcon = URL(fileURLWithPath: #filePath)
@@ -233,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let image = NSImage(contentsOf: repositoryIcon) {
             NSApp.applicationIconImage = image
         }
+        #endif
     }
 
     /// По умолчанию закрытие окна закрывает приложение — так оно вело
