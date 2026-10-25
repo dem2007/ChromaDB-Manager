@@ -52,6 +52,36 @@ if [ "$BUNDLED" != "$VERSION" ]; then
     exit 1
 fi
 
+# MARK: чистота бандла
+
+# Приложение уходит в сеть так же, как репозиторий, и несёт то, что в него
+# вкомпилировано: пути машины сборки и строковые константы кода. До 0.4.0
+# каждый выпуск нёс сотни путей «/Users/<логин>/…», а в 0.4.0 — номер
+# договора из описания инструмента MCP. Проверяется весь бандл, бинарники
+# тоже; список слов — тот же, что у publish.sh, и только на этой машине.
+echo "==> проверка бандла на личное"
+DENYLIST="$ROOT/docs/local/publish-denylist.txt"
+if [ ! -f "$DENYLIST" ]; then
+    echo "!! нет списка запрещённых слов: $DENYLIST" >&2
+    echo "   Он хранится только на машине автора. Собираете у себя — заведите" >&2
+    echo "   пустой файл: пути машины сборки проверятся и без него." >&2
+    exit 1
+fi
+TERMS="$(mktemp)"
+grep -v '^[[:space:]]*#' "$DENYLIST" | sed '/^[[:space:]]*$/d' > "$TERMS"
+printf '%s\n' "/Users/" >> "$TERMS"
+LEAKS="$(grep -rlaiF -f "$TERMS" "$APP" 2>/dev/null || true)"
+if [ -n "$LEAKS" ]; then
+    echo "!! в приложении пути машины сборки или слова из рабочих документов:" >&2
+    while IFS= read -r leak; do
+        echo "   ${leak#"$APP"/}: $(grep -aoiF -f "$TERMS" "$leak" | sort -u | head -5 | paste -sd, -)" >&2
+    done <<< "$LEAKS"
+    rm -f "$TERMS"
+    exit 1
+fi
+rm -f "$TERMS"
+echo "    чисто: ни путей машины, ни слов из документов"
+
 # MARK: подпись Developer ID, если она вообще возможна
 
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
