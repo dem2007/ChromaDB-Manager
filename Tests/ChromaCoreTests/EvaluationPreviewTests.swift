@@ -37,7 +37,7 @@ final class EvaluationPreviewTests: XCTestCase {
     /// Короткие слова не тянут окно на себя: «для» есть в любом куске.
     func testShortWordsAreIgnored() {
         XCTAssertEqual(EvaluationPreview.stems(of: "для как при"), [])
-        XCTAssertEqual(EvaluationPreview.stems(of: "Порядок обновления"), ["порядо", "лиценз"])
+        XCTAssertEqual(EvaluationPreview.stems(of: "Порядок обновления"), ["порядо", "обновл"])
     }
 
     /// Ни одно слово запроса не встретилось — показывается начало, как и

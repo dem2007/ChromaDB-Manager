@@ -334,7 +334,7 @@ public enum FragmentLocator {
     /// (Кол-во, шт.: 2); Память …». В документе этих скобок нет: количество
     /// стоит своей колонкой, и ни одна часть такой ячейки не находилась.
     /// Снимаются только скобки, начатые заголовком этой же таблицы, — свои
-    /// скобки текста («(СРК-Veeam)») остаются.
+    /// скобки текста («(Архив)») остаются.
     static func withoutRecordLabels(_ cell: String, headers: [String]) -> String {
         guard !headers.isEmpty, cell.contains("(") else { return cell }
         var result = ""
