@@ -229,13 +229,13 @@ final class PDFLatticeTests: XCTestCase {
     /// на предыдущей странице, а не отдельной строкой без названия.
     func testACellCutByThePageJoinsItsRow() {
         let edges = [40.0, 260, 560]
-        let header = ["Параметр", "Тип 6"]
+        let header = ["Параметр", "Исполнение 2"]
         var blocks: [Int: [TableGeometry.PageBlock]] = [
-            0: [.table(rows: [header, ["Кол-во адаптеров шт.", "2"],
+            0: [.table(rows: [header, ["Кол-во узлов, шт.", "2"],
                               ["Возможности портов", "- Ускорение обработки (XFER, ABC/DEF/GH stateless assist, QSO, PQS,"]],
                        edges: edges)],
             1: [.table(rows: [header, ["", "Parity Mode, Adaptive event batching);"],
-                              ["Системное управление", "Наличие"]], edges: edges)],
+                              ["Удалённый доступ", "Наличие"]], edges: edges)],
         ]
         PDFExtractor.continueTables(&blocks, pageCount: 2)
         guard case .table(let first, _) = blocks[0]?.first, case .table(let second, _) = blocks[1]?.first else {
@@ -243,7 +243,7 @@ final class PDFLatticeTests: XCTestCase {
         }
         XCTAssertEqual(first.last, ["Возможности портов",
                                     "- Ускорение обработки (XFER, ABC/DEF/GH stateless assist, QSO, PQS, Parity Mode, Adaptive event batching);"])
-        XCTAssertEqual(second, [header, ["Системное управление", "Наличие"]])
+        XCTAssertEqual(second, [header, ["Удалённый доступ", "Наличие"]])
     }
 
     /// Следующая запись под названием, объединённым вниз через страницу,
@@ -272,7 +272,7 @@ final class PDFLatticeTests: XCTestCase {
         XCTAssertFalse(PDFExtractor.isCutOff("-"))
         XCTAssertFalse(PDFExtractor.isCutOff("—"))
         XCTAssertTrue(PDFExtractor.isCutOff("checksum assist, PQS,"))
-        XCTAssertTrue(PDFExtractor.isCutOff("Поддержка протоколов (RoCEv2"))
+        XCTAssertTrue(PDFExtractor.isCutOff("Поддержка режимов (XFERv2"))
         XCTAssertFalse(PDFExtractor.isCutOff("наличие"))
     }
 
