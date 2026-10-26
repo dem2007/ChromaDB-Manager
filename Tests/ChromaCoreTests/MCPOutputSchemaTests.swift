@@ -108,6 +108,14 @@ final class MCPOutputSchemaTests: XCTestCase {
                 "heading": .string("Требования"), "offset": .int(99),
             ]),
             ("collect_mentions", ["collection": .string("заметки"), "contains": .string("приёмк")]),
+            // Список файлов: страница, промах по имени, смещение за концом, узкий срез.
+            ("list_files", ["collection": .string("заметки")]),
+            ("list_files", ["collection": .string("заметки"), "name": .string("нет-такого")]),
+            ("list_files", ["collection": .string("заметки"), "offset": .int(99)]),
+            ("list_files", [
+                "collection": .string("заметки"), "folder": .string("папка"),
+                "sort": .string("chunks"), "limit": .int(1),
+            ]),
             ("add_documents", [
                 "collection": .string("заметки"),
                 "documents": .array([.object(["text": .string("новый кусок")])]),
@@ -124,6 +132,7 @@ final class MCPOutputSchemaTests: XCTestCase {
             ("get_file", ["collection": .string("заметки"), "file": .string("папка/тз.md")]),
             ("get_file", ["collection": .string("заметки"), "file": .string("папка/тз.md"), "outline": .bool(true)]),
             ("collect_mentions", ["collection": .string("заметки"), "contains": .string("приёмк")]),
+            ("list_files", ["collection": .string("заметки")]),
         ] {
             let result = try await service.call(
                 name: tool, arguments: .object(arguments), key: key
@@ -288,6 +297,7 @@ final class MCPOutputSchemaTests: XCTestCase {
             ]),
             ("get_file", ["collection": .string("заметки"), "file": .string(deep)]),
             ("collect_mentions", ["collection": .string("заметки"), "contains": .string("приёмк"), "limit": .int(100)]),
+            ("list_files", ["collection": .string("заметки"), "limit": .int(500)]),
         ]
         // Два потолка, и второй тесный нарочно: при 24 000 запас конверта —
         // четыре процента ответа и скрывает промах в счёте, при 4 000 он
@@ -552,6 +562,9 @@ final class MCPOutputSchemaTests: XCTestCase {
             keyPrefix: String(key.prefix(4)),
             permissions: ClientPermissions(
                 collections: ["заметки", "письма"], allowsWrite: true,
+                // Всплеск — по числу веток в проверке: она зовёт инструменты
+                // подряд, и предел вызовов отказывал бы последним из них.
+                burst: 100,
                 maxSearchResults: 100, maxResponseCharacters: responseCharacters,
                 allowsDelete: true
             )

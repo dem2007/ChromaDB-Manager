@@ -492,10 +492,31 @@ public protocol MCPToolBackend: Sendable {
     /// или файла на месте больше нет. Подложки, которым это неизвестно,
     /// молчат: умолчание ниже.
     func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk?
+
+    /// Файлы коллекции (`list_files`) — по всей коллекции, или по тем
+    /// кускам, что подходят под фильтр.
+    func files(collection: String, filter: DocumentFilter?) async throws -> CollectionFileList
 }
 
 public extension MCPToolBackend {
     func fileOnDisk(metadata: ChromaMetadata?) async -> MCPFileOnDisk? { nil }
+
+    /// Обход через `documents` — для подложек без своего: тот же список,
+    /// но без кэша и без пакетного чтения базы.
+    func files(collection: String, filter: DocumentFilter?) async throws -> CollectionFileList {
+        var grouping = CollectionFiles.Grouping()
+        var offset = 0
+        while true {
+            let answer = try await documents(MCPDocumentsRequest(
+                collection: collection, ids: [], filter: filter,
+                limit: CollectionFiles.pageSize, offset: offset, needsText: false
+            ))
+            for document in answer.documents { grouping.take(document.metadata) }
+            offset += answer.documents.count
+            if !answer.hasMore || answer.documents.isEmpty { break }
+        }
+        return grouping.list(documentCount: offset, builtAt: Date())
+    }
 }
 
 /// Реестр инструментов этапа 7.
@@ -564,7 +585,8 @@ public enum MCPToolCatalogue {
         files without reading their text. \
         Fields that did not fit in the description are listed by **name only** in \
         «otherFields»: a name is all a filter needs, and example values for it can \
-        be fetched with one get_documents call.
+        be fetched with one get_documents call. Which files the collection holds \
+        is answered by list_files, not by the examples here.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -822,7 +844,8 @@ public enum MCPToolCatalogue {
         there, that is the whole document in one step and costs nothing. \
         To work with a large document without reading it whole, ask for \
         «outline» first and then the section you need by «heading». \
-        Ask by file_id: a short fingerprint carried in the metadata of any result. \
+        Ask by file_id: a short fingerprint carried in the metadata of any result \
+        and listed for every file by list_files. \
         A path is accepted too, but it is easy to spoil when retyped. The order is \
         guaranteed by this tool and only by it: get_documents by filter returns an \
         arbitrary order. A file is almost always longer than one answer — the answer \
@@ -1173,6 +1196,81 @@ public enum MCPToolCatalogue {
         permission: .read
     )
 
+    /// Файлы коллекции (`list_files`): что в ней лежит — по строке на файл.
+    public static let listFiles = MCPToolDefinition(
+        name: "list_files",
+        title: "Files of a collection",
+        description: """
+        Lists the files a collection was built from — one line per file, not per \
+        chunk: its path, file_id, how many chunks it has, its size and date. Use it \
+        for «which documents are in this collection», «is there a contract of 2025», \
+        «what is in folder X», and to take the file_id that get_file needs without \
+        searching first. Search answers «what is said about this», not «which files \
+        exist»: a file that is never close to the query never shows up there. \
+        Narrow the list with «name» (part of the file name or path), «folder» (the \
+        start of the path) or «filter» on metadata — the same filter as in search. \
+        Files run in path order unless «sort» says otherwise and are paged with \
+        «offset»; the answer says how many files there are in all. A file without \
+        file_id was written by an earlier build: give its path to get_file as «file». \
+        The first call on a large collection reads the metadata of every chunk and \
+        takes a while; the pages after it come from memory.
+        """,
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object([
+                    "type": .string("string"),
+                    "description": .string("Collection name from list_collections."),
+                ]),
+                "name": .object([
+                    "type": .string("string"),
+                    "description": .string("Part of the file name or path, any case: «contract», «2025/». Not a pattern."),
+                ]),
+                "folder": .object([
+                    "type": .string("string"),
+                    "description": .string("The start of the path relative to the source folder: «Contracts/2025». Only files under it are listed."),
+                ]),
+                "filter": filterProperty,
+                "sort": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("path"), .string("chunks"), .string("modified")]),
+                    "description": .string("«path» (default), «chunks» — the largest files first, «modified» — the newest first."),
+                ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "description": .string("How many files to show at once. Default \(listFilesDefaultLimit), at most \(listFilesMaximumLimit); the answer is also trimmed to the key's character budget."),
+                ]),
+                "offset": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(0),
+                    "description": .string("How many files to skip — for paging."),
+                ]),
+            ]),
+            "required": .array([.string("collection")]),
+            "additionalProperties": .bool(false),
+        ]),
+        outputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "collection": .object(["type": .string("string")]),
+                "files": .object(["type": .string("array")]),
+                "totalFiles": .object(["type": .string("integer")]),
+                "totalChunks": .object(["type": .string("integer")]),
+                "withoutFile": .object(["type": .string("integer")]),
+                "hasMore": .object(["type": .string("boolean")]),
+                "notes": .object(["type": .string("array")]),
+            ]),
+            "required": .array([.string("collection"), .string("files"), .string("totalFiles"), .string("hasMore")]),
+        ]),
+        permission: .read
+    )
+
+    /// Сколько файлов `list_files` показывает, если не попросили иначе:
+    /// строка файла короткая, и пятьдесят — меньше трети бюджета ответа.
+    public static let listFilesDefaultLimit = 50
+    public static let listFilesMaximumLimit = 500
+
     /// Все инструменты сервера в постоянном порядке.
     ///
     /// Порядок именно постоянный, а не «какой получится»: спецификация просит
@@ -1180,14 +1278,14 @@ public enum MCPToolCatalogue {
     /// — свой контекст.
     public static let all: [MCPToolDefinition] = [
         listCollections, describeCollection, search, getDocuments, getFile, collectMentions,
-        addDocuments, deleteDocuments,
+        listFiles, addDocuments, deleteDocuments,
     ]
 
     /// Инструменты, которым коллекция обязательна. Список, а не флаг у
     /// определения: он же и отвечает на вопрос «по чему проверять whitelist».
     public static let collectionRequired: Set<String> = [
         describeCollection.name, search.name, getDocuments.name, getFile.name,
-        collectMentions.name, addDocuments.name, deleteDocuments.name,
+        collectMentions.name, listFiles.name, addDocuments.name, deleteDocuments.name,
     ]
 
     /// Инструменты, доступные ключу с такими правами.
@@ -1549,6 +1647,27 @@ public struct MCPToolService: Sendable {
                         throw error
                     }
                 }
+            case MCPToolCatalogue.listFiles.name:
+                switch Self.fileListRequest(collection ?? "", arguments) {
+                case .failure(let error): return refused(error)
+                case .success(let parsed):
+                    // Первый вызов на большой коллекции — обход всех её кусков,
+                    // как у collect_mentions, и очередь на ключ у них общая.
+                    guard await access.beginHeavyCall(for: client.id) else {
+                        auditNote = "refused: another heavy call of this key is running"
+                        return answered(MCPToolOutcome.failure(
+                            "Another list_files or collect_mentions call of this key is still running — wait for its answer, then call again."
+                        ).result)
+                    }
+                    do {
+                        let outcome = try await listFiles(parsed, limits: limits)
+                        await access.endHeavyCall(for: client.id)
+                        return answered(outcome.result)
+                    } catch {
+                        await access.endHeavyCall(for: client.id)
+                        throw error
+                    }
+                }
             case MCPToolCatalogue.addDocuments.name:
                 guard let writing else {
                     return refused(.invalidParams("No documents passed: the «documents» parameter is required."))
@@ -1772,6 +1891,77 @@ public struct MCPToolService: Sendable {
     }
 
     /// Разобранный «собери по теме».
+    private struct ParsedFileList {
+        enum Sort: String { case path, chunks, modified }
+        let collection: String
+        let name: String?
+        let folder: String?
+        let filter: DocumentFilter?
+        let sort: Sort
+        let limit: Int
+        let offset: Int
+        let limitNote: String?
+    }
+
+    private static func fileListRequest(
+        _ collection: String, _ arguments: JSONValue?
+    ) -> Result<ParsedFileList, JSONRPCError> {
+        func text(_ name: String) -> Result<String?, JSONRPCError> {
+            guard let raw = arguments?[name], raw != .null else { return .success(nil) }
+            guard let value = raw.stringValue else {
+                return .failure(.invalidParams("The «\(name)» parameter must be a string."))
+            }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .success(trimmed.isEmpty ? nil : trimmed)
+        }
+        let name: String?
+        switch text("name") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): name = value
+        }
+        let folder: String?
+        switch text("folder") {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            // Путь в метаданных — от корня источника, без ведущей черты.
+            folder = value.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        let sort: ParsedFileList.Sort
+        switch text("sort") {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            guard let parsed = ParsedFileList.Sort(rawValue: value ?? "path") else {
+                return .failure(.invalidParams("The «sort» parameter is one of «path», «chunks», «modified»."))
+            }
+            sort = parsed
+        }
+        var limit = MCPToolCatalogue.listFilesDefaultLimit
+        var limitNote: String?
+        switch integer(arguments, "limit") {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            if let value {
+                limit = min(MCPToolCatalogue.listFilesMaximumLimit, max(1, value))
+                if value > limit {
+                    limitNote = "Files asked for: \(value.plainDigits), shown at most \(limit.plainDigits) — the limit of this tool. The rest come with «offset»."
+                }
+            }
+        }
+        let offset: Int
+        switch integer(arguments, "offset") {
+        case .failure(let error): return .failure(error)
+        case .success(let value): offset = max(0, value ?? 0)
+        }
+        switch filter(arguments) {
+        case .failure(let error): return .failure(error)
+        case .success(let built):
+            return .success(ParsedFileList(
+                collection: collection, name: name, folder: folder, filter: built,
+                sort: sort, limit: limit, offset: offset, limitNote: limitNote
+            ))
+        }
+    }
+
     private struct ParsedMentions {
         let collection: String
         let contains: String
@@ -2718,6 +2908,139 @@ public struct MCPToolService: Sendable {
     /// текстовому условию стоит около секунды **независимо** от того, сколько
     /// кусков подошло, и агент, листавший то же самое страницами по сто,
     /// платил эту секунду за каждую страницу.
+    /// Файлы коллекции (`list_files`).
+    ///
+    /// Список целиком собирает подложка — один раз на коллекцию и фильтр,
+    /// — а здесь он сужается по имени и папке, упорядочивается и режется на
+    /// страницу. Страница помещается в бюджет ключа так же, как перечень
+    /// у collect_mentions: строка и её зеркало платят вместе.
+    private func listFiles(_ parsed: ParsedFileList, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
+        let list = try await backend.files(collection: parsed.collection, filter: parsed.filter)
+        var files = list.files.filter { file in
+            if let name = parsed.name, !CollectionFiles.matches(file, query: name) { return false }
+            if let folder = parsed.folder {
+                let path = CollectionFiles.folded(file.path)
+                let prefix = CollectionFiles.folded(folder)
+                guard path == prefix || path.hasPrefix(prefix + "/") else { return false }
+            }
+            return true
+        }
+        switch parsed.sort {
+        case .path: break
+        case .chunks: files.sort { $0.chunks == $1.chunks ? $0.path < $1.path : $0.chunks > $1.chunks }
+        case .modified: files.sort { ($0.modifiedDate ?? .distantPast) > ($1.modifiedDate ?? .distantPast) }
+        }
+
+        var notes: [String] = []
+        if let limitNote = parsed.limitNote { notes.append(limitNote) }
+        var structured: [String: JSONValue] = [
+            "collection": .string(parsed.collection),
+            "totalFiles": .int(files.count),
+            "totalChunks": .int(list.records),
+            "withoutFile": .int(list.recordsWithoutFile),
+        ]
+        func answered(_ lines: [String]) -> MCPToolOutcome {
+            if !notes.isEmpty { structured["notes"] = .array(notes.map(JSONValue.string)) }
+            return MCPToolOutcome(text: (lines + notes).joined(separator: "\n"), structured: .object(structured))
+        }
+        let narrowed = parsed.name != nil || parsed.folder != nil
+        guard !files.isEmpty else {
+            structured["files"] = .array([])
+            structured["hasMore"] = .bool(false)
+            if narrowed, !list.files.isEmpty {
+                return answered(["No file of the collection «\(parsed.collection)» matches — it holds \(EnglishCount.grouped(list.files.count, "file", "files")). «name» is a plain part of the name or path, «folder» is the start of the path."])
+            }
+            return answered(["The collection «\(parsed.collection)» holds no files\(parsed.filter == nil ? "" : " under this filter")\(list.recordsWithoutFile > 0 ? " — only \(EnglishCount.grouped(list.recordsWithoutFile, "record", "records")) without a source file" : "")."])
+        }
+        let page = Array(files.dropFirst(parsed.offset).prefix(parsed.limit))
+        guard !page.isEmpty else {
+            structured["files"] = .array([])
+            structured["hasMore"] = .bool(false)
+            return answered(["Files of the collection «\(parsed.collection)»: \(files.count.plainDigits), and offset \(parsed.offset.plainDigits) is already past the end of the list."])
+        }
+
+        // Заголовок и пометки оплачиваются заранее: пометка
+        // уходит дважды — строкой ответа и в structuredContent, — и плоский
+        // запас её не покрывал. Те, что зависят от того, сколько поместится,
+        // считаются по худшему случаю — по всей странице.
+        let header = "Collection «\(parsed.collection)»: \(EnglishCount.grouped(files.count, "file", "files")), \(EnglishCount.grouped(list.records, "chunk", "chunks")) read"
+        func trimmedNote(_ shown: Int) -> String {
+            "The page was trimmed by answer size: \(shown.plainDigits) of \(page.count.plainDigits) files are shown."
+        }
+        func withoutIDNote(_ count: Int) -> String {
+            "\(EnglishCount.grouped(count, "file has", "files have")) no file_id — written by an earlier build. Give the path to get_file as «file»."
+        }
+        func continueNote(_ end: Int) -> String {
+            "Files \((parsed.offset + 1).plainDigits) to \(end.plainDigits) of \(files.count.plainDigits) are shown — continue with offset \(end.plainDigits)."
+        }
+        if parsed.offset == 0, list.recordsWithoutFile > 0 {
+            notes.append("\(EnglishCount.grouped(list.recordsWithoutFile, "record carries", "records carry")) no source file — added by an agent, imported or typed in; they are not files, and get_file cannot return them.")
+        }
+        let pageWithoutID = page.filter { $0.fileID == nil }.count
+        let worstCase = notes
+            + [trimmedNote(page.count), continueNote(parsed.offset + page.count)]
+            + (pageWithoutID > 0 ? [withoutIDNote(pageWithoutID)] : [])
+        // Поля итогов structuredContent — числа и имя коллекции.
+        let totals = 120 + parsed.collection.count
+        let reserve = MCPDocumentRendering.overhead(header: header, notes: worstCase) + totals
+        let budget = max(1, limits.responseCharacters - reserve)
+        var lines: [String] = []
+        var mirrors: [JSONValue] = []
+        var spent = 0
+        var withoutID = 0
+        for (index, file) in page.enumerated() {
+            let line = Self.fileListLine(file)
+            let mirror = Self.fileListMirror(file)
+            let cost = line.count + 1 + mirror.deliveredSize
+            // Первый файл — всегда: ответ без единого файла хуже ответа с одним.
+            if index > 0, spent + cost > budget { break }
+            lines.append(line)
+            mirrors.append(mirror)
+            spent += cost
+            if file.fileID == nil { withoutID += 1 }
+        }
+        if mirrors.count < page.count { notes.append(trimmedNote(mirrors.count)) }
+        if withoutID > 0 { notes.append(withoutIDNote(withoutID)) }
+        let shownEnd = parsed.offset + mirrors.count
+        let hasMore = shownEnd < files.count
+        if hasMore { notes.append(continueNote(shownEnd)) }
+        structured["files"] = .array(mirrors)
+        structured["hasMore"] = .bool(hasMore)
+        return answered([header] + lines)
+    }
+
+    /// Строка файла для модели: путь, отпечаток и то, что помогает решить,
+    /// читать ли его.
+    private static func fileListLine(_ file: CollectionFile) -> String {
+        var parts = [file.path.isEmpty ? file.name : file.path]
+        parts.append(file.fileID.map { "file_id \($0)" } ?? "no file_id")
+        if file.isIncomplete, let expected = file.expectedChunks {
+            parts.append("\(file.chunks.plainDigits) of \(expected.plainDigits) chunks — written incompletely")
+        } else {
+            parts.append(EnglishCount.grouped(file.chunks, "chunk", "chunks"))
+        }
+        if let pages = file.pages { parts.append(EnglishCount.grouped(pages, "page", "pages")) }
+        if let bytes = file.sizeBytes { parts.append("\(bytes.plainDigits) bytes") }
+        if let modified = file.modified { parts.append("modified \(modified)") }
+        return "- " + parts.joined(separator: " · ")
+    }
+
+    private static func fileListMirror(_ file: CollectionFile) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "file": .string(file.path),
+            "name": .string(file.name),
+            "chunks": .int(file.chunks),
+        ]
+        if let fileID = file.fileID { object["fileId"] = .string(fileID) }
+        if let expected = file.expectedChunks { object["expectedChunks"] = .int(expected) }
+        if let bytes = file.sizeBytes { object["bytes"] = .int(Int(bytes)) }
+        if let modified = file.modified { object["modified"] = .string(modified) }
+        if let format = file.format { object["format"] = .string(format) }
+        if let pages = file.pages { object["pages"] = .int(pages) }
+        if let source = file.sourceName { object["source"] = .string(source) }
+        return .object(object)
+    }
+
     private func mentions(_ parsed: ParsedMentions, limits: MCPOutputLimits) async throws -> MCPToolOutcome {
         // Без текстов: группировке по файлам хватает метаданных, а показаны
         // будут один-три образца с файла. Тексты двадцати тысяч совпадений,

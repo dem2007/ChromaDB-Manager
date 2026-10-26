@@ -1,7 +1,7 @@
 ---
 name: chromadb-manager
 description: Query the ChromaDB Manager document base over MCP.
-version: 3.3.0
+version: 3.4.0
 author: Max, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -58,6 +58,7 @@ user in the language the user wrote in.** Quote document text in the original.
 |---|---|
 | "what does it say about this" | `search` |
 | "is it in every specification", "show all the places" | `collect_mentions` |
+| "which documents are there", "is there a file named …", "give me its file_id" | `list_files` |
 | "collect every value of a column" | `get_documents` + `filter` |
 | "read a whole document" | `get_file` — text is what it returns — or its `sourcePath` |
 | "answer a question about a big document" | `get_file` with `outline`, then `heading` |
@@ -147,11 +148,11 @@ only you know which files are specifications.
 
 So before concluding «not in all», establish the denominator and say it:
 
-- list the files: `collect_mentions` with a substring present in every document
-  (a single common letter works) and `per_file: 1` — the header then reads
-  `N matches in M files`, and that `M` is the collection's file count;
-- or narrow with a `filter` to the documents that are specifications, and count
-  those.
+- list the files: `list_files` — its `totalFiles` is the collection's file
+  count, and with `name`, `folder` or `filter` it counts just the documents
+  that are specifications;
+- compare the two lists by path: the files `list_files` names and
+  `collect_mentions` does not are the ones without the word.
 
 An answer of the form «20 files of the 120 in the collection» is worth
 something. «Not in all» on its own is a guess, even when it happens to be

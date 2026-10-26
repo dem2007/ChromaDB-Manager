@@ -586,6 +586,7 @@ struct EvaluationView: View {
 
     private var runsTab: some View {
         VStack(spacing: 0) {
+            runsPartBar
             switch RunsPart(rawValue: runsPart) ?? .history {
             case .history:
                 historyTable
@@ -603,20 +604,36 @@ struct EvaluationView: View {
                 }
             }
         }
-        // Часть прогонов — меню в тулбаре, как в «Замерах» (v6 B2): второй
-        // ряд сегментов под тулбаром был другим видом переключателя.
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Picker(String(localized: "Показать"), selection: $runsPart) {
-                    ForEach(RunsPart.allCases) { part in
-                        Text(part.title).tag(part.rawValue)
-                    }
+        // Сегменты частей — в начале содержимого, и прижаты к верху всегда:
+        // заглушка пустой истории во всю высоту не растягивается, и без этого
+        // вся стопка центрировалась вместе с сегментами.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// Части прогонов — уровнем ниже вкладок экрана, сегментами в начале
+    /// содержимого, как «Документы / Поиск / Обзор» у коллекции: сначала
+    /// «что за экран», потом «какую его часть смотреть». Меню в тулбаре
+    /// (v6 B2) стояло вровень с вкладками экрана и читалось как ещё одна
+    /// из них. Справа — какой прогон открыт: отчёт и разметка — о нём.
+    private var runsPartBar: some View {
+        HStack(spacing: 12) {
+            Picker(String(localized: "Часть прогонов"), selection: $runsPart) {
+                ForEach(RunsPart.allCases) { part in
+                    Text(part.title).tag(part.rawValue)
                 }
-                .pickerStyle(.menu)
-                .help(model.lastRun.map { String(localized: "Открыт «\($0.name)»") }
-                      ?? String(localized: "История, отчёт и разметка прогонов"))
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            if let run = model.lastRun {
+                Text("Открыт «\(run.name)»")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
         }
+        .padding()
     }
 
     private var noOpenRun: some View {
@@ -645,6 +662,8 @@ struct EvaluationView: View {
             } description: {
                 Text("Прогон хранится целиком — с датой, версией приложения и полными параметрами вариантов. Соберите набор, добавьте вариант и нажмите «Прогнать» на вкладке «Варианты».")
             }
+            // Во всю оставшуюся высоту — по центру под сегментами частей.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             Table(model.runs, selection: $selectedRun, columnCustomization: $runColumns) {
                 // Название, дата, набор, число запросов; варианты — главная

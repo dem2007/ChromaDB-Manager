@@ -27,6 +27,7 @@ struct CollectionsView: View {
     /// D3, K1: инспектор живёт своим состоянием — прогон длится и после того,
     /// как окно закрыли и открыли снова.
     @StateObject private var inspector = InspectorViewModel()
+    @StateObject private var files = CollectionFilesViewModel()
     /// перенос коллекции пакетом.
     @StateObject private var transfer = TransferViewModel()
 
@@ -793,6 +794,27 @@ struct CollectionsView: View {
                         ])
                         tab = .documents
                         Task { await model.applyFilter(app) }
+                    }
+                )
+                // Файлы — после состава: состав говорит «сколько и каких»,
+                // файлы — «какие именно» и их ID для get_file.
+                CollectionFilesSection(
+                    model: files, collection: collection,
+                    openFile: { file in
+                        viewer.open(
+                            chunk: "", metadata: CollectionFilesViewModel.wholeFileMetadata(file),
+                            title: file.name, app: app
+                        )
+                    },
+                    showChunks: { file in
+                        model.filter = DocumentFilter(conditions: [file.condition])
+                        tab = .documents
+                        Task { await model.applyFilter(app) }
+                    },
+                    searchInFile: { file in
+                        model.filter = DocumentFilter(conditions: [file.condition])
+                        model.applyFilterToQuery = true
+                        tab = .search
                     }
                 )
                 // Темы — тоже о содержании: о чём коллекция (v3).

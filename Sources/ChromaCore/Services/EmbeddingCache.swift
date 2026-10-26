@@ -54,8 +54,12 @@ public actor EmbeddingCache {
     /// working without a cache rather than refusing to embed anything.
     public private(set) var isAvailable = false
 
+    /// Имя файла кэша в папке приложения — одно на все места, где о нём
+    /// говорят: на экране «Место на диске» он считается своей строкой.
+    public static let defaultFileName = "embedding-cache.sqlite3"
+
     public init(
-        fileURL: URL = AppPaths.supportDirectory.appendingPathComponent("embedding-cache.sqlite3"),
+        fileURL: URL = AppPaths.supportDirectory.appendingPathComponent(EmbeddingCache.defaultFileName),
         limitBytes: Int64 = EmbeddingCache.defaultLimitBytes,
         log: @escaping LogHandler = noopLogHandler
     ) {

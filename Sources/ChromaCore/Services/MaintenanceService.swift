@@ -82,16 +82,7 @@ public struct MaintenanceService {
         return result
     }
 
-    static func directorySize(_ url: URL) -> Int64 {
-        var total: Int64 = 0
-        guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else {
-            return 0
-        }
-        for case let fileURL as URL in enumerator {
-            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        }
-        return total
-    }
+    static func directorySize(_ url: URL) -> Int64 { DiskUsage.size(of: url) }
 }
 
 public enum MaintenanceError: LocalizedError {

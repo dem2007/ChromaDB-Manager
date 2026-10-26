@@ -1956,16 +1956,18 @@ final class MCPPermissionMatrixTests: XCTestCase {
 
     private static let readTools: Set<String> = [
         "list_collections", "describe_collection", "search", "get_documents", "get_file",
-        "collect_mentions",
+        "collect_mentions", "list_files",
     ]
 
     /// Какими вызовами базы оборачиваются разрешённые инструменты.
     ///
     /// Своего метода у `collect_mentions` нет намеренно: он обходит коллекцию
     /// тем же `get_documents`, только один раз вместо страницы за страницей.
+    /// `list_files` у подложки без своего обхода — тоже `get_documents`.
     private static func backendCalls(for tools: Set<String>) -> Set<String> {
         var names = tools
         if names.remove("collect_mentions") != nil { names.insert("get_documents") }
+        if names.remove("list_files") != nil { names.insert("get_documents") }
         return names
     }
 

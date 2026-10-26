@@ -166,14 +166,6 @@ public struct DataWipeService {
     }
 
     private static func size(of url: URL, excluding: [URL]) -> Int64 {
-        let manager = FileManager.default
-        guard let enumerator = manager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
-        let skip = Set(excluding.map(\.standardizedFileURL.path))
-        var total: Int64 = 0
-        for case let fileURL as URL in enumerator {
-            if skip.contains(where: { fileURL.standardizedFileURL.path.hasPrefix($0) }) { continue }
-            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        }
-        return total
+        DiskUsage.size(of: url, excluding: excluding)
     }
 }

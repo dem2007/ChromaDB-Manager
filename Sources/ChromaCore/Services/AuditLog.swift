@@ -291,7 +291,7 @@ public final class AuditLog: ObservableObject {
                 String(format: "%.3f", row.durationSeconds),
                 row.note ?? "",
             ]
-            text += fields.map(Self.escapeCSV).joined(separator: ",") + "\n"
+            text += fields.map(CSVText.field).joined(separator: ",") + "\n"
         }
         return text
     }
@@ -303,11 +303,6 @@ public final class AuditLog: ObservableObject {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(rows) else { return "[]" }
         return String(data: data, encoding: .utf8) ?? "[]"
-    }
-
-    private static func escapeCSV(_ value: String) -> String {
-        guard value.contains(",") || value.contains("\"") || value.contains("\n") else { return value }
-        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
     // MARK: - File

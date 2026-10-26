@@ -14,7 +14,7 @@ quality, and gives agents access to the base over MCP — with keys and permissi
 Vectors are computed by a local [LM Studio](https://lmstudio.ai/): documents never
 leave the machine.
 
-> **Version 0.4.0.** What follows describes what is implemented and works. What is
+> **Version 0.4.1.** What follows describes what is implemented and works. What is
 > deliberately not done, and where the app's limits are, is in
 > [Known limitations](#known-limitations).
 
@@ -84,6 +84,10 @@ person to decide.
   **compacting the database** after mass deletions; **deleting the app's data**
   with a list of paths and sizes — the folders of your databases are never
   touched.
+- **Disk usage** on the "Status" screen: the database, the engine, backups, the
+  trash, the vector cache, service data and logs — part by part, with the free
+  space of the volume and a warning when the next database backup will not fit.
+  Each row leads to where that part is made smaller.
 
 ### Collections
 
@@ -118,6 +122,10 @@ person to decide.
 - **Composition overview** — distributions by source, format, date and length —
   and **collection topics**: k-means over the vectors and topic names from a chat
   model, as a list with examples rather than a picture.
+- **Files of a collection:** every file across the whole collection, not a
+  sample — name, folder, chunk count, size and date; search by name and path;
+  the `file_id` for `get_file` copied with one button; the file opens whole, and
+  its chunks and a search inside it are one step away; the list exports to CSV.
 - **Trash:** deleted documents and collections can be brought back; its limit is
   configurable, and a collection that does not fit into it is explained right in
   the delete dialog.
@@ -322,7 +330,9 @@ by design.
   `get_documents`, `get_file` (a whole file as text, as a map of sections or as
   chunks in order; a section by its heading; the file's path on disk),
   `collect_mentions` (every place a word occurs, grouped by file — what semantic
-  search does not answer), `add_documents`, `delete_documents`.
+  search does not answer), `list_files` (the files of a collection, one line per
+  file with its `file_id` — "which documents are there" without a search),
+  `add_documents`, `delete_documents`.
 - **Two transports:** stdio through the `chromadb-mcp` helper inside the bundle
   (this Mac only) and HTTP `/mcp` on the proxy port, with TLS and the same keys
   (off by default).

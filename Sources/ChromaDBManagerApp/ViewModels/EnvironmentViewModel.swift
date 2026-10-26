@@ -429,6 +429,13 @@ final class EnvironmentViewModel: ObservableObject {
     }
 
     func backupTarget(_ app: AppEnvironment) -> URL? {
+        Self.databaseFolder(app)
+    }
+
+    /// Папка базы, с которой приложение работает сейчас и которая лежит на
+    /// этом диске: локальная — или сервера, которым оно управляет само.
+    /// Одно правило и для резервных копий, и для «Места на диске».
+    static func databaseFolder(_ app: AppEnvironment) -> URL? {
         switch app.settings.configuration.mode {
         case .localDatabase:
             return app.localDatabaseURL

@@ -90,6 +90,12 @@ public final class BackupService: @unchecked Sendable {
     /// Free space required on top of the database size, as a fraction.
     public static let freeSpaceHeadroom = 0.2
 
+    /// Сколько места нужно копии базы такого объёма — одно правило и для
+    /// проверки перед копией, и для предупреждения на экране «Состояние».
+    public static func requiredSpace(forDatabaseBytes size: Int64) -> Int64 {
+        size + Int64(Double(size) * freeSpaceHeadroom)
+    }
+
     /// What a backup would need and what the volume has.
     public struct SpaceCheck: Hashable, Sendable {
         public let requiredBytes: Int64
@@ -109,8 +115,7 @@ public final class BackupService: @unchecked Sendable {
     /// A 40 GB database copied onto a volume with 30 GB free fails halfway and
     /// leaves something that looks like a backup. Cheaper to ask first.
     public func spaceCheck(for source: URL) -> SpaceCheck {
-        let size = directorySize(source)
-        let required = size + Int64(Double(size) * Self.freeSpaceHeadroom)
+        let required = Self.requiredSpace(forDatabaseBytes: directorySize(source))
         let values = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         let available = values?.volumeAvailableCapacityForImportantUsage
             // A path that does not exist yet has no volume values; ask its parent.
@@ -467,16 +472,7 @@ public final class BackupService: @unchecked Sendable {
         log(.warning, "Бэкап", "Резервная копия \(record.name) удалена")
     }
 
-    public func directorySize(_ url: URL) -> Int64 {
-        var total: Int64 = 0
-        guard let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else {
-            return 0
-        }
-        for case let fileURL as URL in enumerator {
-            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        }
-        return total
-    }
+    public func directorySize(_ url: URL) -> Int64 { DiskUsage.size(of: url) }
 }
 
 extension BackupService {

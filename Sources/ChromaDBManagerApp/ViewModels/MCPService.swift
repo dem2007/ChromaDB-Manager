@@ -741,6 +741,25 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         )
     }
 
+    /// Файлы коллекции для `list_files` — одним обходом метаданных на
+    /// коллекцию: агент листает список страницами, и каждая страница иначе
+    /// обходила бы коллекцию заново.
+    func files(collection name: String, filter: DocumentFilter?) async throws -> CollectionFileList {
+        let client = try await client()
+        let collection = try await collection(named: name)
+        let key = MCPFileChunkCache.Key(collectionID: collection.id, filter: filter)
+        // Снимок поколения — до обхода, как и у порядка кусков: запись
+        // посреди обхода не даст запомнить то, что он видел до неё.
+        let ticket = chunkCache.ticket(for: key)
+        let stamp = collection.documentCount ?? -1
+        if stamp >= 0, let remembered = chunkCache.fileList(for: key, stamp: stamp) {
+            return remembered
+        }
+        let built = try await CollectionFiles.build(reader: client, collectionID: collection.id, filter: filter)
+        if stamp >= 0 { chunkCache.storeFileList(built, for: key, stamp: stamp, ticket: ticket) }
+        return built
+    }
+
     func documents(_ request: MCPDocumentsRequest) async throws -> MCPDocumentsAnswer {
         let client = try await client()
         let collection = try await collection(named: request.collection)

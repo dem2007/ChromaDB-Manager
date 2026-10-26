@@ -97,6 +97,22 @@ public final class MCPFileChunkCache: @unchecked Sendable {
         fileprivate let generation: Int
     }
 
+    private struct StoredList {
+        let list: CollectionFileList
+        let ticket: Ticket
+        let stamp: Int
+        let storedAt: TimeInterval
+    }
+
+    /// Сколько списков файлов держится. Список — по строке на файл, а не
+    /// на кусок: восемь списков по тысяче файлов — килобайты.
+    public static let listCapacity = 8
+
+    /// Список живёт дольше порядка кусков: агент листает его страницами,
+    /// а собрать его заново на девяноста тысячах кусков — десятки секунд.
+    /// Запись через приложение и смена счёта снимают его раньше срока.
+    public static let listLifetime: TimeInterval = 300
+
     private struct Stored {
         let entry: Entry
         let ticket: Ticket
@@ -113,6 +129,9 @@ public final class MCPFileChunkCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var storage: [Key: Stored] = [:]
+    /// Списки файлов `list_files` — с теми же проверками свежести, что
+    /// и порядок кусков: запись в коллекцию меняет поколение у обоих.
+    private var lists: [Key: StoredList] = [:]
     /// Ключи в порядке последнего обращения: последний — самый свежий.
     private var order: [Key] = []
     private var generations: [String: Int] = [:]
@@ -190,6 +209,34 @@ public final class MCPFileChunkCache: @unchecked Sendable {
     ///
     /// Поколением, а не вычёркиванием ключей: файл мог и не попасть в кэш,
     /// а изменение коллекции всё равно обязано его обесценить.
+    public func fileList(for key: Key, stamp: Int, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> CollectionFileList? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let stored = lists[key] else { return nil }
+        guard stored.ticket == currentTicket(for: key),
+              stored.stamp == stamp,
+              now - stored.storedAt < Self.listLifetime
+        else {
+            lists[key] = nil
+            return nil
+        }
+        return stored.list
+    }
+
+    public func storeFileList(
+        _ list: CollectionFileList, for key: Key, stamp: Int, ticket: Ticket, now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = currentTicket(for: key)
+        guard ticket == current else { return }
+        lists[key] = StoredList(list: list, ticket: current, stamp: stamp, storedAt: now)
+        for (stale, stored) in lists where now - stored.storedAt > Self.listLifetime { lists[stale] = nil }
+        while lists.count > Self.listCapacity, let oldest = lists.min(by: { $0.value.storedAt < $1.value.storedAt })?.key {
+            lists[oldest] = nil
+        }
+    }
+
     public func invalidate(collectionID: String) {
         lock.lock()
         defer { lock.unlock() }
@@ -209,6 +256,7 @@ public final class MCPFileChunkCache: @unchecked Sendable {
         epoch += 1
         storage.removeAll()
         order.removeAll()
+        lists.removeAll()
     }
 
     /// Сколько файлов помнится — для проверок и диагностики.

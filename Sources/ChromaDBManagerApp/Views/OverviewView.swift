@@ -23,6 +23,7 @@ struct OverviewView: View {
     /// Размер кэша векторов в сводке. Считает его та же модель, что и на
     /// экране «Модели», — число одно на приложение, а не два своих.
     @ObservedObject var embeddings: EmbeddingsViewModel
+    @ObservedObject var diskUsage: DiskUsageViewModel
     /// Куда уйти, если человек решит закрыть находку. Экран не чинит сам —
     /// он показывает и провожает туда, где чинят.
     var go: (SidebarSection, Int?) -> Void = { _, _ in }
@@ -37,21 +38,36 @@ struct OverviewView: View {
             // когда таких процессов нет.
             ChromaProcessesCard(serverModel: server)
             decisionsSection
+            // Место на диске — последним: справка, а не то, с чем идут
+            // на экран первым делом.
+            DiskUsageSection(
+                diskUsage: diskUsage, environment: environment,
+                cacheFileBytes: embeddings.cacheStatistics?.fileBytes, go: go
+            )
         }
         .formStyle(.grouped)
-        .task { await embeddings.refreshCacheStatistics(app) }
+        .task {
+            diskUsage.measureIfNeeded(app)
+            await embeddings.refreshCacheStatistics(app)
+        }
+        // Пересчёт — после того, что меняет объём: копии, корзины, кэша.
+        .onChange(of: environment.backups.map(\.url)) { _, _ in diskUsage.measure(app) }
+        .onReceive(app.trash.$entries.map(\.count).removeDuplicates().dropFirst()) { _ in diskUsage.measure(app) }
+        .onChange(of: embeddings.cacheStatistics?.fileBytes) { _, _ in diskUsage.measure(app) }
+        // Другая база — другие числа: переключили режим или профиль сервера.
+        .onChange(of: EnvironmentViewModel.databaseFolder(app)?.path) { _, _ in diskUsage.measure(app) }
     }
 
     // MARK: - Сводка
 
-    /// Сколько всего — четыре числа. Список коллекций живёт на своём экране
-    /// целиком, здесь от него нужен только счёт (правило 2).
+    /// Сколько всего — три числа. Список коллекций живёт на своём экране
+    /// целиком, здесь от него нужен только счёт (правило 2). Кэш векторов —
+    /// в «Месте на диске», рядом с остальным, что занимает место.
     private var summarySection: some View {
         Section {
             LabeledContent(String(localized: "Коллекций"), value: collectionsModel.collections.count.formatted())
             LabeledContent(String(localized: "Документов"), value: documentsValue)
             LabeledContent(String(localized: "Источников"), value: settings.configuration.dataSources.count.formatted())
-            LabeledContent(String(localized: "Кэш векторов"), value: embeddings.cacheStatistics?.sizeText ?? "—")
         } header: {
             Text("Сводка")
         }
@@ -311,6 +327,15 @@ struct OverviewView: View {
                 isUrgent: false,
                 action: String(localized: "Источники"),
                 go: { go(.sources, nil) }
+            ))
+        }
+        if diskUsage.report?.nextBackupFits == false {
+            found.append(Decision(
+                id: "disk-space",
+                text: String(localized: "Свободного места меньше, чем занимает база, — следующая резервная копия не поместится"),
+                isUrgent: true,
+                action: String(localized: "Резервные копии"),
+                go: { go(.environment, SidebarSection.environment.tabIndex(String(localized: "Резервные копии"))) }
             ))
         }
         if sources.problemCount > 0 {

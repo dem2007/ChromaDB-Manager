@@ -201,6 +201,7 @@ struct RootView: View {
     @StateObject private var collectionsModel = CollectionsViewModel()
     @StateObject private var evaluationModel = EvaluationViewModel()
     @StateObject private var trashModel = TrashViewModel()
+    @StateObject private var diskUsageModel = DiskUsageViewModel()
     // Не `@StateObject`: эти живут дольше окна (см. `AppEnvironment.sourcesModel`).
     @ObservedObject private var embeddingsModel = AppEnvironment.shared.embeddingsModel
     @ObservedObject private var sourcesModel = AppEnvironment.shared.sourcesModel
@@ -597,7 +598,7 @@ struct RootView: View {
                 OverviewView(
                     server: serverModel, collectionsModel: collectionsModel,
                     environment: environmentModel, sources: sourcesModel,
-                    embeddings: embeddingsModel,
+                    embeddings: embeddingsModel, diskUsage: diskUsageModel,
                     // Переход помнит и раздел, и вкладку: «Подключение» вело
                     // на «Обзор», где мы и так стояли, а «Копии» — в тот
                     // раздел, но на вкладку, открытую в прошлый раз.
