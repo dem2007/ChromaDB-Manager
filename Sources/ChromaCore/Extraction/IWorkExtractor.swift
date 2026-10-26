@@ -394,6 +394,10 @@ public struct AppleScriptIWorkExporter: IWorkExporting {
     }
 
     /// Читает канал по мере поступления, чтобы пишущий не упёрся в его буфер.
+    ///
+    /// Чтение — под тем же замком, что и дочитывание: снятый обработчик
+    /// может ещё идти, и без замка он забирал последние байты в ту минуту,
+    /// когда `finish` уже отдавал текст без них (как в `ShellRunner`).
     final class PipeCollector: @unchecked Sendable {
         private let handle: FileHandle
         private let lock = NSLock()
@@ -402,12 +406,17 @@ public struct AppleScriptIWorkExporter: IWorkExporting {
         init(_ pipe: Pipe) {
             handle = pipe.fileHandleForReading
             handle.readabilityHandler = { [weak self] handle in
-                let chunk = handle.availableData
-                guard let self else { return }
-                if chunk.isEmpty {
+                guard let self else {
                     handle.readabilityHandler = nil
-                } else {
-                    self.lock.withLock { self.data.append(chunk) }
+                    return
+                }
+                self.lock.withLock {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty {
+                        handle.readabilityHandler = nil
+                    } else {
+                        self.data.append(chunk)
+                    }
                 }
             }
         }
@@ -415,8 +424,7 @@ public struct AppleScriptIWorkExporter: IWorkExporting {
         /// Всё прочитанное — вместе с тем, что осталось в канале.
         func finish() -> Data {
             handle.readabilityHandler = nil
-            let rest = handle.readDataToEndOfFile()
-            return lock.withLock { data + rest }
+            return lock.withLock { data + handle.readDataToEndOfFile() }
         }
     }
 

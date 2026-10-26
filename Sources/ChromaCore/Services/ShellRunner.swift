@@ -90,6 +90,41 @@ private final class LineSplitter {
     }
 }
 
+/// Одна труба процесса: чтение и дочитывание после выхода — под одним замком.
+///
+/// Обработчик готовности зовётся на своей очереди, и снятие его в
+/// `terminationHandler` не ждёт вызова, который уже идёт. Без замка такой
+/// вызов успевал забрать последние байты через `availableData`, дочитывание
+/// находило трубу пустой, а ответ собирался раньше, чем вызов дописывал
+/// забранное в буфер: `git ls-files` с кодом 0 и пустым выводом — план
+/// индексации без единого файла. Под замком дочитывание ждёт идущий вызов,
+/// а опоздавший застаёт трубу в конце и ничего не забирает.
+private final class PipeReader {
+    private let lock = NSLock()
+    let buffer = OutputBuffer()
+    private let splitter: LineSplitter?
+
+    init(splitter: LineSplitter?) { self.splitter = splitter }
+
+    func readAvailable(_ handle: FileHandle) {
+        lock.lock(); defer { lock.unlock() }
+        take(handle.availableData)
+    }
+
+    func drain(_ handle: FileHandle) {
+        handle.readabilityHandler = nil
+        lock.lock(); defer { lock.unlock() }
+        if let rest = try? handle.readToEnd() { take(rest) }
+        splitter?.flush()
+    }
+
+    private func take(_ data: Data) {
+        guard !data.isEmpty else { return }
+        buffer.append(data)
+        splitter?.feed(data)
+    }
+}
+
 /// Runs shell commands (`pip`, `python3`, `chroma`, …) on behalf of the app.
 ///
 /// Everything the app does with the outside world through processes goes
@@ -175,23 +210,11 @@ public final class ShellRunner: @unchecked Sendable {
         process.standardError = stderrPipe
         process.standardInput = FileHandle.nullDevice
 
-        let stdoutBuffer = OutputBuffer()
-        let stderrBuffer = OutputBuffer()
-        let stdoutSplitter = onOutput.map { LineSplitter(onLine: $0) }
-        let stderrSplitter = onOutput.map { LineSplitter(onLine: $0) }
+        let stdoutReader = PipeReader(splitter: onOutput.map { LineSplitter(onLine: $0) })
+        let stderrReader = PipeReader(splitter: onOutput.map { LineSplitter(onLine: $0) })
 
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            stdoutBuffer.append(data)
-            stdoutSplitter?.feed(data)
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            stderrBuffer.append(data)
-            stderrSplitter?.feed(data)
-        }
+        stdoutPipe.fileHandleForReading.readabilityHandler = { stdoutReader.readAvailable($0) }
+        stderrPipe.fileHandleForReading.readabilityHandler = { stderrReader.readAvailable($0) }
 
         // Boxed so the termination handler can cancel it without capturing a var.
         final class TimeoutBox { var item: DispatchWorkItem? }
@@ -200,24 +223,16 @@ public final class ShellRunner: @unchecked Sendable {
         let result: ProcessResult = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ProcessResult, Error>) in
                 process.terminationHandler = { finished in
-                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                    stderrPipe.fileHandleForReading.readabilityHandler = nil
                     // Drain whatever is still buffered in the pipes.
-                    if let rest = try? stdoutPipe.fileHandleForReading.readToEnd(), !rest.isEmpty {
-                        stdoutBuffer.append(rest); stdoutSplitter?.feed(rest)
-                    }
-                    if let rest = try? stderrPipe.fileHandleForReading.readToEnd(), !rest.isEmpty {
-                        stderrBuffer.append(rest); stderrSplitter?.feed(rest)
-                    }
-                    stdoutSplitter?.flush()
-                    stderrSplitter?.flush()
+                    stdoutReader.drain(stdoutPipe.fileHandleForReading)
+                    stderrReader.drain(stderrPipe.fileHandleForReading)
                     timeoutBox.item?.cancel()
 
                     continuation.resume(returning: ProcessResult(
                         command: displayCommand,
                         exitCode: finished.terminationStatus,
-                        standardOutput: stdoutBuffer.string,
-                        standardError: stderrBuffer.string
+                        standardOutput: stdoutReader.buffer.string,
+                        standardError: stderrReader.buffer.string
                     ))
                 }
 
