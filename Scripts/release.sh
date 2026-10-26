@@ -68,13 +68,23 @@ if [ ! -f "$DENYLIST" ]; then
     exit 1
 fi
 TERMS="$(mktemp)"
-grep -v '^[[:space:]]*#' "$DENYLIST" | sed '/^[[:space:]]*$/d' > "$TERMS"
+# Регистр кириллицы `grep -i` не сводит: в локали C не умеет вовсе, а в UTF-8
+# перестаёт находить что-либо в бинарниках. Поэтому каждое слово ищется
+# побайтно в нескольких написаниях, а `-i` остаётся для латиницы.
+python3 - "$DENYLIST" > "$TERMS" <<'PY'
+import sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    term = line.strip()
+    if term and not term.startswith("#"):
+        for variant in sorted({term, term.lower(), term.upper(), term.capitalize(), term.title()}):
+            print(variant)
+PY
 printf '%s\n' "/Users/" >> "$TERMS"
-LEAKS="$(grep -rlaiF -f "$TERMS" "$APP" 2>/dev/null || true)"
+LEAKS="$(LC_ALL=C grep -rlaiF -f "$TERMS" "$APP" 2>/dev/null || true)"
 if [ -n "$LEAKS" ]; then
     echo "!! в приложении пути машины сборки или слова из рабочих документов:" >&2
     while IFS= read -r leak; do
-        echo "   ${leak#"$APP"/}: $(grep -aoiF -f "$TERMS" "$leak" | sort -u | head -5 | paste -sd, -)" >&2
+        echo "   ${leak#"$APP"/}: $(LC_ALL=C grep -aoiF -f "$TERMS" "$leak" | sort -u | head -5 | paste -sd, -)" >&2
     done <<< "$LEAKS"
     rm -f "$TERMS"
     exit 1
