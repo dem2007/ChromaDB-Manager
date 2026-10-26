@@ -256,7 +256,7 @@ yields a vector that means nothing.
 
 ### Search
 
-Search is not one `query` call but a pipeline of eight stages in a fixed order:
+Search is not one `query` call but a pipeline of nine stages in a fixed order:
 
 | # | Stage | What it does |
 |---|---|---|
@@ -267,7 +267,8 @@ Search is not one `query` call but a pipeline of eight stages in a fixed order:
 | 5 | Parent lift | the whole section instead of a child chunk |
 | 6 | Context | neighbouring chunks of the same file |
 | 7 | Reranking | by a chat model or a cross-encoder |
-| 8 | Truncation | down to `n_results` |
+| 8 | Manual marks | pinned documents go up, even ones search did not find; demoted and outdated ones go down |
+| 9 | Truncation | down to `n_results` |
 
 - **No search setting requires recomputing vectors** — they are query parameters.
   **Search profiles** are named, bound to a collection and portable as a file;
