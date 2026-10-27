@@ -72,6 +72,10 @@ public struct BenchmarkBatchResult: Codable, Hashable, Identifiable, Sendable {
 /// What one measurement of one model produced.
 public struct ModelBenchmark: Codable, Hashable, Identifiable, Sendable {
     public let model: String
+    /// Сервер модели: одноимённые модели LM Studio и Ollama — разные
+    /// модели, и скорость у них своя. `nil` — LM Studio: так записаны и все
+    /// замеры до, и файл у тех, кто Ollama не трогал, не меняется.
+    public let server: String?
     public let measuredAt: Date
     public let dimension: Int
     /// The very first call, measured on its own and excluded from everything
@@ -81,7 +85,12 @@ public struct ModelBenchmark: Codable, Hashable, Identifiable, Sendable {
     public let firstCallSeconds: Double
     public let batches: [BenchmarkBatchResult]
 
-    public var id: String { model }
+    public var serverID: String { server ?? LLMProvider.lmStudio.rawValue }
+
+    public var id: String { serverID + "\u{0}" + model }
+
+    /// Модель для таблиц: сервер называется, если это не LM Studio.
+    public var title: String { ModelSpeedKey.title(model: model, serverID: serverID) }
 
     /// The batch size that produced the highest throughput.
     public var optimalBatchSize: Int? {
@@ -101,12 +110,14 @@ public struct ModelBenchmark: Codable, Hashable, Identifiable, Sendable {
 
     public init(
         model: String,
+        server: LLMProvider = .lmStudio,
         measuredAt: Date,
         dimension: Int,
         firstCallSeconds: Double,
         batches: [BenchmarkBatchResult]
     ) {
         self.model = model
+        self.server = ModelSpeedKey.stored(server)
         self.measuredAt = measuredAt
         self.dimension = dimension
         self.firstCallSeconds = firstCallSeconds
@@ -121,6 +132,35 @@ public struct ModelBenchmark: Codable, Hashable, Identifiable, Sendable {
 /// report a model that is infinitely fast.
 public protocol UncachedEmbeddingProvider: Sendable {
     func embedIgnoringCache(texts: [String], model: String) async throws -> [[Double]]
+    /// Чью модель меряем.
+    var server: LLMProvider { get }
+}
+
+public extension UncachedEmbeddingProvider {
+    var server: LLMProvider { .lmStudio }
+}
+
+/// Замеры скорости — по паре «модель + сервер»: `nomic-embed-text`
+/// в LM Studio на видеокарте и в Ollama на процессоре Intel — разные
+/// скорости, и смешанные в одну они врут обе оценки времени.
+public enum ModelSpeedKey {
+    /// LM Studio хранится как `nil` — так записаны замеры до.
+    static func stored(_ server: LLMProvider) -> String? {
+        server == .lmStudio ? nil : server.rawValue
+    }
+
+    static func title(model: String, serverID: String) -> String {
+        guard serverID != LLMProvider.lmStudio.rawValue else { return model }
+        return "\(model) (\(LLMProvider(rawValue: serverID)?.title ?? serverID))"
+    }
+}
+
+public extension Array where Element == ModelBenchmark {
+    /// Замеры одного сервера — для оценок времени, где модель названа
+    /// одним именем.
+    func serving(_ server: LLMProvider) -> [ModelBenchmark] {
+        filter { $0.serverID == server.rawValue }
+    }
 }
 
 /// Runs the fixed corpus through a model and times it.
@@ -220,6 +260,7 @@ public struct ModelBenchmarkService: Sendable {
 
         let result = ModelBenchmark(
             model: model,
+            server: provider.server,
             measuredAt: now(),
             dimension: dimension,
             firstCallSeconds: firstCallSeconds,
@@ -255,8 +296,8 @@ public actor BenchmarkStore {
         benchmarks.sorted { $0.textsPerSecond > $1.textsPerSecond }
     }
 
-    public func benchmark(for model: String) -> ModelBenchmark? {
-        benchmarks.first { $0.model == model }
+    public func benchmark(for model: String, server: LLMProvider) -> ModelBenchmark? {
+        benchmarks.first { $0.model == model && $0.serverID == server.rawValue }
     }
 
     /// A model is measured once; measuring it again replaces the old numbers
@@ -264,13 +305,13 @@ public actor BenchmarkStore {
     /// may well have changed in between, and an average across those is a
     /// number describing nothing.
     public func store(_ benchmark: ModelBenchmark) {
-        benchmarks.removeAll { $0.model == benchmark.model }
+        benchmarks.removeAll { $0.model == benchmark.model && $0.serverID == benchmark.serverID }
         benchmarks.append(benchmark)
         save()
     }
 
-    public func remove(model: String) {
-        benchmarks.removeAll { $0.model == model }
+    public func remove(model: String, server: LLMProvider) {
+        benchmarks.removeAll { $0.model == model && $0.serverID == server.rawValue }
         save()
     }
 

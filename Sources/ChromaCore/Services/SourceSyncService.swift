@@ -2280,10 +2280,11 @@ public actor SourceSyncService {
         var heterogeneous: [String] = []
         for name in plan.targetCollections {
             progress(SyncProgress(stage: String(localized: "Подготовка коллекции «\(name)»")))
-            let collection = try await chroma.createCollection(
+            var collection = try await chroma.createCollection(
                 name: name,
                 metadata: [
                     CollectionBindingKeys.model: .string(embeddingModel),
+                    CollectionBindingKeys.modelServer: .string(embeddings.server.rawValue),
                     CollectionBindingKeys.dimension: .int(dimension),
                     CollectionBindingKeys.chunkingStrategy: .string(source.chunking.strategy.rawValue),
                     CollectionBindingKeys.strategyParamsHash: StrategyParamsHash.of(source.chunking).value,
@@ -2295,6 +2296,24 @@ public actor SourceSyncService {
                 configuration: CollectionConfiguration(metric: source.metric),
                 getOrCreate: true
             )
+            // Существующая коллекция приходит со своими метаданными, а не с
+            // переданными (проверено на ChromaDB 1.4.4) — сверить её модель
+            // и её сервер с теми, которыми сейчас пойдёт запись.
+            if case .differs(let bound, let requested) = binding.check(
+                model: embeddingModel, server: embeddings.server, for: collection
+            ) {
+                // Пустоту подтверждает счёт записей: `dimension` пуст и у
+                // заполненной коллекции, если сервер его не сообщает.
+                guard try await chroma.documentCount(collectionID: collection.id) == 0 else {
+                    throw BindingError.modelConflict(collection: name, bound: bound, requested: requested)
+                }
+                let metadata = collection.metadataBinding(
+                    model: embeddingModel, server: embeddings.server, dimension: dimension
+                )
+                try await chroma.updateCollection(id: collection.id, newName: nil, metadata: metadata)
+                collection = collection.rebound(metadata: metadata)
+                log(.info, "Источники", "Коллекция «\(name)» пуста — привязана к модели \(requested.title)")
+            }
             try await binding.validate(vectorLength: dimension, for: collection)
             collectionIDs[name] = collection.id
             if try await isHeterogeneous(collection, chunking: source.chunking, chroma: chroma) {
@@ -3308,6 +3327,7 @@ public actor SourceSyncService {
         let vectors = try await embeddings.embed(texts: texts, model: model)
         await metrics?.recordEmbedding(
             model: model,
+            server: embeddings.server,
             texts: chunks.count,
             duration: Date().timeIntervalSince(embeddingStarted)
         )

@@ -179,6 +179,8 @@ final class AppEnvironment: ObservableObject {
     /// сколько само окружение.
     private var sharedTableProfilesWatch: AnyCancellable?
     private var externalClientsWatch: AnyCancellable?
+    private var llmProviderWatch: AnyCancellable?
+    private var providerSwitchWatch: AnyCancellable?
 
     enum ConnectionState: Equatable {
         case disconnected
@@ -304,6 +306,32 @@ final class AppEnvironment: ObservableObject {
             .removeDuplicates()
             .sink { profiles in
                 Task { await sync.adopt(sharedTableProfiles: profiles) }
+            }
+
+        // Профили поиска отдают модель переранжирования выбранного сервера
+        // — тем же способом: сервер меняется на «Подключении», а
+        // профили читают поиск, «Оценка» и MCP.
+        let searchProfiles = self.searchProfiles
+        llmProviderWatch = settings.$configuration
+            .map(\.llmProvider)
+            .removeDuplicates()
+            .sink { provider in searchProfiles.server = provider }
+
+        // Другой сервер — другой список моделей: прежний не
+        // показывается, новый спрашивается сразу — откуда бы ни пришла смена:
+        // с «Подключения», из «Перечитать настройки» или из своей копии
+        //. Подпиской, а не на экране: экран «Подключения» открыт
+        // не всегда. Первое значение — не смена.
+        providerSwitchWatch = settings.$configuration
+            .map(\.llmProvider)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.embeddingsModel.forgetModels()
+                    await self.embeddingsModel.checkConnection(self)
+                }
             }
 
         // Права клиентов — тем же способом и по той же причине. Импорт
@@ -744,7 +772,8 @@ final class AppEnvironment: ObservableObject {
     /// so sharing it is the entire point.
     func makeLMStudioClient() throws -> LMStudioClient {
         try LMStudioClient(
-            baseURLString: settings.configuration.lmStudioBaseURL,
+            baseURLString: settings.configuration.llmBaseURL,
+            provider: settings.configuration.llmProvider,
             log: logHandler,
             timeouts: settings.configuration.timeouts,
             cache: settings.configuration.embeddingCacheEnabled ? embeddingCache : nil,

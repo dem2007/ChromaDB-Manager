@@ -23,9 +23,20 @@ import Foundation
 ///   — carried as their own lists, because they merge by identity instead of
 ///   overwriting.
 /// - `automaticSyncPaused` — the state of this session, not a preference.
+/// - `llmProvider` — какой сервер моделей стоит **на этой машине**:
+///   LM Studio не работает на Intel, и настройки, привезённые с Мака на
+///   Apple Silicon, переключали бы iMac на сервер, которого там нет.
+///   Адрес Ollama и модели векторов обоих серверов переносятся — они
+///   значат то же самое везде.
 public struct TransferablePreferences: Codable, Equatable, Sendable {
     public var lmStudioBaseURL: String
+    /// Необязательный: в файлах до его нет.
+    public var ollamaBaseURL: String?
+    /// Модель векторов LM Studio. Имя поля — из файлов до, когда
+    /// модель по умолчанию была одна.
     public var defaultEmbeddingModel: String?
+    /// Модель векторов Ollama. Необязательная: в файлах до её нет.
+    public var ollamaEmbeddingModel: String?
     public var modelKindOverrides: [String: String]
     public var proxyPort: Int
     public var autoStartServerOnLaunch: Bool
@@ -44,11 +55,15 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
     /// машине значит ровно то же самое. Необязательные — файл, записанный
     /// раньше, их не содержит.
     public var chunkingDefaults: [String: ChunkingConfiguration]?
+    /// Модели умолчаний нарезки у Ollama. В файлах до их нет.
+    public var ollamaChunkingModels: [String: ChunkingModels]?
     public var defaultChunkingStrategy: ChunkStrategy?
 
     public init(from configuration: AppConfiguration) {
         lmStudioBaseURL = configuration.lmStudioBaseURL
-        defaultEmbeddingModel = configuration.defaultEmbeddingModel
+        ollamaBaseURL = configuration.ollamaBaseURL
+        defaultEmbeddingModel = configuration.lmStudioEmbeddingModel
+        ollamaEmbeddingModel = configuration.ollamaEmbeddingModel
         modelKindOverrides = configuration.modelKindOverrides
         proxyPort = configuration.proxyPort
         autoStartServerOnLaunch = configuration.autoStartServerOnLaunch
@@ -63,12 +78,18 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
         syncPreviewThresholdFiles = configuration.syncPreviewThresholdFiles
         preferredInstallPath = configuration.preferredInstallPath
         chunkingDefaults = configuration.chunkingDefaults
+        ollamaChunkingModels = configuration.ollamaChunkingModels
         defaultChunkingStrategy = configuration.defaultChunkingStrategy
     }
 
     public func apply(to configuration: inout AppConfiguration) {
         configuration.lmStudioBaseURL = lmStudioBaseURL
-        configuration.defaultEmbeddingModel = defaultEmbeddingModel
+        if let ollamaBaseURL { configuration.ollamaBaseURL = ollamaBaseURL }
+        // Пустая модель сервера в файле — не выбор, а «этого сервера там нет»:
+        // с Мака на Intel модель LM Studio не приходит, и стирать здешнюю
+        // значило бы, что приложение молча возьмёт первую попавшуюся.
+        if let defaultEmbeddingModel { configuration.lmStudioEmbeddingModel = defaultEmbeddingModel }
+        if let ollamaEmbeddingModel { configuration.ollamaEmbeddingModel = ollamaEmbeddingModel }
         configuration.modelKindOverrides = modelKindOverrides
         configuration.proxyPort = proxyPort
         configuration.autoStartServerOnLaunch = autoStartServerOnLaunch
@@ -84,7 +105,25 @@ public struct TransferablePreferences: Codable, Equatable, Sendable {
         configuration.preferredInstallPath = preferredInstallPath
         // Только если в файле они есть: пустой список умолчаний — это «файл
         // записан старой сборкой», а не «умолчаний нет».
-        if let chunkingDefaults { configuration.chunkingDefaults = chunkingDefaults }
+        // Числа нарезки приходят из файла целиком, а модели — как у модели
+        // векторов: незаданная в файле не стирает здешнюю. С Мака,
+        // где был один сервер, моделей другого не приходит вовсе.
+        if let chunkingDefaults {
+            let local = configuration.chunkingDefaults
+            configuration.chunkingDefaults = chunkingDefaults.reduce(into: [:]) { result, item in
+                var incoming = item.value
+                let kept = local[item.key].map(ChunkingModels.init(of:)) ?? ChunkingModels()
+                ChunkingModels(of: incoming).filling(from: kept).apply(to: &incoming)
+                result[item.key] = incoming
+            }
+        }
+        if let ollamaChunkingModels {
+            for (key, incoming) in ollamaChunkingModels {
+                configuration.ollamaChunkingModels[key] = incoming.filling(
+                    from: configuration.ollamaChunkingModels[key] ?? ChunkingModels()
+                )
+            }
+        }
         if let defaultChunkingStrategy { configuration.defaultChunkingStrategy = defaultChunkingStrategy }
     }
 }

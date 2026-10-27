@@ -204,6 +204,9 @@ struct EvaluationView: View {
                     Button(String(localized: "Новый набор…")) { model.newSet() }
                     Button(String(localized: "Импорт набора…")) { model.importSet(app) }
                 }
+                // Всё место под баннерами — пустому состоянию: иначе стопка
+                // вставала по центру, и баннер висел посреди экрана.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let set = model.selectedSet {
                 if set.queries.isEmpty {
                     ContentUnavailableView {

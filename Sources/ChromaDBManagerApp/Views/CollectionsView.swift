@@ -545,6 +545,9 @@ struct CollectionsView: View {
                 } description: {
                     Text("Документы, поиск и правила относятся к одной коллекции.")
                 }
+                // Всё место под баннерами — пустому состоянию: иначе стопка
+                // вставала по центру, и баннер висел посреди экрана.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -846,7 +849,15 @@ struct CollectionsView: View {
         }
         parts.append(collection.space.map(\.shortTitle)
                      ?? String(localized: "метрика неизвестна"))
-        parts.append(collection.boundModel ?? String(localized: "модель не указана"))
+        if let binding = collection.binding {
+            // Сервер называется, только когда он не выбранный: у такой
+            // коллекции поиск и запись остановятся, и причина видна сразу.
+            parts.append(binding.server == settings.configuration.llmProvider
+                         ? binding.model
+                         : "\(binding.model) (\(binding.serverTitle))")
+        } else {
+            parts.append(String(localized: "модель не указана"))
+        }
         return parts.joined(separator: " · ")
     }
 

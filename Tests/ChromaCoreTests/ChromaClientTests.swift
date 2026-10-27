@@ -138,10 +138,11 @@ final class ChromaResponseDecodingTests: XCTestCase {
         extra["team"] = .string("legal")
         let collection = ChromaCollection(id: "x", name: "demo", metadata: extra)
 
-        let merged = collection.metadataBinding(model: "other-model", dimension: 512)
+        let merged = collection.metadataBinding(model: "other-model", server: .lmStudio, dimension: 512)
         XCTAssertEqual(merged["team"], .string("legal"), "unrelated metadata must survive a rebind")
         XCTAssertEqual(merged[CollectionBindingKeys.model], .string("other-model"))
         XCTAssertEqual(merged[CollectionBindingKeys.dimension], .int(512))
+        XCTAssertEqual(merged[CollectionBindingKeys.modelServer], .string("lmStudio"))
     }
 
     func testGetResponseMapsParallelArrays() throws {

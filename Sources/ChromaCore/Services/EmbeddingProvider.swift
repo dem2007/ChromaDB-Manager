@@ -34,9 +34,20 @@ public protocol EmbeddingProvider: Sendable {
     /// занятую — то самое, из-за чего падала индексация. Не знаем —
     /// отвечаем `nil`.
     func reportedLoadedContextLength(of model: String) async -> Int?
+
+    /// Обрезает ли сервер вход длиннее контекста **молча**.
+    /// LM Studio — да, и предел чтения приходится мерить пробой; Ollama
+    /// с `truncate: false` отвечает ошибкой, и мерить нечего.
+    var truncatesSilently: Bool { get }
+
+    /// Чья это модель: коллекция привязывается к паре «модель +
+    /// сервер», а кэши различают одноимённые модели двух серверов.
+    var server: LLMProvider { get }
 }
 
 public extension EmbeddingProvider {
+    var truncatesSilently: Bool { true }
+    var server: LLMProvider { .lmStudio }
     func contextLength(of model: String) async -> Int? { nil }
     /// Кэша у провайдера может и не быть — тогда это обычный вызов.
     func embedIgnoringCache(texts: [String], model: String) async throws -> [[Double]] {

@@ -105,7 +105,7 @@ final class ChromaIntegrationTests: XCTestCase {
         // The binding survives a metadata update.
         try await client.updateCollection(
             id: collection.id,
-            metadata: collection.metadataBinding(model: "other", dimension: 4)
+            metadata: collection.metadataBinding(model: "other", server: .lmStudio, dimension: 4)
         )
         let updated = try await client.collection(named: "integration_demo")
         XCTAssertEqual(updated.boundModel, "other")
@@ -2525,7 +2525,7 @@ final class ChromaIntegrationTests: XCTestCase {
         }
         try await client.updateCollection(
             id: demo.id,
-            metadata: demo.metadataBinding(model: "seeded-model", dimension: 8)
+            metadata: demo.metadataBinding(model: "seeded-model", server: .lmStudio, dimension: 8)
         )
         let bound = try await client.collection(named: "cdbm_demo")
         XCTAssertEqual(bound.boundModel, "seeded-model")
@@ -3539,7 +3539,7 @@ final class ChromaIntegrationTests: XCTestCase {
             configuration: CollectionConfiguration(metric: DistanceMetric(rawValue: manifest.metric ?? "cosine") ?? .cosine),
             getOrCreate: true
         )
-        let warnings = try CollectionImporter.problems(manifest: manifest, target: target)
+        let warnings = try CollectionImporter.problems(manifest: manifest, target: target, server: .lmStudio)
         XCTAssertTrue(warnings.isEmpty, warnings.joined(separator: "; "))
 
         let report = try await CollectionImporter(

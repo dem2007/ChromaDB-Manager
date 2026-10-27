@@ -518,6 +518,7 @@ final class InspectorViewModel: ObservableObject {
                             collectionName: collection.name,
                             collectionMetric: collection.space,
                             collectionModel: collection.boundModel,
+                            collectionServer: collection.binding?.serverID,
                             collectionDimension: collection.effectiveDimension,
                             reason: .document
                         )

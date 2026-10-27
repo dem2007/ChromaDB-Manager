@@ -283,8 +283,8 @@ final class ModelJudgeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: file) }
 
         let store = MetricsStore(fileURL: file)
-        await store.recordEmbedding(model: "м", texts: 10, duration: 1)
-        await store.recordJudgement(model: "м", calls: 2, duration: 14)
+        await store.recordEmbedding(model: "м", server: .lmStudio, texts: 10, duration: 1)
+        await store.recordJudgement(model: "м", server: .lmStudio, calls: 2, duration: 14)
 
         let snapshot = await store.current()
         XCTAssertEqual(snapshot.models.first?.averageSeconds, 0.1)

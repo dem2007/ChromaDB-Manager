@@ -53,6 +53,9 @@ struct SourcesSection: View {
                     addMenu
                         .fixedSize()
                 }
+                // Всё место под сообщениями — пустому списку: иначе стопка
+                // вставала по центру, и сообщение висело посреди экрана.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 sourceList
             }

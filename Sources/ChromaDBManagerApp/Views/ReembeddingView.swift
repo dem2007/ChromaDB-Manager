@@ -131,7 +131,9 @@ struct ReembeddingSheet: View {
                 Notice(.warning, String(localized: "Список моделей пуст. Проверьте соединение с LM Studio в разделе «Модели»."))
             } else if let note = model.dimensionNote {
                 Notice(.warning, note)
-            } else if request.targetModel == request.collection.boundModel {
+            } else if request.collection.binding == BoundModel(
+                model: request.targetModel, server: settings.configuration.llmProvider
+            ) {
                 Notice(.info, String(localized: "Это та же модель, что уже привязана к коллекции. Пересчёт имеет смысл, только если меняется нарезка."))
             } else if let dimension = model.targetDimension {
                 Text("Размерность модели: \(dimension).")

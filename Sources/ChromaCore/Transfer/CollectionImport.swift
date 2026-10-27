@@ -283,9 +283,24 @@ public struct CollectionImporter: Sendable {
     /// Размерность — запрет; метрика и модель — предупреждения, которые
     /// человек подтверждает: данные останутся валидными, но смысл поиска
     /// изменится.
+    ///
+    /// `target == nil` — импорт в новую коллекцию с привязкой пакета;
+    /// `server` — сервер моделей, выбранный в приложении.
     public static func problems(
-        manifest: CollectionExportManifest, target: ChromaCollection?
+        manifest: CollectionExportManifest, target: ChromaCollection?, server: LLMProvider
     ) throws -> [String] {
+        // Пакет без векторов пересчитывает выбранный сервер, а коллекция —
+        // новая с привязкой пакета или та, куда идёт импорт, — может быть
+        // заполнена моделью другого: одноимённая модель другого сервера —
+        // не обязательно та же. Это запрет, а не предупреждение:
+        // пересчитанное легло бы в коллекцию чужой модели.
+        if !manifest.includesEmbeddings,
+           let bound = target.map({ $0.binding }) ?? manifest.binding,
+           bound.server != server {
+            throw BindingError.serverConflict(
+                collection: target?.name ?? manifest.collectionName, bound: bound, current: server
+            )
+        }
         guard let target else { return [] }
         // Пакет без векторов пересчитывается моделью самой коллекции: его
         // размерность и модель ни с чем не смешиваются, сверять их незачем.
@@ -307,6 +322,9 @@ public struct CollectionImporter: Sendable {
         }
         if let model = manifest.model, let targetModel = target.boundModel, model != targetModel {
             warnings.append(String(localized: "Модель не совпадает: у коллекции \(targetModel), в пакете \(model). Смешивать в одной коллекции векторы разных моделей бессмысленно — искать по ним нечем."))
+        } else if let incoming = manifest.binding, let bound = target.binding, incoming != bound {
+            // Одно имя у двух серверов — не обязательно одна модель.
+            warnings.append(String(localized: "Модель «\(incoming.model)» та же по имени, но посчитана в \(incoming.serverTitle), а коллекция — в \(bound.serverTitle). Под одним именем у двух серверов бывают разные сборки модели, и векторы у них расходятся."))
         }
         return warnings
     }

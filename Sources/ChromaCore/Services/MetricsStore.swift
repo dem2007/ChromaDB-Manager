@@ -11,8 +11,14 @@ public struct MetricsSnapshot: Codable, Hashable {
         public var model: String
         public var texts: Int
         public var seconds: Double
+        /// Сервер модели; `nil` — LM Studio, как и всё записанное
+        /// до.
+        public var server: String? = nil
 
-        public var id: String { model }
+        public var serverID: String { server ?? LLMProvider.lmStudio.rawValue }
+        public var id: String { serverID + "\u{0}" + model }
+        /// Модель для таблиц: сервер называется, если это не LM Studio.
+        public var title: String { ModelSpeedKey.title(model: model, serverID: serverID) }
         /// Seconds per text — the number worth comparing between models.
         public var averageSeconds: Double { texts > 0 ? seconds / Double(texts) : 0 }
     }
@@ -49,6 +55,17 @@ public struct MetricsSnapshot: Codable, Hashable {
     }
 
     public var isEmpty: Bool { models.isEmpty && strategies.isEmpty && judges.isEmpty }
+
+    /// Замеры моделей одного сервера — для оценок времени: там
+    /// модель названа одним именем, а одноимённая модель другого сервера —
+    /// другая скорость. Нарезка от сервера не зависит и остаётся целиком.
+    public func serving(_ server: LLMProvider) -> MetricsSnapshot {
+        MetricsSnapshot(
+            models: models.filter { $0.serverID == server.rawValue },
+            strategies: strategies,
+            judges: judges.filter { $0.serverID == server.rawValue }
+        )
+    }
 
     /// Читается так, чтобы файл, записанный **прежней** сборкой, оставался
     /// читаемым.
@@ -125,26 +142,30 @@ public actor MetricsStore {
 
     public func current() -> MetricsSnapshot { snapshot }
 
-    public func recordEmbedding(model: String, texts: Int, duration: TimeInterval) {
+    public func recordEmbedding(model: String, server: LLMProvider, texts: Int, duration: TimeInterval) {
         guard texts > 0, duration >= 0 else { return }
-        if let index = snapshot.models.firstIndex(where: { $0.model == model }) {
+        if let index = snapshot.models.firstIndex(where: { $0.model == model && $0.serverID == server.rawValue }) {
             snapshot.models[index].texts += texts
             snapshot.models[index].seconds += duration
         } else {
-            snapshot.models.append(MetricsSnapshot.ModelMetric(model: model, texts: texts, seconds: duration))
+            snapshot.models.append(MetricsSnapshot.ModelMetric(
+                model: model, texts: texts, seconds: duration, server: ModelSpeedKey.stored(server)
+            ))
         }
         scheduleSave()
     }
 
     /// сколько времени модель тратит на одну оценку. Отсюда берётся
     /// «около N мин» перед следующим прогоном — и только отсюда.
-    public func recordJudgement(model: String, calls: Int, duration: TimeInterval) {
+    public func recordJudgement(model: String, server: LLMProvider, calls: Int, duration: TimeInterval) {
         guard calls > 0, duration >= 0 else { return }
-        if let index = snapshot.judges.firstIndex(where: { $0.model == model }) {
+        if let index = snapshot.judges.firstIndex(where: { $0.model == model && $0.serverID == server.rawValue }) {
             snapshot.judges[index].texts += calls
             snapshot.judges[index].seconds += duration
         } else {
-            snapshot.judges.append(MetricsSnapshot.ModelMetric(model: model, texts: calls, seconds: duration))
+            snapshot.judges.append(MetricsSnapshot.ModelMetric(
+                model: model, texts: calls, seconds: duration, server: ModelSpeedKey.stored(server)
+            ))
         }
         scheduleSave()
     }

@@ -87,13 +87,20 @@ public struct LMStudioModel: Identifiable, Hashable {
     }
 }
 
+/// Беды сервера моделей.
+///
+/// Случаи, которые бросает только клиент, несут сервер, от которого пришли
+///: текст называет его сам, а не берёт из настройки. Иначе
+/// синхронизация, начатая с LM Studio, после переключения на Ollama упала бы
+/// с советом запустить Ollama. `emptyResponse` и `embeddingCountMismatch`
+/// бросают и службы, которые сервера не знают, — их тексты без имени.
 public enum LMStudioError: LocalizedError {
-    case badURL(String)
-    case unreachable(String)
-    case api(status: Int, message: String)
+    case badURL(String, server: LLMProvider)
+    case unreachable(String, server: LLMProvider)
+    case api(status: Int, message: String, server: LLMProvider)
     case emptyResponse
     case modelNotEmbedding(String)
-    case timedOut(what: String, seconds: TimeInterval)
+    case timedOut(what: String, seconds: TimeInterval, server: LLMProvider)
     /// the answer stopped because it ran out of tokens, so whatever arrived
     /// is a fragment. Never a valid result — a cut-off JSON is broken JSON, and
     /// with a reasoning model the content can even be empty while the whole
@@ -116,28 +123,28 @@ public enum LMStudioError: LocalizedError {
     /// не будет. Просили `bge-m3-mlx` — получили
     /// `text-embedding-qwen3-embedding-0.6b`, и узнать об этом можно было
     /// только по этому полю.
-    case modelSubstituted(requested: String, returned: String)
+    case modelSubstituted(requested: String, returned: String, server: LLMProvider)
 
     public var errorDescription: String? {
         switch self {
-        case .badURL(let value):
-            return "Некорректный адрес LM Studio: \(value)"
-        case .unreachable(let reason):
-            return "LM Studio недоступна: \(reason). Запустите LM Studio и включите Local Server в разделе Developer."
-        case .api(let status, let message):
-            return "LM Studio вернула ошибку \(status): \(message)"
+        case .badURL(let value, let server):
+            return "Некорректный адрес \(server.title): \(value)"
+        case .unreachable(let reason, let server):
+            return "\(server.title) недоступна: \(reason). \(server.unreachableHint)"
+        case .api(let status, let message, let server):
+            return "\(server.title) вернула ошибку \(status): \(message)"
         case .emptyResponse:
-            return "LM Studio вернула пустой ответ."
+            return "Сервер моделей вернул пустой ответ."
         case .modelNotEmbedding(let model):
             return "Модель «\(model)» не вернула вектор — вероятно, это чат-модель, а не эмбеддинговая."
-        case .timedOut(let what, let seconds):
-            return "LM Studio не ответила за \(seconds.secondsText) с (\(what))."
+        case .timedOut(let what, let seconds, let server):
+            return "\(server.title) не ответила за \(seconds.secondsText) с (\(what))."
         case .truncatedByTokenLimit(let model):
             return "Ответ модели «\(model)» оборван по лимиту токенов (finish_reason: length) — это неполный результат, а не короткий."
         case .embeddingCountMismatch(let sent, let received):
-            return "LM Studio вернула \(received) векторов на \(sent) текстов. Сопоставить их с текстами нельзя, поэтому операция остановлена: молча записанная часть означала бы пропавшие документы."
-        case .modelSubstituted(let requested, let returned):
-            return "Запрошена модель «\(requested)», а ответила «\(returned)». Операция остановлена: векторы двух моделей несопоставимы, и записанные молча они превратили бы коллекцию в смесь, которую уже не разделить. Загрузите нужную модель в LM Studio или выберите ту, что уже загружена."
+            return "Сервер моделей вернул \(received) векторов на \(sent) текстов. Сопоставить их с текстами нельзя, поэтому операция остановлена: молча записанная часть означала бы пропавшие документы."
+        case .modelSubstituted(let requested, let returned, let server):
+            return "Запрошена модель «\(requested)», а ответила «\(returned)». Операция остановлена: векторы двух моделей несопоставимы, и записанные молча они превратили бы коллекцию в смесь, которую уже не разделить. Загрузите нужную модель в \(server.title) или выберите ту, что уже загружена."
         }
     }
 
@@ -157,24 +164,24 @@ public enum LMStudioError: LocalizedError {
 extension LMStudioError: MCPReadableError {
     public var mcpReason: String {
         switch self {
-        case .badURL(let value):
-            return "the LM Studio address is malformed: «\(value)»"
-        case .unreachable(let reason):
-            return "LM Studio is not reachable: «\(reason)». It must be running with Local Server enabled."
-        case .api(let status, let message):
-            return "LM Studio answered with an error \(status.plainDigits): «\(message)»"
+        case .badURL(let value, let server):
+            return "the \(server.title) address is malformed: «\(value)»"
+        case .unreachable(let reason, let server):
+            return "\(server.title) is not reachable: «\(reason)». \(server.unreachableHintForAgents)"
+        case .api(let status, let message, let server):
+            return "\(server.title) answered with an error \(status.plainDigits): «\(message)»"
         case .emptyResponse:
-            return "LM Studio returned an empty answer"
+            return "the model server returned an empty answer"
         case .modelNotEmbedding(let model):
             return "the model «\(model)» returned no vector — it is most likely a chat model, not an embedding one"
-        case .timedOut(let what, let seconds):
-            return "LM Studio did not answer in \(seconds.secondsText) seconds (\(what))"
+        case .timedOut(let what, let seconds, let server):
+            return "\(server.title) did not answer in \(seconds.secondsText) seconds (\(what))"
         case .truncatedByTokenLimit(let model):
             return "the answer of «\(model)» was cut off by the token limit, so it is a fragment"
         case .embeddingCountMismatch(let sent, let received):
-            return "LM Studio returned \(received.plainDigits) vectors for \(sent.plainDigits) texts"
-        case .modelSubstituted(let requested, let returned):
-            return "LM Studio answered with the model «\(returned)» instead of the requested «\(requested)»"
+            return "the model server returned \(received.plainDigits) vectors for \(sent.plainDigits) texts"
+        case .modelSubstituted(let requested, let returned, let server):
+            return "\(server.title) answered with the model «\(returned)» instead of the requested «\(requested)»"
         }
     }
 }
@@ -193,9 +200,19 @@ public actor LMStudioClient {
     /// измеренное «символов на токен». Общее на приложение, потому что
     /// клиент создаётся заново на каждую операцию.
     private let ratios: TokenRatioStore?
+    /// Какой сервер на том конце: список моделей, их контекст
+    /// и векторы у Ollama — своими запросами.
+    public nonisolated let provider: LLMProvider
+
+    /// `EmbeddingProvider`: у Ollama вход длиннее окна — ошибка (`truncate: false`).
+    public nonisolated var truncatesSilently: Bool { provider == .lmStudio }
+
+    /// `EmbeddingProvider`: чья модель отвечает.
+    public nonisolated var server: LLMProvider { provider }
 
     public init(
         baseURLString: String,
+        provider: LLMProvider = .lmStudio,
         log: @escaping LogHandler = noopLogHandler,
         timeouts: TimeoutSettings = TimeoutSettings(),
         cache: EmbeddingCache? = nil,
@@ -204,9 +221,10 @@ public actor LMStudioClient {
         let normalized = baseURLString.trimmingCharacters(in: .whitespaces)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: normalized), url.scheme != nil, url.host != nil else {
-            throw LMStudioError.badURL(baseURLString)
+            throw LMStudioError.badURL(baseURLString, server: provider)
         }
         self.baseURL = url
+        self.provider = provider
         self.log = log
         self.timeouts = timeouts
         self.cache = cache
@@ -248,6 +266,7 @@ public actor LMStudioClient {
     /// An LM Studio too old for `/api/v0` falls back to `/v1/models`, and the
     /// probe path stays for exactly that case.
     public func models() async throws -> [LMStudioModel] {
+        if provider == .ollama { return try await ollamaModels() }
         if let native = try? await get("/api/v0/models"),
            let payload = try? JSONDecoder().decode(ModelsResponse.self, from: native),
            !payload.data.isEmpty {
@@ -361,7 +380,7 @@ public actor LMStudioClient {
         var known: [Int: [Double]] = [:]
         var missingIndexes: [Int] = []
         for (index, text) in texts.enumerated() {
-            if let vector = await cache.vector(model: model, text: text) {
+            if let vector = await cache.vector(model: provider.cacheName(of: model), text: text) {
                 known[index] = vector
             } else {
                 missingIndexes.append(index)
@@ -380,17 +399,17 @@ public actor LMStudioClient {
         // from a different model, not a stale one.
         if let fresh = computed.first?.count, known.values.contains(where: { $0.count != fresh }) {
             log(.warning, "Кэш", "Размерность модели \(model) изменилась — кэш этой модели сброшен, батч считается заново")
-            await cache.removeAll(model: model)
+            await cache.removeAll(model: provider.cacheName(of: model))
             let recomputed = try await embedWithoutCache(texts, model: model)
             for (index, vector) in recomputed.enumerated() {
-                await cache.store(model: model, text: texts[index], vector: vector)
+                await cache.store(model: provider.cacheName(of: model), text: texts[index], vector: vector)
             }
             return recomputed
         }
 
         for (offset, index) in missingIndexes.enumerated() {
             known[index] = computed[offset]
-            await cache.store(model: model, text: texts[index], vector: computed[offset])
+            await cache.store(model: provider.cacheName(of: model), text: texts[index], vector: computed[offset])
         }
         return texts.indices.map { known[$0] ?? [] }
     }
@@ -403,6 +422,7 @@ public actor LMStudioClient {
     }
 
     private func embedWithoutCache(_ texts: [String], model: String) async throws -> [[Double]] {
+        if provider == .ollama { return try await ollamaEmbed(texts, model: model) }
         let body: [String: Any] = ["model": model, "input": texts]
         let data = try await send(
             path: "/v1/embeddings",
@@ -449,7 +469,7 @@ public actor LMStudioClient {
         // количества: оба вопроса — «то ли мы получили, что просили», и оба
         // должны действовать на все пути сразу, включая выключенный кэш.
         if let returned = payload.model, substituted(requested: model, returned: returned) {
-            throw LMStudioError.modelSubstituted(requested: model, returned: returned)
+            throw LMStudioError.modelSubstituted(requested: model, returned: returned, server: .lmStudio)
         }
         return items.map(\.embedding)
     }
@@ -497,7 +517,7 @@ public actor LMStudioClient {
 
     // MARK: - Chat
 
-    private struct ChatResponse: Decodable {
+    struct ChatResponse: Decodable {
         struct Choice: Decodable {
             struct Message: Decodable {
                 let content: String?
@@ -510,6 +530,22 @@ public actor LMStudioClient {
                 /// и рассуждения в этом поле, со схемой — `content: ""`
                 /// и `{"word": "Привет"}` в нём.
                 let reasoning_content: String?
+                /// То же поле под именем, каким его пишет Ollama.
+                let reasoning: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case content, reasoning_content, reasoning
+                }
+
+                /// Поля рассуждения — мягко: сервер, приславший их не строкой
+                /// (объектом, массивом), не должен ломать весь ответ — иначе
+                /// любой ответ чата превращался в «пустой ответ».
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    content = try container.decodeIfPresent(String.self, forKey: .content)
+                    reasoning_content = (try? container.decodeIfPresent(String.self, forKey: .reasoning_content)) ?? nil
+                    reasoning = (try? container.decodeIfPresent(String.self, forKey: .reasoning)) ?? nil
+                }
             }
             let message: Message?
             /// the one field that says whether the answer is complete.
@@ -653,7 +689,7 @@ public actor LMStudioClient {
             throw LMStudioError.emptyResponse
         }
         await ratios?.record(
-            characters: prompt.count, tokens: payload.usage?.prompt_tokens, model: model
+            characters: prompt.count, tokens: payload.usage?.prompt_tokens, model: provider.cacheName(of: model)
         )
         // Замер до разбора ответа: оборванный по лимиту ответ — самый длинный
         // из возможных, и для скорости он годится ровно так же.
@@ -673,11 +709,11 @@ public actor LMStudioClient {
         }
 
         guard let answer = Self.answerText(
-            content: choice.message?.content, reasoning: choice.message?.reasoning_content
+            content: choice.message?.content, reasoning: choice.message?.reasoning_content ?? choice.message?.reasoning
         ) else {
             throw LMStudioError.emptyResponse
         }
-        if answer == choice.message?.reasoning_content {
+        if answer == (choice.message?.reasoning_content ?? choice.message?.reasoning) {
             reasoningFallbackCount += 1
             if reasoningFallbackCount == 1 {
                 log(
@@ -746,7 +782,9 @@ public actor LMStudioClient {
     /// Потолок контекста модели — предел входа для эмбеддингов.
     public func contextLength(of model: String) async -> Int? {
         if let cached = contextCeilingCache[model] { return cached }
-        let value = (try? await models())?.first { $0.id == model }?.contextLength
+        let value = provider == .ollama
+            ? await ollamaInputLimit(of: model)
+            : (try? await models())?.first { $0.id == model }?.contextLength
         contextCeilingCache[model] = value
         return value
     }
@@ -759,7 +797,7 @@ public actor LMStudioClient {
     /// по измерениям. `nil` — ещё ни одного ответа с `usage` не приходило
     /// или хранилище не подключено.
     public func charactersPerToken(of model: String) async -> Double? {
-        await ratios?.ratio(of: model)
+        await ratios?.ratio(of: provider.cacheName(of: model))
     }
 
     /// `ChatProvider`: контекст, с которым модель загружена сейчас.
@@ -849,7 +887,7 @@ public actor LMStudioClient {
         what: String = "запрос"
     ) async throws -> Data {
         guard let url = URL(string: baseURL.absoluteString + path) else {
-            throw LMStudioError.badURL(baseURL.absoluteString + path)
+            throw LMStudioError.badURL(baseURL.absoluteString + path, server: provider)
         }
         let deadline = timeout ?? timeouts.metadata
         var request = URLRequest(url: url)
@@ -868,7 +906,7 @@ public actor LMStudioClient {
             let prepared = request
             (data, response) = try await withDeadline(
                 seconds: deadline,
-                onExpiry: { LMStudioError.timedOut(what: what, seconds: deadline) },
+                onExpiry: { [provider] in LMStudioError.timedOut(what: what, seconds: deadline, server: provider) },
                 work: { try await session.data(for: prepared) }
             )
         } catch let error as URLError {
@@ -880,19 +918,221 @@ public actor LMStudioClient {
                 // by the error type, so it has to be thrown as such.
                 throw CancellationError()
             case .cannotConnectToHost, .cannotFindHost:
-                throw LMStudioError.unreachable("не удалось подключиться к \(baseURL.absoluteString)")
+                throw LMStudioError.unreachable("не удалось подключиться к \(baseURL.absoluteString)", server: provider)
             case .timedOut:
-                throw LMStudioError.unreachable("истекло время ожидания ответа")
+                throw LMStudioError.unreachable("истекло время ожидания ответа", server: provider)
             default:
-                throw LMStudioError.unreachable(error.localizedDescription)
+                throw LMStudioError.unreachable(error.localizedDescription, server: provider)
             }
         }
 
         guard let http = response as? HTTPURLResponse else { throw LMStudioError.emptyResponse }
         guard (200..<300).contains(http.statusCode) else {
-            let message = String(data: data, encoding: .utf8)?.prefix(300).description ?? "нет тела ответа"
-            throw LMStudioError.api(status: http.statusCode, message: message)
+            let raw = String(data: data, encoding: .utf8)?.prefix(300).description ?? "нет тела ответа"
+            // Ollama кладёт причину в поле `error` — её и показать,
+            // а не JSON целиком.
+            let message = provider == .ollama ? Self.ollamaErrorMessage(data) ?? raw : raw
+            throw LMStudioError.api(status: http.statusCode, message: message, server: provider)
         }
         return data
+    }
+}
+
+// MARK: - Ollama
+
+/// Ollama на месте LM Studio — для Маков с Intel, где LM Studio не работает.
+///
+/// По официальной документации Ollama (docs.ollama.com/api):
+/// - `GET /api/tags` — скачанные модели (`models[].name`, `modified_at`);
+/// - `POST /api/show` `{"model"}` — `capabilities` (`completion`,
+///   `embedding`, `thinking`, …) и `model_info` с потолком контекста под
+///   ключом `<general.architecture>.context_length`;
+/// - `GET /api/ps` — загруженные модели и `context_length`, с которым каждая
+///   работает: окно задаёт сервер (4096 по умолчанию, `OLLAMA_CONTEXT_LENGTH`,
+///   `num_ctx`), и оно бывает меньше потолка;
+/// - `POST /api/embed` `{"model", "input", "truncate"}` →
+///   `{"model", "embeddings"}`; при `truncate: false` вход длиннее контекста —
+///   ошибка, а не молча обрезанный текст;
+/// - ошибки — JSON `{"error": "…"}` с кодом 4xx/5xx.
+///
+/// Чат и переранжирование идут через `/v1/chat/completions` и
+/// `/v1/completions` — их Ollama понимает так же, как LM Studio.
+extension LMStudioClient {
+    struct OllamaTags: Decodable {
+        struct Model: Decodable {
+            let name: String
+            let modified_at: String?
+            /// Модель в облаке Ollama, а не на этом Маке.
+            let remote_model: String?
+            let remote_host: String?
+
+            var isRemote: Bool { !(remote_model ?? "").isEmpty || !(remote_host ?? "").isEmpty }
+        }
+        let models: [Model]
+    }
+
+    /// Ответы `/api/show` по адресу сервера, модели и дате её изменения.
+    ///
+    /// Общий на приложение, как `TokenRatioStore`: клиент создаётся заново
+    /// на каждую операцию, и кэш внутри него не переживал ни одной — список
+    /// моделей раз в минуту стоил по запросу `/api/show` на каждую модель.
+    static let sharedOllamaFacts = OllamaFactsCache()
+
+    final class OllamaFactsCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var facts: [String: OllamaModelFacts] = [:]
+
+        func value(for key: String) -> OllamaModelFacts? { lock.withLock { facts[key] } }
+        func store(_ value: OllamaModelFacts, for key: String) { lock.withLock { facts[key] = value } }
+    }
+
+    struct OllamaRunning: Decodable {
+        struct Model: Decodable {
+            let name: String
+            let model: String?
+            let context_length: Int?
+        }
+        let models: [Model]
+    }
+
+    /// Что `/api/show` говорит о модели.
+    struct OllamaModelFacts: Equatable, Sendable {
+        let capabilities: [String]
+        /// Потолок контекста — что модель умеет, а не с чем загружена.
+        let contextLength: Int?
+    }
+
+    static func ollamaFacts(from data: Data) -> OllamaModelFacts? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let capabilities = object["capabilities"] as? [String] ?? []
+        var context: Int?
+        if let info = object["model_info"] as? [String: Any] {
+            if let architecture = info["general.architecture"] as? String {
+                context = (info["\(architecture).context_length"] as? NSNumber)?.intValue
+            }
+            // Ключа архитектуры нет — `*.context_length` верхнего уровня:
+            // у модели с кодировщиком картинок рядом лежит и его
+            // `….vision.context_length`, а порядок словаря случаен.
+            if context == nil {
+                context = info.keys
+                    .filter { $0.hasSuffix(".context_length") }
+                    .sorted { ($0.split(separator: ".").count, $0) < ($1.split(separator: ".").count, $1) }
+                    .first
+                    .flatMap { (info[$0] as? NSNumber)?.intValue }
+            }
+        }
+        return OllamaModelFacts(capabilities: capabilities, contextLength: context)
+    }
+
+    /// Тип — из `capabilities`, а не пробным запросом: Ollama знает его сама.
+    static func describeOllama(name: String, facts: OllamaModelFacts?, loadedContext: Int?) -> LMStudioModel {
+        let capabilities = facts?.capabilities ?? []
+        let kind: LMStudioModelKind
+        if capabilities.contains("embedding") {
+            kind = .embedding
+        } else if capabilities.contains("completion") {
+            kind = .chat
+        } else {
+            kind = .unknown
+        }
+        return LMStudioModel(
+            id: name,
+            kind: kind,
+            rawType: capabilities.isEmpty ? nil : capabilities.joined(separator: ", "),
+            contextLength: facts?.contextLength,
+            loadedContextLength: loadedContext,
+            kindIsInferred: false
+        )
+    }
+
+    static func ollamaErrorMessage(_ data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let message = object["error"] as? String, !message.isEmpty else { return nil }
+        return message
+    }
+
+    func ollamaModels() async throws -> [LMStudioModel] {
+        // Сетевая ошибка — своя («Ollama недоступна» с советом), а не
+        // «пустой ответ»: `try?` вокруг запроса проглотил бы её.
+        let data = try await get("/api/tags")
+        guard let tags = try? JSONDecoder().decode(OllamaTags.self, from: data) else {
+            throw LMStudioError.emptyResponse
+        }
+        // Загруженных может не быть вовсе — это не ошибка списка.
+        let running = (try? await get("/api/ps"))
+            .flatMap { try? JSONDecoder().decode(OllamaRunning.self, from: $0) }?.models ?? []
+        var result: [LMStudioModel] = []
+        // Облачные модели Ollama — не на этом Маке: тексты ушли бы на её
+        // сервер, а приложение обещает, что документы с машины не уходят.
+        for model in tags.models where !model.isRemote {
+            let key = [baseURL.absoluteString, model.name, model.modified_at ?? ""].joined(separator: "\u{0}")
+            var facts = Self.sharedOllamaFacts.value(for: key)
+            if facts == nil, let data = try? await post("/api/show", body: ["model": model.name]),
+               let parsed = Self.ollamaFacts(from: data) {
+                facts = parsed
+                Self.sharedOllamaFacts.store(parsed, for: key)
+            }
+            let loaded = running.first { $0.name == model.name || $0.model == model.name }?.context_length
+            result.append(Self.describeOllama(name: model.name, facts: facts, loadedContext: loaded))
+        }
+        return result
+    }
+
+    func ollamaEmbed(_ texts: [String], model: String) async throws -> [[Double]] {
+        // `truncate: false`: по умолчанию Ollama обрезает вход до контекста
+        // молча, и кусок индексировался бы началом — тот самый дефект, против
+        // которого стоит проверка A7.1. Так он становится ошибкой.
+        let body: [String: Any] = ["model": model, "input": texts, "truncate": false]
+        let data = try await send(
+            path: "/api/embed",
+            method: "POST",
+            body: try JSONSerialization.data(withJSONObject: body),
+            timeout: timeouts.embedding,
+            what: String(localized: "эмбеддинг батча из \(texts.count) текстов")
+        )
+        return try Self.ollamaEmbeddings(from: data, sent: texts.count, model: model)
+    }
+
+    /// Разбор ответа `/api/embed` — с теми же проверками, что у LM Studio:
+    /// векторов столько, сколько текстов, и ответила та модель, которую просили.
+    static func ollamaEmbeddings(from data: Data, sent: Int, model: String) throws -> [[Double]] {
+        struct Response: Decodable {
+            let model: String?
+            let embeddings: [[Double]]
+        }
+        guard let response = try? JSONDecoder().decode(Response.self, from: data),
+              !response.embeddings.isEmpty,
+              response.embeddings.allSatisfy({ !$0.isEmpty })
+        else {
+            throw LMStudioError.modelNotEmbedding(model)
+        }
+        guard response.embeddings.count == sent else {
+            throw LMStudioError.embeddingCountMismatch(sent: sent, received: response.embeddings.count)
+        }
+        if let returned = response.model, substituted(requested: model, returned: returned) {
+            throw LMStudioError.modelSubstituted(requested: model, returned: returned, server: .ollama)
+        }
+        return response.embeddings
+    }
+
+    /// Предел входа модели Ollama — окно, с которым она загружена.
+    ///
+    /// Потолок из `/api/show` — что модель умеет; работает она в окне,
+    /// которое задаёт сервер, и длиннее него `/api/embed` откажет. Окно
+    /// известно только у загруженной модели, поэтому эмбеддинг-модель
+    /// будится одним коротким вектором — она всё равно сейчас понадобится.
+    func ollamaInputLimit(of model: String) async -> Int? {
+        var found = (try? await models())?.first { $0.id == model }
+        // Будится и модель неизвестного типа — та, о которой не ответил
+        // `/api/show` (а Ollama старше 0.6.4 `capabilities` не сообщает
+        // вовсе). Спрашивают здесь только про модели эмбеддинга, так что
+        // будится то, что сейчас и понадобится. Окно узнаётся, если его
+        // сообщает `/api/ps`; не сообщает — предел остаётся потолком, как был.
+        if let candidate = found, candidate.loadedContextLength == nil, candidate.kind != .chat {
+            _ = try? await ollamaEmbed(["ping"], model: model)
+            found = (try? await models())?.first { $0.id == model }
+        }
+        guard let found else { return nil }
+        return [found.contextLength, found.loadedContextLength].compactMap { $0 }.min()
     }
 }

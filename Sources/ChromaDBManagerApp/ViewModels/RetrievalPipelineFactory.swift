@@ -88,7 +88,7 @@ extension AppEnvironment {
                 NSLocalizedDescriptionKey: String(localized: "Нет подключения к базе."),
             ])
         }
-        let model = try await bindingService.requiredModel(for: collection)
+        let model = try bindingService.requiredModel(for: collection, server: settings.configuration.llmProvider)
         let lmStudio = try makeLMStudioClient()
         try await bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
 

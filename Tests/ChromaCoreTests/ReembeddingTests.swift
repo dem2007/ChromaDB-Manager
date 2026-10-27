@@ -177,9 +177,9 @@ final class MetricsStoreTests: XCTestCase {
 
     func testEmbeddingAveragesAccumulate() async {
         let store = MetricsStore(fileURL: fileURL)
-        await store.recordEmbedding(model: "m1", texts: 10, duration: 2)
-        await store.recordEmbedding(model: "m1", texts: 10, duration: 4)
-        await store.recordEmbedding(model: "m2", texts: 1, duration: 5)
+        await store.recordEmbedding(model: "m1", server: .lmStudio, texts: 10, duration: 2)
+        await store.recordEmbedding(model: "m1", server: .lmStudio, texts: 10, duration: 4)
+        await store.recordEmbedding(model: "m2", server: .lmStudio, texts: 1, duration: 5)
 
         let snapshot = await store.current()
         let first = snapshot.models.first { $0.model == "m1" }
@@ -207,7 +207,7 @@ final class MetricsStoreTests: XCTestCase {
 
     func testZeroAndNegativeSamplesAreIgnored() async {
         let store = MetricsStore(fileURL: fileURL)
-        await store.recordEmbedding(model: "m", texts: 0, duration: 1)
+        await store.recordEmbedding(model: "m", server: .lmStudio, texts: 0, duration: 1)
         await store.recordChunking(strategy: .fixed, characters: 0, duration: 1)
         let snapshot = await store.current()
         XCTAssertTrue(snapshot.isEmpty)
@@ -215,7 +215,7 @@ final class MetricsStoreTests: XCTestCase {
 
     func testSnapshotSurvivesARestart() async throws {
         let store = MetricsStore(fileURL: fileURL)
-        await store.recordEmbedding(model: "m", texts: 4, duration: 1)
+        await store.recordEmbedding(model: "m", server: .lmStudio, texts: 4, duration: 1)
         // The write is debounced; wait for it rather than reaching into internals.
         try await Task.sleep(nanoseconds: 900_000_000)
 
@@ -226,7 +226,7 @@ final class MetricsStoreTests: XCTestCase {
 
     func testResetClearsEverything() async {
         let store = MetricsStore(fileURL: fileURL)
-        await store.recordEmbedding(model: "m", texts: 4, duration: 1)
+        await store.recordEmbedding(model: "m", server: .lmStudio, texts: 4, duration: 1)
         await store.reset()
         let snapshot = await store.current()
         XCTAssertTrue(snapshot.isEmpty)

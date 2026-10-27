@@ -489,7 +489,7 @@ public actor ReembeddingService {
         if let problem = request.problem { throw ReembeddingError.invalidRequest(problem) }
         if !request.rechunk,
            request.scenario == .inPlace,
-           request.collection.boundModel == request.targetModel {
+           request.collection.binding == BoundModel(model: request.targetModel, server: embeddings.server) {
             throw ReembeddingError.sameModel(request.targetModel)
         }
 
@@ -650,9 +650,9 @@ public actor ReembeddingService {
             throw ReembeddingError.collectionExists(name)
         }
 
-        var metadata = request.collection.metadata ?? [:]
-        metadata[CollectionBindingKeys.model] = .string(request.targetModel)
-        metadata[CollectionBindingKeys.dimension] = .int(dimension)
+        var metadata = request.collection.metadataBinding(
+            model: request.targetModel, server: embeddings.server, dimension: dimension
+        )
         metadata["_cdbm_cloned_from"] = .string(request.collection.name)
         if request.rechunk {
             metadata[CollectionBindingKeys.chunkingStrategy] = .string(request.chunking.strategy.rawValue)
@@ -898,7 +898,9 @@ public actor ReembeddingService {
         // пройдёт по готовому списку и допишет привязку.
         try await chroma.updateCollection(
             id: request.collection.id,
-            metadata: request.collection.metadataBinding(model: request.targetModel, dimension: dimension)
+            metadata: request.collection.metadataBinding(
+                model: request.targetModel, server: embeddings.server, dimension: dimension
+            )
         )
         journal.clearCheckpoint(collectionID: request.collection.id)
 
@@ -1112,7 +1114,9 @@ public actor ReembeddingService {
         }
         let started = Date()
         let vectors = try await embeddings.embed(texts: texts, model: model)
-        await metrics?.recordEmbedding(model: model, texts: texts.count, duration: Date().timeIntervalSince(started))
+        await metrics?.recordEmbedding(
+            model: model, server: embeddings.server, texts: texts.count, duration: Date().timeIntervalSince(started)
+        )
         return vectors
     }
 

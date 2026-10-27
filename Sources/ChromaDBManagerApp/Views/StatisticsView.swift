@@ -175,12 +175,15 @@ struct MeasurementsTab: View {
                 } description: {
                     Text("Запустить измерение можно у модели на вкладке «Модели» — из контекстного меню строки.")
                 }
+                // Всё место между предупреждением и строкой итога: иначе
+                // стопка вставала по центру, и строка итога всплывала к середине.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(embeddings.benchmarks, columnCustomization: $benchmarkColumns) {
                     TableColumn(String(localized: "Модель")) { measured in
-                        Text(measured.model)
+                        Text(measured.title)
                             .lineLimit(1).truncationMode(.middle)
-                            .help(measured.model)
+                            .help(measured.title)
                     }
                     .customizationID("stat.модель")
                     TableColumn(String(localized: "Текстов/с")) { measured in
@@ -241,13 +244,16 @@ struct MeasurementsTab: View {
                          ? String(localized: "Накопленные времена не прочитаны — здесь пусто не потому, что прогонов не было.")
                          : String(localized: "Времена появятся после первой синхронизации или пересчёта."))
                 }
+                // Всё место между предупреждением и строкой итога: иначе
+                // стопка вставала по центру, и строка итога всплывала к середине.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 if showsEmbedding {
-                    Table(metrics.models.sorted { $0.model < $1.model }, columnCustomization: $modelMetricColumns) {
+                    Table(metrics.models.sorted { $0.title < $1.title }, columnCustomization: $modelMetricColumns) {
                         TableColumn(String(localized: "Эмбеддинг")) { metric in
-                            Text(metric.model)
+                            Text(metric.title)
                                 .lineLimit(1).truncationMode(.middle)
-                                .help(metric.model)
+                                .help(metric.title)
                         }
                         .customizationID("stat.эмбеддинг")
                         TableColumn(String(localized: "с на текст")) { metric in
@@ -381,6 +387,9 @@ struct MeasurementsTab: View {
                 } description: {
                     Text("Коллекций нет или список ещё не загружен — откройте раздел «Коллекции».")
                 }
+                // Всё место между предупреждением и строкой итога: иначе
+                // стопка вставала по центру, и строка итога всплывала к середине.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(rows, columnCustomization: $originColumns) {
                     TableColumn(String(localized: "Коллекция")) { row in

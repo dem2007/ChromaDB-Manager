@@ -16,14 +16,19 @@ struct SectionSplit<List: View, Detail: View>: View {
     var body: some View {
         GeometryReader { proxy in
             HSplitView {
+                // По высоте — вся панель, что бы ни лежало в колонке. Пустое
+                // состояние вместо списка своей высоты не берёт, и на macOS 14
+                // разделитель сжимался по нему: обе колонки уезжали вниз,
+                // а сверху оставалась пустота.
                 list
-                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 340)
+                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 340, maxHeight: .infinity)
                 // Деталь забирает всё, что осталось; минимум — только чтобы
                 // разделитель не схлопнул её в ноль.
                 detail
                     .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.leading, proxy.safeAreaInsets.leading)
         }
         .ignoresSafeArea(.container, edges: .leading)

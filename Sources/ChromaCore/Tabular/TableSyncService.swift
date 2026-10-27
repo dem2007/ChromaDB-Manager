@@ -895,6 +895,7 @@ public actor TableSyncService {
         let vectors = try await embeddings.embed(texts: batch.map(\.0.text), model: context.embeddingModel)
         await metrics?.recordEmbedding(
             model: context.embeddingModel,
+            server: embeddings.server,
             texts: batch.count,
             duration: Date().timeIntervalSince(started)
         )

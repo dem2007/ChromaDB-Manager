@@ -1141,8 +1141,10 @@ final class SourcesViewModel: ObservableObject {
                     }
                     return try await syncService.plan(source: source, embeddingModel: model)
                 }
-                let metrics = await app.metrics.current()
-                let benchmarks = await app.benchmarks.all()
+                // Замеры — сервера, которым пойдёт прогон.
+                let server = await MainActor.run { app.settings.configuration.llmProvider }
+                let metrics = await app.metrics.current().serving(server)
+                let benchmarks = await app.benchmarks.all().serving(server)
                 await MainActor.run {
                     self?.plans[source.id] = plan
                     self?.lastPlanMetrics = metrics
@@ -1255,8 +1257,10 @@ final class SourcesViewModel: ObservableObject {
         // при любой правке порога.
         let bigTable = (planned?.tableRowsToEmbed ?? 0) > TableRunEstimate.warningThreshold
         if let plan = planned, plan.needsConfirmation(threshold: threshold) {
-            let metrics = await app.metrics.current()
-            let benchmarks = await app.benchmarks.all()
+            // Замеры — сервера, которым пойдёт прогон.
+            let server = app.settings.configuration.llmProvider
+            let metrics = await app.metrics.current().serving(server)
+            let benchmarks = await app.benchmarks.all().serving(server)
             await MainActor.run {
                 plans[source.id] = plan
                 lastPlanMetrics = metrics

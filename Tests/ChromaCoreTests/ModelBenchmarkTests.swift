@@ -221,7 +221,7 @@ final class BenchmarkStoreTests: XCTestCase {
         await store.store(sample("m", seconds: 4))
 
         let reopened = BenchmarkStore(fileURL: file)
-        let found = await reopened.benchmark(for: "m")
+        let found = await reopened.benchmark(for: "m", server: .lmStudio)
         let stored = try XCTUnwrap(found)
         XCTAssertEqual(stored.dimension, 768)
         XCTAssertEqual(stored.measuredAt.timeIntervalSince1970, 1_700_000_000, accuracy: 1)

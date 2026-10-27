@@ -20,6 +20,17 @@ public struct CollectionExportManifest: Codable, Sendable, Hashable {
     /// `_cdbm_*` целиком — чтобы на другой машине коллекция описывала себя
     /// так же, как здесь.
     public var collectionMetadata: ChromaMetadata
+
+    /// Модель пакета вместе с её сервером — из метаданных коллекции.
+    /// Пакет, выгруженный до, — LM Studio: другого сервера тогда не
+    /// было. Незнакомый сервер остаётся незнакомым.
+    public var binding: BoundModel? {
+        guard let model else { return nil }
+        if case .string(let raw)? = collectionMetadata[CollectionBindingKeys.modelServer] {
+            return BoundModel(model: model, serverID: raw)
+        }
+        return BoundModel(model: model, server: .lmStudio)
+    }
     public var documentCount: Int
     public var includesEmbeddings: Bool
     /// SHA-256 файла данных: испорченный при переносе пакет должен быть виден

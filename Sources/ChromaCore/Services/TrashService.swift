@@ -24,6 +24,10 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
     public var collectionName: String
     public var collectionMetric: DistanceMetric?
     public var collectionModel: String?
+    /// Сервер этой модели — `LLMProvider.rawValue`. Строкой, а не
+    /// перечислением: незнакомое значение не должно делать запись корзины
+    /// нечитаемой. `nil` — запись до или коллекция без модели.
+    public var collectionServer: String?
     public var collectionDimension: Int?
     public var reason: Reason
     /// Сколько чисел в векторе и полей в метаданных — у записи, которую
@@ -45,7 +49,7 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, deletedAt, documentID, document, metadata, embedding
-        case collectionName, collectionMetric, collectionModel, collectionDimension, reason
+        case collectionName, collectionMetric, collectionModel, collectionServer, collectionDimension, reason
     }
 
     public init(
@@ -58,6 +62,7 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
         collectionName: String,
         collectionMetric: DistanceMetric?,
         collectionModel: String?,
+        collectionServer: String?,
         collectionDimension: Int?,
         reason: Reason
     ) {
@@ -70,6 +75,7 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
         self.collectionName = collectionName
         self.collectionMetric = collectionMetric
         self.collectionModel = collectionModel
+        self.collectionServer = collectionServer
         self.collectionDimension = collectionDimension
         self.reason = reason
     }
@@ -102,6 +108,62 @@ public struct TrashEntry: Codable, Identifiable, Hashable, Sendable {
         guard let text = document, text.count > Self.previewCharacters else { return }
         documentBytes = max(documentBytes, text.utf8.count)
         document = String(text.prefix(Self.previewCharacters))
+    }
+}
+
+/// Что из корзины можно вернуть в коллекцию.
+///
+/// Векторы корзины не пересчитываются — в коллекцию ложится то, что
+/// сохранено. Значит, модель и сервер записей обязаны совпасть с привязкой
+/// коллекции: иначе в ней окажутся векторы двух моделей. Удалённая
+/// коллекция создаётся заново с привязкой первой записи, у которой модель
+/// есть, — и тогда сверка с ней.
+public struct TrashRestorePlan: Sendable {
+    /// Привязка, с которой сверялись; `nil` — сверять не с чем.
+    public let target: BoundModel?
+    public let restorable: [TrashEntry]
+    /// Записи другой модели — остаются в корзине.
+    public let left: [TrashEntry]
+
+    /// `existing` — коллекция, если она есть: `.some(nil)` — есть, но без
+    /// модели, и тогда сверять не с чем, как и раньше.
+    public init(entries: [TrashEntry], existing: BoundModel??) {
+        let target: BoundModel?
+        switch existing {
+        case .some(let binding): target = binding
+        case .none: target = entries.lazy.compactMap(\.vectorBinding).first
+        }
+        self.target = target
+        var restorable: [TrashEntry] = []
+        var left: [TrashEntry] = []
+        for entry in entries {
+            if let target, let own = entry.vectorBinding, own != target {
+                left.append(entry)
+            } else {
+                restorable.append(entry)
+            }
+        }
+        self.restorable = restorable
+        self.left = left
+    }
+
+    /// Запись, с чьей привязкой создавать коллекцию заново.
+    public var template: TrashEntry? {
+        restorable.first { $0.vectorBinding == target } ?? restorable.first
+    }
+
+    /// Почему часть записей осталась в корзине; `nil` — вернутся все.
+    public func conflict(collection: String) -> BindingError? {
+        guard let target, let other = left.first?.vectorBinding else { return nil }
+        return .restoreConflict(collection: collection, bound: target, restored: other, left: left.count)
+    }
+}
+
+public extension TrashEntry {
+    /// Модель и сервер, которыми посчитан вектор записи; `nil` — коллекция
+    /// была без модели. Записи до сервера не знают — значит, LM Studio.
+    var vectorBinding: BoundModel? {
+        collectionModel.map { BoundModel(model: $0, serverID: collectionServer ?? LLMProvider.lmStudio.rawValue) }
     }
 }
 
@@ -494,7 +556,8 @@ public final class TrashService: ObservableObject {
                 id: header.id, deletedAt: header.deletedAt, documentID: header.documentID,
                 document: header.document, metadata: nil, embedding: nil,
                 collectionName: header.collectionName, collectionMetric: header.collectionMetric,
-                collectionModel: header.collectionModel, collectionDimension: header.collectionDimension,
+                collectionModel: header.collectionModel, collectionServer: header.collectionServer,
+                collectionDimension: header.collectionDimension,
                 reason: header.reason
             )
             entry.embeddingLength = length
@@ -517,6 +580,7 @@ public final class TrashService: ObservableObject {
         let collectionName: String
         let collectionMetric: DistanceMetric?
         let collectionModel: String?
+        let collectionServer: String?
         let collectionDimension: Int?
         let reason: TrashEntry.Reason
     }

@@ -42,6 +42,9 @@ struct TrashView: View {
                         SettingsLink { Text("Изменить в Настройках…") }
                     }
                 }
+                // Всё место под сообщениями: иначе стопка вставала по центру,
+                // и сообщение висело посреди экрана.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if entries.isEmpty {
                 ContentUnavailableView.search(text: model.searchText)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

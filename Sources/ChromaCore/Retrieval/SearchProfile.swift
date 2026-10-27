@@ -348,7 +348,26 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
     public var rerankEnabled: Bool
     /// Chosen apart from the chunking model — the two tasks want different
     /// things, and a source's model has no business deciding how search ranks.
-    public var rerankModel: String
+    ///
+    /// У каждого сервера моделей своя: имена моделей у LM Studio и
+    /// Ollama разные, и выбранная для одного у другого не найдётся. Модель
+    /// LM Studio лежит в файле под прежним ключом `rerankModel`.
+    public var rerankModel: String {
+        get { server == .ollama ? ollamaRerankModel : lmStudioRerankModel }
+        set {
+            switch server {
+            case .lmStudio: lmStudioRerankModel = newValue
+            case .ollama: ollamaRerankModel = newValue
+            }
+        }
+    }
+    public var lmStudioRerankModel: String
+    public var ollamaRerankModel: String
+    /// Для какого сервера читается и пишется `rerankModel`. Не настройка
+    /// профиля: хранилище профилей ставит его по выбранному в приложении
+    /// серверу. В файл пишется ради снимков — прогон «Оценки» хранит профиль,
+    /// с которым шёл, и должен показывать модель того сервера.
+    public var server: LLMProvider = .lmStudio
     /// Как именно переранжировать: один вызов чат-модели со схемой или
     /// вопрос «подходит?» на каждый фрагмент — так работают специализированные
     /// переранжировщики.
@@ -432,6 +451,7 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         diversityLambda: Double = MaximalMarginalRelevance.defaultLambda,
         rerankEnabled: Bool = false,
         rerankModel: String = "",
+        ollamaRerankModel: String = "",
         rerankMode: RerankMode = .chatSchema,
         rerankPrompt: String = "",
         rerankInstruction: String = "",
@@ -465,7 +485,8 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         self.diversityEnabled = diversityEnabled
         self.diversityLambda = diversityLambda
         self.rerankEnabled = rerankEnabled
-        self.rerankModel = rerankModel
+        self.lmStudioRerankModel = rerankModel
+        self.ollamaRerankModel = ollamaRerankModel
         self.rerankMode = rerankMode
         self.rerankPrompt = rerankPrompt
         self.rerankInstruction = rerankInstruction
@@ -522,7 +543,11 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
         case queryPrefix
         case searchLevel, collapseByParent, promotion
         case diversityEnabled, diversityLambda
-        case rerankEnabled, rerankModel, rerankMode, rerankPrompt, rerankInstruction, rerankCandidates
+        case rerankEnabled
+        case lmStudioRerankModel = "rerankModel"
+        case ollamaRerankModel
+        case server = "modelServer"
+        case rerankMode, rerankPrompt, rerankInstruction, rerankCandidates
         case marksEnabled
         case contextWindow
     }
@@ -570,7 +595,10 @@ public struct SearchProfile: Codable, Hashable, Sendable, Identifiable {
             ?? MaximalMarginalRelevance.defaultLambda
 
         rerankEnabled = try container.decodeIfPresent(Bool.self, forKey: .rerankEnabled) ?? false
-        rerankModel = try container.decodeIfPresent(String.self, forKey: .rerankModel) ?? ""
+        lmStudioRerankModel = try container.decodeIfPresent(String.self, forKey: .lmStudioRerankModel) ?? ""
+        ollamaRerankModel = try container.decodeIfPresent(String.self, forKey: .ollamaRerankModel) ?? ""
+        // Незнакомый сервер — LM Studio, а не нечитаемый профиль.
+        server = ((try? container.decodeIfPresent(LLMProvider.self, forKey: .server)) ?? nil) ?? .lmStudio
         // Профиль, записанный до появления режима, — это чат-схема: другого
         // тогда не было.
         rerankMode = ((try? container.decodeIfPresent(RerankMode.self, forKey: .rerankMode)) ?? nil) ?? .chatSchema

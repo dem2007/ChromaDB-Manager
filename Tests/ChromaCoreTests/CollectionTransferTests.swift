@@ -206,7 +206,7 @@ final class CollectionTransferTests: XCTestCase {
         let manifest = try CollectionImporter.readManifest(at: exported.url)
 
         XCTAssertThrowsError(
-            try CollectionImporter.problems(manifest: manifest, target: collection(dimension: 768))
+            try CollectionImporter.problems(manifest: manifest, target: collection(dimension: 768), server: .lmStudio)
         ) { error in
             XCTAssertEqual(error as? TransferError, .dimensionMismatch(expected: 768, got: 4))
         }
@@ -221,11 +221,28 @@ final class CollectionTransferTests: XCTestCase {
         let manifest = try CollectionImporter.readManifest(at: exported.url)
 
         let warnings = try CollectionImporter.problems(
-            manifest: manifest, target: collection(metric: .l2, model: "другая-модель")
+            manifest: manifest, target: collection(metric: .l2, model: "другая-модель"), server: .lmStudio
         )
         XCTAssertEqual(warnings.count, 2)
         XCTAssertTrue(warnings.contains { $0.contains("Метрика не совпадает") })
         XCTAssertTrue(warnings.contains { $0.contains("Модель не совпадает") })
+    }
+
+    /// Одно имя модели, разные серверы — предупреждение: под одним
+    /// именем у LM Studio и Ollama бывают разные сборки.
+    func testTheSameModelNameFromAnotherServerIsAWarning() async throws {
+        let source = Source()
+        source.documents = documents(3)
+        let exported = try await exportPackage(source)
+        var manifest = try CollectionImporter.readManifest(at: exported.url)
+        let model = try XCTUnwrap(manifest.model)
+        manifest.collectionMetadata[CollectionBindingKeys.modelServer] = .string("ollama")
+        XCTAssertEqual(manifest.binding?.server, .ollama)
+
+        let target = collection(model: model)
+        XCTAssertEqual(target.boundServer,.lmStudio, "коллекция до — LM Studio")
+        let warnings = try CollectionImporter.problems(manifest: manifest, target: target, server: .lmStudio)
+        XCTAssertTrue(warnings.contains { $0.contains("Ollama") && $0.contains("LM Studio") }, "\(warnings)")
     }
 
     func testAPackageFromTheFutureIsRefusedRatherThanGuessedAt() async throws {
@@ -698,16 +715,37 @@ extension CollectionTransferTests {
             id: "cid", name: "чужая",
             metadata: [CollectionBindingKeys.dimension: .int(768)]
         )
-        XCTAssertThrowsError(try CollectionImporter.problems(manifest: manifest, target: unbound)) { error in
+        XCTAssertThrowsError(try CollectionImporter.problems(manifest: manifest, target: unbound, server: .lmStudio)) { error in
             XCTAssertEqual(error as? TransferError, .dimensionMismatch(expected: 768, got: 4))
         }
         // Той же размерности — не запрет, а предупреждение о модели.
         let sameSize = ChromaCollection(
             id: "cid", name: "чужая", metadata: [CollectionBindingKeys.dimension: .int(4)]
         )
-        let warnings = try CollectionImporter.problems(manifest: manifest, target: sameSize)
+        let warnings = try CollectionImporter.problems(manifest: manifest, target: sameSize, server: .lmStudio)
         XCTAssertTrue(warnings.contains { $0.contains("не привязана модель") }, "\(warnings)")
         // Коллекция со своей моделью пересчитывает пакет ею — сверять нечего.
-        XCTAssertEqual(try CollectionImporter.problems(manifest: manifest, target: collection(dimension: 768)), [])
+        XCTAssertEqual(try CollectionImporter.problems(manifest: manifest, target: collection(dimension: 768), server: .lmStudio), [])
+    }
+
+    /// Пакет без векторов пересчитывает выбранный сервер — в коллекцию
+    /// модели другого сервера, новую или существующую, это запрет, и он
+    /// виден до нажатия «Импортировать».
+    func testAPackageWithoutVectorsIsRecomputedOnlyByTheCollectionsServer() async throws {
+        let source = Source()
+        source.documents = documents(3)
+        let exported = try await exportPackage(source, options: CollectionExporter.Options(includesEmbeddings: false))
+        let manifest = try CollectionImporter.readManifest(at: exported.url)
+
+        let studio = collection(dimension: 768)
+        XCTAssertThrowsError(try CollectionImporter.problems(manifest: manifest, target: studio, server: .ollama)) { error in
+            guard case BindingError.serverConflict(_, let bound, let current) = error else { return XCTFail("\(error)") }
+            XCTAssertEqual(bound.server, .lmStudio)
+            XCTAssertEqual(current, .ollama)
+        }
+        // В новую коллекцию — с привязкой пакета: она тоже LM Studio.
+        XCTAssertNotNil(manifest.binding)
+        XCTAssertThrowsError(try CollectionImporter.problems(manifest: manifest, target: nil, server: .ollama))
+        XCTAssertEqual(try CollectionImporter.problems(manifest: manifest, target: nil, server: .lmStudio), [])
     }
 }

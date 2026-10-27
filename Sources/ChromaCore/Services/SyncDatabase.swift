@@ -42,8 +42,24 @@ public protocol SyncDatabase: Sendable {
     /// Only used to clean up after manifests written before chunk ids were
     /// remembered; the normal path deletes by explicit id.
     func deleteDocuments(collectionID: String, filter: DocumentFilter) async throws -> Int
+    /// Сколько записей в коллекции; `nil` — узнать нельзя.
+    ///
+    /// Нужно одному решению: пустую коллекцию другой модели можно
+    /// перепривязать, заполненную — нет. `dimension` для этого не годится:
+    /// сервер, который его не сообщает, выдал бы заполненную коллекцию за
+    /// пустую, и привязка сменилась бы поверх чужих векторов.
+    func documentCount(collectionID: String) async throws -> Int?
+}
+
+public extension SyncDatabase {
+    /// Не знаем — значит, не пустая: перепривязка не случится.
+    func documentCount(collectionID: String) async throws -> Int? { nil }
 }
 
 // `documents(collectionID:ids:)` и `embeddings(collectionID:ids:)` у клиента
 // уже есть — их же требует конвейер поиска.
-extension ChromaClient: SyncDatabase {}
+extension ChromaClient: SyncDatabase {
+    public func documentCount(collectionID: String) async throws -> Int? {
+        try await count(collectionID: collectionID)
+    }
+}

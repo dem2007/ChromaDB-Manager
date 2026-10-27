@@ -31,7 +31,7 @@ final class ModelSubstitutionTests: XCTestCase {
     func testAnAnswerFromAnotherModelStopsTheOperation() {
         let data = response(model: "text-embedding-qwen3-embedding-0.6b")
         XCTAssertThrowsError(try vectors(data, asked: "bge-m3-mlx")) { error in
-            guard case LMStudioError.modelSubstituted(let requested, let returned) = error else {
+            guard case LMStudioError.modelSubstituted(let requested, let returned, .lmStudio) = error else {
                 return XCTFail("ожидалась подмена модели, пришло \(error)")
             }
             XCTAssertEqual(requested, "bge-m3-mlx")
@@ -48,7 +48,7 @@ final class ModelSubstitutionTests: XCTestCase {
     /// Ошибка называет обе стороны: без этого человек не поймёт, что чинить.
     func testTheMessageNamesBothModels() {
         let error = LMStudioError.modelSubstituted(
-            requested: "bge-m3-mlx", returned: "text-embedding-qwen3-embedding-0.6b"
+            requested: "bge-m3-mlx", returned: "text-embedding-qwen3-embedding-0.6b", server: .lmStudio
         )
         let text = error.errorDescription ?? ""
         XCTAssertTrue(text.contains("bge-m3-mlx"), text)

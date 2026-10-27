@@ -90,16 +90,30 @@ final class TrashViewModel: ObservableObject {
         let byCollection = Dictionary(grouping: entries, by: \.collectionName)
 
         for (collectionName, group) in byCollection {
-            let restorable = group.filter { $0.document != nil && $0.embedding != nil }
-            skipped += group.count - restorable.count
-            guard !restorable.isEmpty else { continue }
+            let candidates = group.filter { $0.document != nil && $0.embedding != nil }
+            skipped += group.count - candidates.count
+            guard !candidates.isEmpty else { continue }
 
             do {
+                // Модель и сервер записей сверяются с привязкой коллекции
+                //: векторы корзины не пересчитываются.
+                let existing = try? await client.collection(named: collectionName)
+                let plan = TrashRestorePlan(entries: candidates, existing: existing.map(\.binding))
+                if let conflict = plan.conflict(collection: collectionName) {
+                    errorMessage = app.describe(conflict)
+                    app.report(conflict, category: "Корзина")
+                }
+                let restorable = plan.restorable
+                guard !restorable.isEmpty else { continue }
+
+                let template = plan.template
                 let collectionID = try await resolveOrRecreate(
                     named: collectionName,
-                    model: restorable.first?.collectionModel,
-                    dimension: restorable.first?.collectionDimension,
-                    metric: restorable.first?.collectionMetric,
+                    existing: existing,
+                    model: template?.collectionModel,
+                    server: template?.collectionServer,
+                    dimension: template?.collectionDimension,
+                    metric: template?.collectionMetric,
                     client: client
                 )
                 let records = restorable.map { entry in
@@ -135,17 +149,22 @@ final class TrashViewModel: ObservableObject {
 
     private func resolveOrRecreate(
         named name: String,
+        existing: ChromaCollection?,
         model: String?,
+        server: String?,
         dimension: Int?,
         metric: DistanceMetric?,
         client: ChromaClient
     ) async throws -> String {
-        if let existing = try? await client.collection(named: name) {
+        if let existing {
             return existing.id
         }
         var metadata: ChromaMetadata = [:]
         if let model, let dimension {
             metadata[CollectionBindingKeys.model] = .string(model)
+            // Векторы в корзине — той модели и того сервера, что были;
+            // записи до сервера не знают — значит, LM Studio.
+            if let server { metadata[CollectionBindingKeys.modelServer] = .string(server) }
             metadata[CollectionBindingKeys.dimension] = .int(dimension)
         }
         let configuration = CollectionConfiguration(metric: metric ?? .cosine)

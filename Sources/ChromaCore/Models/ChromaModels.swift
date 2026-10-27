@@ -198,6 +198,9 @@ public struct ChromaCollection: Identifiable, Hashable, Decodable, Sendable {
 /// by other tools simply do not have them, which is normal, not an error.
 public enum CollectionBindingKeys {
     public static let model = "_cdbm_model"
+    /// Сервер, чья это модель: `LLMProvider.rawValue`. Нет ключа —
+    /// LM Studio, единственный сервер до.
+    public static let modelServer = "_cdbm_model_server"
     public static let dimension = "_cdbm_dimension"
     /// The metric this app asked for. The server's own `configuration_json` is
     /// the truth and is always read first; this is written so the database
@@ -237,6 +240,21 @@ public extension ChromaCollection {
         return nil
     }
 
+    /// Привязка целиком — модель и её сервер. Коллекции, привязанные
+    /// до того, как сервер стал записываться, — LM Studio: другого тогда
+    /// не было. Незнакомый сервер остаётся незнакомым, а не становится
+    /// LM Studio.
+    var binding: BoundModel? {
+        guard let model = boundModel else { return nil }
+        if case .string(let value)? = metadata?[CollectionBindingKeys.modelServer] {
+            return BoundModel(model: model, serverID: value)
+        }
+        return BoundModel(model: model, server: .lmStudio)
+    }
+
+    /// Сервер привязки; `nil` — привязки нет или сервер этой сборке незнаком.
+    var boundServer: LLMProvider? { binding?.server }
+
     /// Vector size: what the server reports for stored data wins, because it
     /// is the truth; the recorded value is the fallback for empty collections.
     var effectiveDimension: Int? {
@@ -262,10 +280,20 @@ public extension ChromaCollection {
     /// greys out; not good enough to decide what a query does.
     var looksHierarchical: Bool { chunkingStrategy == .hierarchical }
 
+    /// Та же коллекция с новыми метаданными — после `updateCollection`, чтобы
+    /// не перечитывать её с сервера.
+    func rebound(metadata: ChromaMetadata) -> ChromaCollection {
+        ChromaCollection(
+            id: id, name: name, metadata: metadata, dimension: dimension, tenant: tenant, database: database,
+            documentCount: documentCount, embeddingFunctionName: embeddingFunctionName, space: space, hnsw: hnsw
+        )
+    }
+
     /// Metadata for a rebind, preserving everything else the collection carries.
-    func metadataBinding(model: String, dimension: Int) -> ChromaMetadata {
+    func metadataBinding(model: String, server: LLMProvider, dimension: Int) -> ChromaMetadata {
         var merged = metadata ?? [:]
         merged[CollectionBindingKeys.model] = .string(model)
+        merged[CollectionBindingKeys.modelServer] = .string(server.rawValue)
         merged[CollectionBindingKeys.dimension] = .int(dimension)
         return merged
     }

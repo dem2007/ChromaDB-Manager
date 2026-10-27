@@ -50,10 +50,14 @@ extension View {
     }
 
     @ViewBuilder func hidesToolbarTitle(_ hides: Bool) -> some View {
-        if #available(macOS 15, *), hides {
-            self.toolbar(removing: .title)
+        if #available(macOS 15, *) {
+            if hides { self.toolbar(removing: .title) } else { self }
         } else {
-            self
+            // На 14 `toolbar(removing:)` нет, и заголовок вставал между
+            // вкладками и кнопками: полоса переполнялась, вкладки уезжали.
+            // Окно прячет его само — это AppKit, он есть везде; заголовок
+            // для меню «Окно» и Mission Control остаётся, как и на 15+.
+            self.background(WindowTitleVisibility(hidden: hides))
         }
     }
 
@@ -76,6 +80,40 @@ extension View {
                 .background(.bar)
             }
         }
+    }
+}
+
+/// Видимость заголовка в полосе окна — для macOS 14 (`hidesToolbarTitle`).
+///
+/// Окно узнаётся, когда вид в него попал (`viewDidMoveToWindow`), а не при
+/// первом обновлении: тогда окна у вида ещё нет. Раздел меняется — меняется
+/// и видимость: у разделов без вкладок заголовок виден.
+private struct WindowTitleVisibility: NSViewRepresentable {
+    let hidden: Bool
+
+    final class Probe: NSView {
+        var hidesTitle = false {
+            didSet { apply() }
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        func apply() {
+            window?.titleVisibility = hidesTitle ? .hidden : .visible
+        }
+    }
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.hidesTitle = hidden
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.hidesTitle = hidden
     }
 }
 

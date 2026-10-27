@@ -265,4 +265,31 @@ final class ConfigurationLossTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshot), raw)
         XCTAssertTrue(notice.message.contains(snapshot.lastPathComponent))
     }
+
+    /// Файл, где модель векторов и модель оценки ещё по одной (до),
+    /// читается без тревоги «записано более новой версией»: их ключи — те же,
+    /// под ними теперь модели LM Studio.
+    func testTheSingleModelKeysOfOlderFilesRaiseNoAlarm() throws {
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: SettingsStore.encoded(AppConfiguration())) as? [String: Any])
+        json["llmProvider"] = "lmStudio"
+        json["defaultEmbeddingModel"] = "text-embedding-bge-m3"
+        json["modelJudgeModel"] = "qwen/qwen3-8b"
+        try JSONSerialization.data(withJSONObject: json).write(to: configURL)
+
+        let store = SettingsStore(fileURL: configURL)
+        XCTAssertNil(store.loss, "\(store.loss?.unrepresented ?? [])")
+        XCTAssertEqual(store.configuration.defaultEmbeddingModel, "text-embedding-bge-m3")
+        XCTAssertEqual(store.configuration.modelJudgeModel, "qwen/qwen3-8b")
+    }
+
+    /// Ключи файла перечислены руками, и свойство, забытое в перечне,
+    /// молча не записывалось бы.
+    func testEveryStoredSettingHasAKey() {
+        // Ключ — имя свойства, кроме двух моделей LM Studio под прежними ключами.
+        let renamed = ["lmStudioEmbeddingModel": "defaultEmbeddingModel", "lmStudioJudgeModel": "modelJudgeModel"]
+        let stored = Set(Mirror(reflecting: AppConfiguration()).children.compactMap(\.label).map { renamed[$0] ?? $0 })
+        let keyed = Set(AppConfiguration.CodingKeys.allCases.map(\.stringValue))
+        XCTAssertEqual(stored.subtracting(keyed), [], "свойства без ключа")
+        XCTAssertEqual(keyed.subtracting(stored), [], "ключи без свойства")
+    }
 }

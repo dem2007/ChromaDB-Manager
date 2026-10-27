@@ -394,7 +394,7 @@ final class BindingErrorTests: XCTestCase {
     func testEveryCaseExplainsItselfAndWhatToDo() {
         let errors: [BindingError] = [
             .notBound(collection: "demo"),
-            .modelUnavailable(model: "m"),
+            .modelUnavailable(model: "m", server: .lmStudio),
             .dimensionConflict(collection: "demo", stored: 768, model: 384),
         ]
         for error in errors {

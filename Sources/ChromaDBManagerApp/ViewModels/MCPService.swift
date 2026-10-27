@@ -883,7 +883,8 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
         // и `LMStudioError` умеют говорить с ней сами (`MCPReadableError`,
         //). Оборачивать их здесь своей формулировкой нельзя: «модель
         // не загружена» вместо «LM Studio не отвечает» — это подмена причины.
-        let model = try await app.bindingService.requiredModel(for: collection)
+        let server = await MainActor.run { app.settings.configuration.llmProvider }
+        let model = try app.bindingService.requiredModel(for: collection, server: server)
         let lmStudio = try await MainActor.run { try app.makeLMStudioClient() }
         try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
 
@@ -1019,6 +1020,7 @@ final class AppMCPBackend: MCPToolBackend, @unchecked Sendable {
                     collectionName: collection.name,
                     collectionMetric: collection.space,
                     collectionModel: collection.boundModel,
+                    collectionServer: collection.binding?.serverID,
                     collectionDimension: collection.effectiveDimension,
                     reason: .document
                 )

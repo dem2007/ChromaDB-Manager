@@ -133,7 +133,7 @@ final class ForeignCollectionTests: XCTestCase {
 
         try await client.updateCollection(
             id: collection.id,
-            metadata: collection.metadataBinding(model: "nomic-embed", dimension: 4)
+            metadata: collection.metadataBinding(model: "nomic-embed", server: .lmStudio, dimension: 4)
         )
         XCTAssertEqual(transport.writes.count, 1)
         XCTAssertEqual(transport.writes.first?.method, "PUT")

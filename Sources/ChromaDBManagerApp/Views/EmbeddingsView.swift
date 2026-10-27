@@ -36,6 +36,10 @@ struct EmbeddingsView: View {
                 modelsTab
             }
         }
+        // Сообщения — у верхнего края. Без этого стопка «сообщение + пустой
+        // список» не занимала высоту целиком, и SwiftUI ставил её по центру:
+        // предупреждение висело посреди экрана.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // Экран о моделях открывают, чтобы посмотреть на список, — и он
         // спрашивает LM Studio, не дожидаясь минутного такта.
         .task { await model.refreshModelsQuietly(app) }
@@ -81,11 +85,37 @@ struct EmbeddingsView: View {
     /// Эмбеддинг по умолчанию и LM Studio — своей вкладкой (v3): у
     /// вкладки «Модели» один контейнер — таблица.
     private var connectionForm: some View {
-        Form {
-            defaultModelSection
-            lmStudioSection
+        VStack(spacing: 0) {
+            providerBar
+            Form {
+                defaultModelSection
+                lmStudioSection
+            }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
+        // Смену сервера — сброс списка и новый запрос — ведёт приложение
+        // (`AppEnvironment.providerSwitchWatch`), а не этот экран.
+    }
+
+    /// Сервер моделей — сегментами в начале вкладки, как части прогонов
+    /// на «Оценке». Выбранный сегмент — тот сервер, с которым
+    /// работает всё приложение; адрес у каждого свой.
+    private var providerBar: some View {
+        HStack(spacing: 12) {
+            Picker(String(localized: "Сервер моделей"), selection: Binding(
+                get: { settings.configuration.llmProvider },
+                set: { settings.configuration.llmProvider = $0 }
+            )) {
+                ForEach(LLMProvider.allCases) { provider in
+                    Text(provider.title).tag(provider)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            Spacer()
+        }
+        .padding()
     }
 
     private var modelsTab: some View {
@@ -98,6 +128,9 @@ struct EmbeddingsView: View {
                          ? String(localized: "Список ещё не получен — приложение спрашивает LM Studio само, это займёт секунду.")
                          : String(localized: "LM Studio не отдала ни одной модели. Проверьте на вкладке «Подключение», что она запущена и Local Server включён."))
                 }
+                // Всё оставшееся место — пустому списку: подпись — по центру
+                // под сообщениями, а не вместе с ними.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 modelsTable
                 modelsFooter
@@ -172,7 +205,7 @@ struct EmbeddingsView: View {
             )
         } footer: {
             if let measured = settings.configuration.defaultEmbeddingModel
-                .flatMap({ model.benchmark(for: $0) }) {
+                .flatMap({ model.benchmark(for: $0, server: settings.configuration.llmProvider) }) {
                 Text("Измерено: \((measured.textsPerSecond).decimal(1)) текстов/с · размерность \(measured.dimension.plainDigits).")
             } else if model.embeddingModels.isEmpty {
                 Text("Список моделей пуст — проверьте соединение с LM Studio ниже.")
@@ -184,10 +217,17 @@ struct EmbeddingsView: View {
 
     private var lmStudioSection: some View {
         Section {
+            // LM Studio выпускается только для Apple Silicon: на Маке
+            // с Intel её адрес имеет смысл, только если она на другом компьютере.
+            // Условие — во время работы, а не `#if`: строку должен видеть
+            // каталог текстов, собираемый на Apple Silicon.
+            if LLMProvider.platformDefault == .ollama, settings.configuration.llmProvider == .lmStudio {
+                Notice(.info, String(localized: "На Маке с Intel LM Studio не работает. Выберите Ollama или впишите адрес LM Studio на другом компьютере."))
+            }
             LabeledContent(String(localized: "Адрес")) {
                 TextField(String(localized: "Адрес локального сервера"), text: Binding(
-                    get: { settings.configuration.lmStudioBaseURL },
-                    set: { settings.configuration.lmStudioBaseURL = $0 }
+                    get: { settings.configuration.llmBaseURL },
+                    set: { settings.configuration.llmBaseURL = $0 }
                 ))
                 .labelsHidden()
                 .multilineTextAlignment(.trailing)
@@ -203,12 +243,25 @@ struct EmbeddingsView: View {
                 lmStudioStatus
             }
         } header: {
-            SectionHeader(
-                String(localized: "LM Studio"),
-                help: String(localized: "По умолчанию http://localhost:1234. Если соединение не устанавливается — запустите LM Studio и включите Local Server в разделе Developer. Список моделей приложение обновляет само: раз в минуту, пока окно активно, и сразу при возврате в приложение. «Проверить соединение» делает больше — выясняет тип моделей, о которых API молчит, пробным запросом.")
-            )
+            switch settings.configuration.llmProvider {
+            case .lmStudio:
+                SectionHeader(
+                    String(localized: "LM Studio"),
+                    help: String(localized: "По умолчанию http://localhost:1234. Если соединение не устанавливается — запустите LM Studio и включите Local Server в разделе Developer. Список моделей приложение обновляет само: раз в минуту, пока окно активно, и сразу при возврате в приложение. «Проверить соединение» делает больше — выясняет тип моделей, о которых API молчит, пробным запросом.")
+                )
+            case .ollama:
+                SectionHeader(
+                    String(localized: "Ollama"),
+                    help: String(localized: "По умолчанию http://localhost:11434. Если соединение не устанавливается — запустите Ollama: приложение Ollama или `ollama serve` в терминале. Модели скачиваются в самой Ollama, например `ollama pull nomic-embed-text`; их тип и контекст она сообщает сама. Рабочий контекст задаёт сервер: по умолчанию он зависит от памяти видеокарты, и на Маке с Intel это 4096 токенов; больше — в настройках Ollama или переменной OLLAMA_CONTEXT_LENGTH. Список моделей приложение обновляет само: раз в минуту, пока окно активно, и сразу при возврате в приложение.")
+                )
+            }
         } footer: {
-            Text("Приложение не скачивает и не устанавливает модели — оно использует то, что уже доступно в LM Studio.")
+            switch settings.configuration.llmProvider {
+            case .lmStudio:
+                Text("Приложение не скачивает и не устанавливает модели — оно использует то, что уже доступно в LM Studio.")
+            case .ollama:
+                Text("Приложение не скачивает и не устанавливает модели — оно использует то, что уже скачано в Ollama.")
+            }
         }
     }
 
@@ -268,7 +321,7 @@ struct EmbeddingsView: View {
             .alignment(.numeric)
             .customizationID("speed")
             TableColumn(String(localized: "Размерность")) { item in
-                Text(model.benchmark(for: item.id).map { $0.dimension.plainDigits } ?? "—")
+                Text(model.benchmark(for: item.id, server: settings.configuration.llmProvider).map { $0.dimension.plainDigits } ?? "—")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
@@ -293,14 +346,17 @@ struct EmbeddingsView: View {
         .contextMenu(forSelectionType: String.self) { ids in
             if let id = ids.first, let item = model.models.first(where: { $0.id == id }) {
                 if item.kind == .embedding {
-                    Button(model.benchmark(for: item.id) == nil
+                    Button(model.benchmark(for: item.id, server: settings.configuration.llmProvider) == nil
                            ? String(localized: "Измерить скорость…")
                            : String(localized: "Измерить заново…")) {
                         Task { await model.requestBenchmark(item, app: app) }
                     }
                     .disabled(model.benchmarkingModel != nil)
                 }
-                if let range = model.reloadableContext(item), model.loadingModel == nil {
+                // Перезагрузка — через `lms`, то есть только у LM Studio:
+                // контекст Ollama задаётся в её настройках.
+                if settings.configuration.llmProvider == .lmStudio,
+                   let range = model.reloadableContext(item), model.loadingModel == nil {
                     Button(String(localized: "Перезагрузить с контекстом \(range.to.plainDigits)…")) {
                         model.requestLoad(item)
                     }
@@ -328,7 +384,7 @@ struct EmbeddingsView: View {
         if model.benchmarkingModel == item.id {
             ProgressView().controlSize(.small)
                 .help(String(localized: "измеряется…"))
-        } else if item.kind == .embedding, let measured = model.benchmark(for: item.id) {
+        } else if item.kind == .embedding, let measured = model.benchmark(for: item.id, server: settings.configuration.llmProvider) {
             Text("\((measured.textsPerSecond).decimal(1)) текстов/с")
                 .monospacedDigit()
                 .foregroundStyle(.secondary)

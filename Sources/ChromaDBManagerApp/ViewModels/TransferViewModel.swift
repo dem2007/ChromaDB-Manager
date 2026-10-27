@@ -156,7 +156,8 @@ final class TransferViewModel: ObservableObject {
             packageManifest = manifest
             newCollectionName = manifest.collectionName
             packageWarnings = try CollectionImporter.problems(
-                manifest: manifest, target: importsIntoNewCollection ? nil : target
+                manifest: manifest, target: importsIntoNewCollection ? nil : target,
+                server: app.settings.configuration.llmProvider
             )
             resumeOffer = checkpoints.load(checksum: manifest.dataSHA256)
         } catch {
@@ -169,7 +170,8 @@ final class TransferViewModel: ObservableObject {
         guard let manifest = packageManifest else { return }
         do {
             packageWarnings = try CollectionImporter.problems(
-                manifest: manifest, target: importsIntoNewCollection ? nil : target
+                manifest: manifest, target: importsIntoNewCollection ? nil : target,
+                server: app.settings.configuration.llmProvider
             )
             packageProblem = nil
         } catch {
@@ -181,6 +183,17 @@ final class TransferViewModel: ObservableObject {
     func runImport(target: ChromaCollection?, app: AppEnvironment) {
         guard let client = app.client, let manifest = packageManifest, let package = packageURL else { return }
         guard packageProblem == nil else { return }
+        // Ещё раз, а не по запомненному: сервер моделей могли сменить после
+        // выбора пакета, а пересчитывать будет именно он.
+        do {
+            _ = try CollectionImporter.problems(
+                manifest: manifest, target: importsIntoNewCollection ? nil : target,
+                server: app.settings.configuration.llmProvider
+            )
+        } catch {
+            errorMessage = app.describe(error)
+            return
+        }
 
         isRunning = true
         errorMessage = nil

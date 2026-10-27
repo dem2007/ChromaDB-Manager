@@ -33,6 +33,7 @@ final class TrashServiceTests: XCTestCase {
             collectionName: collectionName,
             collectionMetric: .cosine,
             collectionModel: "some-model",
+            collectionServer: "ollama",
             collectionDimension: 3,
             reason: reason
         )
@@ -73,6 +74,10 @@ final class TrashServiceTests: XCTestCase {
         let full = await reloaded.fullEntries(withIDs: Set(reloaded.entries.map(\.id)))
         XCTAssertEqual(full.first?.embedding, [0.1, 0.2, 0.3])
         XCTAssertEqual(full.first?.metadata?["k"], .string("v"))
+        // Сервер модели переживает перезапуск — восстановленная коллекция
+        // привязывается к нему, а не к одноимённой модели другого.
+        XCTAssertEqual(reloaded.entries.first?.collectionServer, "ollama")
+        XCTAssertEqual(full.first?.collectionServer, "ollama")
     }
 
     /// перезапись после восстановления берёт строки из файла —
@@ -101,7 +106,7 @@ final class TrashServiceTests: XCTestCase {
         let trash = TrashService(fileURL: fileURL)
         let tricky = TrashEntry(
             documentID: "d", document: #"в тексте "id":"не-uuid" и ещё"#, metadata: nil,
-            embedding: [1], collectionName: "c", collectionMetric: nil, collectionModel: nil,
+            embedding: [1], collectionName: "c", collectionMetric: nil, collectionModel: nil, collectionServer: nil,
             collectionDimension: nil, reason: .document
         )
         try trash.record(tricky)
@@ -316,7 +321,7 @@ final class TrashBackgroundLoadTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         func entry(_ name: String) -> TrashEntry {
             TrashEntry(documentID: name, document: name, metadata: ["k": .string("v")], embedding: [1, 2, 3],
-                       collectionName: "c", collectionMetric: nil, collectionModel: nil,
+                       collectionName: "c", collectionMetric: nil, collectionModel: nil, collectionServer: nil,
                        collectionDimension: nil, reason: .document)
         }
         let old = entry("старая"), gone = entry("снятая")
@@ -350,7 +355,7 @@ final class TrashPreviewTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         let long = String(repeating: "абв ", count: 1000)
         let entry = TrashEntry(documentID: "d", document: long, metadata: nil, embedding: [1],
-                               collectionName: "c", collectionMetric: nil, collectionModel: nil,
+                               collectionName: "c", collectionMetric: nil, collectionModel: nil, collectionServer: nil,
                                collectionDimension: nil, reason: .document)
         let trash = TrashService(fileURL: url)
         try trash.record(entry)
@@ -402,3 +407,61 @@ final class TrashPreviewTests: XCTestCase {
     }
 }
 
+
+/// из корзины в коллекцию ложатся только векторы её модели и сервера.
+final class TrashRestorePlanTests: XCTestCase {
+    private func entry(_ id: String, model: String?, server: String?) -> TrashEntry {
+        TrashEntry(
+            documentID: id, document: "текст", metadata: nil, embedding: [1, 2],
+            collectionName: "notes", collectionMetric: .cosine,
+            collectionModel: model, collectionServer: server, collectionDimension: 2,
+            reason: .document
+        )
+    }
+
+    func testOnlyVectorsOfTheCollectionsModelGoBack() throws {
+        let studio = entry("a", model: "nomic-embed-text", server: "lmStudio")
+        let ollama = entry("b", model: "nomic-embed-text", server: "ollama")
+        let plan = TrashRestorePlan(
+            entries: [studio, ollama],
+            existing: .some(BoundModel(model: "nomic-embed-text", server: .ollama))
+        )
+        XCTAssertEqual(plan.restorable.map(\.documentID), ["b"])
+        XCTAssertEqual(plan.left.map(\.documentID), ["a"])
+        let conflict = try XCTUnwrap(plan.conflict(collection: "notes"))
+        XCTAssertTrue((conflict.errorDescription ?? "").contains("LM Studio"), conflict.errorDescription ?? "")
+    }
+
+    /// Записи до сервера не знают — это LM Studio.
+    func testAnOldEntryIsLMStudios() {
+        let old = entry("a", model: "text-embedding-bge-m3", server: nil)
+        let plan = TrashRestorePlan(
+            entries: [old], existing: .some(BoundModel(model: "text-embedding-bge-m3", server: .lmStudio))
+        )
+        XCTAssertEqual(plan.restorable.count, 1)
+        XCTAssertNil(plan.conflict(collection: "notes"))
+    }
+
+    /// Коллекции нет — создаётся с привязкой первой записи, у которой модель
+    /// есть, и записи другой модели в неё не идут.
+    func testARecreatedCollectionTakesTheFirstModelAndOnlyIt() {
+        let bare = entry("a", model: nil, server: nil)
+        let first = entry("b", model: "bge-m3:latest", server: "ollama")
+        let other = entry("c", model: "text-embedding-bge-m3", server: "lmStudio")
+        let plan = TrashRestorePlan(entries: [bare, first, other], existing: .none)
+        XCTAssertEqual(plan.target, BoundModel(model: "bge-m3:latest", server: .ollama))
+        XCTAssertEqual(plan.template?.documentID, "b", "коллекция создаётся с моделью, а не без неё")
+        XCTAssertEqual(plan.restorable.map(\.documentID), ["a", "b"])
+        XCTAssertEqual(plan.left.map(\.documentID), ["c"])
+    }
+
+    /// Коллекция без модели — сверять не с чем, как и раньше.
+    func testAnUnboundCollectionTakesEverything() {
+        let plan = TrashRestorePlan(
+            entries: [entry("a", model: "m", server: "lmStudio"), entry("b", model: "n", server: "ollama")],
+            existing: .some(nil)
+        )
+        XCTAssertEqual(plan.restorable.count, 2)
+        XCTAssertNil(plan.conflict(collection: "notes"))
+    }
+}

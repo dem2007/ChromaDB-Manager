@@ -4,11 +4,27 @@
 # Xcode is not required: the SwiftPM binary is wrapped into a regular .app
 # bundle with Resources/Info.plist and ad-hoc signed so macOS lets it run.
 #
-# Usage: Scripts/build-app.sh [debug|release]   (default: release)
+# Usage: Scripts/build-app.sh [debug|release] [arm64|x86_64]
+#        (default: release, architecture of this Mac)
 
 set -euo pipefail
 
 CONFIG="${1:-release}"
+# Конфигурация — первым аргументом, архитектура — вторым. Перепутанный
+# порядок («build-app.sh x86_64») иначе доходил до SwiftPM ошибкой разбора
+# ключа `-c`, из которой не понять, что не так.
+case "$CONFIG" in
+    debug|release) ;;
+    *) echo "неизвестная конфигурация: $CONFIG (нужна debug или release; архитектура — вторым аргументом)" >&2; exit 2 ;;
+esac
+# Архитектура сборки. Под каждый процессор — своё приложение:
+# универсальное весило вдвое больше (31 МБ архива против 16), а каждому
+# Маку из двух половин нужна одна. По умолчанию — под эту машину.
+ARCH="${2:-$(uname -m)}"
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *) echo "неизвестная архитектура: $ARCH (нужна arm64 или x86_64)" >&2; exit 2 ;;
+esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="ChromaDB Manager"
 BUNDLE="$ROOT/dist/$APP_NAME.app"
@@ -23,24 +39,23 @@ cd "$ROOT"
 # их отрезает `-oso_prefix`.
 SWIFT_FLAGS=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=/ChromaDBManager" -Xlinker -oso_prefix -Xlinker "$ROOT/")
 
-echo "==> swift build -c $CONFIG"
-swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product ChromaDBManager
 # Вспомогательный файл MCP-сервера: его запускает агентское приложение,
 # путь к нему приложение выдаёт в готовой конфигурации, поэтому он обязан
 # лежать в бандле — иначе выданная конфигурация указывает в пустоту.
-swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product chromadb-mcp
+PRODUCTS=(ChromaDBManager chromadb-mcp)
+for product in "${PRODUCTS[@]}"; do
+    echo "==> swift build -c $CONFIG --arch $ARCH --product $product"
+    swift build -c "$CONFIG" --arch "$ARCH" "${SWIFT_FLAGS[@]}" --product "$product"
+done
 
-BIN_DIR="$(swift build -c "$CONFIG" "${SWIFT_FLAGS[@]}" --product ChromaDBManager --show-bin-path)"
+BIN_DIR="$(swift build -c "$CONFIG" --arch "$ARCH" "${SWIFT_FLAGS[@]}" --product ChromaDBManager --show-bin-path)"
 BIN="$BIN_DIR/ChromaDBManager"
-MCP_BIN="$BIN_DIR/chromadb-mcp"
-if [[ ! -x "$BIN" ]]; then
-    echo "Build product not found at $BIN" >&2
-    exit 1
-fi
-if [[ ! -x "$MCP_BIN" ]]; then
-    echo "MCP helper not found at $MCP_BIN" >&2
-    exit 1
-fi
+for product in "${PRODUCTS[@]}"; do
+    if [[ ! -x "$BIN_DIR/$product" ]]; then
+        echo "Build product not found at $BIN_DIR/$product" >&2
+        exit 1
+    fi
+done
 
 ICON="$ROOT/Resources/AppIcon.icns"
 if [[ ! -f "$ICON" ]]; then
@@ -51,8 +66,16 @@ fi
 echo "==> assembling $BUNDLE"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
-cp "$BIN" "$BUNDLE/Contents/MacOS/ChromaDBManager"
-cp "$MCP_BIN" "$BUNDLE/Contents/MacOS/chromadb-mcp"
+for product in "${PRODUCTS[@]}"; do
+    cp "$BIN_DIR/$product" "$BUNDLE/Contents/MacOS/$product"
+    # Архитектура проверяется, а не предполагается: архив не под тот
+    # процессор не запустится у человека — молча, перечёркнутым значком.
+    if [[ "$(lipo -archs "$BUNDLE/Contents/MacOS/$product")" != "$ARCH" ]]; then
+        echo "!! $product собран не под $ARCH: $(lipo -archs "$BUNDLE/Contents/MacOS/$product")" >&2
+        exit 1
+    fi
+done
+echo "==> архитектура: $ARCH"
 cp "$ROOT/Resources/Info.plist" "$BUNDLE/Contents/Info.plist"
 cp "$ICON" "$BUNDLE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
@@ -105,12 +128,11 @@ PROTOCOLS="$TOOLCHAIN/usr/share/swift/SwiftConstantValues/AppIntents.json"
 APP_SOURCES="$ROOT/Sources/ChromaDBManagerApp"
 INTENTS_SOURCE="$APP_SOURCES/App/AppIntents.swift"
 
-# Цель сборки — та же, что у SwiftPM выше: архитектура машины, а не
+# Цель сборки — та же, что у SwiftPM выше: архитектура сборки, а не
 # «arm64» из головы, и минимальная система из Info.plist (её с Package.swift
 # сверяет BundleManifestTests). С прибитыми числами на Intel-маке или после
 # подъёма минимальной версии модули пакета не импортировались, и приложение
 # уезжало без интентов под одно лишь предупреждение.
-ARCH="$(uname -m)"
 MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$ROOT/Resources/Info.plist" 2>/dev/null || echo 14.0)"
 TRIPLE="$ARCH-apple-macos$MIN_OS"
 
@@ -172,10 +194,25 @@ else
 fi
 
 echo "==> codesign (hardened runtime, ad-hoc identity)"
-codesign --force --sign - --options runtime --timestamp=none \
-    --entitlements "$ROOT/Resources/ChromaDBManager.entitlements" \
-    "$BUNDLE" >/dev/null 2>&1 || \
-    echo "warning: codesign failed; the app may still run locally" >&2
+# Вспомогательный бинарник — своей подписью, до бандла. Компоновщик
+# подписывает сам только arm64; собранный под x86_64 не подписан, а подпись
+# бандла требует, чтобы всё вложенное было уже подписано: иначе «code object
+# is not signed at all».
+#
+# Провал подписи — провал сборки: неподписанный бинарник на Apple Silicon
+# не запускается, и предупреждение в конце вывода этого не спасало. А вывод
+# удачной подписи («replacing existing signature») не печатается: его не ждёт
+# ни человек, ни release.sh, где он выглядел предупреждением.
+sign() {
+    local output
+    if ! output="$(codesign --force --sign - --options runtime --timestamp=none "$@" 2>&1)"; then
+        echo "!! подпись не удалась: $output" >&2
+        exit 1
+    fi
+}
+sign "$BUNDLE/Contents/MacOS/chromadb-mcp"
+sign --entitlements "$ROOT/Resources/ChromaDBManager.entitlements" "$BUNDLE"
+codesign --verify --deep --strict "$BUNDLE"
 
 echo "Done: $BUNDLE"
 echo "Run it with:  open \"$BUNDLE\""

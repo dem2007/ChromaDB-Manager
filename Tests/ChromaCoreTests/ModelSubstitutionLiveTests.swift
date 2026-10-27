@@ -36,7 +36,7 @@ final class ModelSubstitutionLiveTests: XCTestCase {
             _ = try await client.embedIgnoringCache(texts: ["проверка"], model: unserved)
             XCTFail("LM Studio подала «\(unserved)» на эмбеддинги — проверьте, та ли это модель")
         } catch let error as LMStudioError {
-            guard case .modelSubstituted(let requested, let returned) = error else {
+            guard case .modelSubstituted(let requested, let returned, _) = error else {
                 throw XCTSkip("LM Studio ответила иначе: \(error.errorDescription ?? "\(error)")")
             }
             XCTAssertEqual(requested, unserved)

@@ -471,7 +471,37 @@ public struct AppConfiguration: Codable, Sendable {
     /// Update checks hit the network, so they are opt-in.
     public var checkUpdatesAutomatically: Bool
     public var lmStudioBaseURL: String
-    public var defaultEmbeddingModel: String?
+    /// Какой сервер моделей использует приложение. У каждого свой
+    /// адрес: переключение туда и обратно не теряет ни один из них.
+    public var llmProvider: LLMProvider
+    public var ollamaBaseURL: String
+    /// Адрес выбранного сервера моделей.
+    public var llmBaseURL: String {
+        get { llmProvider == .ollama ? ollamaBaseURL : lmStudioBaseURL }
+        set {
+            switch llmProvider {
+            case .lmStudio: lmStudioBaseURL = newValue
+            case .ollama: ollamaBaseURL = newValue
+            }
+        }
+    }
+    /// Модель векторов по умолчанию — у каждого сервера своя: имена
+    /// моделей у LM Studio и Ollama разные (`text-embedding-nomic-embed-text-v1.5`
+    /// против `nomic-embed-text:latest`), и выбранная для одного сервера
+    /// у другого не найдётся. Модель LM Studio лежит в файле под прежним
+    /// ключом `defaultEmbeddingModel` (см. `CodingKeys`).
+    public var lmStudioEmbeddingModel: String?
+    public var ollamaEmbeddingModel: String?
+    /// Модель векторов по умолчанию у выбранного сервера.
+    public var defaultEmbeddingModel: String? {
+        get { llmProvider == .ollama ? ollamaEmbeddingModel : lmStudioEmbeddingModel }
+        set {
+            switch llmProvider {
+            case .lmStudio: lmStudioEmbeddingModel = newValue
+            case .ollama: ollamaEmbeddingModel = newValue
+            }
+        }
+    }
     /// Manual `embedding` / `chat` tags for LM Studio models, keyed by model id.
     public var modelKindOverrides: [String: String]
     /// Порядок списка коллекций — настройка человека, а не экрана: он
@@ -485,8 +515,21 @@ public struct AppConfiguration: Codable, Sendable {
     /// оценка выдачи чат-моделью. **Выключено по умолчанию**, как
     /// требует ТЗ: это вызов модели на каждый результат каждого варианта.
     public var modelJudgeEnabled: Bool
-    /// Модель, которой оценивать. `nil` — не выбрана, режим не запускается.
-    public var modelJudgeModel: String?
+    /// Модель, которой оценивать, — у каждого сервера своя, как и модель
+    /// векторов; у LM Studio — под прежним ключом `modelJudgeModel`. `nil` —
+    /// не выбрана, режим не запускается.
+    public var lmStudioJudgeModel: String?
+    public var ollamaJudgeModel: String?
+    /// Модель оценки у выбранного сервера.
+    public var modelJudgeModel: String? {
+        get { llmProvider == .ollama ? ollamaJudgeModel : lmStudioJudgeModel }
+        set {
+            switch llmProvider {
+            case .lmStudio: lmStudioJudgeModel = newValue
+            case .ollama: ollamaJudgeModel = newValue
+            }
+        }
+    }
     /// Промпт оценки — редактируемый; схема ответа при этом фиксирована.
     public var modelJudgePrompt: JudgePrompt
     public var dataSources: [DataSource]
@@ -501,6 +544,11 @@ public struct AppConfiguration: Codable, Sendable {
     /// «включить умолчания» нет: умолчание есть всегда, вопрос лишь в том,
     /// чьё оно — наше или человека.
     public var chunkingDefaults: [String: ChunkingConfiguration]
+    /// Модели умолчаний нарезки у Ollama, по стратегиям. Числа нарезки
+    /// у серверов общие, а модели — свои: в `chunkingDefaults` лежат модели
+    /// LM Studio, здесь — Ollama. Читать и писать — через `chunkingDefault(for:)`
+    /// и `setChunkingDefault(_:)`, они раскладывают сами.
+    public var ollamaChunkingModels: [String: ChunkingModels]
     /// Стратегия, с которой заводится новый источник. `nil` — заводская
     /// (`ChunkingConfiguration()`, то есть recursive).
     public var defaultChunkingStrategy: ChunkStrategy?
@@ -592,16 +640,21 @@ public struct AppConfiguration: Codable, Sendable {
         preferredInstallPath: EngineInstallPath = .standalone,
         checkUpdatesAutomatically: Bool = false,
         lmStudioBaseURL: String = "http://localhost:1234",
-        defaultEmbeddingModel: String? = nil,
+        llmProvider: LLMProvider = .platformDefault,
+        ollamaBaseURL: String = LLMProvider.ollama.defaultBaseURL,
+        lmStudioEmbeddingModel: String? = nil,
+        ollamaEmbeddingModel: String? = nil,
         modelKindOverrides: [String: String] = [:],
         collectionListOrder: CollectionListOrder = .default,
         menuBar: MenuBarPreferences = MenuBarPreferences(),
         evaluationKs: [Int] = EvaluationMetrics.defaultKs,
         modelJudgeEnabled: Bool = false,
-        modelJudgeModel: String? = nil,
+        lmStudioJudgeModel: String? = nil,
+        ollamaJudgeModel: String? = nil,
         modelJudgePrompt: JudgePrompt = JudgePrompt(),
         dataSources: [DataSource] = [],
         chunkingDefaults: [String: ChunkingConfiguration] = [:],
+        ollamaChunkingModels: [String: ChunkingModels] = [:],
         defaultChunkingStrategy: ChunkStrategy? = nil,
         sharedTableProfiles: [TableProfile] = [],
         automaticSyncPaused: Bool = false,
@@ -633,16 +686,21 @@ public struct AppConfiguration: Codable, Sendable {
         self.preferredInstallPath = preferredInstallPath
         self.checkUpdatesAutomatically = checkUpdatesAutomatically
         self.lmStudioBaseURL = lmStudioBaseURL
-        self.defaultEmbeddingModel = defaultEmbeddingModel
+        self.llmProvider = llmProvider
+        self.ollamaBaseURL = ollamaBaseURL
+        self.lmStudioEmbeddingModel = lmStudioEmbeddingModel
+        self.ollamaEmbeddingModel = ollamaEmbeddingModel
         self.modelKindOverrides = modelKindOverrides
         self.collectionListOrder = collectionListOrder
         self.menuBar = menuBar
         self.evaluationKs = evaluationKs
         self.modelJudgeEnabled = modelJudgeEnabled
-        self.modelJudgeModel = modelJudgeModel
+        self.lmStudioJudgeModel = lmStudioJudgeModel
+        self.ollamaJudgeModel = ollamaJudgeModel
         self.modelJudgePrompt = modelJudgePrompt
         self.dataSources = dataSources
         self.chunkingDefaults = chunkingDefaults
+        self.ollamaChunkingModels = ollamaChunkingModels
         self.defaultChunkingStrategy = defaultChunkingStrategy
         self.sharedTableProfiles = sharedTableProfiles
         self.automaticSyncPaused = automaticSyncPaused
@@ -723,7 +781,12 @@ public struct AppConfiguration: Codable, Sendable {
         preferredInstallPath = ((try? container.decodeIfPresent(EngineInstallPath.self, forKey: .preferredInstallPath)) ?? nil) ?? .standalone
         checkUpdatesAutomatically = try container.decodeIfPresent(Bool.self, forKey: .checkUpdatesAutomatically) ?? false
         lmStudioBaseURL = try container.decodeIfPresent(String.self, forKey: .lmStudioBaseURL) ?? "http://localhost:1234"
-        defaultEmbeddingModel = try container.decodeIfPresent(String.self, forKey: .defaultEmbeddingModel)
+        // Нет поля (файл до) или значение незнакомо — сервер по умолчанию
+        // для этого Мака: на Apple Silicon это LM Studio, как и было.
+        llmProvider = ((try? container.decodeIfPresent(LLMProvider.self, forKey: .llmProvider)) ?? nil) ?? .platformDefault
+        ollamaBaseURL = try container.decodeIfPresent(String.self, forKey: .ollamaBaseURL) ?? LLMProvider.ollama.defaultBaseURL
+        lmStudioEmbeddingModel = try container.decodeIfPresent(String.self, forKey: .lmStudioEmbeddingModel)
+        ollamaEmbeddingModel = try container.decodeIfPresent(String.self, forKey: .ollamaEmbeddingModel)
         modelKindOverrides = try container.decodeIfPresent([String: String].self, forKey: .modelKindOverrides) ?? [:]
         // Element by element, deliberately. `[DataSource].self` in one call is
         // all-or-nothing: one source the decoder chokes on takes **every** other
@@ -733,6 +796,7 @@ public struct AppConfiguration: Codable, Sendable {
         // Поэлементно по той же причине: один нечитаемый набор параметров
         // не должен уносить умолчания остальных стратегий.
         chunkingDefaults = AppConfiguration.decodeLeniently(container, dictionaryForKey: .chunkingDefaults)
+        ollamaChunkingModels = AppConfiguration.decodeLeniently(container, dictionaryForKey: .ollamaChunkingModels)
         defaultChunkingStrategy = (try? container.decodeIfPresent(ChunkStrategy.self, forKey: .defaultChunkingStrategy)) ?? nil
         // Тоже поэлементно: общий профиль — такая же ручная работа человека,
         // как источник, и один нечитаемый не должен уносить остальные.
@@ -781,12 +845,76 @@ public struct AppConfiguration: Codable, Sendable {
             (try? container.decodeIfPresent([Int].self, forKey: .evaluationKs)) ?? EvaluationMetrics.defaultKs
         )
         modelJudgeEnabled = try container.decodeIfPresent(Bool.self, forKey: .modelJudgeEnabled) ?? false
-        modelJudgeModel = try container.decodeIfPresent(String.self, forKey: .modelJudgeModel)
+        lmStudioJudgeModel = try container.decodeIfPresent(String.self, forKey: .lmStudioJudgeModel)
+        ollamaJudgeModel = try container.decodeIfPresent(String.self, forKey: .ollamaJudgeModel)
         modelJudgePrompt = ((try? container.decodeIfPresent(JudgePrompt.self, forKey: .modelJudgePrompt)) ?? nil) ?? JudgePrompt()
+    }
+
+    /// Ключи файла — перечнем, ради двух строк.
+    ///
+    /// Модели LM Studio лежат под ключами тех времён, когда сервер был один:
+    /// `defaultEmbeddingModel` и `modelJudgeModel`. Под новыми именами файл
+    /// прежней версии читался бы, но сравнение при чтении называло бы
+    /// оба ключа пропадающими — «записано более новой версией» при каждом
+    /// обновлении, — а прежняя сборка, открыв файл новой, теряла бы модель.
+    /// Свойство, которого здесь нет, не записывается вовсе, — это ловит
+    /// `testEveryStoredSettingHasAKey`.
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case mode, localDatabasePath, localDatabaseIsReadOnly, selectedProfileID, serverProfiles
+        case preferredPythonPath, preferredInstallPath, checkUpdatesAutomatically
+        case lmStudioBaseURL, llmProvider, ollamaBaseURL
+        case lmStudioEmbeddingModel = "defaultEmbeddingModel"
+        case ollamaEmbeddingModel
+        case modelKindOverrides, collectionListOrder, menuBar, evaluationKs
+        case modelJudgeEnabled
+        case lmStudioJudgeModel = "modelJudgeModel"
+        case ollamaJudgeModel
+        case modelJudgePrompt, dataSources, chunkingDefaults, ollamaChunkingModels, defaultChunkingStrategy, sharedTableProfiles
+        case automaticSyncPaused, externalClients, proxyPort, autoStartServerOnLaunch, proxyExposure, proxyUsesTLS
+        case checkAppUpdatesOnLaunch, mcpReadOnly, mcpOverHTTP, notificationsEnabled, operationNotifications
+        case embeddingCacheEnabled, embeddingCacheLimitBytes, timeouts, logRetention
+        case trashEnabled, trashRetentionDays, trashLimitBytes, syncPreviewThresholdFiles
     }
 }
 
 // MARK: - Умолчания нарезки
+
+/// Модели в настройках нарезки — та их часть, что у каждого сервера своя
+///: модель обогащения, модель предложений Semantic и чат-модель
+/// LLM-нарезки. `nil` — не задана, работает модель источника.
+public struct ChunkingModels: Codable, Hashable, Sendable {
+    public var enrichmentModel: String?
+    public var sentenceEmbeddingModel: String?
+    public var chatModel: String?
+
+    public init(enrichmentModel: String? = nil, sentenceEmbeddingModel: String? = nil, chatModel: String? = nil) {
+        self.enrichmentModel = enrichmentModel
+        self.sentenceEmbeddingModel = sentenceEmbeddingModel
+        self.chatModel = chatModel
+    }
+
+    public init(of configuration: ChunkingConfiguration) {
+        enrichmentModel = configuration.enrichmentModel
+        sentenceEmbeddingModel = configuration.sentenceEmbeddingModel
+        chatModel = configuration.chatModel
+    }
+
+    public func apply(to configuration: inout ChunkingConfiguration) {
+        configuration.enrichmentModel = enrichmentModel
+        configuration.sentenceEmbeddingModel = sentenceEmbeddingModel
+        configuration.chatModel = chatModel
+    }
+
+    /// Пустые поля — из `other`. Для переноса настроек: незаданная в файле
+    /// модель значит «на той машине этого сервера нет», а не «стереть».
+    public func filling(from other: ChunkingModels) -> ChunkingModels {
+        ChunkingModels(
+            enrichmentModel: enrichmentModel ?? other.enrichmentModel,
+            sentenceEmbeddingModel: sentenceEmbeddingModel ?? other.sentenceEmbeddingModel,
+            chatModel: chatModel ?? other.chatModel
+        )
+    }
+}
 
 extension AppConfiguration {
     /// Параметры, с которыми открывается эта стратегия: заданные человеком
@@ -795,9 +923,15 @@ extension AppConfiguration {
     /// Стратегия проставляется поверх сохранённого набора: запись под ключом
     /// «semantic», внутри которой почему-то стоит `strategy: .fixed`, должна
     /// читаться как параметры semantic, а не молча переключать стратегию.
+    ///
+    /// Модели — выбранного сервера: у Ollama свои, пустые, пока
+    /// их не задали, — тогда работают модели самого источника.
     public func chunkingDefault(for strategy: ChunkStrategy) -> ChunkingConfiguration {
         var configuration = chunkingDefaults[strategy.rawValue] ?? ChunkingConfiguration()
         configuration.strategy = strategy
+        if llmProvider == .ollama {
+            (ollamaChunkingModels[strategy.rawValue] ?? ChunkingModels()).apply(to: &configuration)
+        }
         return configuration
     }
 
@@ -818,8 +952,20 @@ extension AppConfiguration {
     /// Обе половины сразу: человек, нажавший «сделать умолчанием» на экране
     /// источника, имеет в виду «новые источники заводить вот так», а не
     /// «запомни числа, но заводи по-старому».
+    ///
+    /// Модели — в поле выбранного сервера; модели другого остаются
+    /// как были.
     public mutating func setChunkingDefault(_ configuration: ChunkingConfiguration) {
-        chunkingDefaults[configuration.strategy.rawValue] = configuration
+        let key = configuration.strategy.rawValue
+        switch llmProvider {
+        case .lmStudio:
+            chunkingDefaults[key] = configuration
+        case .ollama:
+            var stored = configuration
+            (chunkingDefaults[key].map(ChunkingModels.init(of:)) ?? ChunkingModels()).apply(to: &stored)
+            chunkingDefaults[key] = stored
+            ollamaChunkingModels[key] = ChunkingModels(of: configuration)
+        }
         defaultChunkingStrategy = configuration.strategy
     }
 
@@ -829,6 +975,24 @@ extension AppConfiguration {
     /// и остаться на этой стратегии — обычное желание.
     public mutating func clearChunkingDefault(for strategy: ChunkStrategy) {
         chunkingDefaults.removeValue(forKey: strategy.rawValue)
+        ollamaChunkingModels.removeValue(forKey: strategy.rawValue)
+    }
+}
+
+// MARK: - Ручные пометки типа модели
+
+extension AppConfiguration {
+    /// Тип, который человек отметил руками, — у модели этого сервера.
+    ///
+    /// Ключ — пара «сервер + имя»: у одноимённой модели другого сервера тип
+    /// может быть другим. У LM Studio ключ — само имя, как до, и
+    /// прежние пометки остаются на месте.
+    public func kindOverride(of model: String, server: LLMProvider) -> LMStudioModelKind? {
+        modelKindOverrides[server.cacheName(of: model)].flatMap(LMStudioModelKind.init(rawValue:))
+    }
+
+    public mutating func setKindOverride(_ kind: LMStudioModelKind, of model: String, server: LLMProvider) {
+        modelKindOverrides[server.cacheName(of: model)] = kind.rawValue
     }
 }
 

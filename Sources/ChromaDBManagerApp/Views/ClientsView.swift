@@ -198,6 +198,7 @@ struct ClientsView: View {
                     } description: {
                         Text("Права, коллекции и лимиты — у каждого ключа свои.")
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
@@ -243,6 +244,7 @@ struct ClientsView: View {
             } actions: {
                 Button(String(localized: "Новый ключ…")) { showsNewClient = true }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List(selection: $selection) {
                 ForEach(clients) { client in

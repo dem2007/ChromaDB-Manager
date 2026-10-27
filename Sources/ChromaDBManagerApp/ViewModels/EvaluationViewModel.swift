@@ -359,7 +359,7 @@ final class EvaluationViewModel: ObservableObject {
     func addVariant(_ app: AppEnvironment) async {
         guard let draft, let collection = collections.first(where: { $0.name == draft.collectionName }) else { return }
         do {
-            let model = try await app.bindingService.requiredModel(for: collection)
+            let model = try app.bindingService.requiredModel(for: collection, server: app.settings.configuration.llmProvider)
             let profile = draft.profileID.flatMap { app.searchProfiles.profile(id: $0) }
                 ?? app.searchProfiles.effectiveProfile(for: collection.name, model: model)
             let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -390,8 +390,10 @@ final class EvaluationViewModel: ObservableObject {
             cost = nil
             return
         }
-        let metrics = await app.metrics.current()
-        let benchmarks = await app.benchmarks.all()
+        // Замеры — выбранного сервера.
+        let server = app.settings.configuration.llmProvider
+        let metrics = await app.metrics.current().serving(server)
+        let benchmarks = await app.benchmarks.all().serving(server)
         cost = EvaluationCost.estimate(
             queries: set.queries, variants: variants, metrics: metrics, benchmarks: benchmarks
         )
@@ -404,6 +406,20 @@ final class EvaluationViewModel: ObservableObject {
         let lmStudio: LMStudioClient
         do {
             lmStudio = try app.makeLMStudioClient()
+            // Варианты собраны раньше, а сервер моделей могли сменить:
+            // вектор запроса посчитала бы одноимённая модель другого сервера,
+            // и метрики тихо сравнивали бы несравнимое.
+            // И модель: коллекцию могли пересчитать другой моделью после того,
+            // как вариант добавлен, — запросы посчитала бы прежняя.
+            let server = app.settings.configuration.llmProvider
+            for variant in variants {
+                guard let collection = collections.first(where: { $0.id == variant.collectionID }) else { continue }
+                let model = try app.bindingService.requiredModel(for: collection, server: server)
+                guard model == variant.model else {
+                    errorMessage = String(localized: "Коллекция «\(collection.name)» теперь заполнена моделью «\(model)», а вариант «\(variant.name)» собран для «\(variant.model)». Удалите вариант и добавьте его заново.")
+                    return
+                }
+            }
         } catch {
             errorMessage = app.describe(error)
             return
@@ -755,7 +771,7 @@ final class EvaluationViewModel: ObservableObject {
             judgeCost = nil
             return
         }
-        let metrics = await app.metrics.current()
+        let metrics = await app.metrics.current().serving(app.settings.configuration.llmProvider)
         judgeCost = JudgementCost.estimate(
             run: run,
             existing: judgements,
@@ -853,7 +869,8 @@ final class EvaluationViewModel: ObservableObject {
                 let calls = await judge.measuredCalls
                 if calls > 0 {
                     await app.metrics.recordJudgement(
-                        model: model, calls: calls, duration: Date().timeIntervalSince(started)
+                        model: model, server: app.settings.configuration.llmProvider,
+                        calls: calls, duration: Date().timeIntervalSince(started)
                     )
                 }
                 // На экран — только если это всё ещё тот прогон. Оценка идёт

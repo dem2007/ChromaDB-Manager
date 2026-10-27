@@ -69,6 +69,18 @@ public final class SearchProfileStore {
         self.collectionsWithoutPipeline = Set(contents.collectionsWithoutPipeline)
     }
 
+    /// Сервер моделей, выбранный в приложении: профили отдаются
+    /// с моделью переранжирования этого сервера. Ставит приложение — по
+    /// настройке, при каждой её смене.
+    public var server: LLMProvider = .lmStudio
+
+    /// Профиль, читающий и пишущий модель переранжирования текущего сервера.
+    private func serving(_ profile: SearchProfile) -> SearchProfile {
+        var copy = profile
+        copy.server = server
+        return copy
+    }
+
     /// Почему ничего не сохраняется, если это так.
     public var persistenceProblem: String? { file.problem }
 
@@ -106,12 +118,13 @@ public final class SearchProfileStore {
     public func effectiveProfile(for collectionName: String, model: String? = nil) -> SearchProfile {
         let profile = defaultProfile(for: collectionName, model: model)
         guard !isPipelineEnabled(for: collectionName) else { return profile }
-        return SearchProfile.plain(collectionName: collectionName, name: profile.name)
+        return serving(SearchProfile.plain(collectionName: collectionName, name: profile.name))
     }
 
     public func profiles(for collectionName: String) -> [SearchProfile] {
         profiles
             .filter { $0.collectionName == collectionName }
+            .map(serving)
             .sorted { left, right in
                 if left.isDefault != right.isDefault { return left.isDefault }
                 return left.name.localizedStandardCompare(right.name) == .orderedAscending
@@ -131,11 +144,11 @@ public final class SearchProfileStore {
     public func defaultProfile(for collectionName: String, model: String? = nil) -> SearchProfile {
         profiles(for: collectionName).first { $0.isDefault }
             ?? profiles(for: collectionName).first
-            ?? SearchProfile(collectionName: collectionName, queryPrefix: SearchProfile.queryPrefix(forModel: model))
+            ?? serving(SearchProfile(collectionName: collectionName, queryPrefix: SearchProfile.queryPrefix(forModel: model)))
     }
 
     public func profile(id: UUID) -> SearchProfile? {
-        profiles.first { $0.id == id }
+        profiles.first { $0.id == id }.map(serving)
     }
 
     @discardableResult
@@ -159,7 +172,7 @@ public final class SearchProfileStore {
         }
         persist()
         log(.info, "Поиск", "Профиль поиска «\(stored.name)» сохранён для коллекции «\(stored.collectionName)»")
-        return stored
+        return serving(stored)
     }
 
     public func remove(id: UUID) {
@@ -185,7 +198,7 @@ public final class SearchProfileStore {
         persist()
     }
 
-    public func all() -> [SearchProfile] { profiles }
+    public func all() -> [SearchProfile] { profiles.map(serving) }
 
     /// Replaces the whole list, for an import already shown and confirmed.
     public func replaceAll(_ replacement: [SearchProfile]) {
@@ -217,7 +230,7 @@ public final class SearchProfileStore {
             copy.id = UUID()
             copy.collectionName = collectionName
             copy.isDefault = false
-            return copy
+            return serving(copy)
         }
     }
 

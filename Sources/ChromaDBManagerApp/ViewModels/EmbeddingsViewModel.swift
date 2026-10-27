@@ -98,11 +98,11 @@ final class EmbeddingsViewModel: ObservableObject {
         do {
             let client = try app.makeLMStudioClient()
             var loaded = try await client.models()
+            guard client.provider == app.settings.configuration.llmProvider else { return }
 
-            let overrides = app.settings.configuration.modelKindOverrides
+            let configuration = app.settings.configuration
             for index in loaded.indices {
-                if let override = overrides[loaded[index].id],
-                   let kind = LMStudioModelKind(rawValue: override) {
+                if let kind = configuration.kindOverride(of: loaded[index].id, server: client.provider) {
                     loaded[index].kind = kind
                     loaded[index].kindIsInferred = true
                 }
@@ -123,7 +123,7 @@ final class EmbeddingsViewModel: ObservableObject {
             // Не баннером над всеми вкладками «Моделей» (v6 A4): что
             // подключено и сколько моделей — строка «Состояние» на вкладке
             // «Подключение»; баннер — только для ошибки и итога действия.
-            app.log.record(.info, "LM Studio", "Подключено к \(app.settings.configuration.lmStudioBaseURL). Моделей: \(models.count), из них эмбеддинговых: \(embeddingModels.count).")
+            app.log.record(.info, "LM Studio", "\(app.settings.configuration.llmProvider.title): подключено к \(app.settings.configuration.llmBaseURL). Моделей: \(models.count), из них эмбеддинговых: \(embeddingModels.count).")
 
             if app.settings.configuration.defaultEmbeddingModel == nil,
                let first = embeddingModels.first {
@@ -141,6 +141,18 @@ final class EmbeddingsViewModel: ObservableObject {
     /// Когда список последний раз удалось получить. Показывается на экране:
     /// «пусто» и «не спрашивали» — разные вещи.
     @Published private(set) var modelsRefreshedAt: Date?
+
+    /// Сервер моделей сменился: список, его время и сообщения —
+    /// о прежнем сервере, и показывать их под новым нельзя.
+    func forgetModels() {
+        models = []
+        modelsRefreshedAt = nil
+        errorMessage = nil
+        connectionMessage = nil
+        // Пауза, выросшая на недоступном прежнем сервере, к новому отношения
+        // не имеет: иначе список Ollama обновлялся бы сам раз в десять минут.
+        quietInterval = .seconds(60)
+    }
     private var autoRefreshTask: Task<Void, Never>?
     private var activationObserver: NSObjectProtocol?
     /// Пауза между тихими опросами. Растёт при неудачах, чтобы выключенная
@@ -163,13 +175,15 @@ final class EmbeddingsViewModel: ObservableObject {
             quietInterval = min(quietInterval * 2, .seconds(600))
             return
         }
+        // Пока шёл запрос, сервер сменили: ответ — о прежнем,
+        // и лечь поверх списка нового он не должен.
+        guard client.provider == app.settings.configuration.llmProvider else { return }
         quietInterval = .seconds(60)
 
-        let overrides = app.settings.configuration.modelKindOverrides
+        let configuration = app.settings.configuration
         let remembered = Dictionary(models.map { ($0.id, $0.kind) }, uniquingKeysWith: { first, _ in first })
         for index in loaded.indices {
-            if let override = overrides[loaded[index].id],
-               let kind = LMStudioModelKind(rawValue: override) {
+            if let kind = configuration.kindOverride(of: loaded[index].id, server: client.provider) {
                 loaded[index].kind = kind
                 loaded[index].kindIsInferred = true
             } else if loaded[index].kind == .unknown,
@@ -222,7 +236,10 @@ final class EmbeddingsViewModel: ObservableObject {
     // нажать. Задача и наблюдатель уходят вместе с процессом.
 
     func overrideKind(_ model: LMStudioModel, to kind: LMStudioModelKind, app: AppEnvironment) {
-        app.settings.configuration.modelKindOverrides[model.id] = kind.rawValue
+        // Пометка — модели этого сервера.
+        app.settings.configuration.setKindOverride(
+            kind, of: model.id, server: app.settings.configuration.llmProvider
+        )
         if let index = models.firstIndex(where: { $0.id == model.id }) {
             models[index].kind = kind
             models[index].kindIsInferred = true
@@ -300,19 +317,22 @@ final class EmbeddingsViewModel: ObservableObject {
         benchmarksProblem = await app.benchmarks.persistenceProblem()
     }
 
-    func benchmark(for model: String) -> ModelBenchmark? {
-        benchmarks.first { $0.model == model }
+    /// Замер модели этого сервера: одноимённая модель другого —
+    /// другая скорость.
+    func benchmark(for model: String, server: LLMProvider) -> ModelBenchmark? {
+        benchmarks.first { $0.model == model && $0.serverID == server.rawValue }
     }
 
     /// Asks first. The run holds the model for its whole duration, and the
     /// duration is exactly what the user cannot guess — so it is shown before
     /// the button does anything (rule 4, Приложение 5).
     func requestBenchmark(_ model: LMStudioModel, app: AppEnvironment) async {
-        let metrics = await app.metrics.current()
+        let server = app.settings.configuration.llmProvider
+        let metrics = await app.metrics.current().serving(server)
         pendingAction = .benchmark(
             model: model.id,
             estimatedSeconds: ModelBenchmarkService.estimatedSeconds(
-                model: model.id, benchmarks: benchmarks, metrics: metrics
+                model: model.id, benchmarks: benchmarks.serving(server), metrics: metrics
             )
         )
     }

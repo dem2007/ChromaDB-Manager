@@ -284,7 +284,7 @@ final class CollectionsViewModel: ObservableObject {
         defer { isImporting = false }
 
         do {
-            let model = try await app.bindingService.requiredModel(for: collection)
+            let model = try app.bindingService.requiredModel(for: collection, server: app.settings.configuration.llmProvider)
             let lmStudio = try app.makeLMStudioClient()
             try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
             let limit = await app.bindingService.contextLength(of: model, lmStudio: lmStudio)
@@ -680,6 +680,7 @@ final class CollectionsViewModel: ObservableObject {
                 let lmStudio = try app.makeLMStudioClient()
                 let dimension = try await app.bindingService.dimension(of: model, lmStudio: lmStudio)
                 metadata[CollectionBindingKeys.model] = .string(model)
+                metadata[CollectionBindingKeys.modelServer] = .string(lmStudio.provider.rawValue)
                 metadata[CollectionBindingKeys.dimension] = .int(dimension)
             }
             let created = try await client.createCollection(
@@ -792,6 +793,7 @@ final class CollectionsViewModel: ObservableObject {
     private func captureCollectionToTrash(_ collection: ChromaCollection, client: ChromaClient, app: AppEnvironment) async throws {
         let metric = collection.space
         let model = collection.boundModel
+        let server = collection.binding?.serverID
         let dimension = collection.effectiveDimension
         let pageSize = 200
         var offset = 0
@@ -809,6 +811,7 @@ final class CollectionsViewModel: ObservableObject {
                     collectionName: collection.name,
                     collectionMetric: metric,
                     collectionModel: model,
+                    collectionServer: server,
                     collectionDimension: dimension,
                     reason: .collection
                 )
@@ -1049,7 +1052,7 @@ final class CollectionsViewModel: ObservableObject {
         documentContextLimit = nil
         guard let collection = selected else { return }
         Task { [weak self] in
-            guard let model = try? await app.bindingService.requiredModel(for: collection),
+            guard let model = try? app.bindingService.requiredModel(for: collection, server: app.settings.configuration.llmProvider),
                   let lmStudio = try? app.makeLMStudioClient() else { return }
             let limit = await app.bindingService.contextLength(of: model, lmStudio: lmStudio)
             await MainActor.run { self?.documentContextLimit = limit }
@@ -1119,7 +1122,7 @@ final class CollectionsViewModel: ObservableObject {
         defer { isSavingDocument = false }
 
         do {
-            let model = try await app.bindingService.requiredModel(for: collection)
+            let model = try app.bindingService.requiredModel(for: collection, server: app.settings.configuration.llmProvider)
             let lmStudio = try app.makeLMStudioClient()
             try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
 
@@ -1362,6 +1365,7 @@ final class CollectionsViewModel: ObservableObject {
                     collectionName: collection.name,
                     collectionMetric: collection.space,
                     collectionModel: collection.boundModel,
+                    collectionServer: collection.binding?.serverID,
                     collectionDimension: collection.effectiveDimension,
                     reason: .document
                 ))
@@ -1471,7 +1475,7 @@ final class CollectionsViewModel: ObservableObject {
                     }
                 }
 
-                let model = try await app.bindingService.requiredModel(for: collection)
+                let model = try app.bindingService.requiredModel(for: collection, server: app.settings.configuration.llmProvider)
                 let lmStudio = try app.makeLMStudioClient()
                 try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
 
@@ -1812,11 +1816,14 @@ final class CollectionsViewModel: ObservableObject {
         // A new profile starts from the defaults of the specification, not from
         // whatever is on screen: «создать» and «дублировать» are different
         // actions and must not quietly be the same one.
-        profileDraft = SearchProfile(
+        var draft = SearchProfile(
             name: String(localized: "Новый профиль"),
             collectionName: collection.name,
             isDefault: profiles.isEmpty
         )
+        // Модель переранжирования пишется в поле выбранного сервера.
+        draft.server = app.searchProfiles.server
+        profileDraft = draft
         showProfileEditor = true
     }
 

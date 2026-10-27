@@ -297,13 +297,13 @@ final class MCPAnswerSurfaceTests: XCTestCase {
 
     func testTheCommonFailuresNameTheirReasonInEnglish() {
         let errors: [any Error] = [
-            LMStudioError.unreachable("connection refused"),
+            LMStudioError.unreachable("connection refused", server: .lmStudio),
             LMStudioError.modelNotEmbedding("qwen3-chat"),
             ChromaError.unreachable(endpoint: "http://127.0.0.1:8000", reason: "connection refused"),
             ChromaError.collectionNotFound("notes"),
             ChromaError.api(status: 500, code: nil, message: "internal error"),
             BindingError.notBound(collection: "notes"),
-            BindingError.modelUnavailable(model: "e5"),
+            BindingError.modelUnavailable(model: "e5", server: .lmStudio),
             FilterError.invalidRawJSON("unexpected token"),
         ]
         for error in errors {

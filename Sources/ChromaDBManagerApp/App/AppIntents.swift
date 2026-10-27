@@ -109,7 +109,7 @@ struct AddTextIntent: AppIntent {
         guard let target = collections.first(where: { $0.name == collection }) else {
             throw IntentProblem.noCollection(collection)
         }
-        let model = try await app.bindingService.requiredModel(for: target)
+        let model = try app.bindingService.requiredModel(for: target, server: app.settings.configuration.llmProvider)
         let lmStudio = try app.makeLMStudioClient()
         try await app.bindingService.ensureAvailable(model: model, lmStudio: lmStudio)
         let limit = await app.bindingService.contextLength(of: model, lmStudio: lmStudio)

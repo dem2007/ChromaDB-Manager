@@ -14,7 +14,7 @@ quality, and gives agents access to the base over MCP — with keys and permissi
 Vectors are computed by a local [LM Studio](https://lmstudio.ai/): documents never
 leave the machine.
 
-> **Version 0.4.1.** What follows describes what is implemented and works. What is
+> **Version 0.4.2.** What follows describes what is implemented and works. What is
 > deliberately not done, and where the app's limits are, is in
 > [Known limitations](#known-limitations).
 
@@ -385,8 +385,10 @@ access control lives in a proxy in front of it.
 
 ## Installation
 
-A ready build is on the releases page: download `ChromaDB-Manager-<version>.zip`,
-unpack it and move the app to Applications.
+A ready build is on the releases page: download the archive for your processor —
+`ChromaDB-Manager-<version>-apple-silicon.zip` for M1 and later Macs or
+`ChromaDB-Manager-<version>-intel.zip` for Intel Macs (the processor is named in
+the Apple menu → About This Mac) — unpack it and move the app to Applications.
 
 The package is not notarised, so on first launch macOS says it cannot verify the
 developer:
@@ -398,10 +400,20 @@ developer:
 | What | Needed? |
 |---|---|
 | macOS | 14 Sonoma or later |
+| Processor | Apple Silicon or Intel — each has its own archive (since 0.4.2) |
 | ChromaDB | 1.x — the app installs it itself |
 | LM Studio | for vectors and semantic search; installed separately, models are loaded in it |
 | Python 3 | not needed; only for the second way of installing the engine |
 | Pages, Keynote, Numbers | only for `.pages`, `.key` and `.numbers` |
+
+**On an Intel Mac** LM Studio does not run: it is released for Apple Silicon
+only. Use [Ollama](https://ollama.com) instead (macOS 14+, CPU-only on Intel):
+Embeddings → Connection → Ollama, default address `http://localhost:11434`; on
+Intel the app starts with it by itself. Models are downloaded in Ollama
+(`ollama pull nomic-embed-text`), and it reports their type and context; the
+working context on Intel is 4096 tokens by default, more in Ollama's settings. You can
+also keep LM Studio on another computer by entering its address — texts for
+vectors then go to that computer.
 
 ---
 
